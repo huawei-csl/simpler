@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <tracr/tracr.hpp>
+#include <tracr_simple_api.hpp>
 
 #include "acl/acl.h"
 
@@ -548,19 +549,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     runtime.sche_cpu_num = launch_aicpu_num;
 
     // Initialize TraCR memory on the device
-    const size_t size = sizeof(TraCR::Payload) * runtime.sche_cpu_num * TraCR::CAPACITY;
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrData_ = mem_alloc_.alloc(size);
-    if (runtime.tracrData_ == nullptr) {
-        LOG_ERROR("runtime.tracrData_: alloc %zu bytes failed", size);
-        return -1;
+    rc = DevAllocTraCR(runtime, mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
+        return rc;
     }
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrDataSizes_ = mem_alloc_.alloc(runtime.sche_cpu_num * sizeof(size_t));
-    if (runtime.tracrDataSizes_ == nullptr) {
-        LOG_ERROR("runtime.tracrDataSizes_: alloc %zu bytes failed", size);
-        return -1;
-    }
+    
 
     // Scope guards for register-address cleanup on all exit paths. Declared
     // before the allocs so that an alloc-failure early-return still triggers
@@ -812,18 +806,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
     }
 
-    // Download TraCR memory from Device
-    
-
-    // Free TraCR memory from Device
-    rc = mem_alloc_.free(runtime.tracrData_);
+    // Download and Free TraCR memory from Device and store in memory (~/ascend/)
+    rc = StoreTracrData(runtime, mem_alloc_);
     if (rc != 0) {
-        LOG_ERROR("Device Free Memory of runtime.tracrData_ failed: %d", rc);
-        return -1;
-    }
-    rc = mem_alloc_.free(runtime.tracrDataSizes_);
-    if (rc != 0) {
-        LOG_ERROR("Device Free Memory of runtime.tracrDataSizes_ failed: %d", rc);
+        LOG_ERROR("FreeTraCR failed: %d", rc);
         return -1;
     }
 

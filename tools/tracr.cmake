@@ -35,6 +35,7 @@ function(tracr_enable target)
     # Append the nlohmann json path as well
     set(TRACR_INCLUDE_DIR
         ${TRACR_INCLUDE_DIR}
+        ${TRACR_ROOT_DIR}
         ${TRACR_ROOT_DIR}/tracr/extern
     )
 
