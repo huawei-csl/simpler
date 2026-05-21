@@ -73,6 +73,11 @@ message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
+# TraCR
+option(BUILD_TRACR "Enable TraCR" ON) # default ON for testing
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(host_runtime)
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

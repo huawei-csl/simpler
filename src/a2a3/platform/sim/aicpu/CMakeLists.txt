@@ -56,6 +56,11 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
+# TraCR
+option(BUILD_TRACR "Enable TraCR" ON)  # default ON for testing
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
 # Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE

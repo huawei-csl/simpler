@@ -26,6 +26,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <tracr/tracr.hpp>
+
 #include "acl/acl.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
@@ -544,6 +547,21 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
     runtime.sche_cpu_num = launch_aicpu_num;
 
+    // Initialize TraCR memory on the device
+    const size_t size = sizeof(TraCR::Payload) * runtime.sche_cpu_num * TraCR::CAPACITY;
+    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
+    runtime.tracrData_ = mem_alloc_.alloc(size);
+    if (runtime.tracrData_ == nullptr) {
+        LOG_ERROR("runtime.tracrData_: alloc %zu bytes failed", size);
+        return -1;
+    }
+    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
+    runtime.tracrDataSizes_ = mem_alloc_.alloc(runtime.sche_cpu_num * sizeof(size_t));
+    if (runtime.tracrDataSizes_ == nullptr) {
+        LOG_ERROR("runtime.tracrDataSizes_: alloc %zu bytes failed", size);
+        return -1;
+    }
+
     // Scope guards for register-address cleanup on all exit paths. Declared
     // before the allocs so that an alloc-failure early-return still triggers
     // cleanup of previously-allocated buffers (the predicates no-op on 0).
@@ -792,6 +810,21 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
             device_wall_ns_ = 0;
         }
+    }
+
+    // Download TraCR memory from Device
+    
+
+    // Free TraCR memory from Device
+    rc = mem_alloc_.free(runtime.tracrData_);
+    if (rc != 0) {
+        LOG_ERROR("Device Free Memory of runtime.tracrData_ failed: %d", rc);
+        return -1;
+    }
+    rc = mem_alloc_.free(runtime.tracrDataSizes_);
+    if (rc != 0) {
+        LOG_ERROR("Device Free Memory of runtime.tracrDataSizes_ failed: %d", rc);
+        return -1;
     }
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe

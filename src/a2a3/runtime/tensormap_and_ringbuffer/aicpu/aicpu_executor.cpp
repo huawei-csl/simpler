@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #endif
 
+#include <tracr/tracr.hpp>
+
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
@@ -738,6 +740,59 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 // ===== Public Entry Point =====
 
+
+
+/**
+ * init tracr profiler
+ * 
+ * NOTE: make shure threadIdx starts at 0 and follows in the positive direction
+ */
+inline void tracr_start(const int threadIdx) {
+    if (threadIdx == 0) {
+        LOG_INFO_V9("[TraCR] thread[%d] start", threadIdx);
+        INSTRUMENTATION_START();
+    } else {
+        LOG_INFO_V9("[TraCR] thread[%d] thread init", threadIdx);
+        INSTRUMENTATION_THREAD_INIT();
+    }
+}
+
+/**
+ * finalizing tracr function
+ * 
+ * NOTE: make shure threadIdx starts at 0 and follows in the positive direction
+ */
+inline void tracr_finalize(const int threadIdx, Runtime *runtime) {
+    // (void)(runtime);
+
+#ifdef ENABLE_TRACR
+    LOG_INFO_V9("[TraCR] thread[%d] dumping the #traces: %lu %p", threadIdx, tracrThread->_traceIdx, runtime->tracrData_);
+
+    if (tracrThread->_traceIdx > 0) {
+        TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->tracrData_);
+        const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
+
+        std::memcpy(
+            &tracrData[threadIdx * TraCR::CAPACITY], 
+            tracrThread->_traces.data(),
+            payload_size
+        );
+    }
+
+    size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->tracrDataSizes_);
+    tracrDataSizes[threadIdx] = tracrThread->_traceIdx;
+
+    LOG_INFO_V9("[TraCR] thread[%d] dumping the #traces: done", threadIdx);
+#endif
+
+    if (threadIdx == 0) {
+        INSTRUMENTATION_END();
+    } else {
+        INSTRUMENTATION_THREAD_FINALIZE();
+    }
+}
+
+
 /**
  * aicpu_execute - Main AICPU kernel execution entry point
  *
@@ -757,6 +812,20 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return -1;
     }
 
+    // Watch out, basicly hardcoded, we assume the all four threads to lie on each CPU on the same NUMA domain
+    if (sched_getcpu() <= 3) {
+        LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! sche_cpu_num=%d sched_getcpu=%d", runtime->sche_cpu_num, sched_getcpu());
+        return -1;
+    }
+
+    // WARNING: hardcoded threadIdx (for now)
+    tracr_start(sched_getcpu()-4);
+    LOG_INFO_V9("[TraCR] thread[%d] start ENABLE_TRACR=%d", sched_getcpu()-4, INSTRUMENTATION_ACTIVE);
+
+    for(int i = 0; i < sched_getcpu()*128; ++i) {
+        INSTRUMENTATION_MARK_RESET(i%3);
+    }
+
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     g_aicpu_executor.init(runtime);
@@ -772,6 +841,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
+
+    // WARNING: hardcoded threadIdx (for now)
+    tracr_finalize(sched_getcpu()-4, runtime);
+    LOG_INFO_V9("[TraCR] thread[%d] finalize ENABLE_TRACR=%d", sched_getcpu()-4, INSTRUMENTATION_ACTIVE);
 
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
 
@@ -789,7 +862,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (rc != 0) {
         return rc;
     }
-
-    LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
+    
+    LOG_INFO_V9("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

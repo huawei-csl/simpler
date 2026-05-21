@@ -343,7 +343,7 @@ int run_prepared(
         auto run_context_guard = RAIIScopeGuard([runner]() {
             runner->release_run_context();
         });
-
+        
         Runtime *r = new (runtime) Runtime();
         r->host_api.device_malloc = device_malloc;
         r->host_api.device_free = device_free;
