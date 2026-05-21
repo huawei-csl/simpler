@@ -24,6 +24,8 @@
 
 #include <tracr/tracr.hpp>
 
+#include "acl/acl.h"
+
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 

@@ -27,7 +27,6 @@
 #include <string>
 #include <vector>
 
-#include <tracr/tracr.hpp>
 #include <tracr_simple_api.hpp>
 
 #include "acl/acl.h"

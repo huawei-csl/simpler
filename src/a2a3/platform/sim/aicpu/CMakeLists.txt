@@ -61,6 +61,8 @@ option(BUILD_TRACR "Enable TraCR" ON)  # default ON for testing
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
 tracr_enable(aicpu_kernel)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+
 # Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE

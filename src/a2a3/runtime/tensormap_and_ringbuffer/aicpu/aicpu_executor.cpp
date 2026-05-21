@@ -823,7 +823,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO_V9("[TraCR] thread[%d] start ENABLE_TRACR=%d", sched_getcpu()-4, INSTRUMENTATION_ACTIVE);
 
     for(int i = 0; i < sched_getcpu()*128; ++i) {
-        INSTRUMENTATION_MARK_RESET(i%3);
+        INSTRUMENTATION_MARK_SET(i%3, i%5, i%5);
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
