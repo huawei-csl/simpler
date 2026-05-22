@@ -18,7 +18,8 @@
     X(Orchestrating)    \
     X(Scheduling)       \
     X(Initializing)     \
-    X(De_Initializing)
+    X(De_Initializing)  \
+    X(DLL_loading)
 
 enum MarkerType {
 #define X(name) name,

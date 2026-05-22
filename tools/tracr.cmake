@@ -17,9 +17,6 @@ function(tracr_enable target)
         message(FATAL_ERROR "Target '${target}' does not exist.")
     endif()
 
-    # Link tracr with json and filesystem
-    # target_link_libraries(${target} PRIVATE json stdc++fs)
-
     # Create the TraCR include directory path
     set(TRACR_INCLUDE_DIR
         ${TRACR_ROOT_DIR}/tracr/include

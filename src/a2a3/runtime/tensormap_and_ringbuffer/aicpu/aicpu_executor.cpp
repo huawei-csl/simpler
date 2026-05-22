@@ -236,6 +236,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
             const bool reload_so = runtime->register_new_callable_id();
 
+            INSTRUMENTATION_MARK_SET(thread_idx, DLL_loading, 0);
+            
             if (reload_so) {
                 LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
                 if (*p_handle != nullptr) {

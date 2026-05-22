@@ -12,7 +12,7 @@
  * TraCR Simpler API functions for A2A3, A2A3sim, A5, A5sim
  */
 
-#include <filesystem>
+#include <filesystem>           // C++17 or newer
 #include <fstream>
 #include <array>
 #include <string>
@@ -135,10 +135,10 @@ int StoreTracrMetaData(RuntimeT &runtime) {
     for(int i = 0; i < runtime.sche_cpu_num; ++i) {
         channel_names.push_back("AICPU_" + std::to_string(i));
     }
-    for(int i = 0; i < runtime.worker_count; ++i) {
+    for(int i = 0; i < int(RUNTIME_MAX_WORKER/3); ++i) {
         channel_names.push_back("AICube_" + std::to_string(i));
     }
-    for(int i = 0; i < 2*runtime.worker_count; ++i) {
+    for(int i = 0; i < int(2*RUNTIME_MAX_WORKER/3); ++i) {
         channel_names.push_back("AIVector_" + std::to_string(i));
     }
     channel_names.push_back("INVALID");
