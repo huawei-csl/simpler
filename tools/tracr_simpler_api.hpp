@@ -9,34 +9,22 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Device Runner Implementation
- *
- * This file implements the device execution utilities for launching and
- * managing AICPU and AICore kernels on Ascend devices.
+ * TraCR Simpler API functions for A2A3, A2A3sim, A5, A5sim
  */
 
 #include <filesystem>
 #include <fstream>
 #include <array>
 #include <string>
-#include <string_view>
 #include <nlohmann/json.hpp>
 
 #include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
 
 #include "acl/acl.h"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
-
-
-constexpr std::array markerTypes_str{
-    "Orchestrating",
-    "Running Task",
-    "Resolving Dependencies",
-    "Checking Terrmination",
-    "Assigning Task to Core"
-};
 
 // TraCR profiling/benchmarking stuff
 size_t getSampleID() {
@@ -161,10 +149,10 @@ int StoreTracrMetaData(RuntimeT &runtime) {
     // markerTypes
     metadata["markerTypes"] = nlohmann::json::object();
 
-    for (int i = 0; i < markerTypes_str.size(); ++i) {
+    for (int i = 0; i < MARKERTYPE_COUNT; ++i) {
         std::ostringstream oss;
         oss << std::setw(2) << std::setfill('0') << (i + 1);
-        metadata["markerTypes"][oss.str()] = markerTypes_str[i];
+        metadata["markerTypes"][oss.str()] = MarkerTypeNames[i];
     }
 
     metadata["pid"] = 1;
