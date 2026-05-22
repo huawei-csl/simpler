@@ -193,6 +193,42 @@ static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
+    if (static_arena_.is_committed()) {
+        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        cached_gm_heap_size_ = 0;
+        cached_gm_sm_size_ = 0;
+    }
+    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
+    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
+    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        // Roll back the two reserves: commit() failure leaves committed_=false,
+        // so the next entry would skip the release branch and stack new
+        // reserves on top of the stale cursor. release() is idempotent on a
+        // never-committed arena (just zeroes cursor_ / region_count_).
+        static_arena_.release();
+        gm_heap_region_off_ = SIZE_MAX;
+        gm_sm_region_off_ = SIZE_MAX;
+        return -1;
+    }
+    cached_gm_heap_size_ = gm_heap_size;
+    cached_gm_sm_size_ = gm_sm_size;
+    return 0;
+}
+
+void *DeviceRunner::acquire_pooled_gm_heap() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_heap_region_off_);
+}
+
+void *DeviceRunner::acquire_pooled_gm_sm() {
+    if (!static_arena_.is_committed()) return nullptr;
+    return static_arena_.region_ptr(gm_sm_region_off_);
+}
+
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     int dev_id = device_id_;
     return std::thread([dev_id, fn = std::move(fn)]() {
@@ -233,8 +269,27 @@ int DeviceRunner::attach_current_thread(int device_id) {
         return rc;
     }
 
+    if (device_id_ == -1) {
+        configure_aicore_op_timeout();
+    }
+
     device_id_ = device_id;
     return 0;
+}
+
+void DeviceRunner::configure_aicore_op_timeout() {
+    uint64_t actual_timeout = 0;
+    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
+    if (rc != 0) {
+        LOG_ERROR(
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
+        );
+    } else {
+        LOG_INFO_V0(
+            "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
+            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
+        );
+    }
 }
 
 int DeviceRunner::prepare_run_context(int device_id) {
@@ -558,17 +613,31 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicpu_ ===");
-    rc = rtStreamSynchronize(stream_aicpu_);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
     if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== rtStreamSynchronize stream_aicore_ ===");
-    rc = rtStreamSynchronize(stream_aicore_);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
+            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+        );
+        return rc;
+    }
     if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
         return rc;
     }
 
@@ -899,10 +968,14 @@ int DeviceRunner::finalize() {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
 
-    // Release per-Worker pooled GM heap / SM. Must precede mem_alloc_.finalize()
-    // so the pool frees through the still-live allocator, not after it.
-    gm_heap_pool_.release();
-    gm_sm_pool_.release();
+    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
+    // device allocation). Must precede mem_alloc_.finalize() so the arena
+    // frees through the still-live allocator, not after it.
+    static_arena_.release();
+    gm_heap_region_off_ = SIZE_MAX;
+    gm_sm_region_off_ = SIZE_MAX;
+    cached_gm_heap_size_ = 0;
+    cached_gm_sm_size_ = 0;
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();

@@ -108,17 +108,25 @@ static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     }
 }
 
-static void *acquire_pooled_gm_heap_wrapper(size_t size) {
+static int setup_static_arena_wrapper(size_t gm_heap_size, size_t gm_sm_size) {
     try {
-        return current_runner()->acquire_pooled_gm_heap(size);
+        return current_runner()->setup_static_arena(gm_heap_size, gm_sm_size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static void *acquire_pooled_gm_heap_wrapper() {
+    try {
+        return current_runner()->acquire_pooled_gm_heap();
     } catch (...) {
         return nullptr;
     }
 }
 
-static void *acquire_pooled_gm_sm_wrapper(size_t size) {
+static void *acquire_pooled_gm_sm_wrapper() {
     try {
-        return current_runner()->acquire_pooled_gm_sm(size);
+        return current_runner()->acquire_pooled_gm_sm();
     } catch (...) {
         return nullptr;
     }
@@ -249,6 +257,29 @@ int comm_derive_context(
     (void)window_offset;
     (void)window_size;
     (void)device_ctx_out;
+    return -1;
+}
+
+int comm_alloc_domain_windows(
+    void *handle, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_ids;
+    (void)rank_count;
+    (void)domain_rank;
+    (void)window_size;
+    (void)device_ctx_out;
+    (void)local_window_base_out;
+    return -1;
+}
+
+int comm_release_domain_windows(void *handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) {
+    (void)handle;
+    (void)allocation_id;
+    (void)rank_count;
+    (void)domain_rank;
     return -1;
 }
 
@@ -385,6 +416,7 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.setup_static_arena = setup_static_arena_wrapper;
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
