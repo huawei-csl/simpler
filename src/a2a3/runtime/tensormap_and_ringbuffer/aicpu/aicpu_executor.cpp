@@ -116,6 +116,7 @@ struct AicpuExecutor {
     bool orch_to_sched_{false};
 
     // ===== Thread management state =====
+    std::atomic<int32_t> tracr_thread_idx_{0};
     std::atomic<int32_t> thread_idx_{0};
     std::atomic<bool> initialized_{false};
     std::atomic<bool> init_done_{false};
@@ -823,7 +824,8 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! aicpu_thread_num=%d sched_getcpu=%d", runtime->aicpu_thread_num, sched_getcpu());
         return -1;
     }
-    const int threadIdx = sched_getcpu()-4; // HARDCODED: We know we are 4 threads all lying on the NUMA 1 domain
+    
+    const int threadIdx = g_aicpu_executor.tracr_thread_idx_.fetch_add(1, std::memory_order_relaxed);
 
     // INIT TraCR all threads coming in
     tracr_start(threadIdx);

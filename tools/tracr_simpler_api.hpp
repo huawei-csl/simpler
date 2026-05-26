@@ -8,8 +8,12 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 /**
  * TraCR Simpler API functions for A2A3, A2A3sim, A5, A5sim
+ * 
+ * TODO: A2A3sim and A5sim not yet supported
+ * TODO: A5 not yet able to test
  */
 
 #include <filesystem>           // C++17 or newer
@@ -21,6 +25,7 @@
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
 
+// TODO: Remove this and make the 'MemoryAllocator' able to copyD2H. This will help sim mode to work as well!
 #include "acl/acl.h"
 
 namespace fs = std::filesystem;
