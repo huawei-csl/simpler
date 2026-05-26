@@ -820,7 +820,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // Watch out, basicly hardcoded, we assume the all four threads to lie on each CPU on the same NUMA domain
     if (sched_getcpu() <= 3) {
-        LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! sche_cpu_num=%d sched_getcpu=%d", runtime->sche_cpu_num, sched_getcpu());
+        LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! aicpu_thread_num=%d sched_getcpu=%d", runtime->aicpu_thread_num, sched_getcpu());
         return -1;
     }
     const int threadIdx = sched_getcpu()-4; // HARDCODED: We know we are 4 threads all lying on the NUMA 1 domain

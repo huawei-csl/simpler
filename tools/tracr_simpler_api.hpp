@@ -132,7 +132,7 @@ int StoreTracrMetaData(RuntimeT &runtime) {
 
     // channel_names
     nlohmann::json channel_names = nlohmann::json::array();
-    for(int i = 0; i < runtime.sche_cpu_num; ++i) {
+    for(int i = 0; i < runtime.aicpu_thread_num; ++i) {
         channel_names.push_back("AICPU_" + std::to_string(i));
     }
     for(int i = 0; i < int(RUNTIME_MAX_WORKER/3); ++i) {
@@ -197,7 +197,7 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
     TraCR::Payload* tracrData = nullptr;
     size_t* tracrDataSizes = nullptr;
 
-    size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.sche_cpu_num;
+    size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.aicpu_thread_num;
     int rc = cpyD2H(reinterpret_cast<void**>(&tracrData), 
                     reinterpret_cast<void*>(runtime.tracrData_), size);
     if (rc != 0) {
@@ -205,7 +205,7 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
         return rc;
     }
 
-    size = sizeof(size_t) * runtime.sche_cpu_num;
+    size = sizeof(size_t) * runtime.aicpu_thread_num;
     rc = cpyD2H(reinterpret_cast<void**>(&tracrDataSizes), 
                 reinterpret_cast<void*>(runtime.tracrDataSizes_), size);
     if (rc != 0) {
@@ -214,7 +214,7 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
 
     // Now, store the traces into '~/ascend/tracr/'
     tracr_dir = "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc.1";
-    rc = TracrData2BTS(tracrData, tracrDataSizes, runtime.sche_cpu_num);
+    rc = TracrData2BTS(tracrData, tracrDataSizes, runtime.aicpu_thread_num);
     if (rc != 0) {
         LOG_ERROR("TracrData2BTS() failed");
         return rc;
@@ -260,7 +260,7 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
  */
 template <typename RuntimeT, typename MemoryAllocatorT>
 int DevAllocTraCR(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_){
-    const size_t size = sizeof(TraCR::Payload) * runtime.sche_cpu_num * TraCR::CAPACITY;
+    const size_t size = sizeof(TraCR::Payload) * runtime.aicpu_thread_num * TraCR::CAPACITY;
     // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
     runtime.tracrData_ = mem_alloc_.alloc(size);
     if (runtime.tracrData_ == nullptr) {
@@ -268,7 +268,7 @@ int DevAllocTraCR(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_){
         return -1;
     }
     // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrDataSizes_ = mem_alloc_.alloc(runtime.sche_cpu_num * sizeof(size_t));
+    runtime.tracrDataSizes_ = mem_alloc_.alloc(runtime.aicpu_thread_num * sizeof(size_t));
     if (runtime.tracrDataSizes_ == nullptr) {
         LOG_ERROR("runtime.tracrDataSizes_: alloc %zu bytes failed", size);
         return -1;
