@@ -10,7 +10,7 @@
  */
 
 /**
- * TraCR Simpler API functions for A2A3, A2A3sim, A5, A5sim
+ * TraCR API functions for Simpler A2A3, A2A3sim, A5, A5sim
  * 
  * TODO: A2A3sim and A5sim not yet supported
  * TODO: A5 not yet able to test
