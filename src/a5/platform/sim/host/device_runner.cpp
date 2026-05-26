@@ -345,6 +345,13 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // DeviceRunner::validate_block_dim). The scheduler assigns cores to
     // threads cluster-aligned round-robin, so block_dim need not be evenly
     // divisible by the scheduler thread count.
+    //
+    // block_dim == 0 is the CallConfig "auto" sentinel — resolve to the
+    // static max since sim has no per-stream resource query.
+    if (block_dim == 0) {
+        block_dim = PLATFORM_MAX_BLOCKDIM;
+        LOG_INFO_V0("block_dim auto-resolved to %d", block_dim);
+    }
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
         LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
@@ -378,7 +385,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // Initialize handshake buffers
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;
-    runtime.sche_cpu_num = launch_aicpu_num;
+    runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Calculate number of AIC cores
     int num_aic = block_dim;
@@ -1061,7 +1068,7 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
     int rc = l2_perf_collector_.initialize(
-        num_aicore, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
+        num_aicore, device_id, l2_perf_level_, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.l2_perf_data_base = reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
@@ -1072,7 +1079,7 @@ int DeviceRunner::init_l2_perf(int num_aicore, int device_id) {
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.sche_cpu_num;
+    int num_dump_threads = runtime.aicpu_thread_num;
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_

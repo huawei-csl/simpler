@@ -285,7 +285,10 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_l2_swimlane_enabled(int level) {
+        l2_perf_level_ = static_cast<L2PerfLevel>(level);
+        enable_l2_swimlane_ = (l2_perf_level_ != L2PerfLevel::DISABLED);
+    }
     void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -580,10 +583,25 @@ private:
     int ensure_device_initialized();
 
     /**
+     * Query the maximum block_dim the stream can host.
+     *
+     * Uses aclrtGetStreamResLimit(CUBE_CORE / VECTOR_CORE) and returns
+     * min(cube / AIC_PER_BLOCKDIM, vector / AIV_PER_BLOCKDIM). Falls back to
+     * the static PLATFORM_MAX_BLOCKDIM cap when the query is unavailable or
+     * reports no cores. Used both to validate explicit block_dim values and
+     * to resolve the CallConfig "auto" sentinel (block_dim == 0).
+     *
+     * If non-null, `out_cube` / `out_vector` receive the raw ACL limits when
+     * the query succeeded, or 0 when it failed. Callers use this to
+     * distinguish the ACL-unavailable fallback path from the success path in
+     * error logs.
+     */
+    int query_max_block_dim(rtStream_t stream, uint32_t *out_cube = nullptr, uint32_t *out_vector = nullptr);
+
+    /**
      * Validate block_dim against the stream's CUBE/VECTOR core limits
-     * (aclrtGetStreamResLimit). When that query is unavailable or reports no
-     * cores, falls back to the static PLATFORM_MAX_BLOCKDIM cap.
-     * Returns 0 if block_dim fits, -1 otherwise (or if block_dim < 1).
+     * (via query_max_block_dim). Returns 0 if block_dim fits, -1 otherwise
+     * (or if block_dim < 1).
      */
     int validate_block_dim(rtStream_t stream, int block_dim);
 
@@ -651,6 +669,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
+    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};             // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                  // diagnostic artifact root directory
 
