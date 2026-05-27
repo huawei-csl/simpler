@@ -731,12 +731,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
             if (idle_iterations >= MAX_IDLE_ITERATIONS) {
                 return handle_timeout_exit(
-                    thread_idx, header, runtime, idle_iterations
-#if PTO2_PROFILING
-                    ,
-                    l2_perf.sched_start_ts
-#endif
-                );
+                    thread_idx, header, runtime, idle_iterations);
             } else {
                 SPIN_WAIT_HINT();
             }
@@ -764,31 +759,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
     }
-
-#if PTO2_PROFILING
-    // Final-drain: emit any pop_hit / pop_miss accrued since the last
-    // dispatch emit (typically the trailing idle loops while waiting for
-    // orchestrator_done_) as a zero-duration synthetic dispatch record so
-    // sum(record.pop_*) reconciles with the run-cumulative counter.
-    // Gate on SCHED_PHASES — at lower levels the phase buffer is never
-    // flushed (see below), so writing this record would be wasted work.
-    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-        uint64_t final_pop_hit_delta = l2_perf.pop_hit - l2_perf.pop_hit_at_last_emit;
-        uint64_t final_pop_miss_delta = l2_perf.pop_miss - l2_perf.pop_miss_at_last_emit;
-        debug_assert(final_pop_hit_delta < (1ULL << 32));
-        debug_assert(final_pop_miss_delta < (1ULL << 32));
-        if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
-            uint64_t t_now = get_sys_cnt_aicpu();
-            l2_perf_aicpu_record_phase(
-                thread_idx, AicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_perf.sched_loop_count, 0,
-                static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
-            );
-            l2_perf.pop_hit_at_last_emit = l2_perf.pop_hit;
-            l2_perf.pop_miss_at_last_emit = l2_perf.pop_miss;
-        }
-    }
-    log_l2_perf_summary(thread_idx, cur_thread_completed);
-#endif
 
 #if PTO2_PROFILING
     if (l2_perf.l2_perf_enabled) {

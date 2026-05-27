@@ -336,16 +336,7 @@ private:
     int32_t find_core_owner_thread(int32_t core_id) const;
 
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
-        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations
-#if PTO2_PROFILING
-        ,
-        uint64_t sched_start_ts
-#endif
-    );
-
-#if PTO2_PROFILING
-    __attribute__((noinline, cold)) void log_l2_perf_summary(int32_t thread_idx, int32_t cur_thread_completed);
-#endif
+        int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations );
 
     // =========================================================================
     // Small inline helpers
