@@ -720,6 +720,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
+    tracr_thread_idx_.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
@@ -872,6 +873,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return rc;
     }
     
-    LOG_INFO_V9("%s", "aicpu_execute: Kernel execution completed successfully");
+    LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

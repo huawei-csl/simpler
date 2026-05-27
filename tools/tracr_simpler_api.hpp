@@ -12,7 +12,6 @@
 /**
  * TraCR API functions for Simpler A2A3, A2A3sim, A5, A5sim
  * 
- * TODO: A2A3sim and A5sim not yet supported
  * TODO: A5 not yet able to test
  */
 
@@ -24,9 +23,6 @@
 
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
-
-// TODO: Remove this and make the 'MemoryAllocator' able to copyD2H. This will help sim mode to work as well!
-#include "acl/acl.h"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -68,7 +64,8 @@ inline int TracrData2BTS(const TraCR::Payload* tracrData, const size_t* tracrDat
     fs::create_directories(base_dir);
 
     for (uint32_t t = 0; t < num_threads; ++t) {
-        size_t num_traces = tracrDataSizes[t];
+        size_t num_traces = tracrDataSizes[t];  
+
         if (num_traces == 0)
             continue;
 
@@ -103,25 +100,6 @@ inline int TracrData2BTS(const TraCR::Payload* tracrData, const size_t* tracrDat
             return -1;
         }
     }
-    return 0;
-}
-
-/**
- * 
- */
-inline int cpyD2H(void** host, void* dev, const size_t size) {
-    int rc = rtMallocHost(host, size, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtMallocHost failed");
-        return rc;
-    }
-
-    rc = rtMemcpy(*host, size, dev, size, RT_MEMCPY_DEVICE_TO_HOST);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy failed");
-        return rc;
-    }
-
     return 0;
 }
 
@@ -184,8 +162,8 @@ int StoreTracrMetaData(RuntimeT &runtime) {
 /**
  * A function for extracting the TraCR data from the Device to Host
  */
-template <typename RuntimeT, typename MemoryAllocatorT>
-int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
+template <typename DeviceRunnerT, typename RuntimeT>
+int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     static_assert(std::is_trivially_copyable_v<TraCR::Payload>,
               "TraCR::Payload must be trivially copyable for raw binary dump");
 
@@ -198,22 +176,24 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
         LOG_ERROR("runtime.tracrDataSizes_ is a nullptr");
         return -1;
     }
-
-    TraCR::Payload* tracrData = nullptr;
-    size_t* tracrDataSizes = nullptr;
-
+    
+    // Download the tracrData_ from Device to Host
     size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.aicpu_thread_num;
-    int rc = cpyD2H(reinterpret_cast<void**>(&tracrData), 
-                    reinterpret_cast<void*>(runtime.tracrData_), size);
+    TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload *>(std::malloc(size));
+    int rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrData), 
+                                            reinterpret_cast<void*>(runtime.tracrData_), size);
     if (rc != 0) {
-        LOG_ERROR("cpyD2H failed rc=%d", rc);
+        LOG_ERROR("device_runner->copy_from_device 'tracrData' failed rc=%d", rc);
         return rc;
     }
 
+    // Download the tracrDataSizes_ from Device to Host
     size = sizeof(size_t) * runtime.aicpu_thread_num;
-    rc = cpyD2H(reinterpret_cast<void**>(&tracrDataSizes), 
-                reinterpret_cast<void*>(runtime.tracrDataSizes_), size);
+    size_t* tracrDataSizes = reinterpret_cast<size_t *>(std::malloc(size));
+    rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrDataSizes), 
+                                            reinterpret_cast<void*>(runtime.tracrDataSizes_), size);
     if (rc != 0) {
+        LOG_ERROR("device_runner->copy_from_device 'tracrDataSizes' failed rc=%d", rc);
         return rc;
     }
 
@@ -226,28 +206,12 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
     }
 
     // Free tmp Host TraCR data placeholders
-    rc = rtFreeHost(reinterpret_cast<void *>(tracrData));
-    if (rc != 0) {
-        LOG_ERROR("rtFreeHost tracrData sync failed");
-        return rc;
-    }
-    rc = rtFreeHost(reinterpret_cast<void *>(tracrDataSizes));
-    if (rc != 0) {
-        LOG_ERROR("rtFreeHost tracrDataSizes sync failed");
-        return rc;
-    }
+    std::free(reinterpret_cast<void *>(tracrData));
+    std::free(reinterpret_cast<void *>(tracrDataSizes));
 
     // Free device TraCR memory data placeholder
-    rc = mem_alloc_.free(runtime.tracrData_);
-    if (rc != 0) {
-        LOG_ERROR("Device Free Memory of runtime.tracrData_ failed: %d", rc);
-        return rc;
-    }
-    rc = mem_alloc_.free(runtime.tracrDataSizes_);
-    if (rc != 0) {
-        LOG_ERROR("Device Free Memory of runtime.tracrDataSizes_ failed: %d", rc);
-        return rc;
-    }
+    device_runner->free_tensor(runtime.tracrData_);
+    device_runner->free_tensor(runtime.tracrDataSizes_);
 
     rc = StoreTracrMetaData(runtime);
     if (rc != 0) {
@@ -263,17 +227,17 @@ int StoreTracrData(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_) {
  * 
  * Polymorphic to A2A3 and A5 (should be)
  */
-template <typename RuntimeT, typename MemoryAllocatorT>
-int DevAllocTraCR(RuntimeT &runtime, MemoryAllocatorT &mem_alloc_){
+template <typename DeviceRunnerT, typename RuntimeT>
+int DevAllocTraCR(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     const size_t size = sizeof(TraCR::Payload) * runtime.aicpu_thread_num * TraCR::CAPACITY;
     // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrData_ = mem_alloc_.alloc(size);
+    runtime.tracrData_ = device_runner->allocate_tensor(size);
     if (runtime.tracrData_ == nullptr) {
         LOG_ERROR("runtime.tracrData_: alloc %zu bytes failed", size);
         return -1;
     }
     // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrDataSizes_ = mem_alloc_.alloc(runtime.aicpu_thread_num * sizeof(size_t));
+    runtime.tracrDataSizes_ = device_runner->allocate_tensor(runtime.aicpu_thread_num * sizeof(size_t));
     if (runtime.tracrDataSizes_ == nullptr) {
         LOG_ERROR("runtime.tracrDataSizes_: alloc %zu bytes failed", size);
         return -1;

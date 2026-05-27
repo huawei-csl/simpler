@@ -607,7 +607,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     runtime.aicpu_thread_num = launch_aicpu_num;
 
     // Initialize TraCR memory on the device
-    rc = DevAllocTraCR(runtime, mem_alloc_);
+    rc = DevAllocTraCR(this, runtime);
     if (rc != 0) {
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
         return rc;
@@ -865,7 +865,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     // Download and Free TraCR memory from Device and store in memory (~/ascend/)
-    rc = StoreTracrData(runtime, mem_alloc_);
+    rc = StoreTracrData(this, runtime);
     if (rc != 0) {
         LOG_ERROR("FreeTraCR failed: %d", rc);
         return -1;
