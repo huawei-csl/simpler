@@ -134,13 +134,6 @@ private:
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
 
-#if PTO2_PROFILING
-    SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_perf_level(), AFTER
-    // l2_perf_aicpu_init has promoted the level from the shared-memory header.
-    L2PerfLevel l2_perf_level_{L2PerfLevel::DISABLED};
-#endif
-
     // --- Task-execution tracking ---
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
@@ -170,13 +163,6 @@ private:
 
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
-
-#if PTO2_PROFILING
-    // PMU profiling: physical core IDs for PMU MMIO base resolution.
-    // Separate storage because CoreExecState's 64-byte budget has no room for
-    // physical_core_id when PTO2_PROFILING=1.
-    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
-#endif
 
     // --- One-time init coordination ---
     std::atomic<bool> pto2_init_done_{false};
@@ -295,10 +281,6 @@ private:
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
         PTO2LocalReadyBuffer *local_bufs
-#if PTO2_PROFILING
-        ,
-        uint64_t dispatch_ts
-#endif
     );
 
     static void promote_pending_to_running(CoreExecState &core);

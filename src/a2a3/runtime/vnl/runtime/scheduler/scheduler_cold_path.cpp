@@ -441,11 +441,6 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 
         core_exec_states_[i].reg_addr = reg_addr;
 
-#if PTO2_PROFILING
-        // Record physical_core_id for PMU init later (CoreExecState has no room
-        // for this field under PTO2_PROFILING).
-        physical_core_ids_[i] = physical_core_id;
-#endif
 #if !PTO2_PROFILING
         core_exec_states_[i].worker_id = i;
         core_exec_states_[i].physical_core_id = physical_core_id;
@@ -645,20 +640,6 @@ int32_t SchedulerContext::init(
     orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
 
-#if PTO2_PROFILING
-    // l2_perf_aicpu_init promotes g_l2_perf_level from the shared-memory
-    // header — must be called BEFORE caching the level, otherwise the cached
-    // value would still be 0 (only the binary enable bit has been seeded by
-    // kernel.cpp at this point).
-    if (is_l2_swimlane_enabled()) {
-        l2_perf_aicpu_init(runtime->worker_count);
-        l2_perf_level_ = get_l2_perf_level();
-        if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-            l2_perf_aicpu_init_phase(runtime->worker_count, sched_thread_num_);
-        }
-    }
-#endif
-
     // Discover cores and assign to scheduler threads.
     int32_t rc = handshake_all_cores(runtime);
     if (rc != 0) {
@@ -778,22 +759,12 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
-#if PTO2_PROFILING
-    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-        // Flush orchestrator's phase record buffer
-        l2_perf_aicpu_flush_phase_buffers(thread_idx);
-    }
-#endif
-
     total_tasks_ = total_tasks;
 
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
     if (inline_completed > 0) {
         completed_tasks_.fetch_add(inline_completed, std::memory_order_relaxed);
-#if PTO2_SCHED_PROFILING
-        rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
-#endif
     }
     orchestrator_done_ = true;
 
@@ -830,17 +801,4 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-#if PTO2_PROFILING
-    // Write core-to-thread mapping AFTER reassignment so the profiling data
-    // reflects the final distribution (all active_sched_threads_, including
-    // former orchestrator threads when orch_to_sched_ is enabled).
-    if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-        l2_perf_aicpu_init_core_assignments(cores_total_num_);
-        for (int32_t t = 0; t < active_sched_threads_; t++) {
-            l2_perf_aicpu_write_core_assignments_for_thread(
-                t, core_trackers_[t].core_ids(), core_trackers_[t].core_num()
-            );
-        }
-    }
-#endif
 }

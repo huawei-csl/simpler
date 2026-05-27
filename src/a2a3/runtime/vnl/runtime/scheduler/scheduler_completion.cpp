@@ -70,16 +70,8 @@ void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
-#if PTO2_PROFILING
-    ,
-    uint64_t dispatch_ts
-#endif
 ) {
-#if PTO2_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
-#else
     (void)hank;
-#endif
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
     if (slot_state.payload != nullptr) {
         int32_t reg_err = PTO2_ERROR_NONE;
@@ -107,89 +99,18 @@ void SchedulerContext::complete_slot_task(
         }
     }
     if (mixed_complete) {
-#if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
-                [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
-                    return get_function_bin_addr(func_id);
-                }
-            );
-        }
-#endif
-#if PTO2_SCHED_PROFILING
-        // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
-        // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
-        // by the otc_* log lines). Its return value is unused.
-        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
-#else
         sched_->on_mixed_task_complete(slot_state, local_bufs);
-#endif
-#if PTO2_PROFILING
-        l2_perf.phase_complete_count++;
-#endif
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
             LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-                // SCHED_PROFILING variant takes thread_idx for the per-thread
-                // atomic counter side-effects. The return value is unused.
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
             }
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         }
         completed_this_turn++;
     }
-
-#if PTO2_PROFILING
-    if (l2_perf.l2_perf_enabled) {
-#if PTO2_SCHED_PROFILING
-        uint64_t t_perf_start = get_sys_cnt_aicpu();
-#endif
-        uint64_t finish_ts = 0;
-        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-        int32_t fanout_n = 0;
-
-        if (l2_perf_level_ >= L2PerfLevel::AICPU_TIMING) {
-            finish_ts = get_sys_cnt_aicpu();
-            PTO2DepListEntry *cur = slot_state.fanout_head;
-            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-                cur = cur->next;
-            }
-        }
-
-        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
-        if (l2_perf_aicpu_complete_record(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
-            ) != 0) {
-            LOG_ERROR(
-                "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
-                static_cast<uint64_t>(slot_state.task->task_id.raw)
-            );
-        }
-#if PTO2_SCHED_PROFILING
-        l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
-#endif
-    }
-
-    if (is_pmu_enabled()) {
-        pmu_aicpu_record_task(
-            core_id, thread_idx, slot_state.task->task_id.raw,
-            slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
-        );
-    }
-#endif
 }
 
 // Promote pending slot data to running slot. Clears pending fields.
@@ -197,9 +118,6 @@ void SchedulerContext::promote_pending_to_running(CoreExecState &core) {
     core.running_slot_state = core.pending_slot_state;
     core.running_reg_task_id = core.pending_reg_task_id;
     core.running_subslot = core.pending_subslot;
-#if PTO2_PROFILING
-    core.running_dispatch_timestamp = core.pending_dispatch_timestamp;
-#endif
     core.pending_slot_state = nullptr;
     core.pending_reg_task_id = AICPU_TASK_INVALID;
 }
@@ -215,9 +133,6 @@ void SchedulerContext::check_running_cores_for_completion(
     bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
     PTO2LocalReadyBuffer *local_bufs
 ) {
-#if PTO2_SCHED_PROFILING
-    auto &l2_perf = sched_l2_perf_[thread_idx];
-#endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
     while (running_core_states.has_value()) {
@@ -230,21 +145,9 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
 
-#if PTO2_SCHED_PROFILING
-        if (l2_perf.l2_perf_enabled) {
-            l2_perf.complete_probe_count++;
-        }
-#endif
-
         SlotTransition t =
             decide_slot_transition(reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id);
         if (!t.matched) continue;
-
-#if PTO2_SCHED_PROFILING
-        if (l2_perf.l2_perf_enabled && (t.running_done || t.pending_done)) {
-            l2_perf.complete_hit_count++;
-        }
-#endif
 
         // --- Apply phase: execute actions based on transition ---
 
@@ -253,10 +156,6 @@ void SchedulerContext::check_running_cores_for_completion(
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
-#if PTO2_PROFILING
-                ,
-                core.pending_dispatch_timestamp
-#endif
             );
             cur_thread_completed++;
         }
@@ -264,10 +163,6 @@ void SchedulerContext::check_running_cores_for_completion(
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
-#if PTO2_PROFILING
-                ,
-                core.running_dispatch_timestamp
-#endif
             );
             cur_thread_completed++;
         }
