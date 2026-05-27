@@ -22,6 +22,8 @@
 
 #include <dlfcn.h>
 
+#include "load_aicpu_op.h"
+
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -193,40 +195,75 @@ static int prof_free_cb(void *dev_ptr) { return rtFree(dev_ptr); }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size) {
-    if (static_arena_.is_committed()) {
-        if (gm_heap_size <= cached_gm_heap_size_ && gm_sm_size <= cached_gm_sm_size_) return 0;
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
+int DeviceRunner::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // runtime arena. Split out from a single large allocation because the
+    // combined size can exceed the device allocator's largest contiguous
+    // block. Each arena commits exactly one region, so its base() is the
+    // pooled pointer the caller wants.
+    //
+    // Idempotent for the production case (sizes do not change across a
+    // worker's lifetime). If a caller asks for a larger layout on any
+    // region, redo just that region — already-committed peers stay alive
+    // so their callers don't have to re-acquire.
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+        if (requested_size == 0) {
+            // hbg's runtime_arena path: caller passed 0 and never reserved
+            // a region. Leave the arena uncommitted; acquire_pooled_* will
+            // return nullptr.
+            if (arena.is_committed() && cached_size != 0) {
+                arena.release();
+                cached_size = 0;
+            }
+            return 0;
+        }
+        if (arena.is_committed() && requested_size <= cached_size) {
+            return 0;
+        }
+        arena.release();
+        cached_size = 0;
+        arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
+        if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            // commit() failure leaves committed_=false, so the next entry's
+            // is_committed() guard skips the release branch. release() is
+            // idempotent on a never-committed arena (zeroes cursor_).
+            arena.release();
+            return -1;
+        }
+        cached_size = requested_size;
+        return 0;
+    };
+    if (commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) != 0) return -1;
+    if (commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) != 0) {
+        gm_heap_arena_.release();
         cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-    }
-    gm_heap_region_off_ = static_arena_.reserve(gm_heap_size, DeviceArena::kDefaultBaseAlign);
-    gm_sm_region_off_ = static_arena_.reserve(gm_sm_size, DeviceArena::kDefaultBaseAlign);
-    if (static_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        // Roll back the two reserves: commit() failure leaves committed_=false,
-        // so the next entry would skip the release branch and stack new
-        // reserves on top of the stale cursor. release() is idempotent on a
-        // never-committed arena (just zeroes cursor_ / region_count_).
-        static_arena_.release();
-        gm_heap_region_off_ = SIZE_MAX;
-        gm_sm_region_off_ = SIZE_MAX;
         return -1;
     }
-    cached_gm_heap_size_ = gm_heap_size;
-    cached_gm_sm_size_ = gm_sm_size;
+    if (commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) != 0) {
+        gm_heap_arena_.release();
+        gm_sm_arena_.release();
+        cached_gm_heap_size_ = 0;
+        cached_gm_sm_size_ = 0;
+        return -1;
+    }
     return 0;
 }
 
 void *DeviceRunner::acquire_pooled_gm_heap() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_heap_region_off_);
+    if (!gm_heap_arena_.is_committed()) return nullptr;
+    return gm_heap_arena_.base();
 }
 
 void *DeviceRunner::acquire_pooled_gm_sm() {
-    if (!static_arena_.is_committed()) return nullptr;
-    return static_arena_.region_ptr(gm_sm_region_off_);
+    if (!gm_sm_arena_.is_committed()) return nullptr;
+    return gm_sm_arena_.base();
+}
+
+void *DeviceRunner::acquire_pooled_runtime_arena() {
+    // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
+    // uncommitted — fail loudly if a caller asks for it anyway.
+    if (!runtime_arena_pool_.is_committed()) return nullptr;
+    return runtime_arena_pool_.base();
 }
 
 std::thread DeviceRunner::create_thread(std::function<void()> fn) {
@@ -238,14 +275,43 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
 }
 
 int DeviceRunner::ensure_device_initialized() {
-    // First attach the current thread and create fresh run-scoped streams.
-    // device_id_ was set in attach_current_thread() during simpler_init.
-    int rc = prepare_run_context(device_id_);
+    // Attach the current thread to the device (device_id_ was set in
+    // attach_current_thread() during simpler_init) and create the persistent
+    // AICPU/AICore streams. Streams live for the DeviceRunner's lifetime and
+    // are destroyed in finalize().
+    int rc = attach_current_thread(device_id_);
     if (rc != 0) {
         return rc;
     }
 
-    // Then ensure binaries are loaded
+    bool aicpu_created_here = false;
+    bool aicore_created_here = false;
+    if (stream_aicpu_ == nullptr) {
+        rc = rtStreamCreate(&stream_aicpu_, 0);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
+            return rc;
+        }
+        aicpu_created_here = true;
+    }
+    if (stream_aicore_ == nullptr) {
+        rc = rtStreamCreate(&stream_aicore_, 0);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
+            // Roll back only the AICPU stream we just created, not a
+            // pre-existing persistent one.
+            if (aicpu_created_here) {
+                rtStreamDestroy(stream_aicpu_);
+                stream_aicpu_ = nullptr;
+            }
+            return rc;
+        }
+        aicore_created_here = true;
+    }
+    if (aicpu_created_here || aicore_created_here) {
+        LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
+    }
+
     return ensure_binaries_loaded();
 }
 
@@ -292,48 +358,6 @@ void DeviceRunner::configure_aicore_op_timeout() {
     }
 }
 
-int DeviceRunner::prepare_run_context(int device_id) {
-    int rc = attach_current_thread(device_id);
-    if (rc != 0) {
-        return rc;
-    }
-
-    if (stream_aicpu_ != nullptr && stream_aicore_ != nullptr) {
-        return 0;
-    }
-
-    release_run_context();
-
-    // Create streams
-    rc = rtStreamCreate(&stream_aicpu_, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
-        return rc;
-    }
-
-    rc = rtStreamCreate(&stream_aicore_, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-        return rc;
-    }
-
-    LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id);
-    return 0;
-}
-
-void DeviceRunner::release_run_context() {
-    if (stream_aicpu_ != nullptr) {
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-    }
-    if (stream_aicore_ != nullptr) {
-        rtStreamDestroy(stream_aicore_);
-        stream_aicore_ = nullptr;
-    }
-}
-
 int DeviceRunner::ensure_binaries_loaded() {
     // Check if already loaded (binaries owned by the runner via set_executors).
     if (binaries_loaded_) {
@@ -346,14 +370,47 @@ int DeviceRunner::ensure_binaries_loaded() {
         return -1;
     }
 
-    // Load AICPU SO
-    int rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
+    if (dispatcher_so_binary_.empty()) {
+        LOG_ERROR(
+            "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
+            "(RuntimeBinaries.dispatcher_path)"
+        );
+        return -1;
+    }
+
+    // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
+    // which writes the runtime AICPU SO bytes to simpler_inner_<fp>.so in
+    // the device-side preinstall path. The dispatcher SO itself is never
+    // persisted. Subsequent per-task AICPU launches resolve symbols via
+    // rtsBinaryLoadFromFile + rtsFuncGetByName + rtsLaunchCpuKernel
+    // directly against that preinstall file.
+    int rc = load_aicpu_op_.BootstrapDispatcher(
+        dispatcher_so_binary_.data(), dispatcher_so_binary_.size(), aicpu_so_binary_.data(), aicpu_so_binary_.size(),
+        stream_aicpu_
+    );
+    if (rc != 0) {
+        LOG_ERROR("LoadAicpuOp::BootstrapDispatcher failed: %d", rc);
+        return rc;
+    }
+    LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
+
+    rc = load_aicpu_op_.Init();
+    if (rc != 0) {
+        LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
+        return rc;
+    }
+    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
+
+    // H2D copy aicpu kernel SO bytes and stamp the resulting device pointer
+    // into device_args_.aicpu_so_bin/len. Our own runtime AICPU SO never
+    // reads these fields, but the H2D allocation is load-bearing on a5
+    // onboard — dropping it surfaces 507899 stream-create failures from
+    // the next rtStreamCreate call.
+    rc = so_info_.init(aicpu_so_binary_, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
     }
-
-    // Initialize device args
     device_args_.aicpu_so_bin = so_info_.aicpu_so_bin;
     device_args_.aicpu_so_len = so_info_.aicpu_so_len;
     rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
@@ -362,6 +419,15 @@ int DeviceRunner::ensure_binaries_loaded() {
         so_info_.finalize();
         return rc;
     }
+
+    // Release host bytes — per-task launches use the cached rtFuncHandle on
+    // LoadAicpuOp; dispatcher SO bytes are never referenced again; the
+    // aicpu kernel SO's host buffer is free to drop now that so_info_
+    // already H2D'd the bytes above.
+    dispatcher_so_binary_.clear();
+    dispatcher_so_binary_.shrink_to_fit();
+    aicpu_so_binary_.clear();
+    aicpu_so_binary_.shrink_to_fit();
 
     binaries_loaded_ = true;
     LOG_INFO_V0("DeviceRunner: binaries loaded");
@@ -606,16 +672,16 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         pmu_collector_.start(thread_factory);
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServerInit ===");
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
+    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         return rc;
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel DynTileFwkKernelServer ===");
+    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
+        stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
@@ -932,15 +998,35 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
-    release_run_context();
+    // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
+    // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
+    // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
+    // (507018) at run-path sync; calling aclrtSynchronizeStream* again on the
+    // error-state stream at finalize wedges subsequent tests (observed: 507018
+    // / 507899 / 507901 cascade across the whole st-onboard-a2a3 suite).
+    // rtStreamDestroy on an error-state stream is the supported teardown path.
+    if (stream_aicpu_ != nullptr) {
+        rtStreamDestroy(stream_aicpu_);
+        stream_aicpu_ = nullptr;
+    }
+    if (stream_aicore_ != nullptr) {
+        rtStreamDestroy(stream_aicore_);
+        stream_aicore_ = nullptr;
+    }
 
     // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
     kernel_args_.finalize_device_args();
 
-    // Cleanup AICPU SO
+    // Cleanup AICPU SO H2D allocation
     so_info_.finalize();
 
+    // load_aicpu_op_ has no per-task host-side state to release —
+    // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
+    // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
+    // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
+    // releases its device-side state when the device context tears down.
+    aicore_bin_handle_ = nullptr;
     binaries_loaded_ = false;
 
     // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
@@ -989,14 +1075,25 @@ int DeviceRunner::finalize() {
         pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
 
-    // Release per-Worker static arena (GM heap + PTO2 SM in a single backing
-    // device allocation). Must precede mem_alloc_.finalize() so the arena
-    // frees through the still-live allocator, not after it.
-    static_arena_.release();
-    gm_heap_region_off_ = SIZE_MAX;
-    gm_sm_region_off_ = SIZE_MAX;
+    // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
+    // trb prebuilt runtime arena — each its own device_malloc). Must precede
+    // mem_alloc_.finalize() so the arenas free through the still-live
+    // allocator, not after it.
+    gm_heap_arena_.release();
+    gm_sm_arena_.release();
+    runtime_arena_pool_.release();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
+    cached_runtime_arena_size_ = 0;
+
+    // Free the 8-byte device_wall buffer (allocated lazily in run()) while
+    // mem_alloc_ and the device context are still live. free_tensor() routes
+    // through mem_alloc_.free(), so it must run before finalize() and before
+    // rtDeviceReset() tears down the device runtime.
+    if (device_wall_dev_ptr_ != nullptr) {
+        free_tensor(device_wall_dev_ptr_);
+        device_wall_dev_ptr_ = nullptr;
+    }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
@@ -1007,11 +1104,6 @@ int DeviceRunner::finalize() {
         return rc;
     }
 
-    // Free the 8-byte device_wall buffer (allocated lazily in run()).
-    if (device_wall_dev_ptr_ != nullptr) {
-        free_tensor(device_wall_dev_ptr_);
-        device_wall_dev_ptr_ = nullptr;
-    }
     device_id_ = -1;
     block_dim_ = 0;
     worker_count_ = 0;
@@ -1022,49 +1114,36 @@ int DeviceRunner::finalize() {
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
-    struct Args {
-        KernelArgs k_args;
-        char kernel_name[32];
-        const char so_name[32] = {"libaicpu_extend_kernels.so"};
-        const char op_name[32] = {""};
-    } args;
-
-    args.k_args = *k_args;
-    std::strncpy(args.kernel_name, kernel_name, sizeof(args.kernel_name) - 1);
-    args.kernel_name[sizeof(args.kernel_name) - 1] = '\0';
-
-    rtAicpuArgsEx_t rt_args;
-    std::memset(&rt_args, 0, sizeof(rt_args));
-    rt_args.args = &args;
-    rt_args.argsSize = sizeof(args);
-    rt_args.kernelNameAddrOffset = offsetof(struct Args, kernel_name);
-    rt_args.soNameAddrOffset = offsetof(struct Args, so_name);
-
-    return rtAicpuKernelLaunchExWithArgs(
-        rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpu_num, &rt_args, nullptr, stream, 0
-    );
+    // kernel_name is host::KernelNames::InitName / RunName — the runtime SO's
+    // actual exported symbol (simpler_aicpu_init / simpler_aicpu_exec).
+    // LaunchBuiltInOp dispatches via rtsLaunchCpuKernel on the cached
+    // rtFuncHandle resolved by LoadAicpuOp::Init at first-time bootstrap.
+    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
-    if (aicore_kernel_binary_.empty()) {
-        LOG_ERROR("AICore kernel binary is empty");
-        return -1;
-    }
-
-    size_t bin_size = aicore_kernel_binary_.size();
-    const void *bin_data = aicore_kernel_binary_.data();
-
-    rtDevBinary_t binary;
-    std::memset(&binary, 0, sizeof(binary));
-    binary.magic = RT_DEV_BINARY_MAGIC_ELF;
-    binary.version = 0;
-    binary.data = bin_data;
-    binary.length = bin_size;
-    void *bin_handle = nullptr;
-    int rc = rtRegisterAllKernel(&binary, &bin_handle);
-    if (rc != RT_ERROR_NONE) {
-        LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
-        return rc;
+    // Lazy-register the AICore binary on first call; reuse cached handle
+    // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
+    // every run would pin another device-side copy of the ELF (~365KB on a5)
+    // and quickly exhaust HBM — surfaced in CI as 207001 at
+    // rtKernelLaunchWithHandleV2 with a 507899 cascade at rtStreamCreate.
+    if (aicore_bin_handle_ == nullptr) {
+        if (aicore_kernel_binary_.empty()) {
+            LOG_ERROR("AICore kernel binary is empty");
+            return -1;
+        }
+        rtDevBinary_t binary;
+        std::memset(&binary, 0, sizeof(binary));
+        binary.magic = RT_DEV_BINARY_MAGIC_ELF;
+        binary.version = 0;
+        binary.data = aicore_kernel_binary_.data();
+        binary.length = aicore_kernel_binary_.size();
+        int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
+        if (rc != RT_ERROR_NONE) {
+            LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
+            aicore_bin_handle_ = nullptr;
+            return rc;
+        }
     }
 
     struct Args {
@@ -1080,7 +1159,7 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
     rtTaskCfgInfo_t cfg = {};
     cfg.schemMode = RT_SCHEM_MODE_BATCH;
 
-    rc = rtKernelLaunchWithHandleV2(bin_handle, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
+    int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
         return rc;

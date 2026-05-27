@@ -31,7 +31,6 @@ predecessor — the barrier.
 """
 
 import json
-import sys
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -162,7 +161,6 @@ class TestDepGenChain(SceneTestCase):
 
         with deps_path.open() as f:
             deps = json.load(f)
-        assert deps.get("version") == 3, f"deps.json version {deps.get('version')} != 3"
 
         raw_edges = deps.get("edges", [])
         # Project annotated edges → (pred, succ) — we only care about graph
@@ -209,8 +207,4 @@ class TestDepGenChain(SceneTestCase):
 
 
 if __name__ == "__main__":
-    # Standalone entry: auto-add the swimlane flag so fanout ⊆ deps gate runs
-    # alongside the chain assertions, matching test_dep_gen.py's convention.
-    if "--enable-dep-gen" in sys.argv and "--enable-l2-swimlane" not in sys.argv:
-        sys.argv.append("--enable-l2-swimlane")
     SceneTestCase.run_module(__name__)

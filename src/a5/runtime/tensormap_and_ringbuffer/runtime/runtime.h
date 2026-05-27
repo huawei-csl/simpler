@@ -48,7 +48,7 @@
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 108  // 36 AIC + 72 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
-#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 1MB max for orchestration SO
+#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
@@ -127,18 +127,25 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Lay out and commit the per-Worker static device arena that backs both
-    // the PTO2 GM heap and the PTO2 shared memory in a single underlying
-    // allocation. Must be called once before acquire_pooled_gm_heap /
-    // acquire_pooled_gm_sm. Returns 0 on success, -1 on allocation failure.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size);
+    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+    // memory, trb prebuilt runtime arena) as three independent device
+    // allocations. `runtime_arena_size == 0` skips the third region (hbg
+    // path: hbg has no prebuilt runtime arena). Idempotent on identical
+    // sizes; returns 0 on success, -1 on allocation failure.
+    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
     // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
-    // memory. The static arena must already be committed via
-    // setup_static_arena; the returned pointer is owned by the DeviceRunner
-    // and freed in `DeviceRunner::finalize()` — do NOT pass it to
-    // device_free or record it in `tensor_pairs_`.
+    // memory / prebuilt runtime arena. setup_static_arena must have already
+    // committed the relevant region; the returned pointer is owned by the
+    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
+    // to device_free or record it in `tensor_pairs_`.
+    //
+    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
+    // only committed when setup_static_arena was invoked with
+    // runtime_arena_size > 0. Calling it on the hbg path
+    // (setup_static_arena(...,0)) returns nullptr (not undefined).
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
+    void *(*acquire_pooled_runtime_arena)();
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
@@ -218,6 +225,13 @@ private:
     void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
+    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
+    // Runtime to device; AICPU reads them in the boot path to skip
+    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
+    // (already populated by runtime_init_data_from_layout + wire on host).
+    void *prebuilt_arena_base_;
+    size_t prebuilt_runtime_offset_;
+
     // Device orchestration SO (for dlopen on AICPU thread 3).
     // The SO bytes themselves live in a separately-allocated device buffer
     // owned by DeviceRunner; only the metadata below travels inside Runtime.
@@ -253,6 +267,16 @@ public:
     void set_gm_heap(void *p);
     void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
+
+    // Prebuilt-arena fast path (trb only). Set by host's
+    // bind_prepared_to_runtime_impl; consumed by AICPU at boot to attach a
+    // DeviceArena to `prebuilt_arena_base_` and pick up the PTO2Runtime at
+    // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
+    // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
+    // path can still detect "no prebuilt image set" via nullptr.
+    void set_prebuilt_arena(void *arena_base, size_t runtime_off);
+    void *get_prebuilt_arena_base() const;
+    size_t get_prebuilt_runtime_offset() const;
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
     void set_dev_orch_so(uint64_t dev_addr, uint64_t size);

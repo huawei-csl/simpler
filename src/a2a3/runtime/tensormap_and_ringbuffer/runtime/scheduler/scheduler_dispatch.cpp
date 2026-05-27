@@ -92,7 +92,8 @@ int SchedulerContext::pop_ready_tasks_batch(
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
     // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
-    // so the v2 JSON dispatch records carry queue-health stats on default builds.
+    // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
+    // stats on default builds.
     if (count > 0) {
         l2_perf.pop_hit += count;
     } else {
@@ -762,10 +763,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+            // Idle iterations no longer emit a phase record. Host tooling
+            // recovers idle spans from the gap between consecutive sched
+            // phase records on the same thread. _t0_phase still advances
+            // so the next emitted COMPLETE/DISPATCH gets the correct
+            // start_time (the iter it actually ran in), not the start of
+            // the preceding idle stretch.
             if (l2_perf_level_ >= L2PerfLevel::SCHED_PHASES) {
-                l2_perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_perf.sched_loop_count, 0
-                );
                 _t0_phase = _t1;
             }
 #endif
