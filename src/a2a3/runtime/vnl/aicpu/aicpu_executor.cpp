@@ -498,11 +498,6 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
     // Only the orchestrator thread runs this
     if (my_thread_idx_ < sched_thread_num_) return 0;
 
-#if PTO2_PROFILING
-    uint64_t orch_cycle_start = 0;
-    int32_t pto2_submitted_tasks = -1;
-#endif
-
     // Orchestrator thread: load + run the device orchestration SO. 
     LOG_INFO_V0("Thread %d: Orchestrator Running", my_thread_idx_);
 
@@ -560,10 +555,6 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
         return -1;
     }
 
-#if PTO2_PROFILING
-    rt->orchestrator.l2_perf_level = get_l2_perf_level();
-#endif
-
     // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
     rt->orchestrator.total_cluster_count = sched_ctx_.aic_count();
     rt->orchestrator.total_aiv_count = sched_ctx_.aiv_count();
@@ -582,11 +573,6 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
     // Wait for scheduler's one-time init to complete
     // sched_ctx_.wait_pto2_init_complete();
 
-#if PTO2_PROFILING
-    if (get_l2_perf_level() >= L2PerfLevel::ORCH_PHASES) {
-        l2_perf_aicpu_set_orch_thread_idx(my_thread_idx_);
-    }
-#endif
 
     // dep_gen plugs into the orchestrator thread (single-instance subsystem):
     // set the per-thread queue index and pop the initial buffer before any
@@ -596,9 +582,6 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
         dep_gen_aicpu_init();
     }
 
-#if PTO2_PROFILING
-    orch_cycle_start = get_sys_cnt_aicpu();
-#endif
     framework_bind_runtime(rt);
     if (*p_bind_ != nullptr) {
         (*p_bind_)(rt);
@@ -612,73 +595,6 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
     if (is_dep_gen_enabled()) {
         dep_gen_aicpu_flush();
     }
-#if PTO2_PROFILING
-    uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-    (void)orch_cycle_end;
-#endif
-
-    // Print orchestrator profiling data
-#if PTO2_ORCH_PROFILING
-    PTO2OrchProfilingData p = orchestrator_get_profiling();
-    uint64_t total =
-        p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
-    if (total == 0) total = 1;  // avoid div-by-zero
-    LOG_INFO_V9(
-        "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", my_thread_idx_,
-        static_cast<int64_t>(p.submit_count), cycles_to_us(total)
-    );
-    LOG_INFO_V9(
-        "Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
-        my_thread_idx_, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-        cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
-        static_cast<uint64_t>(p.alloc_atomic_count)
-    );
-    LOG_INFO_V9(
-        "Thread %d:   sync_tensormap : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.sync_cycle),
-        p.sync_cycle * 100.0 / total
-    );
-    LOG_INFO_V9(
-        "Thread %d:   lookup+dep     : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.lookup_cycle),
-        p.lookup_cycle * 100.0 / total
-    );
-    LOG_INFO_V9(
-        "Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", my_thread_idx_, cycles_to_us(p.insert_cycle),
-        p.insert_cycle * 100.0 / total
-    );
-    LOG_INFO_V9(
-        "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", my_thread_idx_,
-        cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
-    );
-    LOG_INFO_V9(
-        "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus", my_thread_idx_,
-        cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-        cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle)
-    );
-    LOG_INFO_V9(
-        "Thread %d:   avg/task       : %.3fus", my_thread_idx_,
-        p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
-    );
-
-#if PTO2_TENSORMAP_PROFILING
-    PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-    LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", my_thread_idx_);
-    LOG_INFO_V9(
-        "Thread %d:   lookups        : %" PRIu64 ", inserts: %" PRIu64 "", my_thread_idx_,
-        static_cast<uint64_t>(tp.lookup_count), static_cast<uint64_t>(tp.insert_count)
-    );
-    LOG_INFO_V9(
-        "Thread %d:   chain walked   : total=%" PRIu64 ", avg=%.1f, max=%d", my_thread_idx_,
-        static_cast<uint64_t>(tp.lookup_chain_total),
-        tp.lookup_count > 0 ? static_cast<double>(tp.lookup_chain_total) / tp.lookup_count : 0.0,
-        tp.lookup_chain_max
-    );
-    LOG_INFO_V9(
-        "Thread %d:   overlap checks : %" PRIu64 ", hits=%" PRIu64 " (%.1f%%)", my_thread_idx_,
-        static_cast<uint64_t>(tp.overlap_checks), static_cast<uint64_t>(tp.overlap_hits),
-        tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
-    );
-#endif
-#endif  // PTO2_ORCH_PROFILING
 
     // Latch task count from PTO2 shared memory to hand off to the
     // scheduler. The orchestrator's run window (start_time / end_time /
@@ -696,28 +612,10 @@ int32_t AicpuExecutor::runOrchestration(Runtime* runtime)
         }
     }
 
-#if PTO2_PROFILING
-    pto2_submitted_tasks = total_tasks;
-#endif
-
     // Signal completion to the orchestrator state machine
     rt_orchestration_done(rt);
 
     sched_ctx_.on_orchestration_done(runtime, rt, my_thread_idx_, total_tasks);
-#if PTO2_PROFILING
-    uint64_t orch_end_ts = get_sys_cnt_aicpu();
-    LOG_INFO_V9(
-        "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", my_thread_idx_,
-        static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
-        cycles_to_us(orch_end_ts - orch_cycle_start)
-    );
-    if (pto2_submitted_tasks >= 0) {
-        LOG_INFO_V9(
-            "PTO2 total submitted tasks = %d, already executed %d tasks", pto2_submitted_tasks,
-            sched_ctx_.completed_tasks_count()
-        );
-    }
-#endif
     LOG_INFO_V0("Thread %d: Orchestrator completed", my_thread_idx_);
 
     return 0;
