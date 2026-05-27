@@ -666,6 +666,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize TraCR memory on the device
 #ifdef ENABLE_TRACR
+    // LOG_INFO_V9("[TraCR] thread[%d] DevAllocTraCR device_id_=%d", sched_getcpu(), device_id_);
     rc = DevAllocTraCR(this, runtime);
     if (rc != 0) {
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
