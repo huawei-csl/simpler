@@ -463,11 +463,6 @@ bool SchedulerContext::assign_cores_to_threads() {
         return false;
     }
 
-    LOG_INFO_V0(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
-        active_sched_threads_, aic_count_, aiv_count_
-    );
-
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
@@ -606,9 +601,8 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t SchedulerContext::init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
-) {
+int32_t SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base)
+ {
     always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
@@ -720,65 +714,8 @@ void SchedulerContext::deinit() {
     func_id_to_addr_ = nullptr;
 }
 
-void SchedulerContext::wait_pto2_init_complete() const {
-    while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-        SPIN_WAIT_HINT();
-    }
-}
-
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     rt_ = rt;
     sched_ = &rt->scheduler;
 }
 
-// =============================================================================
-// Post-orchestration bookkeeping. Runs on the orchestrator thread once the
-// build phase finishes; folds inline-completed tasks, flips orchestrator_done_,
-// and drives the orchestrator → scheduler core transition (or fatal shutdown).
-// =============================================================================
-void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
-) {
-    total_tasks_ = total_tasks;
-
-    // Fold tasks completed inline during orchestration
-    int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
-    if (inline_completed > 0) {
-        completed_tasks_.fetch_add(inline_completed, std::memory_order_relaxed);
-    }
-    orchestrator_done_ = true;
-
-    // Check for fatal error from orchestration; if so, shut down immediately.
-    int32_t orch_err = 0;
-    if (sched_->sm_header) {
-        orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
-    }
-    if (orch_err != PTO2_ERROR_NONE) {
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
-    }
-
-    // Skip core transition on fatal error — cores already shut down above.
-    if (completed_.load(std::memory_order_acquire)) {
-        // Signal transition to unblock scheduler threads waiting at core transition
-        transition_requested_.store(true, std::memory_order_release);
-        reassigned_.store(true, std::memory_order_release);
-    } else if (orch_to_sched_) {
-        LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
-        transition_requested_.store(true, std::memory_order_release);
-
-        // Wait for scheduler threads to acknowledge transition request
-        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
-            if (completed_.load(std::memory_order_acquire)) {
-                break;
-            }
-            SPIN_WAIT_HINT();
-        }
-        if (!completed_.load(std::memory_order_acquire)) {
-            reassign_cores_for_all_threads();
-            reassigned_.store(true, std::memory_order_release);
-        }
-    }
-
-}

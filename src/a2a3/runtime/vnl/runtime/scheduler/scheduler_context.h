@@ -16,6 +16,7 @@
 #include "scheduler_types.h"
 
 #include "scheduler/pto_scheduler.h"
+#include "pto_runtime2.h"
 
 #include "aicore_completion_mailbox.h"
 #include "pto2_dispatch_payload.h"
@@ -87,7 +88,50 @@ public:
     //    (skipped on fatal error — emergency_shutdown runs instead)
     // Callers must invoke rt_orchestration_done(rt) before this — that
     // step belongs to the orchestrator lifecycle, not the scheduler.
-    void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
+    inline void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks)
+    {
+        total_tasks_ = total_tasks;
+
+        // Fold tasks completed inline during orchestration
+        int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
+        if (inline_completed > 0) {
+            completed_tasks_.fetch_add(inline_completed, std::memory_order_relaxed);
+        }
+        orchestrator_done_ = true;
+
+        // Check for fatal error from orchestration; if so, shut down immediately.
+        int32_t orch_err = 0;
+        if (sched_->sm_header) {
+            orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
+        }
+        if (orch_err != PTO2_ERROR_NONE) {
+            if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+                emergency_shutdown(runtime);
+            }
+        }
+
+        // Skip core transition on fatal error — cores already shut down above.
+        if (completed_.load(std::memory_order_acquire)) {
+            // Signal transition to unblock scheduler threads waiting at core transition
+            transition_requested_.store(true, std::memory_order_release);
+            reassigned_.store(true, std::memory_order_release);
+        } else if (orch_to_sched_) {
+            LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
+            transition_requested_.store(true, std::memory_order_release);
+
+            // Wait for scheduler threads to acknowledge transition request
+            while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
+                if (completed_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                SPIN_WAIT_HINT();
+            }
+            if (!completed_.load(std::memory_order_acquire)) {
+                reassign_cores_for_all_threads();
+                reassigned_.store(true, std::memory_order_release);
+            }
+        }
+    }
 
     // Bind the PTO2Runtime scheduler pointer. Required in device-orchestration
     // mode where rt is created by the orchestrator thread after init().
@@ -101,10 +145,6 @@ public:
     int32_t aiv_count() const { return aiv_count_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
-
-    // Block until the first scheduler thread has finished one-time PTO2 init.
-    // Called by the orchestrator thread in device-orch mode.
-    void wait_pto2_init_complete() const;
 
 private:
     // =========================================================================
