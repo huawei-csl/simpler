@@ -454,37 +454,6 @@ void SchedulerContext::dispatch_ready_tasks(
     }
 }
 
-
-void SchedulerContext::initializePerfCounters()
-{
-    // One-time init: assign perf buffers (one thread does it; others wait)
-    if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel))
-    {
-        LOG_INFO_V0("Initializing scheduler perf counters");
-
-#if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
-        }
-#endif
-
-#if PTO2_PROFILING
-        // Initialize PMU: program events, start counters, and pop initial buffers
-        if (is_pmu_enabled()) {
-            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-            LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-        }
-#endif
-
-        LOG_INFO_V0("Initialized scheduler perf counters");
-        pto2_init_complete_.store(true, std::memory_order_release);
-    } else {
-        while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
-        }
-    }
-}
-
 // =============================================================================
 // Main scheduler dispatch loop
 // =============================================================================

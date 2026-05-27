@@ -231,8 +231,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     finished_count_.store(0, std::memory_order_release);
 
-    sched_ctx_.initializePerfCounters();
-
     // Loading orchestrator
     int32_t load_orch_rc = loadOrchestrator(runtime);
     if (load_orch_rc != 0)
