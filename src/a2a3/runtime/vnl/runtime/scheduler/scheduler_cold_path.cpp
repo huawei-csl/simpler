@@ -351,12 +351,6 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;
 
-#if PTO2_PROFILING
-    if (is_pmu_enabled()) {
-        pmu_aicpu_finalize(cores, core_num);
-    }
-#endif
-
     LOG_INFO_V0("Thread %d: Shutting down %d cores", thread_idx, core_num);
     int32_t rc = 0;
     for (int32_t i = 0; i < core_num; i++) {
@@ -440,12 +434,6 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
-
-#if !PTO2_PROFILING
-        core_exec_states_[i].worker_id = i;
-        core_exec_states_[i].physical_core_id = physical_core_id;
-        core_exec_states_[i].core_type = type;
-#endif
 
         if (type == CoreType::AIC) {
             aic_worker_ids_[aic_count_++] = i;

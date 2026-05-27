@@ -19,24 +19,6 @@
 #include "pto_runtime2_types.h"
 #include "spin_hint.h"
 
-// =============================================================================
-// Profiling macros (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-#include "aicpu/device_time.h"
-// Accumulated nanoseconds per sub-step
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc)       \
-    do {                           \
-        _t1 = get_sys_cnt_aicpu(); \
-        acc += (_t1 - _t0);        \
-        _t0 = _t1;                 \
-    } while (0)
-#else
-#define CYCLE_COUNT_START()
-#define CYCLE_COUNT_LAP(acc)
-#endif
 
 // =============================================================================
 // Scheduler constants
@@ -331,43 +313,6 @@ struct SlotTransition {
     bool pending_freed = false;  // pending_occupied can be cleared
     bool matched = false;        // some case was hit (otherwise skip apply)
 };
-
-// =============================================================================
-// Profiling counters (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-struct alignas(64) SchedL2PerfCounters {
-    bool l2_perf_enabled{false};
-    uint64_t sched_start_ts{0};
-    uint64_t sched_scan_cycle{0};
-    uint64_t sched_complete_cycle{0};
-    uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
-    uint64_t sched_idle_cycle{0};
-    uint64_t sched_loop_count{0};
-    uint32_t phase_complete_count{0};
-    uint32_t phase_dispatch_count{0};
-    // Run-cumulative pop counters; the v2 JSON dispatch-record emitter writes
-    // per-emit deltas computed as (current - pop_*_at_last_emit) and the
-    // end-of-run cold-path log reads the cumulatives directly.
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
-    uint64_t pop_hit_at_last_emit{0};
-    uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
-    uint64_t complete_probe_count{0};
-    uint64_t complete_hit_count{0};
-    uint64_t local_dispatch_count{0};
-    uint64_t local_overflow_count{0};
-    uint64_t sched_complete_perf_cycle{0};
-    uint64_t sched_dispatch_pop_cycle{0};
-    uint64_t sched_dispatch_setup_cycle{0};
-#endif
-    void reset() { *this = SchedL2PerfCounters{}; }
-};
-#endif
 
 // =============================================================================
 // sync_start drain coordination
