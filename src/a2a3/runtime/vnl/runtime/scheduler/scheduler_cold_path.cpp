@@ -386,8 +386,6 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
     aic_count_ = 0;
     aiv_count_ = 0;
 
-    LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
-
     // Step 1: Write per-core payload addresses and send handshake signal.
     // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
     // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
@@ -435,13 +433,8 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 
         core_exec_states_[i].reg_addr = reg_addr;
 
-        if (type == CoreType::AIC) {
-            aic_worker_ids_[aic_count_++] = i;
-            LOG_INFO_V0("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        } else {
-            aiv_worker_ids_[aiv_count_++] = i;
-            LOG_INFO_V0("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        }
+        if (type == CoreType::AIC) aic_worker_ids_[aic_count_++] = i;
+        else aiv_worker_ids_[aiv_count_++] = i;
     }
 
     if (handshake_failed) {
@@ -449,7 +442,6 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
     return 0;
 }
 
