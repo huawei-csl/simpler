@@ -51,7 +51,6 @@ message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 
 # TraCR
-option(BUILD_TRACR "Enable TraCR" ON)  # default ON for testing
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
 tracr_enable(aicpu_kernel)
 

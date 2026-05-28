@@ -81,7 +81,6 @@ message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
 # TraCR
-option(BUILD_TRACR "Enable TraCR" ON) # default ON for testing
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
 tracr_enable(host_runtime)
 
