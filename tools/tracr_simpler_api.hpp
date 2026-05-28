@@ -198,7 +198,7 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     }
 
     // Now, store the traces into '~/ascend/tracr/'
-    tracr_dir = "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc.1";
+    tracr_dir = "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc." + std::to_string(device_runner->device_id());
     rc = TracrData2BTS(tracrData, tracrDataSizes, runtime.aicpu_thread_num);
     if (rc != 0) {
         LOG_ERROR("TracrData2BTS() failed");
