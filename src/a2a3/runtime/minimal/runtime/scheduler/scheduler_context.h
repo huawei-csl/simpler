@@ -31,6 +31,11 @@
 #define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
+namespace {
+inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+}
+
+
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
 class Runtime;
 struct Handshake;
@@ -335,12 +340,93 @@ private:
     void dispatch_block(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
         bool to_pending, int32_t block_idx
-    );
+    )
+    {
+        if (shape == PTO2ResourceShape::MIX) {
+            dispatch_mix_block_to_cluster(thread_idx, core_offset, slot_state, to_pending, block_idx);
+        } else if (shape == PTO2ResourceShape::AIC) {
+            dispatch_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx);
+        } else {
+            dispatch_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx);
+        }
+    }
 
     void dispatch_shape(
         int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
-    );
+    )
+    {
+        if (entered_drain) return;
+
+        bool is_pending = (phase == CoreTracker::DispatchPhase::PENDING);
+        auto cores = tracker.get_dispatchable_cores(shape, phase);
+        if (!cores.has_value()) return;
+
+        while (cores.has_value() && !entered_drain) {
+            int want = cores.count();
+            PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+            int got = pop_ready_tasks_batch(shape, thread_idx, local_buf, batch, want);
+            if (got == 0) break;
+
+            bool dispatched_any = false;
+            for (int bi = 0; bi < got; bi++) {
+                PTO2TaskSlotState *slot_state = batch[bi];
+
+                if (slot_state->active_mask.requires_sync_start()) {
+                    if (is_pending) {
+                        sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        continue;
+                    }
+                    int32_t available = cores.count();
+                    if (available < slot_state->logical_block_num) {
+                        if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
+                            sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        }
+                        for (int rem = bi + 1; rem < got; rem++) {
+                            sched_->ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        }
+                        entered_drain = true;
+                        break;
+                    }
+                }
+
+                if (!cores.has_value()) {
+                    sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                    break;
+                }
+
+                dispatched_any = true;
+                try_pushed = true;
+                // Claim a contiguous range of blocks, hand the slot back to the
+                // ready queue immediately, then perform the expensive dispatches.
+                // This lets other schedulers concurrently claim and dispatch the
+                // remaining blocks of the same SPMD task instead of spinning while
+                // this thread fills all its own cores.  Only local `start + b` is
+                // read after the push -- `next_block_idx` may already be advanced
+                // by another scheduler that popped the slot.
+                int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
+                int32_t claim = std::min(cores.count(), remaining);
+                int32_t start = slot_state->next_block_idx;
+                slot_state->next_block_idx += claim;
+
+                if (slot_state->next_block_idx < slot_state->logical_block_num) {
+                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                }
+
+                for (int32_t b = 0; b < claim; b++) {
+                    auto core_offset = cores.pop_first();
+                    dispatch_block(thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
+                }
+                made_progress = true;
+            }
+
+            if (!dispatched_any) break;
+
+            if (!cores.has_value()) {
+                cores = tracker.get_dispatchable_cores(shape, phase);
+            }
+        }
+    }
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then
@@ -357,7 +443,115 @@ private:
     void dispatch_ready_tasks(
         int32_t thread_idx, CoreTracker &tracker, PTO2LocalReadyBuffer (&local_bufs)[PTO2_NUM_RESOURCE_SHAPES],
         bool pmu_active, bool &made_progress, bool &try_pushed
-    );
+    )
+    {
+        using Phase = CoreTracker::DispatchPhase;
+        constexpr int32_t MIX_I = static_cast<int32_t>(PTO2ResourceShape::MIX);
+
+        // MIX is handled explicitly at the top of each stage; only AIC/AIV cycle
+        // through this 2-elem array, with order toggled by thread parity for
+        // shape-level load balancing across threads.
+        static constexpr PTO2ResourceShape kAicAivOrder[2][2] = {
+            {PTO2ResourceShape::AIC, PTO2ResourceShape::AIV},
+            {PTO2ResourceShape::AIV, PTO2ResourceShape::AIC},
+        };
+        const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
+
+        // Note: flush_local_bufs is invoked multiple times per pass (mid-function
+        // flush + RAII tail flush). local_overflow_count accumulates each batch
+        // separately — each entry is counted exactly once (count is zeroed after
+        // push_batch). The total reflects "entries this pass pushed to the global
+        // queue", which is slightly larger than the pre-refactor "buf residual at
+        // pass end" semantics — comparing PTO2_SCHED_PROFILING traces across
+        // commits, expect the post-refactor number to be greater-or-equal.
+        auto flush_local_bufs = [&]() {
+            for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+                auto &lb = local_bufs[s];
+                if (lb.count > 0) {
+                    sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
+                    lb.count = 0;
+                }
+            }
+        };
+        // Every return path below must flush; wrap in RAII so we cannot forget.
+        // The mid-function flush between IDLE and PENDING is still called
+        // explicitly — guard only covers exit.
+        struct FlushGuard {
+            decltype(flush_local_bufs) &flush_fn;
+            ~FlushGuard() { flush_fn(); }
+        } flush_guard{flush_local_bufs};
+
+        bool entered_drain = false;
+
+        // ===== IDLE stage =====
+        dispatch_shape(
+            thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, local_bufs[MIX_I], tracker, entered_drain, made_progress,
+            try_pushed
+        );
+        if (entered_drain) return;
+
+        // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
+        // MIX-PENDING below still runs — that is the core of "mix strict priority":
+        // pending slots are spent on mix before AIC/AIV get any chance.
+        bool skip_aic_aiv = has_residual_mix(local_bufs[MIX_I]);
+
+        if (!skip_aic_aiv) {
+            for (int i = 0; i < 2; i++) {
+                PTO2ResourceShape s = aic_aiv[i];
+                dispatch_shape(
+                    thread_idx, s, Phase::IDLE, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain, made_progress,
+                    try_pushed
+                );
+                if (entered_drain) return;
+            }
+        }
+
+        // Flush between IDLE and PENDING so PENDING-stage queue-size checks and any
+        // peer-thread reads see the IDLE-stage release_fanin output.
+        flush_local_bufs();
+
+        if (pmu_active) return;
+
+        // ===== PENDING stage =====
+        // MIX-PENDING gate: skip when a peer has an idle MIX-capable cluster — that
+        // peer's next IDLE-MIX iteration will pull the mix task from the global
+        // queue (already flushed above) at lower latency than us pre-loading a
+        // pending slot here. Forward progress for MIX is preserved: at least one
+        // thread will run MIX-IDLE next pass and consume the residual.
+        //
+        // The gate is NOT subject to skip_aic_aiv — residual mix continues to drain
+        // via pending slots on this thread when no peer is idle.
+        if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
+            dispatch_shape(
+                thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, local_bufs[MIX_I], tracker, entered_drain,
+                made_progress, try_pushed
+            );
+            if (entered_drain) return;
+        }
+
+        // Re-check after MIX-PENDING. If MIX-IDLE already set skip_aic_aiv, leave
+        // it set; otherwise, escalate iff PENDING-MIX left residual.
+        if (!skip_aic_aiv && has_residual_mix(local_bufs[MIX_I])) {
+            skip_aic_aiv = true;
+        }
+
+        // PENDING-MIX may have re-populated AIC/AIV local_bufs via release_fanin
+        // during in-flight completions; flush_guard ensures these don't carry
+        // across to the next iteration's IDLE stage.
+        if (skip_aic_aiv) return;
+
+        // AIC/AIV-PENDING gate: a peer-idle skip is a delay, not a loss — the peer
+        // will pull from the global queue on its next IDLE pass.
+        for (int i = 0; i < 2; i++) {
+            PTO2ResourceShape s = aic_aiv[i];
+            if (has_idle_in_other_threads(thread_idx, s)) continue;
+            dispatch_shape(
+                thread_idx, s, Phase::PENDING, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain, made_progress,
+                try_pushed
+            );
+            if (entered_drain) return;
+        }
+    }
 
     // Returns true if any *other* scheduler thread currently has an idle core
     // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
@@ -398,23 +592,174 @@ private:
     // =========================================================================
 
     static SlotTransition
-    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id);
+    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id)
+    {
+        SlotTransition t;
+        if (pending_id != AICPU_TASK_INVALID && reg_task_id == pending_id) {
+            t.matched = true;
+            t.running_done = true;  // Serial execution: pending event implies running done
+            t.running_freed = true;
+            t.pending_freed = true;
+            if (reg_state == TASK_FIN_STATE) {
+                t.pending_done = true;  // Case 1: pending FIN
+            }
+            // else: Case 2: pending ACK (pending_done stays false)
+        } else if (reg_task_id == running_id) {
+            if (reg_state == TASK_FIN_STATE) {
+                if (pending_id == AICPU_TASK_INVALID) {
+                    // Case 3.2: running FIN, no pending -> core goes idle
+                    t.matched = true;
+                    t.running_done = true;
+                    t.running_freed = true;
+                }
+                // Case 3.1: running FIN, pending exists -> skip (transient state).
+                // Case 1/2 (pending ACK/FIN) will complete running implicitly via running_done=true.
+            } else {
+                // Case 4: running ACK -- only pending_freed (slot now hardware-latched)
+                t.matched = true;
+                t.pending_freed = true;
+            }
+        }
+        return t;
+    }
 
     void complete_slot_task(
-        PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
-        int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
+        PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot, int32_t thread_idx,
+        int32_t core_id, [[maybe_unused]] Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
         PTO2LocalReadyBuffer *local_bufs
-    );
+    )
+    {
+        bool mixed_complete = sched_->on_subtask_complete(slot_state);
+        if (slot_state.payload != nullptr) {
+            int32_t reg_err = PTO2_ERROR_NONE;
+            AsyncWaitList::RegisterResult reg_result;
+            volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
+            AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
+            do {
+                reg_result = sched_->async_wait_list.register_deferred(slot_state, async_ctx, mixed_complete, reg_err);
+                if (reg_result == AsyncWaitList::RegisterResult::Skipped) {
+                    SPIN_WAIT_HINT();
+                }
+            } while (reg_result == AsyncWaitList::RegisterResult::Skipped);
 
-    static void promote_pending_to_running(CoreExecState &core);
-    static void clear_running_slot(CoreExecState &core);
+            if (reg_result == AsyncWaitList::RegisterResult::Error) {
+                int32_t expected = PTO2_ERROR_NONE;
+                sched_->sm_header->sched_error_code.compare_exchange_strong(
+                    expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+                );
+                completed_.store(true, std::memory_order_release);
+                return;
+            }
+
+            if (mixed_complete && reg_result == AsyncWaitList::RegisterResult::Registered) {
+                return;
+            }
+        }
+        if (mixed_complete) {
+            sched_->on_mixed_task_complete(slot_state, local_bufs);
+            if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
+                deferred_release_slot_states[deferred_release_count++] = &slot_state;
+            } else {
+                LOG_INFO_V9("Thread %d: release", thread_idx);
+                while (deferred_release_count > 0) {
+                    sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                }
+                deferred_release_slot_states[deferred_release_count++] = &slot_state;
+            }
+            completed_this_turn++;
+        }
+    }
+
+    static void promote_pending_to_running(CoreExecState &core)
+    {
+        core.running_slot_state = core.pending_slot_state;
+        core.running_reg_task_id = core.pending_reg_task_id;
+        core.running_subslot = core.pending_subslot;
+        core.pending_slot_state = nullptr;
+        core.pending_reg_task_id = AICPU_TASK_INVALID;
+    }
+
+    static void clear_running_slot(CoreExecState &core)
+    {
+        core.running_slot_state = nullptr;
+        core.running_reg_task_id = AICPU_TASK_INVALID;
+    }
 
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
         PTO2LocalReadyBuffer *local_bufs
-    );
+    )
+    {
+        CoreTracker &tracker = core_trackers_[thread_idx];
+        auto running_core_states = tracker.get_all_running_cores();
+        while (running_core_states.has_value()) {
+            int32_t bit_pos = running_core_states.pop_first();
+            int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
+            CoreExecState &core = core_exec_states_[core_id];
+
+            // --- Judgment phase: read register, derive transition ---
+            uint64_t reg_val = read_reg(core.reg_addr, RegId::COND);
+            int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
+            int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
+
+            SlotTransition t =
+                decide_slot_transition(reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id);
+            if (!t.matched) continue;
+
+            // --- Apply phase: execute actions based on transition ---
+
+            // 1. Complete finished tasks (capture pointers before modifying core state)
+            if (t.pending_done) {
+                complete_slot_task(
+                    *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                );
+                cur_thread_completed++;
+            }
+            if (t.running_done) {
+                complete_slot_task(
+                    *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                );
+                cur_thread_completed++;
+            }
+
+            // 2. Update slot data
+            if (t.running_freed) {
+                if (core.pending_slot_state != nullptr && !t.pending_done) {
+                    promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
+                } else {
+                    clear_running_slot(core);  // Case 1 or Case 3 (no pending)
+                    if (t.pending_done) {
+                        // Case 1: pending FIN observed directly -- clear stale pending fields.
+                        // Without this, pending_reg_task_id retains a stale value that blocks
+                        // clear_pending_occupied and permanently degrades pipelining.
+                        core.pending_slot_state = nullptr;
+                        core.pending_reg_task_id = AICPU_TASK_INVALID;
+                    }
+                }
+            }
+
+            // 3. Update tracker bitmap
+            bool is_idle = (core.running_reg_task_id == AICPU_TASK_INVALID);
+            if (is_idle) {
+                tracker.change_core_state(bit_pos);       // Mark idle
+                tracker.clear_pending_occupied(bit_pos);  // Idle safeguard: no payload to protect
+            } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {
+                // Case 4 (running ACK) or Case 2 (pending ACK): clear pending_occupied only
+                // when no pending task is currently held. Otherwise pending slot is occupied
+                // by a pre-loaded task and must stay protected.
+                tracker.clear_pending_occupied(bit_pos);
+            }
+
+            // 4. Progress signal (only when running task completes)
+            if (t.running_done) {
+                made_progress = true;
+            }
+        }
+    }
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
     int32_t count_global_available(PTO2ResourceShape shape);
