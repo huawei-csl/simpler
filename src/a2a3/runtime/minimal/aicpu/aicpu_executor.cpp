@@ -412,7 +412,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             } 
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Orchestrating, 0);
+            INSTRUMENTATION_MARK_SET(thread_idx, Initializing, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -505,6 +505,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_init();
             }
 
+            INSTRUMENTATION_MARK_SET(thread_idx, Orchestrating, 0);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);

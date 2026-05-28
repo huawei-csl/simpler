@@ -435,7 +435,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
             }
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Orchestrating, 0);
+            INSTRUMENTATION_MARK_SET(thread_idx, Initializing, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -560,6 +560,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
+            INSTRUMENTATION_MARK_SET(thread_idx, Orchestrating, 0);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
