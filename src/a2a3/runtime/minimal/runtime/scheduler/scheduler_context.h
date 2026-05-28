@@ -11,6 +11,9 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -133,6 +136,7 @@ public:
     {
         // Reset all per-core execution state
         for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
+            INSTRUMENTATION_MARK_RESET(sched_thread_num_ + i);
             core_exec_states_[i] = {};
             core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
             core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
@@ -841,10 +845,12 @@ private:
         build_payload(payload, slot_state, subslot, async_ctx, block_idx);
 
         if (to_pending) {
+            INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, 0);
             core_exec_state.pending_subslot = subslot;
             core_exec_state.pending_slot_state = &slot_state;
             core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
         } else {
+            INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, 0);
             core_exec_state.running_subslot = subslot;
             core_exec_state.running_slot_state = &slot_state;
             core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -1273,6 +1279,7 @@ private:
                     completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
                 );
                 cur_thread_completed++;
+                INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + core_id);
             }
             if (t.running_done) {
                 complete_slot_task(
@@ -1280,6 +1287,7 @@ private:
                     completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
                 );
                 cur_thread_completed++;
+                INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + core_id);
             }
 
             // 2. Update slot data

@@ -12,6 +12,8 @@
  * TraCR Simpler Marker Types
  */
 
+#pragma once
+
 #include <string_view>
 
 #define MARKER_TYPES    \
@@ -19,7 +21,10 @@
     X(Scheduling)       \
     X(Initializing)     \
     X(De_Initializing)  \
-    X(DLL_loading)
+    X(DLL_loading)      \
+    X(Running_Task_Single) \
+    X(Running_Task_Pair)
+    
 
 enum MarkerType {
 #define X(name) name,

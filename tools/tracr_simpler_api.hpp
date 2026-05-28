@@ -15,6 +15,8 @@
  * TODO: A5 not yet able to test
  */
 
+#pragma once
+
 #include <filesystem>           // C++17 or newer
 #include <fstream>
 #include <array>
