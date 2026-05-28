@@ -358,7 +358,7 @@ def _log_round_timings(timings):
     dev_avg = (sum(dev_nonzero) / dev_count) if dev_count else 0.0
     show_device = dev_count > 0
 
-    header = f"  {'Round':<6}  {'Host (us)':>12}"
+    header = f"\n  {'Round':<6}  {'Host (us)':>12}"
     if show_device:
         header += f"  {'Device (us)':>12}"
     print(header)
