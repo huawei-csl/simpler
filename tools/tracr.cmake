@@ -10,6 +10,12 @@
 
 set(TRACR_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
+option(BUILD_TRACR "Enable TraCR" OFF)
+
+if(DEFINED ENV{BUILD_TRACR})
+    set(BUILD_TRACR $ENV{BUILD_TRACR})
+endif()
+
 function(tracr_enable target)
     message(STATUS "Enabling TraCR '${BUILD_TRACR}' for target: ${target}")
 
