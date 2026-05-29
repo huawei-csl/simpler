@@ -175,6 +175,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return 0;
     }
 
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, 0);
+
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
@@ -236,7 +238,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
             const bool reload_so = runtime->register_new_callable_id();
 
-            INSTRUMENTATION_MARK_SET(thread_idx, DLL_loading, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, DLL_loading, 0);
             
             if (reload_so) {
                 if (*p_handle != nullptr) {
@@ -412,7 +414,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             } 
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Allocating, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Allocating, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -505,7 +507,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_init();
             }
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Orchestrating, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, 0);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
@@ -541,7 +543,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
 
-            INSTRUMENTATION_MARK_RESET(thread_idx);
+            INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
         }
     }
 
@@ -554,7 +556,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
-            INSTRUMENTATION_MARK_SET(thread_idx, Scheduling, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, 0);
             sched_ctx_.bind_runtime(rt);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
@@ -567,7 +569,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
-    INSTRUMENTATION_MARK_SET(thread_idx, De_Initializing, 0);
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
@@ -607,7 +609,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    tracr_thread_idx_.store(0, std::memory_order_release);
+    g_TraCR_thread_idx_counter.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 
@@ -635,15 +637,15 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 // ===== Public Entry Point =====
 
-
-
 /**
  * init tracr profiler
  * 
- * NOTE: make sure threadIdx starts at 0 and follows in the positive direction
+ * NOTE: make sure g_TraCR_thread_idx starts at 0 and follows in the positive direction
  */
-inline void tracr_start(const int threadIdx) {
-    if (threadIdx == 0) {
+inline void TRACR_START() {
+    g_TraCR_thread_idx = g_TraCR_thread_idx_counter.fetch_add(1, std::memory_order_relaxed);
+
+    if (g_TraCR_thread_idx == 0) {
         INSTRUMENTATION_START();
     } else {
         INSTRUMENTATION_THREAD_INIT();
@@ -653,36 +655,38 @@ inline void tracr_start(const int threadIdx) {
 /**
  * finalizing tracr function
  * 
- * NOTE: make shure threadIdx starts at 0 and follows in the positive direction
+ * NOTE: make shure g_TraCR_thread_idx starts at 0 and follows in the positive direction
  */
-inline void tracr_finalize(const int threadIdx, Runtime *runtime) {
+inline void TRACR_FINALIZE(Runtime *runtime) {
     (void)(runtime);
 
 #ifdef ENABLE_TRACR
-    // LOG_INFO_V0("[TraCR] thread[%d] dumping the #traces: %lu %p", threadIdx, tracrThread->_traceIdx, runtime->tracrData_);
+    LOG_INFO_V0("[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx, runtime->tracrData_);
 
     if (tracrThread->_traceIdx > 0) {
         TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->tracrData_);
         const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
 
         std::memcpy(
-            &tracrData[threadIdx * TraCR::CAPACITY], 
+            &tracrData[g_TraCR_thread_idx * TraCR::CAPACITY], 
             tracrThread->_traces.data(),
             payload_size
         );
     }
 
     size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->tracrDataSizes_);
-    tracrDataSizes[threadIdx] = tracrThread->_traceIdx;
+    tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
 #endif
 
-    if (threadIdx == 0) {
+    if (g_TraCR_thread_idx == 0) {
         INSTRUMENTATION_END();
+        g_TraCR_thread_idx_counter.store(0, std::memory_order_relaxed);
     } else {
         INSTRUMENTATION_THREAD_FINALIZE();
     }
-}
 
+    g_TraCR_thread_idx = -1;
+}
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point
@@ -708,18 +712,13 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! aicpu_thread_num=%d sched_getcpu=%d", runtime->aicpu_thread_num, sched_getcpu());
         return -1;
     }
-    
-    const int threadIdx = g_aicpu_executor.tracr_thread_idx_.fetch_add(1, std::memory_order_relaxed);
 
     // INIT TraCR all threads coming in
-    tracr_start(threadIdx);
-    // LOG_INFO_V9("[TraCR] thread[%d] start ENABLE_TRACR=%d", threadIdx, INSTRUMENTATION_ACTIVE);
-
-    INSTRUMENTATION_MARK_SET(threadIdx, Initializing, 0); // 'Initializing'
+    TRACR_START();
+    // LOG_INFO_V9("[TraCR] thread[%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, INSTRUMENTATION_ACTIVE);
 
     g_aicpu_executor.init(runtime);
 
-    INSTRUMENTATION_MARK_RESET(threadIdx);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
         if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
@@ -742,9 +741,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         g_aicpu_executor.deinit(runtime);
     }
 
-    INSTRUMENTATION_MARK_RESET(threadIdx);
+    INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
     // Finalize TraCR all threads coming in
-    tracr_finalize(threadIdx, runtime);
+    TRACR_FINALIZE(runtime);
     
     if (runtime_rc != 0) {
         LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);

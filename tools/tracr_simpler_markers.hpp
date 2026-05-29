@@ -14,7 +14,14 @@
 
 #pragma once
 
+#include <atomic>
 #include <string_view>
+
+// Global TraCR thread idx counter
+std::atomic<int> g_TraCR_thread_idx_counter{0};
+
+// Global thread local thread idx placeholder to capture traces
+thread_local int g_TraCR_thread_idx{-1};
 
 #define MARKER_TYPES    \
     X(Orchestrating)    \
