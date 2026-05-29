@@ -435,7 +435,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
             }
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Initializing, 0);
+            INSTRUMENTATION_MARK_SET(thread_idx, Allocating, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -681,6 +681,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
         }
 #endif
+        INSTRUMENTATION_MARK_RESET(thread_idx);
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
@@ -867,6 +868,8 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     g_aicpu_executor.init(runtime);
+
+    INSTRUMENTATION_MARK_RESET(threadIdx);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
         if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {

@@ -412,7 +412,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             } 
 
-            INSTRUMENTATION_MARK_SET(thread_idx, Initializing, 0);
+            INSTRUMENTATION_MARK_SET(thread_idx, Allocating, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -540,6 +540,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_orchestration_done(rt);
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
+
+            INSTRUMENTATION_MARK_RESET(thread_idx);
         }
     }
 
@@ -558,7 +560,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
-            } else {
             }
         }
     }
@@ -717,6 +718,8 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     INSTRUMENTATION_MARK_SET(threadIdx, Initializing, 0); // 'Initializing'
 
     g_aicpu_executor.init(runtime);
+
+    INSTRUMENTATION_MARK_RESET(threadIdx);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
         if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {

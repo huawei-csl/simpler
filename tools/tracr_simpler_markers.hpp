@@ -22,6 +22,7 @@
     X(Initializing)     \
     X(De_Initializing)  \
     X(DLL_loading)      \
+    X(Allocating)       \
     X(Running_Task_Single) \
     X(Running_Task_Pair)
     
