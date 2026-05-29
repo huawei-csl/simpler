@@ -684,8 +684,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
-    INSTRUMENTATION_MARK_RESET(thread_idx);
-
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
     if (!sched_ctx_.is_completed() && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
