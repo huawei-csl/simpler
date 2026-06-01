@@ -32,18 +32,6 @@
 #include "common/unified_log.h"
 
 // =============================================================================
-// TensorMap Lookup Chain Length Statistics (compile-time toggle)
-// =============================================================================
-#if PTO2_TENSORMAP_PROFILING
-uint64_t g_lookup_chain_total = 0;
-uint64_t g_lookup_count = 0;
-int32_t g_lookup_chain_max = 0;
-uint64_t g_lookup_overlap_checks = 0;
-uint64_t g_lookup_overlap_hits = 0;
-uint64_t g_insert_count = 0;
-#endif
-
-// =============================================================================
 // Initialization and Destruction
 // =============================================================================
 
@@ -236,26 +224,3 @@ void PTO2TensorMap::sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_aliv
     }
 }
 
-// =============================================================================
-// TensorMap Lookup Profiling
-// =============================================================================
-#if PTO2_TENSORMAP_PROFILING
-PTO2TensorMapProfilingData pto2_tensormap_get_profiling() {
-    PTO2TensorMapProfilingData d;
-    d.lookup_chain_total = g_lookup_chain_total;
-    d.lookup_count = g_lookup_count;
-    d.lookup_chain_max = g_lookup_chain_max;
-    d.overlap_checks = g_lookup_overlap_checks;
-    d.overlap_hits = g_lookup_overlap_hits;
-    d.insert_count = g_insert_count;
-
-    // Reset
-    g_lookup_chain_total = 0;
-    g_lookup_count = 0;
-    g_lookup_chain_max = 0;
-    g_lookup_overlap_checks = 0;
-    g_lookup_overlap_hits = 0;
-    g_insert_count = 0;
-    return d;
-}
-#endif
