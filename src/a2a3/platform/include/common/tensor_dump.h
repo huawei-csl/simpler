@@ -44,7 +44,6 @@
 #include <cstdint>
 
 #include "common/platform_config.h"
-#include "host_build_graph/runtime/pto_runtime2_types.h"
 
 // =============================================================================
 // Constants
@@ -72,6 +71,9 @@ enum class TensorDumpStage : uint8_t {
 };
 
 using TensorDumpArgMask = uint64_t;
+
+#define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+#define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers
 
 // Bitmask stored in the platform-owned mask pool when orchestration selects
 // specific task tensor arguments for dump. Bit N corresponds to tensors[N].
