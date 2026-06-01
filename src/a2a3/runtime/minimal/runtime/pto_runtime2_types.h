@@ -394,33 +394,6 @@ struct alignas(64) PTO2TaskSlotState {
     // the orchestrator adds consumers concurrently with the scheduler
     // traversing the list after task completion.
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void lock_fanout(uint64_t &atomic_count, uint64_t &wait_cycle) {
-        uint64_t t0 = get_sys_cnt_aicpu();
-        bool contended = false;
-        uint32_t atomic_ops = 0;
-
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                contended = true;
-                atomic_ops++;
-                SPIN_WAIT_HINT();
-            }
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                atomic_ops++;
-                atomic_count += atomic_ops;
-                if (contended) {
-                    wait_cycle += (get_sys_cnt_aicpu() - t0);
-                }
-                return;
-            }
-            contended = true;
-            atomic_ops++;
-        }
-    }
-#endif
-
     void lock_fanout() {
         for (;;) {
             while (fanout_lock.load(std::memory_order_acquire) != 0) {

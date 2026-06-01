@@ -118,10 +118,6 @@ public:
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
-#if PTO2_ORCH_PROFILING
-        uint64_t wait_start = 0;
-        bool waiting = false;
-#endif
 
         while (true) {
             // Check both resources; commit only if both available
@@ -129,9 +125,6 @@ public:
                 void *heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
-#if PTO2_ORCH_PROFILING
-                    record_wait(spin_count, wait_start, waiting);
-#endif
                     return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
                 }
                 blocked_on_heap = true;
@@ -141,12 +134,6 @@ public:
 
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
-#if PTO2_ORCH_PROFILING
-            if (!waiting) {
-                wait_start = get_sys_cnt_aicpu();
-                waiting = true;
-            }
-#endif
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
             if (last_alive > prev_last_alive) {
@@ -293,19 +280,6 @@ private:
 
         return result;
     }
-
-#if PTO2_ORCH_PROFILING
-    void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
-        if (waiting) {
-            extern uint64_t g_orch_alloc_wait_cycle;
-            g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
-        }
-        {
-            extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += spin_count + 1;
-        }
-    }
-#endif
 
     /**
      * Report deadlock with targeted diagnostics.
