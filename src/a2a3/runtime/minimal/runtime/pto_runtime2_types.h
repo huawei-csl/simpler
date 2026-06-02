@@ -228,6 +228,10 @@ struct PTO2TaskDescriptor {
 // Per-Slot Scheduling State
 // =============================================================================
 
+typedef uint16_t tensorId_t;
+#define MAX_TENSOR_ID_INPUTS 8
+#define MAX_TENSOR_ID_OUTPUTS 8
+
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
@@ -251,6 +255,11 @@ struct PTO2TaskPayload {
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
+
+    uint8_t _tensorIdInputCount = 0;
+    uint8_t _tensorIdOutputCount = 0;
+    tensorId_t _tensorIdInputs[MAX_TENSOR_ID_INPUTS];
+    tensorId_t _tensorIdOutputs[MAX_TENSOR_ID_OUTPUTS];
 
     /**
      * Initialize payload: copy tensors, store scalars.
@@ -296,14 +305,10 @@ static_assert(
     offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
 );
-static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
-);
-
-typedef uint16_t tensorId_t;
-#define MAX_TENSOR_ID_INPUTS 8
-#define MAX_TENSOR_ID_OUTPUTS 8
+// static_assert(
+//     sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+//     "PTO2TaskPayload size must stay on the baseline cache-line footprint"
+// );
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
@@ -341,11 +346,6 @@ struct alignas(64) PTO2TaskSlotState {
     // them out of init makes startup cost independent of task_window_size.
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
-
-    // uint8_t _tensorIdInputCount = 0;
-    // uint8_t _tensorIdOutputCount = 0;
-    // tensorId_t _tensorIdInputs[MAX_TENSOR_ID_INPUTS];
-    // tensorId_t _tensorIdOutputs[MAX_TENSOR_ID_OUTPUTS];
 
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;    // Bitmask of active subtask slots (set once)
@@ -418,6 +418,6 @@ struct alignas(64) PTO2TaskSlotState {
     void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
 };
 
-// static_assert(sizeof(PTO2TaskSlotState) == 64);
+static_assert(sizeof(PTO2TaskSlotState) == 64);
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

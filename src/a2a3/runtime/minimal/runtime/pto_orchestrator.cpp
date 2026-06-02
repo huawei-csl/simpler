@@ -36,6 +36,9 @@
 #include "pto_types.h"
 #include "tensor.h"
 
+#include "../common/concurrent.hpp"
+#include "../common/hash.hpp"
+
 extern "C" void set_dump_tensor_selective_mode(bool enable);
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
 
@@ -360,6 +363,7 @@ void PTO2OrchestratorState::end_scope() {
 // computation (explicit_deps + auto), output registration, slot init, and pushes
 // to the scheduler wiring queue.
 // static size_t outputTensorCount = 0;
+// static size_t inputTensorCount = 0;
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
     int32_t aiv1_kernel_id
@@ -489,20 +493,27 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 
-    // for (int i = 0; i < args.tensor_count(); i++)
-    // {
-    //    if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
-    //    {
-    //     outputTensorCount++;
-    //      LOG_INFO_V9("Input Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
-    //    }
+    // size_t taskInputTensorCount = 0;
+    // size_t taskOutputTensorCount = 0;
+    for (int i = 0; i < args.tensor_count(); i++)
+    {
+       if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
+       {
+        //  inputTensorCount++;
+        //  taskInputTensorCount++;
+        //  LOG_INFO_V9("Input Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+       }
 
-    //    if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::OUTPUT || args.tag(i) == TensorArgType::INOUT)
-    //    {
-    //     outputTensorCount++;
-    //      LOG_INFO_V9("Output Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
-    //    }
-    // }
+       if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::OUTPUT || args.tag(i) == TensorArgType::INOUT)
+       {
+        //  outputTensorCount++;
+        //  taskOutputTensorCount++;
+        //  LOG_INFO_V9("Output Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+       }
+    }
+
+    // LOG_INFO_V9("Total Input Tensors: %lu - Task: %lu", inputTensorCount, taskInputTensorCount);
+    // LOG_INFO_V9("Total Output Tensors: %lu - Task: %lu", outputTensorCount, taskOutputTensorCount);
 
     // === STEP 6: push to wiring queue ===
     // Deferred wiring: orchestrator only stores dependency metadata and increments
