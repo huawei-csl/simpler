@@ -359,6 +359,7 @@ void PTO2OrchestratorState::end_scope() {
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
 // computation (explicit_deps + auto), output registration, slot init, and pushes
 // to the scheduler wiring queue.
+// static size_t outputTensorCount = 0;
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
     int32_t aiv1_kernel_id
@@ -487,6 +488,21 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+
+    // for (int i = 0; i < args.tensor_count(); i++)
+    // {
+    //    if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
+    //    {
+    //     outputTensorCount++;
+    //      LOG_INFO_V9("Input Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+    //    }
+
+    //    if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::OUTPUT || args.tag(i) == TensorArgType::INOUT)
+    //    {
+    //     outputTensorCount++;
+    //      LOG_INFO_V9("Output Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+    //    }
+    // }
 
     // === STEP 6: push to wiring queue ===
     // Deferred wiring: orchestrator only stores dependency metadata and increments
