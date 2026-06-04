@@ -508,14 +508,15 @@ static TaskOutputTensors submit_task_common(
             const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
 
             tensorIdx_t tensorIdx = 0;
-            if (_tensorIdToIdxMap.find(tensorIdHash) != _tensorIdToIdxMap.end()) tensorIdx = _tensorIdToIdxMap.at(tensorIdHash);
+            const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
+            if (tensorIdHashItr != _tensorIdToIdxMap.end()) tensorIdx = tensorIdHashItr->second;
             else 
             {
                 tensorIdx = orch->_globalTensorIdxCount++;
                 _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
             }
 
-            if (payload._inputTensorCount >= MAX_TENSOR_HASH_INPUTS) LOG_INFO_V9("Tensor addr: - Exceeded number of tensor inputs! %u > %u", payload._inputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+            if (payload._inputTensorCount >= MAX_TENSOR_HASH_INPUTS) LOG_INFO_V9("[VNL] Tensor addr: - Exceeded number of tensor inputs! %u > %u", payload._inputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
             else  payload._inputTensorIdxs[payload._inputTensorCount++] = tensorIdx;
 
             //LOG_INFO_V9("Input  Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %lu - inputTensorCount: %u", (uint64_t) args.tensor(i).ptr->buffer.addr, currentTensorVersion, tensorAddressHash, tensorIdHash, args.tag(i), tensorIdx, payload._inputTensorCount);
@@ -534,14 +535,15 @@ static TaskOutputTensors submit_task_common(
             const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
             
             tensorIdx_t tensorIdx = 0;
-            if (_tensorIdToIdxMap.find(tensorIdHash) != _tensorIdToIdxMap.end()) tensorIdx = _tensorIdToIdxMap.at(tensorIdHash);
+            const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
+            if (tensorIdHashItr != _tensorIdToIdxMap.end()) tensorIdx = tensorIdHashItr->second;
             else 
             {
                 tensorIdx = orch->_globalTensorIdxCount++;
                 _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
             }
 
-            if (payload._outputTensorCount >= MAX_TENSOR_HASH_OUTPUTS) LOG_INFO_V9("Tensor addr: Exceeded number of tensor outputs! %u > %u", payload._outputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+            if (payload._outputTensorCount >= MAX_TENSOR_HASH_OUTPUTS) LOG_INFO_V9("[VNL] Tensor addr: Exceeded number of tensor outputs! %u > %u", payload._outputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
             else payload._outputTensorIdxs[payload._outputTensorCount++] = tensorIdx;
 
             //LOG_INFO_V9("Output Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %lu - outputTensorCount: %u", (uint64_t) args.tensor(i).ptr->buffer.addr, newTensorVersion, tensorAddressHash, tensorIdHash,  args.tag(i), tensorIdx, payload._outputTensorCount);

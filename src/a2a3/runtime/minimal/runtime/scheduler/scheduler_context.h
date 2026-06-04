@@ -178,6 +178,8 @@ public:
             core_trackers_[t] = CoreTracker{};
         }
 
+        memset(sched_->_tensorStatus, 0x00, PTO2_MAX_TENSOR_POOL * sizeof(uint8_t));
+
         regs_ = 0;
         sched_ = nullptr;
         rt_ = nullptr;
@@ -1231,6 +1233,16 @@ private:
             }
             completed_this_turn++;
         }
+
+        // Setting output tensors as finished
+        for (size_t i = 0; i < slot_state.payload->_outputTensorCount; i++)
+        {
+            const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
+            sched_->_tensorStatus[tensorIdx] = 1;
+            //LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
+        }
+            
+
     }
 
     static void promote_pending_to_running(CoreExecState &core)

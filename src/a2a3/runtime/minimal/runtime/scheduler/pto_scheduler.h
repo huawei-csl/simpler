@@ -50,6 +50,8 @@ struct PTO2ReadyQueueSlot {
     PTO2TaskSlotState *slot_state;
 };
 
+#define PTO2_MAX_TENSOR_POOL 1024
+
 /**
  * Thread-local ready buffer for local-first dispatch optimization.
  *
@@ -443,6 +445,8 @@ struct PTO2SchedulerState {
             sync_to_sm();
         }
     } ring_sched_states[PTO2_MAX_RING_DEPTH];
+
+    uint8_t _tensorStatus[PTO2_MAX_TENSOR_POOL];
 
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];

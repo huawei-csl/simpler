@@ -38,8 +38,6 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"
 
-#define PTO2_MAX_TENSOR_POOL 1024
-
 typedef uint64_t tensorIdx_t;
 typedef uint64_t addressHash_t;
 typedef uint64_t tensorUniqueIdHash_t;
@@ -96,7 +94,6 @@ struct PTO2OrchestratorState {
     uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     int32_t manual_begin_depth{PTO2_MAX_SCOPE_DEPTH};
  
-    uint8_t _tensorStatus[PTO2_MAX_TENSOR_POOL];
     tensorIdx_t _globalTensorIdxCount;
 
     // === SCHEDULER REFERENCE ===
@@ -212,8 +209,6 @@ inline bool PTO2OrchestratorState::init_data_from_layout(
 ) {
     auto *orch = this;
     *orch = PTO2OrchestratorState{};
-
-    memset(orch->_tensorStatus, 0x00, PTO2_MAX_TENSOR_POOL * sizeof(uint8_t));
 
     orch->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
     orch->gm_heap_base = gm_heap;
