@@ -35,9 +35,12 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"
 #include "tensor.h"
+#include <unordered_map>
+#include "../../utils/fnv1a_64.h"
 
-#include "../common/concurrent.hpp"
-#include "../common/hash.hpp"
+static std::unordered_map<addressHash_t, size_t> _tensorVersionMap;
+static std::unordered_map<tensorUniqueIdHash_t, tensorIdx_t> _tensorIdToIdxMap;
+
 
 extern "C" void set_dump_tensor_selective_mode(bool enable);
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
@@ -493,22 +496,55 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 
-    // size_t taskInputTensorCount = 0;
-    // size_t taskOutputTensorCount = 0;
-    for (int i = 0; i < args.tensor_count(); i++)
+    for (int i = 0; i < args.tensor_count(); i++) 
     {
        if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
        {
-        //  inputTensorCount++;
-        //  taskInputTensorCount++;
-        //  LOG_INFO_V9("Input Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+            const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
+            const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
+            const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
+            
+            tensorUniqueId_t tensorId { .address = tensorAddress, .version = currentTensorVersion };
+            const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
+
+            tensorIdx_t tensorIdx = 0;
+            if (_tensorIdToIdxMap.find(tensorIdHash) != _tensorIdToIdxMap.end()) tensorIdx = _tensorIdToIdxMap.at(tensorIdHash);
+            else 
+            {
+                tensorIdx = orch->_globalTensorIdxCount++;
+                _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
+            }
+
+            if (payload._inputTensorCount >= MAX_TENSOR_HASH_INPUTS) LOG_INFO_V9("Tensor addr: - Exceeded number of tensor inputs! %u > %u", payload._inputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+            else  payload._inputTensorIdxs[payload._inputTensorCount++] = tensorIdx;
+
+            //LOG_INFO_V9("Input  Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %lu - inputTensorCount: %u", (uint64_t) args.tensor(i).ptr->buffer.addr, currentTensorVersion, tensorAddressHash, tensorIdHash, args.tag(i), tensorIdx, payload._inputTensorCount);
        }
 
-       if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::OUTPUT || args.tag(i) == TensorArgType::INOUT)
+       if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::INOUT)
        {
-        //  outputTensorCount++;
-        //  taskOutputTensorCount++;
-        //  LOG_INFO_V9("Output Tensor addr: %lu - Task: %d - Type: %d, Total: %lu", (uint64_t) args.tensor(i).ptr->buffer.addr, task_id, args.tag(i), outputTensorCount);
+            const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
+            const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
+            const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
+
+            const auto newTensorVersion = currentTensorVersion + 1;
+            _tensorVersionMap[tensorAddressHash] = newTensorVersion;
+
+            tensorUniqueId_t tensorId { .address = tensorAddress, .version = newTensorVersion };
+            const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
+            
+            tensorIdx_t tensorIdx = 0;
+            if (_tensorIdToIdxMap.find(tensorIdHash) != _tensorIdToIdxMap.end()) tensorIdx = _tensorIdToIdxMap.at(tensorIdHash);
+            else 
+            {
+                tensorIdx = orch->_globalTensorIdxCount++;
+                _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
+            }
+
+            if (payload._outputTensorCount >= MAX_TENSOR_HASH_OUTPUTS) LOG_INFO_V9("Tensor addr: Exceeded number of tensor outputs! %u > %u", payload._outputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+            else payload._outputTensorIdxs[payload._outputTensorCount++] = tensorIdx;
+
+            //LOG_INFO_V9("Output Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %lu - outputTensorCount: %u", (uint64_t) args.tensor(i).ptr->buffer.addr, newTensorVersion, tensorAddressHash, tensorIdHash,  args.tag(i), tensorIdx, payload._outputTensorCount);
        }
     }
 
@@ -715,5 +751,9 @@ void PTO2OrchestratorState::mark_done() {
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
+
+    orch->_globalTensorIdxCount = 0;
+    _tensorVersionMap.clear();
+    _tensorIdToIdxMap.clear();
 }
 

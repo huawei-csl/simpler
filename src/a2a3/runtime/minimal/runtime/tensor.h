@@ -180,7 +180,7 @@ struct alignas(64) Tensor {
     // to avoid 4B padding between them (sizeof(Tensor) must stay 128).
     uint64_t extent_elem_cache;                 // Cached extent_elem (see extent_elem()); maintained by ops
     uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
-    uint8_t _pad_cl2[36];                       // Reserved for future extension
+    uint8_t _pad_cl2[24];                       // Reserved for future extension
 
     // --- Copy / move / destroy ---
     // Kept trivially copyable (default copy = byte-for-byte) so other modules

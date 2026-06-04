@@ -229,8 +229,8 @@ struct PTO2TaskDescriptor {
 // =============================================================================
 
 typedef uint16_t tensorId_t;
-#define MAX_TENSOR_ID_INPUTS 8
-#define MAX_TENSOR_ID_OUTPUTS 8
+#define MAX_TENSOR_HASH_INPUTS 8
+#define MAX_TENSOR_HASH_OUTPUTS 8
 
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
@@ -256,10 +256,10 @@ struct PTO2TaskPayload {
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
 
-    uint8_t _tensorIdInputCount = 0;
-    uint8_t _tensorIdOutputCount = 0;
-    tensorId_t _tensorIdInputs[MAX_TENSOR_ID_INPUTS];
-    tensorId_t _tensorIdOutputs[MAX_TENSOR_ID_OUTPUTS];
+    uint8_t  _inputTensorCount = 0;
+    uint8_t  _outputTensorCount = 0;
+    uint64_t _inputTensorIdxs[MAX_TENSOR_HASH_INPUTS];
+    uint64_t _outputTensorIdxs[MAX_TENSOR_HASH_OUTPUTS];
 
     /**
      * Initialize payload: copy tensors, store scalars.
@@ -274,6 +274,9 @@ struct PTO2TaskPayload {
     void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
+
+        _inputTensorCount = 0;
+        _outputTensorCount = 0;
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
