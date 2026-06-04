@@ -20,18 +20,23 @@
 // Global TraCR thread idx counter
 std::atomic<int> g_TraCR_thread_idx_counter{0};
 
-// Global thread local thread idx placeholder to capture traces
+// Global thread local thread idx placeholder
 thread_local int g_TraCR_thread_idx{-1};
 
-#define MARKER_TYPES    \
-    X(Orchestrating)    \
-    X(Scheduling)       \
-    X(Initializing)     \
-    X(De_Initializing)  \
-    X(DLL_loading)      \
-    X(Allocating)       \
-    X(Running_Task_Single) \
-    X(Running_Task_Pair)
+#define MARKER_TYPES        \
+    X(Orchestrating)        \
+    X(Read_Dimensions)      \
+    X(Reshape_Kernels)      \
+    X(Pre_Loop_Info)        \
+    X(For_Loop_Batching)    \
+    X(Scheduling)           \
+    X(Initializing)         \
+    X(De_Initializing)      \
+    X(DLL_loading)          \
+    X(Allocating)           \
+    X(Running_Task_Single)  \
+    X(Running_Task_Pair)    \
+    X(Barrier)
     
 
 enum MarkerType {

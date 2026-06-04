@@ -8,10 +8,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+# The tracr.cmake directory
 set(TRACR_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
+# This BUILD_TRACR is a Environment variable used to toggle the build of TraCR
+# Use: BUILD_TRACR=ON pip install --no-build-isolation -e '.[test]'
+# Default is 'OFF'
 option(BUILD_TRACR "Enable TraCR" OFF)
-
 if(DEFINED ENV{BUILD_TRACR})
     set(BUILD_TRACR $ENV{BUILD_TRACR})
 endif()
