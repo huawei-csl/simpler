@@ -29,7 +29,16 @@ thread_local int g_TraCR_thread_idx{-1};
     X(Reshape_Kernels)      \
     X(Pre_Loop_Info)        \
     X(For_Loop_Batching)    \
+    X(PTO2_SCOPE_GUARD_)    \
+    X(rt_submit_aic_task_)    \
+    X(rt_submit_aiv_task_)    \
     X(Scheduling)           \
+    X(Phase1)               \
+    X(Phase2)               \
+    X(Phase3)               \
+    X(Phase3b)               \
+    X(Phase4)               \
+    X(Drain)               \
     X(Initializing)         \
     X(De_Initializing)      \
     X(DLL_loading)          \
