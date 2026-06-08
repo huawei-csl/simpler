@@ -906,6 +906,13 @@ private:
         bool to_pending, int32_t block_idx
     )
     {
+        for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+        {
+            const auto idx = slot_state.payload->_inputTensorIdxs[i];
+            const auto tensorStatus = sched_->_tensorStatus[idx];
+            LOG_INFO_V9("[VNL] Dispatching Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+        }
+
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(thread_idx, core_offset, slot_state, to_pending, block_idx);
         } else if (shape == PTO2ResourceShape::AIC) {
@@ -1194,6 +1201,15 @@ private:
         PTO2LocalReadyBuffer *local_bufs
     )
     {
+        // Setting output tensors as finished
+        for (size_t i = 0; i < slot_state.payload->_outputTensorCount; i++)
+        {
+            const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
+            sched_->_tensorStatus[tensorIdx] = 1;
+            LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
+            // LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
+        }
+
         bool mixed_complete = sched_->on_subtask_complete(slot_state);
         if (slot_state.payload != nullptr) {
             int32_t reg_err = PTO2_ERROR_NONE;
@@ -1233,16 +1249,6 @@ private:
             }
             completed_this_turn++;
         }
-
-        // Setting output tensors as finished
-        for (size_t i = 0; i < slot_state.payload->_outputTensorCount; i++)
-        {
-            const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
-            sched_->_tensorStatus[tensorIdx] = 1;
-            //LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
-        }
-            
-
     }
 
     static void promote_pending_to_running(CoreExecState &core)

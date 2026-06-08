@@ -546,6 +546,14 @@ struct PTO2SchedulerState {
     // ready buffer (e.g. wiring). See push_ready_routed_local for the
     // dispatch-time fast path.
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
+
+        for (size_t i = 0; i < slot_state->payload->_inputTensorCount; i++)
+        {
+            const auto idx = slot_state->payload->_inputTensorIdxs[i];
+            const auto tensorStatus = _tensorStatus[idx];
+            LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", slot_state->task->task_id.local(), idx, tensorStatus);
+        }
+
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(slot_state);
@@ -628,8 +636,22 @@ struct PTO2SchedulerState {
             // dummy slots bypass the local fast path and go straight to dummy_ready_queue.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
+                for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+                {
+                    const auto idx = slot_state.payload->_inputTensorIdxs[i];
+                    const auto tensorStatus = _tensorStatus[idx];
+                    LOG_INFO_V9("[VNL] Dummy Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+                }
+
                 dummy_ready_queue.push(&slot_state);
-            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state))
+            {
+                for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+                {
+                    const auto idx = slot_state.payload->_inputTensorIdxs[i];
+                    const auto tensorStatus = _tensorStatus[idx];
+                    LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+                }
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
             return true;
