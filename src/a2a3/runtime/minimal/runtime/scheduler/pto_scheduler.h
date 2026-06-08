@@ -30,13 +30,58 @@
 #pragma once
 
 #include <atomic>
-
 #include "common/core_type.h"
 #include "device_arena.h"
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+
+
+// Implement the queue data structure
+class PendingTaskQueue {
+
+public:
+
+    static constexpr size_t MAX_QUEUE_SIZE = 64;
+
+    uint64_t front;
+    uint64_t rear;
+    void*  arr[MAX_QUEUE_SIZE];
+
+    // initializing pointers in the constructor
+    PendingTaskQueue(): front(0), rear(0) {}
+
+    // Function to check if the queue is empty or not
+    inline bool isEmpty() { return front == rear; }
+
+    // Function to check if the queue is full or not
+    inline bool isFull() { return getSize() == MAX_QUEUE_SIZE - 1; }
+
+    inline size_t getSize() const
+    {
+        return rear - front;
+    }
+
+    inline void pop()
+    {
+       front++;
+    }
+
+    // Function to enqueue elements from the queue
+    inline void enqueue(void* val)
+    {
+        arr[rear++ % MAX_QUEUE_SIZE] = val;
+    }
+
+    // Function to dequeue elements from the queue
+    inline void* dequeue()
+    {
+        return arr[front++ % MAX_QUEUE_SIZE];
+    }
+};
+
+
 
 // =============================================================================
 // Ready Queue (Lock-free bounded MPMC — Vyukov design)
@@ -485,6 +530,9 @@ struct PTO2SchedulerState {
 
     alignas(64) AsyncWaitList async_wait_list;
 
+    alignas(64)  PendingTaskQueue _pending_task_queue;
+
+
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
@@ -546,14 +594,6 @@ struct PTO2SchedulerState {
     // ready buffer (e.g. wiring). See push_ready_routed_local for the
     // dispatch-time fast path.
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
-
-        for (size_t i = 0; i < slot_state->payload->_inputTensorCount; i++)
-        {
-            const auto idx = slot_state->payload->_inputTensorIdxs[i];
-            const auto tensorStatus = _tensorStatus[idx];
-            LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", slot_state->task->task_id.local(), idx, tensorStatus);
-        }
-
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(slot_state);
@@ -562,12 +602,35 @@ struct PTO2SchedulerState {
         }
     }
 
+    inline bool checkTaskIsReady(const PTO2TaskSlotState *ws) const
+    {
+        for (size_t i = 0; i < ws->payload->_inputTensorCount; i++)
+        {
+            const auto idx = ws->payload->_inputTensorIdxs[i];
+            const auto tensorStatus = _tensorStatus[idx];
+            if (tensorStatus != 1) return false;
+        }
+
+        return true;
+    }
+    
     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,
      * pushes the task to the ready queue once its fanin refcount is satisfied.
      */
     void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin) {
+
+        // Adding task to pending task queue, if not alraedy ready
+        // if (checkTaskIsReady(ws)) push_ready_routed(ws);
+        // else 
+        if (checkTaskIsReady(ws) == false)
+        {
+            LOG_INFO_V9("[VNL] Pending Task Count A %lu", _pending_task_queue.getSize());
+            _pending_task_queue.enqueue(ws);
+            LOG_INFO_V9("[VNL] Pending Task Count B %lu", _pending_task_queue.getSize());
+        }
+    
         PTO2TaskPayload *wp = ws->payload;
         ws->fanin_count = wfanin + 1;
 
@@ -595,6 +658,25 @@ struct PTO2SchedulerState {
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
+    }
+
+    inline size_t checkPendingTasks()
+    {
+        size_t releasedTasks = 0;
+        const auto pendingTaskCount = _pending_task_queue.getSize();
+        for (size_t i = 0; i < pendingTaskCount; i++)
+        {
+            auto ws = (PTO2TaskSlotState *)_pending_task_queue.dequeue();
+            LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
+            if (checkTaskIsReady(ws))
+            {
+              LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
+            //   push_ready_routed(ws);
+              releasedTasks++;  
+            } 
+            else _pending_task_queue.enqueue(ws);
+        }
+        return releasedTasks;
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
