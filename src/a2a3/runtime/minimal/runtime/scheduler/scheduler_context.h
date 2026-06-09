@@ -178,6 +178,7 @@ public:
             core_trackers_[t] = CoreTracker{};
         }
 
+        LOG_INFO_V9("[VNL] Resetting tensor status");
         memset(sched_->_tensorStatus, 0x00, PTO2_MAX_TENSOR_POOL * sizeof(uint8_t));
 
         regs_ = 0;
@@ -849,7 +850,7 @@ private:
         {
             const auto idx = slot_state.payload->_inputTensorIdxs[i];
             const auto tensorStatus = sched_->_tensorStatus[idx];
-            LOG_INFO_V9("[VNL] Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+            if (tensorStatus == 0) LOG_INFO_V9("[VNL] Warning! Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
         }
 
         CoreTracker &tracker = core_trackers_[thread_idx];
@@ -1222,12 +1223,22 @@ private:
     }
 
     void complete_slot_task(
-        PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot, int32_t thread_idx,
+        PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot, [[maybe_unused]] int32_t thread_idx,
         int32_t core_id, [[maybe_unused]] Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
         PTO2LocalReadyBuffer *local_bufs
     )
     {
+        // Setting output tensors as finished
+        if (slot_state.payload != nullptr) 
+        for (size_t i = 0; i < slot_state.payload->_outputTensorCount; i++)
+        {
+            const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
+            sched_->_tensorStatus[tensorIdx] = 1;
+            LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
+            // LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
+        }
+
         bool mixed_complete = sched_->on_subtask_complete(slot_state);
         if (slot_state.payload != nullptr) {
             int32_t reg_err = PTO2_ERROR_NONE;
@@ -1259,22 +1270,13 @@ private:
             if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
                 deferred_release_slot_states[deferred_release_count++] = &slot_state;
             } else {
-                LOG_INFO_V9("Thread %d: release", thread_idx);
+                // LOG_INFO_V9("Thread %d: release", thread_idx);
                 while (deferred_release_count > 0) {
                     sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
                 }
                 deferred_release_slot_states[deferred_release_count++] = &slot_state;
             }
             completed_this_turn++;
-        }
-
-        // Setting output tensors as finished
-        for (size_t i = 0; i < slot_state.payload->_outputTensorCount; i++)
-        {
-            const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
-            sched_->_tensorStatus[tensorIdx] = 1;
-            LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
-            // LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
         }
     }
 

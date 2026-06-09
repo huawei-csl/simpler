@@ -584,7 +584,14 @@ struct PTO2SchedulerState {
                 // LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
                 if (checkTaskIsReady(ws))
                 {
-                    // LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
+                    LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
+                    for (size_t i = 0; i < ws->payload->_inputTensorCount; i++)
+                    {
+                        const auto idx = ws->payload->_inputTensorIdxs[i];
+                        const auto tensorStatus = _tensorStatus[idx];
+                        LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", ws->task->task_id.local(), idx, tensorStatus);
+                    }
+
                     push_ready_routed(ws);
                     releasedTasks++;  
                 } 
@@ -665,21 +672,20 @@ struct PTO2SchedulerState {
         return wired;
     }
 
-    /**
+     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,
      * pushes the task to the ready queue once its fanin refcount is satisfied.
      */
-    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
-
+    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin)
+    {
         // // Adding task to pending task queue, if not alraedy ready
         // if (checkTaskIsReady(ws)) push_ready_routed(ws);
         // else 
         // {
         //     _pending_task_queue.lock();
-        //     LOG_INFO_V9("[VNL] Pending Task Count A %lu", _pending_task_queue.getSize());
         //     _pending_task_queue.enqueue(ws);
-        //     LOG_INFO_V9("[VNL] Pending Task Count B %lu", _pending_task_queue.getSize());
+        //     LOG_INFO_V9("[VNL] New Pending Task Count: %lu", _pending_task_queue.getSize());
         //     _pending_task_queue.unlock();
         // }
     
@@ -718,31 +724,45 @@ struct PTO2SchedulerState {
         // init release, making fanin_count visible — plain load suffices.
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-        if (new_refcount == slot_state.fanin_count) {
+        if (new_refcount == slot_state.fanin_count)
+        {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
             // dummy slots bypass the local fast path and go straight to dummy_ready_queue.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (shape == PTO2ResourceShape::DUMMY) {
-                // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-                // {
-                //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
-                //     const auto tensorStatus = _tensorStatus[idx];
-                //     LOG_INFO_V9("[VNL] Dummy Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-                // }
+
+            // If dummy
+            if (shape == PTO2ResourceShape::DUMMY)
+            {
+                for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+                {
+                    const auto idx = slot_state.payload->_inputTensorIdxs[i];
+                    const auto tensorStatus = _tensorStatus[idx];
+                    LOG_INFO_V9("[VNL] Dummy Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+                }
 
                 dummy_ready_queue.push(&slot_state);
-            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state))
+            } 
+            
+            // If not dummy
+            if (shape != PTO2ResourceShape::DUMMY)
             {
-                // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-                // {
-                //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
-                //     const auto tensorStatus = _tensorStatus[idx];
-                //     LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-                // }
-                ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+                for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+                {
+                    const auto idx = slot_state.payload->_inputTensorIdxs[i];
+                    const auto tensorStatus = _tensorStatus[idx];
+                    LOG_INFO_V9("[VNL] Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+                }
+
+                // Try local buffer first
+                bool pushedLocally = false;
+                if (local_bufs != nullptr) pushedLocally = local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state);   
+
+                // If didn't work, push to the common queue
+                if (pushedLocally == false) ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
+
             return true;
         }
         return false;
@@ -792,9 +812,8 @@ struct PTO2SchedulerState {
      */
     void
     on_mixed_task_complete(
-        PTO2TaskSlotState &slot_state,
-
-        PTO2LocalReadyBuffer *local_bufs = nullptr
+        [[maybe_unused]] PTO2TaskSlotState &slot_state,
+        [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
         slot_state.lock_fanout();
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
