@@ -231,6 +231,12 @@ public:
         // compiler cannot hoist it across the dispatch loop on its own.
         const bool pmu_active = is_pmu_enabled();
 
+#ifdef INDEP_ORCH
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_);
+        LOG_INFO_V0("Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load(), orchestrator_done_);
+        while (!orchestrator_done_){};
+#endif
+
         while (true) {
             if (completed_.load(std::memory_order_acquire)) {
                 break;
@@ -248,6 +254,7 @@ public:
             }
 
             // Phase 1: Check running cores for completion
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
             int32_t completed_this_turn = 0;
 
             bool try_completed = tracker.has_any_running_cores();
@@ -294,6 +301,7 @@ public:
 
             // Phase 2 drain check
             if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
                 handle_drain_mode(thread_idx);
                 continue;
             }
@@ -302,6 +310,7 @@ public:
             if (thread_idx == 0) {
                 int wired = sched_->drain_wiring_queue(orchestrator_done_);
                 if (wired > 0) {
+                    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
                     made_progress = true;
                 }
             }
@@ -316,7 +325,9 @@ public:
                 constexpr int DUMMY_DRAIN_BATCH = 16;
                 PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
                 int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+                
                 for (int di = 0; di < dummy_got; di++) {
+                    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3b, 0);
                     PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
                     sched_->on_mixed_task_complete(dummy_slot, local_bufs);
                     // Dummy tasks have no subtasks to retire and no fanout pre-conditions
@@ -337,6 +348,7 @@ public:
 
             // Phase 4: MIX-strict-priority dispatch with phase-split and
             // cross-thread idle gating. See dispatch_ready_tasks for the policy.
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
             dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
             (void)try_completed;
             (void)try_pushed;
@@ -370,6 +382,7 @@ public:
         // here so every consumed producer slot completes its on_task_release
         // regardless of which loop-exit path fired.
         while (deferred_release_count > 0) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
             sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
         }
 

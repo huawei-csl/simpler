@@ -145,7 +145,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     Tensor context_lens =
         make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
-    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Pre_Loop_Info, 0);
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Pre_Loop_Info, uint32_t(batch));
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
     uint32_t tile2d_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -159,12 +159,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     PROF_INC(prof_make_count, 4);
     CYCLE_COUNT_LAP(prof_make_tensor);
 
+    LOG_INFO_V0("Thread %d: Orch PTO2_SCOPE loop: #batch=%u, q_loop=%u", g_TraCR_thread_idx, batch, q_loop);
+
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, For_Loop_Batching, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, uint32_t(b_idx + batch * q_idx));
             PTO2_SCOPE() {
                 CYCLE_COUNT_LAP(prof_scope);
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
@@ -262,9 +264,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             CYCLE_COUNT_LAP(prof_scope);
         }
     }
-
-    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, 0);
-
 #ifdef ENABLE_PROFILING
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor + prof_tensor_view + prof_param_setup +
                      prof_submit_task + prof_scope;
