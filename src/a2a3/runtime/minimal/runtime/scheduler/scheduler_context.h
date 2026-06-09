@@ -301,9 +301,11 @@ public:
             }
 
             // Phase 3x: Check pending tasks
-            size_t released = sched_->checkPendingTasks();
-            if (released > 0) {
-                made_progress = true;
+            if (thread_idx == 0) {
+                size_t released = sched_->checkPendingTasks();
+                if (released > 0) {
+                    made_progress = true;
+                }
             }
 
             // Phase 3b: Drain dummy ready queue (thread 0 only).
@@ -911,12 +913,12 @@ private:
         bool to_pending, int32_t block_idx
     )
     {
-        // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-        // {
-        //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
-        //     const auto tensorStatus = sched_->_tensorStatus[idx];
-        //     LOG_INFO_V9("[VNL] Dispatching Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-        // }
+        for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+        {
+            const auto idx = slot_state.payload->_inputTensorIdxs[i];
+            const auto tensorStatus = sched_->_tensorStatus[idx];
+            if (tensorStatus == 0) LOG_INFO_V9("[VNL] WARNING: Dispatching Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+        }
 
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(thread_idx, core_offset, slot_state, to_pending, block_idx);

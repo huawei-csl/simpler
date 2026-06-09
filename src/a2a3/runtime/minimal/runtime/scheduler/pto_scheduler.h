@@ -554,7 +554,7 @@ struct PTO2SchedulerState {
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(slot_state);
         } else {
-            ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            while (ready_queues[static_cast<int32_t>(shape)].push(slot_state) == false) SPIN_WAIT_HINT();
         }
     }
 
@@ -584,9 +584,9 @@ struct PTO2SchedulerState {
                 // LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
                 if (checkTaskIsReady(ws))
                 {
-                // LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
-                push_ready_routed(ws);
-                releasedTasks++;  
+                    // LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
+                    push_ready_routed(ws);
+                    releasedTasks++;  
                 } 
                 else _pending_task_queue.enqueue(ws);
             }
