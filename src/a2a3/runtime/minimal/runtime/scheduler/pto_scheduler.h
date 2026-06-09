@@ -63,6 +63,7 @@ public:
 
     inline void lock() { _lock.lock(); }
     inline void unlock() { _lock.unlock(); }
+    inline bool trylock() { return _lock.try_lock(); }
 
     inline size_t getSize() const
     {
@@ -543,57 +544,6 @@ struct PTO2SchedulerState {
     // Inline hot-path methods
     // =========================================================================
 
-    /**
-     * Drain wiring queue: pop submitted tasks and wire their fanout edges.
-     * Called by scheduler thread 0 each loop iteration. Sets fanin_count,
-     * acquires fanout_lock per producer, allocates dep_pool entries, and
-     * pushes ready tasks to the appropriate ready queue.
-     *
-     * @return Number of tasks wired this call.
-     */
-
-    int drain_wiring_queue(bool force_drain = false) {
-        int wired = 0;
-
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count) {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
-                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
-            }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
-        }
-
-        // Process tasks from local buffer in strict FIFO order.
-        while (wiring.batch_index < wiring.batch_count) {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
-
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                    break;  // not enough dep_pool space — keep remainder for next call
-                }
-            }
-
-            wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
-            wired++;
-        }
-
-        return wired;
-    }
-
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
     // per-shape ready_queues[]. Used by paths that do not have a thread-local
@@ -620,74 +570,29 @@ struct PTO2SchedulerState {
         return true;
     }
     
-    /**
-     * Wire fanout edges for a single task. Sets fanin_count, acquires each
-     * producer's fanout_lock, allocates dep_pool entries for live producers,
-     * pushes the task to the ready queue once its fanin refcount is satisfied.
-     */
-    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
-
-        // Adding task to pending task queue, if not alraedy ready
-        if (checkTaskIsReady(ws)) push_ready_routed(ws);
-        else 
-        {
-            _pending_task_queue.lock();
-            LOG_INFO_V9("[VNL] Pending Task Count A %lu", _pending_task_queue.getSize());
-            _pending_task_queue.enqueue(ws);
-            LOG_INFO_V9("[VNL] Pending Task Count B %lu", _pending_task_queue.getSize());
-            _pending_task_queue.unlock();
-        }
-    
-        // PTO2TaskPayload *wp = ws->payload;
-        // ws->fanin_count = wfanin + 1;
-
-        // if (wfanin != 0) {
-        //     int32_t early_finished = 0;
-        //     for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-        //         producer->lock_fanout();
-        //         int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-        //         if (pstate >= PTO2_TASK_COMPLETED) {
-        //             early_finished++;
-        //         } else {
-        //             producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-        //         }
-        //         producer->unlock_fanout();
-        //     });
-
-        //     int32_t init_rc = early_finished + 1;
-        //     int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-        //     if (new_rc >= ws->fanin_count) {
-        //         push_ready_routed(ws);
-        //     }
-        // } else {
-        //     ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-        //     push_ready_routed(ws);
-        // }
-
-        // ws->dep_pool_mark = rss.dep_pool.top;
-    }
-
     inline size_t checkPendingTasks()
     {
         size_t releasedTasks = 0;
 
-        _pending_task_queue.lock();
-
-        const auto pendingTaskCount = _pending_task_queue.getSize();
-        for (size_t i = 0; i < pendingTaskCount; i++)
+        if (_pending_task_queue.trylock())
         {
-            auto ws = (PTO2TaskSlotState *)_pending_task_queue.dequeue();
-            LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
-            if (checkTaskIsReady(ws))
-            {
-              LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
-              push_ready_routed(ws);
-              releasedTasks++;  
-            } 
-            else _pending_task_queue.enqueue(ws);
-        }
 
-        _pending_task_queue.unlock();
+            const auto pendingTaskCount = _pending_task_queue.getSize();
+            for (size_t i = 0; i < pendingTaskCount; i++)
+            {
+                auto ws = (PTO2TaskSlotState *)_pending_task_queue.dequeue();
+                LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
+                if (checkTaskIsReady(ws))
+                {
+                LOG_INFO_V9("[VNL] Task %u released as ready task now", ws->task->task_id.local());
+                push_ready_routed(ws);
+                releasedTasks++;  
+                } 
+                else _pending_task_queue.enqueue(ws);
+            }
+
+            _pending_task_queue.unlock();
+        }
 
         return releasedTasks;
     }

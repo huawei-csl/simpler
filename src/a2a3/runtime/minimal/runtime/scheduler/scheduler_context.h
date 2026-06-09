@@ -300,20 +300,10 @@ public:
                 continue;
             }
 
-            // Phase 3: Drain wiring queue (thread 0 only)
-            if (thread_idx == 0) {
-                int wired = sched_->drain_wiring_queue(orchestrator_done_);
-                if (wired > 0) {
-                    made_progress = true;
-                }
-            }
-            
-            // Phase 3x: Drain wiring queue (thread 0 only)
-            if (thread_idx == 0) {
-                size_t released = sched_->checkPendingTasks();
-                if (released > 0) {
-                    made_progress = true;
-                }
+            // Phase 3x: Drain wiring queue (any thread)
+            size_t released = sched_->checkPendingTasks();
+            if (released > 0) {
+                made_progress = true;
             }
 
             // Phase 3b: Drain dummy ready queue (thread 0 only).
