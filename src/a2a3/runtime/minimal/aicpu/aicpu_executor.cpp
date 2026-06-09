@@ -116,7 +116,6 @@ struct AicpuExecutor {
     bool orch_to_sched_{false};
 
     // ===== Thread management state =====
-    std::atomic<int32_t> tracr_thread_idx_{0};
     std::atomic<int32_t> thread_idx_{0};
     std::atomic<bool> initialized_{false};
     std::atomic<bool> init_done_{false};
@@ -507,14 +506,16 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_init();
             }
 
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, thread_idx);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
             }
+            LOG_INFO_V0("Thread %d: Orch start: %d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load());
             rt_scope_begin(rt);
             (*p_func)(*orch_args_cached_);
             rt_scope_end(rt);
+            LOG_INFO_V0("Thread %d: Orch done: %d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load());
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.
@@ -542,8 +543,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_orchestration_done(rt);
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
-
-            INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
         }
     }
 
@@ -556,7 +555,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, 0);
+            LOG_INFO_V0("Thread %d: Scheduling: %d", thread_idx, thread_idx_.load());
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
@@ -609,7 +609,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    g_TraCR_thread_idx_counter.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);
     runtime_init_ready_.store(false, std::memory_order_release);
 

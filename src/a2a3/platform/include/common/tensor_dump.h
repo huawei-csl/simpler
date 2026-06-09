@@ -72,7 +72,12 @@ enum class TensorDumpStage : uint8_t {
 
 using TensorDumpArgMask = uint64_t;
 
+#ifdef INDEP_ORCH
+#define PTO2_TASK_WINDOW_SIZE 65536  // Default per-ring task window size (power of 2)
+#else
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+#endif
+
 #define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers
 
 // Bitmask stored in the platform-owned mask pool when orchestration selects
