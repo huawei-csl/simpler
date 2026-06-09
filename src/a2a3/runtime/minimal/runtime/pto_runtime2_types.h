@@ -119,7 +119,11 @@
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
 // Wiring queue
+#ifdef INDEP_ORCH
+#define PTO2_WRIRING_QUEUE_SIZE 65536  // Per-shape queue size
+#else
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
+#endif
 
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64

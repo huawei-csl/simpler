@@ -78,7 +78,7 @@ using TensorDumpArgMask = uint64_t;
 // Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
 constexpr TensorDumpArgMask TENSOR_DUMP_ARG_MASK_NONE = 0;
 constexpr uint32_t TENSOR_DUMP_ARG_MASK_BITS = 64;
-constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_RINGS = 1024;
+constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_RINGS = 4;
 constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_SLOTS = 1024;
 constexpr uint32_t TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK = TENSOR_DUMP_MASK_POOL_MAX_SLOTS - 1;
 

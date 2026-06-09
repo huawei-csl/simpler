@@ -54,6 +54,16 @@ add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
 tracr_enable(aicpu_kernel)
 
+# Make the Orchestrator run independently (i.e. finalize before letting the schedulers run)
+option(INDEP_ORCH "Run Orchestrator independent from the Schedulers" OFF)
+if(DEFINED ENV{INDEP_ORCH})
+    set(INDEP_ORCH $ENV{INDEP_ORCH})
+endif()
+if(INDEP_ORCH)
+    target_compile_definitions(aicpu_kernel PRIVATE INDEP_ORCH)
+endif()
+
+
 # Compile options (common to both C and C++)
 target_compile_options(aicpu_kernel
     PRIVATE
