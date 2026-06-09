@@ -559,10 +559,18 @@ static TaskOutputTensors submit_task_common(
     // LOG_INFO_V9("Total Input Tensors: %lu - Task: %lu", inputTensorCount, taskInputTensorCount);
     // LOG_INFO_V9("Total Output Tensors: %lu - Task: %lu", outputTensorCount, taskOutputTensorCount);
 
-    // === STEP 6: push to pending task queue
-    sched->_pending_task_queue.lock();
-    sched->_pending_task_queue.enqueue(&cur_slot_state);
-    sched->_pending_task_queue.unlock();
+    // === STEP 6: push to wiring queue ===
+    // Deferred wiring: orchestrator only stores dependency metadata and increments
+    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
+    // is handled asynchronously by scheduler thread 0 via the wiring queue.
+    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+    while (!sched->wiring.queue.push(&cur_slot_state)) {
+        SPIN_WAIT_HINT();
+    }
+
+    // sched->_pending_task_queue.lock();
+    // sched->_pending_task_queue.enqueue(&cur_slot_state);
+    // sched->_pending_task_queue.unlock();
 
     return result;
 }

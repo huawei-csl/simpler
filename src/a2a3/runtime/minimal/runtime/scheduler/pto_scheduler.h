@@ -623,6 +623,95 @@ struct PTO2SchedulerState {
         check_and_handle_consumed(slot_state);
     }
 
+    int drain_wiring_queue(bool force_drain = false) {
+        int wired = 0;
+
+        // Refill local batch buffer when exhausted.
+        if (wiring.batch_index >= wiring.batch_count) {
+            // Backoff: defer pop when queue holds fewer than a full batch,
+            // unless force_drain, orch_needs_drain, or backoff limit reached.
+            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
+                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
+                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
+                    wiring.backoff_counter++;
+                    return 0;
+                }
+            }
+            wiring.backoff_counter = 0;
+            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
+            wiring.batch_index = 0;
+            if (wiring.batch_count == 0) return 0;
+        }
+
+        // Process tasks from local buffer in strict FIFO order.
+        while (wiring.batch_index < wiring.batch_count) {
+            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
+            int ring_id = ws->ring_id;
+            auto &rss = ring_sched_states[ring_id];
+            int32_t wfanin = ws->payload->fanin_actual_count;
+
+            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
+                if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                    break;  // not enough dep_pool space — keep remainder for next call
+                }
+            }
+
+            wiring.batch_index++;
+            wire_task(rss, ws, wfanin);
+            wired++;
+        }
+
+        return wired;
+    }
+
+    /**
+     * Wire fanout edges for a single task. Sets fanin_count, acquires each
+     * producer's fanout_lock, allocates dep_pool entries for live producers,
+     * pushes the task to the ready queue once its fanin refcount is satisfied.
+     */
+    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
+
+        // // Adding task to pending task queue, if not alraedy ready
+        // if (checkTaskIsReady(ws)) push_ready_routed(ws);
+        // else 
+        // {
+        //     _pending_task_queue.lock();
+        //     LOG_INFO_V9("[VNL] Pending Task Count A %lu", _pending_task_queue.getSize());
+        //     _pending_task_queue.enqueue(ws);
+        //     LOG_INFO_V9("[VNL] Pending Task Count B %lu", _pending_task_queue.getSize());
+        //     _pending_task_queue.unlock();
+        // }
+    
+        PTO2TaskPayload *wp = ws->payload;
+        ws->fanin_count = wfanin + 1;
+
+        if (wfanin != 0) {
+            int32_t early_finished = 0;
+            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+                producer->lock_fanout();
+                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+                if (pstate >= PTO2_TASK_COMPLETED) {
+                    early_finished++;
+                } else {
+                    producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
+                }
+                producer->unlock_fanout();
+            });
+
+            int32_t init_rc = early_finished + 1;
+            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
+            if (new_rc >= ws->fanin_count) {
+                push_ready_routed(ws);
+            }
+        } else {
+            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
+            push_ready_routed(ws);
+        }
+
+        ws->dep_pool_mark = rss.dep_pool.top;
+    }
+
     bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's

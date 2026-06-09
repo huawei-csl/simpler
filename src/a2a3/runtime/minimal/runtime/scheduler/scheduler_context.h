@@ -300,7 +300,15 @@ public:
                 continue;
             }
 
-            // Phase 3x: Check pending tasks
+            // Phase 3: Drain wiring queue (thread 0 only)
+            if (thread_idx == 0) {
+                int wired = sched_->drain_wiring_queue(orchestrator_done_);
+                if (wired > 0) {
+                    made_progress = true;
+                }
+            }
+            
+            // Phase 3x: Drain wiring queue (thread 0 only)
             if (thread_idx == 0) {
                 size_t released = sched_->checkPendingTasks();
                 if (released > 0) {
@@ -825,12 +833,12 @@ private:
         bool to_pending, int32_t block_idx
     )
     {
-        // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-        // {
-        //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
-        //     const auto tensorStatus = sched_->_tensorStatus[idx];
-        //     LOG_INFO_V9("[VNL] Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-        // }
+        for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+        {
+            const auto idx = slot_state.payload->_inputTensorIdxs[i];
+            const auto tensorStatus = sched_->_tensorStatus[idx];
+            LOG_INFO_V9("[VNL] Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+        }
 
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -913,12 +921,12 @@ private:
         bool to_pending, int32_t block_idx
     )
     {
-        for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-        {
-            const auto idx = slot_state.payload->_inputTensorIdxs[i];
-            const auto tensorStatus = sched_->_tensorStatus[idx];
-            if (tensorStatus == 0) LOG_INFO_V9("[VNL] WARNING: Dispatching Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-        }
+        // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+        // {
+        //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
+        //     const auto tensorStatus = sched_->_tensorStatus[idx];
+        //     LOG_INFO_V9("[VNL] Dispatching Task %u Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+        // }
 
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(thread_idx, core_offset, slot_state, to_pending, block_idx);
@@ -1253,7 +1261,7 @@ private:
         {
             const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
             sched_->_tensorStatus[tensorIdx] = 1;
-            // LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
+            LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
             // LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
         }
     }
