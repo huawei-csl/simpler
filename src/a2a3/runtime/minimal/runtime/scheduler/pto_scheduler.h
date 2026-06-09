@@ -30,6 +30,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include "common/core_type.h"
 #include "device_arena.h"
 #include "pto_async_wait.h"
@@ -39,7 +40,7 @@
 
 
 // Implement the queue data structure
-class PendingTaskQueue {
+class PendingTaskQueueReplaceMe {
 
 public:
 
@@ -48,15 +49,20 @@ public:
     uint64_t front;
     uint64_t rear;
     void*  arr[MAX_QUEUE_SIZE];
+    std::mutex _lock;
 
     // initializing pointers in the constructor
-    PendingTaskQueue(): front(0), rear(0) {}
+    PendingTaskQueueReplaceMe(): front(0), rear(0) {}
 
     // Function to check if the queue is empty or not
     inline bool isEmpty() { return front == rear; }
 
     // Function to check if the queue is full or not
     inline bool isFull() { return getSize() == MAX_QUEUE_SIZE - 1; }
+
+
+    inline void lock() { _lock.lock(); }
+    inline void unlock() { _lock.unlock(); }
 
     inline size_t getSize() const
     {
@@ -530,7 +536,7 @@ struct PTO2SchedulerState {
 
     alignas(64) AsyncWaitList async_wait_list;
 
-    alignas(64)  PendingTaskQueue _pending_task_queue;
+    alignas(64)  PendingTaskQueueReplaceMe _pending_task_queue;
 
 
     // =========================================================================
@@ -622,12 +628,14 @@ struct PTO2SchedulerState {
     void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
 
         // Adding task to pending task queue, if not alraedy ready
-        // if (checkTaskIsReady(ws)) push_ready_routed(ws);
-        // else 
+        if (checkTaskIsReady(ws)) push_ready_routed(ws);
+        else 
         {
+            _pending_task_queue.lock();
             LOG_INFO_V9("[VNL] Pending Task Count A %lu", _pending_task_queue.getSize());
             _pending_task_queue.enqueue(ws);
             LOG_INFO_V9("[VNL] Pending Task Count B %lu", _pending_task_queue.getSize());
+            _pending_task_queue.unlock();
         }
     
         // PTO2TaskPayload *wp = ws->payload;
@@ -662,6 +670,9 @@ struct PTO2SchedulerState {
     inline size_t checkPendingTasks()
     {
         size_t releasedTasks = 0;
+
+        _pending_task_queue.lock();
+
         const auto pendingTaskCount = _pending_task_queue.getSize();
         for (size_t i = 0; i < pendingTaskCount; i++)
         {
@@ -675,6 +686,9 @@ struct PTO2SchedulerState {
             } 
             else _pending_task_queue.enqueue(ws);
         }
+
+        _pending_task_queue.unlock();
+
         return releasedTasks;
     }
 
