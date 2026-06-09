@@ -10,6 +10,8 @@
  */
 #include "scheduler_context.h"
 
+#include <algorithm>
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
@@ -408,9 +410,27 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
-        while (valid.has_value() && slot_state->next_block_idx < block_num) {
-            dispatch_block(t, valid.pop_first(), *slot_state, shape, false, slot_state->next_block_idx);
-            slot_state->next_block_idx++;
+        int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
+        int32_t claim = std::min(valid.count(), remaining);
+        int32_t start = slot_state->next_block_idx;
+        slot_state->next_block_idx += claim;
+        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+        int handle_count = 0;
+        for (int32_t b = 0; b < claim; b++) {
+            auto core_offset = valid.pop_first();
+            handle_count += prepare_block_for_dispatch(
+                t, core_offset, *slot_state, shape, false, start + b, &handles[handle_count]
+            );
+        }
+        wmb();
+        uint64_t dispatch_ts = 0;
+#if PTO2_PROFILING
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+            dispatch_ts = get_sys_cnt_aicpu();
+        }
+#endif
+        for (int i = 0; i < handle_count; i++) {
+            publish_subtask_to_core(handles[i], dispatch_ts);
         }
     }
 

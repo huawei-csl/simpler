@@ -73,14 +73,13 @@ struct L2SwimlaneAicoreLocalState {
  * their records and dcci'd them out before AICPU enqueues the old buffer to
  * the ready queue.
  *
- * @param head            Per-core L2SwimlaneActiveHead channel — lazy-resolved on
- *                        the executor's first-task branch via
- *                        get_l2_swimlane_aicore_head(), which deref's the slot
- *                        the kernel entry stashed from
- *                        KernelArgs::l2_swimlane_aicore_rotation_table[block_idx].
- *                        (Kernel entry can't deref directly — AICPU init runs
- *                        concurrently with kernel entry, so the slot may not yet
- *                        hold a valid address at that point.)
+ * @param head            Per-core L2SwimlaneActiveHead channel. The executor
+ *                        resolves it right after Phase 1 handshake exit
+ *                        (`aicpu_ready == 1`) via get_l2_swimlane_aicore_head(),
+ *                        which dereferences the slot the kernel entry stashed
+ *                        from KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]
+ *                        — by then AICPU's `l2_swimlane_aicpu_init` has
+ *                        populated the slot.
  * @param local           Per-core AICore-local state (caller-owned static)
  * @param task_token_raw  Full task identity (PTO2 encoding for tensormap_and_ringbuffer
  *                        runtime: `(ring_id << 32) | local_id`; plain task index

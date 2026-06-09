@@ -477,24 +477,9 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
-        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
-        // the run-cumulative tracked in this struct (final-drain emit covers
-        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_dispatch_cycle),
             l2_swimlane.sched_dispatch_cycle * 100.0 / sched_total
-        );
-        uint64_t global_dispatch_count = l2_swimlane.pop_hit - l2_swimlane.local_dispatch_count;
-        uint64_t total_dispatched = l2_swimlane.local_dispatch_count + global_dispatch_count;
-        double local_hit_rate =
-            total_dispatched > 0 ? l2_swimlane.local_dispatch_count * 100.0 / total_dispatched : 0.0;
-        LOG_INFO_V9(
-            "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
-            ", local_rate=%.1f%%",
-            thread_idx, static_cast<uint64_t>(l2_swimlane.local_dispatch_count),
-            static_cast<uint64_t>(global_dispatch_count), static_cast<uint64_t>(l2_swimlane.local_overflow_count),
-            local_hit_rate
         );
 
         uint64_t d_parent = l2_swimlane.sched_dispatch_cycle > 0 ? l2_swimlane.sched_dispatch_cycle : 1;
@@ -910,11 +895,19 @@ int32_t SchedulerContext::init(
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        int32_t task_count = 0;
+        // Read at one-time boot init, before the SM is reset for the run, so a
+        // ring not yet written holds uninitialized memory (0xbe... under ASAN's
+        // malloc-fill). Sum in int64 and only count rings whose value is a
+        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
+        // more than the scope cap. This rejects any garbage pattern (negative
+        // or positive), so uninitialized rings contribute 0 (the correct boot
+        // count) while valid counts still add up, with no signed overflow.
+        int64_t task_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            task_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) task_count += ring_tasks;
         }
-        total_tasks_ = task_count > 0 ? task_count : 0;
+        total_tasks_ = static_cast<int32_t>(task_count);
     } else {
         total_tasks_ = 0;
     }
