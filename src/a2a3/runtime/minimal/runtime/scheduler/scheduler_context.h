@@ -300,7 +300,7 @@ public:
                 continue;
             }
 
-            // Phase 3x: Drain wiring queue (any thread)
+            // Phase 3x: Check pending tasks
             size_t released = sched_->checkPendingTasks();
             if (released > 0) {
                 made_progress = true;
@@ -823,12 +823,12 @@ private:
         bool to_pending, int32_t block_idx
     )
     {
-        for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
-        {
-            const auto idx = slot_state.payload->_inputTensorIdxs[i];
-            const auto tensorStatus = sched_->_tensorStatus[idx];
-            LOG_INFO_V9("[VNL] Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
-        }
+        // for (size_t i = 0; i < slot_state.payload->_inputTensorCount; i++)
+        // {
+        //     const auto idx = slot_state.payload->_inputTensorIdxs[i];
+        //     const auto tensorStatus = sched_->_tensorStatus[idx];
+        //     LOG_INFO_V9("[VNL] Dispatching Task %u with Input Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), idx, tensorStatus);
+        // }
 
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -1251,7 +1251,7 @@ private:
         {
             const auto tensorIdx = slot_state.payload->_outputTensorIdxs[i];
             sched_->_tensorStatus[tensorIdx] = 1;
-            LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
+            // LOG_INFO_V9("[VNL] Task %u Ouput Tensor Idx: %u Status: %u", slot_state.task->task_id.local(), tensorIdx, sched_->_tensorStatus[tensorIdx] );
             // LOG_INFO_V9("[VNL] Output Tensor Freed: %lu", tensorIdx);
         }
     }
