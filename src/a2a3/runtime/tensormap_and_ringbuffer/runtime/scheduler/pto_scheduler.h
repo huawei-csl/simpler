@@ -764,30 +764,13 @@ struct PTO2SchedulerState {
             wiring.backoff_counter = 0;
             wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
             wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
         }
 
         // Process tasks from local buffer in strict FIFO order.
         while (wiring.batch_index < wiring.batch_count) {
             PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
-
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (rss.dep_pool.available() < wfanin) {
-#if PTO2_PROFILING
-                    if (is_scope_stats_enabled()) {
-                        rss.publish_dep_pool_snapshot();
-                    }
-#endif
-                    break;  // not enough dep_pool space — keep remainder for next call
-                }
-            }
-
             wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
+            _pending_task_queue.enqueue(ws);
             wired++;
         }
 
@@ -824,7 +807,7 @@ struct PTO2SchedulerState {
     {
         size_t releasedTasks = 0;
 
-        if (_pending_task_queue.trylock())
+        // if (_pending_task_queue.trylock())
         {
             const auto pendingTaskCount = _pending_task_queue.getSize();
             for (size_t i = 0; i < pendingTaskCount; i++)
@@ -839,60 +822,10 @@ struct PTO2SchedulerState {
                 else _pending_task_queue.enqueue(ws);
             }
 
-            _pending_task_queue.unlock();
+            // _pending_task_queue.unlock();
         }
 
         return releasedTasks;
-    }
-
-    /**
-     * Wire fanout edges for a single task. Sets fanin_count, acquires each
-     * producer's fanout_lock, allocates dep_pool entries for live producers,
-     * pushes the task to the ready queue once its fanin refcount is satisfied.
-     */
-    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
-//         PTO2TaskPayload *wp = ws->payload;
-//         ws->fanin_count = wfanin + 1;
-
-//         if (wfanin != 0) {
-//             int32_t early_finished = 0;
-//             for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-//                 producer->lock_fanout();
-//                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-//                 if (pstate >= PTO2_TASK_COMPLETED) {
-//                     early_finished++;
-//                 } else {
-//                     producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-//                 }
-//                 producer->unlock_fanout();
-//             });
-
-//             int32_t init_rc = early_finished + 1;
-//             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-//             if (new_rc >= ws->fanin_count) {
-//                 push_ready_routed(ws);
-//             }
-//         } else {
-//             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-//             push_ready_routed(ws);
-//         }
-
-//         ws->dep_pool_mark = rss.dep_pool.top;
-// #if PTO2_PROFILING
-//         if (is_scope_stats_enabled()) {
-//             rss.publish_dep_pool_snapshot();
-//         }
-// #endif
-
-        // Adding task to pending task queue, if not alraedy ready
-        if (checkTaskIsReady(ws)) push_ready_routed(ws);
-        else 
-        {
-            _pending_task_queue.lock();
-            _pending_task_queue.enqueue(ws);
-            // LOG_INFO_V9("[VNL] New Pending Task Count: %lu", _pending_task_queue.getSize());
-            _pending_task_queue.unlock();
-        }
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {

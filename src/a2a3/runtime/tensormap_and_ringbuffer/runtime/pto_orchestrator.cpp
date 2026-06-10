@@ -686,6 +686,10 @@ static TaskOutputTensors submit_task_common(
         SPIN_WAIT_HINT();
     }
 
+    // sched->_pending_task_queue.lock();
+    // sched->_pending_task_queue.enqueue(&cur_slot_state);
+    // sched->_pending_task_queue.unlock();
+
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
 
