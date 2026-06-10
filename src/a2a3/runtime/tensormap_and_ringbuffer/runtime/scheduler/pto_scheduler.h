@@ -764,6 +764,7 @@ struct PTO2SchedulerState {
             wiring.backoff_counter = 0;
             wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
             wiring.batch_index = 0;
+            if (wiring.batch_count == 0) return 0;
         }
 
         // Process tasks from local buffer in strict FIFO order.
