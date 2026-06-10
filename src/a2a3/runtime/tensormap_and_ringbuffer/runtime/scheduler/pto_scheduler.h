@@ -37,6 +37,7 @@
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+#include <mutex>
 
 #if PTO2_PROFILING
 // Strong def in scope_stats_collector_aicpu.cpp; weak fallback in pto_scheduler.cpp for host/UT builds.
@@ -53,6 +54,56 @@ extern "C" bool is_scope_stats_enabled();
         _st0 = _st1;                \
     } while (0)
 #endif
+
+
+// Implement the queue data structure
+class PendingTaskQueueReplaceMe {
+
+public:
+
+    static constexpr size_t MAX_QUEUE_SIZE = 65536;
+
+    uint64_t front;
+    uint64_t rear;
+    void*  arr[MAX_QUEUE_SIZE];
+    std::mutex _lock;
+
+    // initializing pointers in the constructor
+    PendingTaskQueueReplaceMe(): front(0), rear(0) {}
+
+    // Function to check if the queue is empty or not
+    inline bool isEmpty() { return front == rear; }
+
+    // Function to check if the queue is full or not
+    inline bool isFull() { return getSize() == MAX_QUEUE_SIZE - 1; }
+
+
+    inline void lock() { _lock.lock(); }
+    inline void unlock() { _lock.unlock(); }
+    inline bool trylock() { return _lock.try_lock(); }
+
+    inline size_t getSize() const
+    {
+        return rear - front;
+    }
+
+    inline void pop()
+    {
+       front++;
+    }
+
+    // Function to enqueue elements from the queue
+    inline void enqueue(void* val)
+    {
+        arr[rear++ % MAX_QUEUE_SIZE] = val;
+    }
+
+    // Function to dequeue elements from the queue
+    inline void* dequeue()
+    {
+        return arr[front++ % MAX_QUEUE_SIZE];
+    }
+};
 
 // =============================================================================
 // Ready Queue (Lock-free bounded MPMC — Vyukov design)
@@ -676,6 +727,8 @@ struct PTO2SchedulerState {
 
     alignas(64) AsyncWaitList async_wait_list;
 
+    alignas(64)  PendingTaskQueueReplaceMe _pending_task_queue;
+
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
     alignas(64) std::atomic<int64_t> tasks_completed;
@@ -755,44 +808,91 @@ struct PTO2SchedulerState {
         }
     }
 
+    static inline bool checkTaskIsReady(PTO2TaskSlotState *ws)
+    {
+        bool isReady = true;
+        PTO2TaskPayload *wp = ws->payload;
+        for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+            int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+            if (pstate < PTO2_TASK_COMPLETED) isReady = false;
+        });
+
+        return isReady;
+    }
+    
+    inline size_t checkPendingTasks()
+    {
+        size_t releasedTasks = 0;
+
+        if (_pending_task_queue.trylock())
+        {
+            const auto pendingTaskCount = _pending_task_queue.getSize();
+            for (size_t i = 0; i < pendingTaskCount; i++)
+            {
+                auto ws = (PTO2TaskSlotState *)_pending_task_queue.dequeue();
+                // LOG_INFO_V9("[VNL] Checking readiness of pending task Task %u", ws->task->task_id.local());
+                if (checkTaskIsReady(ws))
+                {
+                    push_ready_routed(ws);
+                    releasedTasks++;  
+                } 
+                else _pending_task_queue.enqueue(ws);
+            }
+
+            _pending_task_queue.unlock();
+        }
+
+        return releasedTasks;
+    }
+
     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,
      * pushes the task to the ready queue once its fanin refcount is satisfied.
      */
-    void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin) {
-        PTO2TaskPayload *wp = ws->payload;
-        ws->fanin_count = wfanin + 1;
+    void wire_task([[maybe_unused]] RingSchedState &rss, PTO2TaskSlotState *ws, [[maybe_unused]] int32_t wfanin) {
+//         PTO2TaskPayload *wp = ws->payload;
+//         ws->fanin_count = wfanin + 1;
 
-        if (wfanin != 0) {
-            int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                producer->lock_fanout();
-                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-                if (pstate >= PTO2_TASK_COMPLETED) {
-                    early_finished++;
-                } else {
-                    producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-                }
-                producer->unlock_fanout();
-            });
+//         if (wfanin != 0) {
+//             int32_t early_finished = 0;
+//             for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+//                 producer->lock_fanout();
+//                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+//                 if (pstate >= PTO2_TASK_COMPLETED) {
+//                     early_finished++;
+//                 } else {
+//                     producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
+//                 }
+//                 producer->unlock_fanout();
+//             });
 
-            int32_t init_rc = early_finished + 1;
-            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-            if (new_rc >= ws->fanin_count) {
-                push_ready_routed(ws);
-            }
-        } else {
-            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            push_ready_routed(ws);
+//             int32_t init_rc = early_finished + 1;
+//             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
+//             if (new_rc >= ws->fanin_count) {
+//                 push_ready_routed(ws);
+//             }
+//         } else {
+//             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
+//             push_ready_routed(ws);
+//         }
+
+//         ws->dep_pool_mark = rss.dep_pool.top;
+// #if PTO2_PROFILING
+//         if (is_scope_stats_enabled()) {
+//             rss.publish_dep_pool_snapshot();
+//         }
+// #endif
+
+        // Adding task to pending task queue, if not alraedy ready
+        if (checkTaskIsReady(ws)) push_ready_routed(ws);
+        else 
+        {
+            _pending_task_queue.lock();
+            _pending_task_queue.enqueue(ws);
+            // LOG_INFO_V9("[VNL] New Pending Task Count: %lu", _pending_task_queue.getSize());
+            _pending_task_queue.unlock();
         }
-
-        ws->dep_pool_mark = rss.dep_pool.top;
-#if PTO2_PROFILING
-        if (is_scope_stats_enabled()) {
-            rss.publish_dep_pool_snapshot();
-        }
-#endif
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
@@ -979,117 +1079,44 @@ struct PTO2SchedulerState {
         int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
         return (prev + 1) == slot_state.total_required_subtasks;
     }
-
     /**
      * Two-stage completion: second stage.
      * Called exactly once when all subtasks of a mixed task are done
      * (i.e., on_subtask_complete returned true).
      * Handles fanout notification, fanin release, and self-consumption check.
      */
-#if PTO2_SCHED_PROFILING
-    CompletionStats
-#else
     void
-#endif
     on_mixed_task_complete(
-        PTO2TaskSlotState &slot_state,
-#if PTO2_SCHED_PROFILING
-        int thread_idx,
-#endif
-
-        PTO2LocalReadyBuffer *local_bufs = nullptr
+        [[maybe_unused]] PTO2TaskSlotState &slot_state,
+        [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
-#if PTO2_SCHED_PROFILING
-        CompletionStats stats = {0, 0, 0, true};
-#endif
-#if PTO2_SCHED_PROFILING
-        extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
-        extern uint64_t g_sched_lock_atomic_count[], g_sched_lock_wait_cycle[];
-        extern uint64_t g_sched_fanout_atomic_count[], g_sched_push_wait_cycle[];
-        uint64_t lock_atomics = 0, lock_wait = 0;
-        PTO2_SCHED_CYCLE_START();
-#endif
+        // slot_state.lock_fanout();
+        slot_state.task_state = PTO2_TASK_COMPLETED;
+        // PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
+        // slot_state.unlock_fanout();
 
-#if PTO2_SCHED_PROFILING
-        slot_state.lock_fanout(lock_atomics, lock_wait);
-#else
-        slot_state.lock_fanout();
-#endif
-        slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        slot_state.unlock_fanout();
-
-#if PTO2_SCHED_PROFILING
-        lock_atomics += 2;  // state.store + unlock.store
-        g_sched_lock_atomic_count[thread_idx] += lock_atomics;
-        g_sched_lock_wait_cycle[thread_idx] += lock_wait;
-        PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
-#endif
-
-        // Fanout: notify consumers
-#if PTO2_SCHED_PROFILING
-        uint64_t fanout_atomics = 0, push_wait = 0;
-#endif
-        while (current != nullptr) {
-            PTO2TaskSlotState &consumer_slot = *current->slot_state;
-#if PTO2_SCHED_PROFILING
-            stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs)) {
-                stats.tasks_enqueued++;
-            }
-#else
-            release_fanin_and_check_ready(consumer_slot, local_bufs);
-#endif
-            current = current->next;
-        }
-
-#if PTO2_SCHED_PROFILING
-        g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
-        g_sched_push_wait_cycle[thread_idx] += push_wait;
-        PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
-        return stats;
-#endif
+        // // Fanout: notify consumers
+        // while (current != nullptr) {
+        //     PTO2TaskSlotState &consumer_slot = *current->slot_state;
+        //     // LOG_INFO_V9("[VNL] Task %u Releases Consumer Task %u", slot_state.task->task_id.local(), consumer_slot.task->task_id.local());
+        //     release_fanin_and_check_ready(consumer_slot, local_bufs);
+        //     current = current->next;
+        // }
     }
 
     /**
      * Cold path: release producers (fanin traversal) + check self for CONSUMED.
      * Returns fanin edge count for profiling.
      */
-
-#if PTO2_SCHED_PROFILING
-    int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
-        PTO2_SCHED_CYCLE_START();
-        extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
-        extern uint64_t g_sched_self_atomic_count[];
-        extern uint64_t g_sched_self_consumed_cycle[];
-        extern uint64_t g_sched_complete_count[];
-        uint64_t fanin_atomics = 0;
-#else
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
-#endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-#if PTO2_SCHED_PROFILING
-            release_producer(*producer_slot_state, fanin_atomics);
-#else
-            release_producer(*producer_slot_state);
-#endif
-        });
-#if PTO2_SCHED_PROFILING
-        g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
-#endif
+        // for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        // // LOG_INFO_V9("[VNL] Task %u Notifies Producer Task %u", slot_state.task->task_id.local(), producer_slot_state->task->task_id.local());
+        // release_producer(*producer_slot_state);
+        // });
 
         // Self consumed check
-#if PTO2_SCHED_PROFILING
-        uint64_t self_atomics = 0;
-        check_and_handle_consumed(slot_state, self_atomics);
-        g_sched_self_atomic_count[thread_idx] += self_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
-        g_sched_complete_count[thread_idx]++;
-#else
         check_and_handle_consumed(slot_state);
-#endif
         return payload->fanin_actual_count;
     }
 

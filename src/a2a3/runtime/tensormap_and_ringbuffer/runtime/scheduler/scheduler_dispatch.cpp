@@ -845,6 +845,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
 #endif
 
+        // Phase 3x: Drain wiring queue (thread 0 only)
+            if (thread_idx == 0) {
+                size_t released = sched_->checkPendingTasks();
+                if (released > 0) {
+                    made_progress = true;
+                }
+            }
+
         // Phase 3b: Drain dummy ready queue (thread 0 only).
         //
         // Dependency-only tasks bypass AICore dispatch: they go through the
