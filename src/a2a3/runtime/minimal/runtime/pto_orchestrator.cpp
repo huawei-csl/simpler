@@ -496,65 +496,72 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 
-    for (int i = 0; i < args.tensor_count(); i++) 
-    {
-       if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
-       {
-            const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
-            const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
-            const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
+    // LOG_INFO_V9("[VNL] Orchestrator: Adding Task %5lu", task_id.local());
+
+    // Processing input tensors
+    // for (int i = 0; i < args.tensor_count(); i++) 
+    // {
+    //    if (args.tag(i) == TensorArgType::INPUT || args.tag(i) == TensorArgType::INOUT)
+    //    {
+    //         const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
+    //         const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
+    //         const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
             
-            tensorUniqueId_t tensorId { .address = tensorAddress, .version = currentTensorVersion };
-            const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
+    //         tensorUniqueId_t tensorId { .address = tensorAddress, .version = currentTensorVersion };
+    //         const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
 
-            tensorIdx_t tensorIdx = 0;
-            const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
+    //         tensorIdx_t tensorIdx = 0;
+    //         const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
 
-            // Important. If the tensor doesn't exist in the map, it is an pre-existing tensor with no producer task. Therefore, no dependency needs to be created
-            if (tensorIdHashItr == _tensorIdToIdxMap.end())
-            {
-                // LOG_INFO_V9("[VNL] Pre existing tensor, skipping dependency. Addr: 0x%0lX", tensorAddress);
-            } 
-            else
-            {
-                // LOG_INFO_V9("[VNL] Adding tensor dependency. Addr: 0x%0lX", tensorAddress);
+    //         // Important. If the tensor doesn't exist in the map, it is an pre-existing tensor with no producer task. Therefore, no dependency needs to be created
+    //         if (tensorIdHashItr == _tensorIdToIdxMap.end())
+    //         {
+    //             // LOG_INFO_V9("[VNL] Pre existing tensor, skipping dependency. Addr: 0x%0lX", tensorAddress);
+    //         } 
+    //         else
+    //         {
+    //             // LOG_INFO_V9("[VNL] Adding tensor dependency. Addr: 0x%0lX", tensorAddress);
 
-                // If the tensor is created by another task, then do get its index to create the dependency
-                tensorIdx = tensorIdHashItr->second;
-                if (payload._inputTensorCount >= MAX_TENSOR_HASH_INPUTS) LOG_INFO_V9("[VNL] Tensor addr: - Exceeded number of tensor inputs! %u > %u", payload._inputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
-                else  payload._inputTensorIdxs[payload._inputTensorCount++] = tensorIdx;
+    //             // If the tensor is created by another task, then do get its index to create the dependency
+    //             tensorIdx = tensorIdHashItr->second;
+    //             if (payload._inputTensorCount >= MAX_TENSOR_HASH_INPUTS) LOG_INFO_V9("[VNL] Tensor addr: - Exceeded number of tensor inputs! %u > %u", payload._inputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+    //             else  payload._inputTensorIdxs[payload._inputTensorCount++] = tensorIdx;
 
-                // LOG_INFO_V9("[VNL] Task Id: %5lu - Input  Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %5lu - inputTensorCount:  %3u", task_id.local(), (uint64_t) args.tensor(i).ptr->buffer.addr, currentTensorVersion, tensorAddressHash, tensorIdHash, args.tag(i), tensorIdx, payload._inputTensorCount);
-            }
-       }
+    //             LOG_INFO_V9("[VNL] Orchestrator Task Id: %5lu - Input  Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %5lu - inputTensorCount:  %3u - Producer Task: %5lu", task_id.local(), (uint64_t) args.tensor(i).ptr->buffer.addr, currentTensorVersion, tensorAddressHash, tensorIdHash, args.tag(i), tensorIdx, payload._inputTensorCount, args.tensor(i).ptr->owner_task_id.local());
+    //         }
+    //    }
+    // }
 
-       if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::INOUT)
-       {
-            const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
-            const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
-            const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
+    // // Processing output tensors
+    // for (int i = 0; i < args.tensor_count(); i++) 
+    // {
+    //    if (args.tag(i) == TensorArgType::OUTPUT_EXISTING || args.tag(i) == TensorArgType::INOUT)
+    //    {
+    //         const auto tensorAddress = (args.tensor(i).ptr)->buffer.addr;
+    //         const auto tensorAddressHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorAddress), sizeof(tensorAddress));
+    //         const size_t currentTensorVersion = _tensorVersionMap[tensorAddressHash];
 
-            const auto newTensorVersion = currentTensorVersion + 1;
-            _tensorVersionMap[tensorAddressHash] = newTensorVersion;
+    //         const auto newTensorVersion = currentTensorVersion + 1;
+    //         _tensorVersionMap[tensorAddressHash] = newTensorVersion;
 
-            tensorUniqueId_t tensorId { .address = tensorAddress, .version = newTensorVersion };
-            const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
+    //         tensorUniqueId_t tensorId { .address = tensorAddress, .version = newTensorVersion };
+    //         const auto tensorIdHash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(&tensorId), sizeof(tensorId));
             
-            tensorIdx_t tensorIdx = 0;
-            const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
-            if (tensorIdHashItr != _tensorIdToIdxMap.end()) tensorIdx = tensorIdHashItr->second;
-            else 
-            {
-                tensorIdx = orch->_globalTensorIdxCount++;
-                _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
-            }
+    //         tensorIdx_t tensorIdx = 0;
+    //         const auto tensorIdHashItr = _tensorIdToIdxMap.find(tensorIdHash);
+    //         if (tensorIdHashItr != _tensorIdToIdxMap.end()) tensorIdx = tensorIdHashItr->second;
+    //         else 
+    //         {
+    //             tensorIdx = orch->_globalTensorIdxCount++;
+    //             _tensorIdToIdxMap[tensorIdHash] = tensorIdx;
+    //         }
 
-            if (payload._outputTensorCount >= MAX_TENSOR_HASH_OUTPUTS) LOG_INFO_V9("[VNL] Tensor addr: Exceeded number of tensor outputs! %u > %u", payload._outputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
-            else payload._outputTensorIdxs[payload._outputTensorCount++] = tensorIdx;
+    //         if (payload._outputTensorCount >= MAX_TENSOR_HASH_OUTPUTS) LOG_INFO_V9("[VNL] Tensor addr: Exceeded number of tensor outputs! %u > %u", payload._outputTensorCount, MAX_TENSOR_HASH_OUTPUTS);
+    //         else payload._outputTensorIdxs[payload._outputTensorCount++] = tensorIdx;
 
-            // LOG_INFO_V9("[VNL] Task Id: %5lu - Output Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %5lu - outputTensorCount: %3u", task_id.local(), (uint64_t) args.tensor(i).ptr->buffer.addr, newTensorVersion, tensorAddressHash, tensorIdHash,  args.tag(i), tensorIdx, payload._outputTensorCount);
-       }
-    }
+    //         LOG_INFO_V9("[VNL] Orchestrator Task Id: %5lu - Output Tensor addr: 0x%16lX - Version: %lu - Address Hash: 0x%16lX - Id Hash: 0x%16lX - Type: %d - Index: %5lu - outputTensorCount: %3u", task_id.local(), (uint64_t) args.tensor(i).ptr->buffer.addr, newTensorVersion, tensorAddressHash, tensorIdHash,  args.tag(i), tensorIdx, payload._outputTensorCount);
+    //    }
+    // }
 
     // LOG_INFO_V9("Total Input Tensors: %lu - Task: %lu", inputTensorCount, taskInputTensorCount);
     // LOG_INFO_V9("Total Output Tensors: %lu - Task: %lu", outputTensorCount, taskOutputTensorCount);
@@ -564,13 +571,13 @@ static TaskOutputTensors submit_task_common(
     // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
     // is handled asynchronously by scheduler thread 0 via the wiring queue.
     // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
-        SPIN_WAIT_HINT();
-    }
+    // while (!sched->wiring.queue.push(&cur_slot_state)) {
+    //     SPIN_WAIT_HINT();
+    // }
 
-    // sched->_pending_task_queue.lock();
-    // sched->_pending_task_queue.enqueue(&cur_slot_state);
-    // sched->_pending_task_queue.unlock();
+    sched->_pending_task_queue.lock();
+    sched->_pending_task_queue.enqueue(&cur_slot_state);
+    sched->_pending_task_queue.unlock();
 
     return result;
 }
