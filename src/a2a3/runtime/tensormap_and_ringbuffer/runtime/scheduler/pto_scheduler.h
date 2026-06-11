@@ -56,53 +56,24 @@ extern "C" bool is_scope_stats_enabled();
 #endif
 
 
-// Implement the queue data structure
-class PendingTaskQueueReplaceMe {
-
-public:
+// Implementation for the pending task queue, it's circular because there is no upper bound on tasks pushed here
+template <class T> class circularBufferQueue
+{
+    private: 
 
     static constexpr size_t MAX_QUEUE_SIZE = 65536;
+    uint64_t front = 0;
+    uint64_t rear = 0;
+    T*  arr[MAX_QUEUE_SIZE];
 
-    uint64_t front;
-    uint64_t rear;
-    void*  arr[MAX_QUEUE_SIZE];
-    std::mutex _lock;
+    public:
 
-    // initializing pointers in the constructor
-    PendingTaskQueueReplaceMe(): front(0), rear(0) {}
-
-    // Function to check if the queue is empty or not
-    inline bool isEmpty() { return front == rear; }
-
-    // Function to check if the queue is full or not
-    inline bool isFull() { return getSize() == MAX_QUEUE_SIZE - 1; }
-
-
-    inline void lock() { _lock.lock(); }
-    inline void unlock() { _lock.unlock(); }
-    inline bool trylock() { return _lock.try_lock(); }
-
-    inline size_t getSize() const
-    {
-        return rear - front;
-    }
-
-    inline void pop()
-    {
-       front++;
-    }
-
-    // Function to enqueue elements from the queue
-    inline void enqueue(void* val)
-    {
-        arr[rear++ % MAX_QUEUE_SIZE] = val;
-    }
-
-    // Function to dequeue elements from the queue
-    inline void* dequeue()
-    {
-        return arr[front++ % MAX_QUEUE_SIZE];
-    }
+    inline bool isEmpty() const { return front == rear; }
+    inline bool isFull() const { return getSize() == MAX_QUEUE_SIZE - 1; }
+    inline size_t getSize() const { return rear - front; } 
+    inline void pop() { front++; }
+    inline void enqueue(T* val) { arr[rear++ % MAX_QUEUE_SIZE] = val; }
+    inline T* dequeue() { return arr[front++ % MAX_QUEUE_SIZE]; }
 };
 
 // =============================================================================
@@ -727,7 +698,7 @@ struct PTO2SchedulerState {
 
     alignas(64) AsyncWaitList async_wait_list;
 
-    alignas(64)  PendingTaskQueueReplaceMe _pending_task_queue;
+    alignas(64)  circularBufferQueue<PTO2TaskSlotState> _pending_task_queue;
 
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
