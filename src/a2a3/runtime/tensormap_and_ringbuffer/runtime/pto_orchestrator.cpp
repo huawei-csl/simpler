@@ -682,13 +682,11 @@ static TaskOutputTensors submit_task_common(
     // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
     // is handled asynchronously by scheduler thread 0 via the wiring queue.
     // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
-        SPIN_WAIT_HINT();
-    }
+    // while (!sched->wiring.queue.push(&cur_slot_state)) {
+    //     SPIN_WAIT_HINT();
+    // }
 
-    // sched->_pending_task_queue.lock();
-    // sched->_pending_task_queue.enqueue(&cur_slot_state);
-    // sched->_pending_task_queue.unlock();
+    sched->newTaskQueue.enqueue(&cur_slot_state);
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);

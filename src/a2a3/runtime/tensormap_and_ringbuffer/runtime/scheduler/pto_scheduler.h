@@ -61,7 +61,7 @@ template <class T> class circularBufferQueue
 {
     private: 
 
-    static constexpr size_t MAX_QUEUE_SIZE = 65536;
+    static constexpr size_t MAX_QUEUE_SIZE = 2048;
     uint64_t front = 0;
     uint64_t rear = 0;
     T*  arr[MAX_QUEUE_SIZE];
@@ -71,11 +71,35 @@ template <class T> class circularBufferQueue
     inline bool isEmpty() const { return front == rear; }
     inline bool isFull() const { return getSize() == MAX_QUEUE_SIZE - 1; }
     inline size_t getSize() const { return rear - front; } 
-    inline void pop() { front++; }
-    inline void enqueue(T* val) { arr[rear++ % MAX_QUEUE_SIZE] = val; }
+    inline void pop(const size_t n = 1) { front += n; }
+    inline void enqueue(T* const val) { arr[rear++ % MAX_QUEUE_SIZE] = val; }
     inline T* dequeue() { return arr[front++ % MAX_QUEUE_SIZE]; }
 };
 
+
+// Array queue for transferring tasks from the orchestrator to scheduler 0
+template <class T> class arrayQueue
+{
+    private:
+    
+    static constexpr size_t MAX_QUEUE_SIZE = 65536;
+
+    uint64_t front  = 0;
+    uint64_t rear = 0;
+    T* arr[MAX_QUEUE_SIZE];
+
+    public:
+
+    // Function to check if the queue is empty or not
+    inline bool isEmpty() const { return front == rear; }
+    inline size_t getSize() const { return rear - front; }
+    inline void pop(const size_t n = 1) { front += n; }
+    inline T** getFront() { return &arr[front]; }
+    inline void enqueue(T* const val) { arr[rear++] = val; }
+    inline void enqueueBatch(const T vals[], const size_t n) { memcpy(arr[rear], vals, sizeof(T*) * n); rear += n; }
+    inline T* dequeue() { return arr[front++];  }
+    inline T* dequeueBatch() { return arr[front++];  }
+};
 // =============================================================================
 // Ready Queue (Lock-free bounded MPMC — Vyukov design)
 // =============================================================================
@@ -668,6 +692,7 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
+
     // Wiring subsystem — groups all wiring-related state for cache-line isolation.
     //
     // Three cache-line regions by writer:
@@ -691,14 +716,10 @@ struct PTO2SchedulerState {
         alignas(64) std::atomic<bool> orch_needs_drain{false};
     } wiring;
 
-    static_assert(
-        offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
-    );
-    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
-
     alignas(64) AsyncWaitList async_wait_list;
 
-    alignas(64)  circularBufferQueue<PTO2TaskSlotState> _pending_task_queue;
+    alignas(64) circularBufferQueue<PTO2TaskSlotState> _pending_task_queue;
+    alignas(64) arrayQueue<PTO2TaskSlotState> newTaskQueue;
 
     // Statistics (cold path, isolated from hot-path fields)
 #if PTO2_SCHED_PROFILING
@@ -718,35 +739,54 @@ struct PTO2SchedulerState {
      * @return Number of tasks wired this call.
      */
 
-    int drain_wiring_queue(bool force_drain = false) {
-        int wired = 0;
+    int drain_wiring_queue([[maybe_unused]] bool force_drain = false) {
 
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count) {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
-                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
+        const auto queuedTaskCount = newTaskQueue.getSize();
+        
+        if (queuedTaskCount > 0)
+        {
+            const auto queueArray = newTaskQueue.getFront();
+            // LOG_INFO_V9("[VNL] Popping %lu tasks", queuedTaskCount);
+            for (size_t i = 0; i < queuedTaskCount; i++)
+            {
+                const auto newTask = queueArray[i];
+                if (checkTaskIsReady(newTask)) push_ready_routed(newTask);
+                else _pending_task_queue.enqueue(newTask);
             }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
+
+            newTaskQueue.pop(queuedTaskCount);
         }
 
-        // Process tasks from local buffer in strict FIFO order.
-        while (wiring.batch_index < wiring.batch_count) {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            wiring.batch_index++;
-            _pending_task_queue.enqueue(ws);
-            wired++;
-        }
+        return queuedTaskCount;
 
-        return wired;
+        // int wired = 0;
+
+        // // Refill local batch buffer when exhausted.
+        // if (wiring.batch_index >= wiring.batch_count) {
+        //     // Backoff: defer pop when queue holds fewer than a full batch,
+        //     // unless force_drain, orch_needs_drain, or backoff limit reached.
+        //     if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
+        //         if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
+        //             wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
+        //             wiring.backoff_counter++;
+        //             return 0;
+        //         }
+        //     }
+        //     wiring.backoff_counter = 0;
+        //     wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
+        //     wiring.batch_index = 0;
+        //     if (wiring.batch_count == 0) return 0;
+        // }
+
+        // // Process tasks from local buffer in strict FIFO order.
+        // while (wiring.batch_index < wiring.batch_count) {
+        //     PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
+        //     wiring.batch_index++;
+        //     _pending_task_queue.enqueue(ws);
+        //     wired++;
+        // }
+
+        // return wired;
     }
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
