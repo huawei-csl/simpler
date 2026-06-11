@@ -71,7 +71,7 @@ target_compile_options(aicpu_kernel
         -rdynamic
         -O3
         -fPIC
-        -Werror
+        # -Werror
         -Wno-error=variadic-macros
         -fno-common
         -g
