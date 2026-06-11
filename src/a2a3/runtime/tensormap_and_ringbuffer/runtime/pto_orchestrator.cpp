@@ -374,7 +374,7 @@ static bool prepare_task(
     // here lets RingSchedState::init() skip the O(window_size) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
-    // Must precede the scheduler wiring.queue.push at the end of
+    // Must precede the scheduler at the end of
     // submit_task_common — that push is the first read of slot_state->task /
     // slot_state->payload by another thread.
     out->slot_state->bind_buffers(out->payload, out->task);
@@ -392,7 +392,6 @@ static bool prepare_task(
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
-    // fanin_count is set by scheduler during wiring
     scope_tasks_push(orch, out->slot_state);
 
     return true;
@@ -444,9 +443,6 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
         auto &alloc = orch->rings[ring_id].task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        if (orch->scheduler) {
-            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
-        }
         scope_stats_begin(
             ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -473,9 +469,6 @@ void PTO2OrchestratorState::end_scope() {
         auto &alloc = orch->rings[ring_id].task_allocator;
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
-        if (orch->scheduler) {
-            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
-        }
         scope_stats_end(
             ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
@@ -515,7 +508,6 @@ void PTO2OrchestratorState::end_scope() {
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
 // computation (explicit_deps + auto), output registration, slot init, and pushes
-// to the scheduler wiring queue.
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
     int32_t aiv1_kernel_id
@@ -677,14 +669,7 @@ static TaskOutputTensors submit_task_common(
     g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    // while (!sched->wiring.queue.push(&cur_slot_state)) {
-    //     SPIN_WAIT_HINT();
-    // }
+    // === STEP 6: push to new task queue
 
     sched->newTaskQueue.enqueue(&cur_slot_state);
 

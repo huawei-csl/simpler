@@ -160,10 +160,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
             if (failed) return;
         }
         seg[seg_count++] = &s;
-        if (!signaled) {
-            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
-            signaled = true;
-        }
     };
 
     auto do_wait = [&]() {
@@ -186,9 +182,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     };
 
     do_wait();
-    if (signaled) {
-        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
-    }
     return !failed;
 }
 MAYBE_UNINITIALIZED_END
@@ -270,7 +263,6 @@ static const PTO2RuntimeOps s_runtime_ops = {
 //
 // Layout / init_data / wire / destroy live in
 // runtime/shared/pto_runtime2_init.cpp so the host build can pre-populate the
-// prebuilt arena image. The pieces below — wiring the ops table and the
 // SPMD core counts — depend on the device-side s_runtime_ops global and the
 // AICPU SchedulerContext respectively, so they remain in the AICPU build.
 
