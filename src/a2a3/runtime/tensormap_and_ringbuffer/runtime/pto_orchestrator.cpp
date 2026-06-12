@@ -224,17 +224,7 @@ struct PTO2FaninBuilder {
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
 
     bool contains(PTO2TaskSlotState *prod_state) const {
-        bool found = false;
-        for_each([&](PTO2TaskSlotState *slot_state) {
-            if (slot_state == prod_state) {
-                found = true;
-                return false;
-            }
-            return true;
-        });
-        if (found) {
-            return true;
-        }
+        for (size_t i = 0; i < count; i++) if (inline_slots[i] == prod_state) return true;
         return false;
     }
 };
@@ -629,15 +619,6 @@ static TaskOutputTensors submit_task_common(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
-
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
-        }
-    );
 
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
