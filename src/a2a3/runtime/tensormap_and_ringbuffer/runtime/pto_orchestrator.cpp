@@ -623,8 +623,6 @@ static TaskOutputTensors submit_task_common(
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
     for (int i = 0; i < inline_count; i++) {
         payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
@@ -819,8 +817,6 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
-    payload.fanin_spill_start = 0;
-    payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {

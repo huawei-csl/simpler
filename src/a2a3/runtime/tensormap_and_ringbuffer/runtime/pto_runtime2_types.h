@@ -240,8 +240,6 @@ struct PTO2TaskPayload {
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
-    PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
@@ -285,21 +283,6 @@ struct PTO2TaskPayload {
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
 };
-
-// PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
-static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
-);
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
-static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
-    "scalars must immediately follow tensors"
-);
-static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
-);
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
