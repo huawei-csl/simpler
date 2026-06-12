@@ -604,14 +604,11 @@ struct PTO2SchedulerState {
 
     static inline bool checkTaskIsReady(PTO2TaskSlotState *ws)
     {
-        bool isReady = true;
-        PTO2TaskPayload *wp = ws->payload;
-        for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-            int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-            if (pstate < PTO2_TASK_COMPLETED) isReady = false;
-        });
+        for (size_t i = 0; i < ws->payload->fanin_actual_count; i++)
+          if (ws->payload->fanin_inline_slot_states[i]->task_state < PTO2_TASK_COMPLETED)
+           return false;
 
-        return isReady;
+        return true;
     }
     
     inline size_t checkPendingTasks()
