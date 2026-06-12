@@ -606,7 +606,7 @@ struct PTO2SchedulerState {
     {
         for (size_t i = 0; i < ws->payload->fanin_actual_count; i++)
           if (ws->payload->fanin_inline_slot_states[i]->task_state < PTO2_TASK_COMPLETED)
-           return false;
+            return false;
 
         return true;
     }
@@ -851,10 +851,6 @@ struct PTO2SchedulerState {
      */
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
         PTO2TaskPayload *payload = slot_state.payload;
-        // for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-        // // LOG_INFO_V9("[VNL] Task %u Notifies Producer Task %u", slot_state.task->task_id.local(), producer_slot_state->task->task_id.local());
-        // release_producer(*producer_slot_state);
-        // });
 
         // Self consumed check
         check_and_handle_consumed(slot_state);

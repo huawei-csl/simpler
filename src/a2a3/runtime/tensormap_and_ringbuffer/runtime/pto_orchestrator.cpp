@@ -223,11 +223,6 @@ struct PTO2FaninBuilder {
     PTO2FaninPool &spill_pool;
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
 
-    template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
-    }
-
     bool contains(PTO2TaskSlotState *prod_state) const {
         bool found = false;
         for_each([&](PTO2TaskSlotState *slot_state) {

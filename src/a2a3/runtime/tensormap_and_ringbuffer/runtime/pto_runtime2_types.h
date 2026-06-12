@@ -247,7 +247,7 @@ struct PTO2TaskPayload {
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 41-44 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
-
+    
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
