@@ -21,7 +21,8 @@
 #include "pto_orchestrator.h"
 #include "aicore_completion_mailbox.h"
 
-enum PTO2RuntimeMode {
+enum PTO2RuntimeMode
+{
     PTO2_MODE_EXECUTE = 0,    // Execute tasks on workers
     PTO2_MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
     PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
@@ -29,7 +30,8 @@ enum PTO2RuntimeMode {
 
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
-struct PTO2RuntimeOps {
+struct PTO2RuntimeOps
+{
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
@@ -43,15 +45,14 @@ struct PTO2RuntimeOps {
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-    );
+    void (*set_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
     void (*scope_set_site)(const char *file, int line);
 };
 
-struct PTO2RuntimeArenaLayout {
+struct PTO2RuntimeArenaLayout
+{
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
@@ -68,7 +69,8 @@ struct PTO2RuntimeArenaLayout {
     size_t arena_size{0};
 };
 
-struct PTO2Runtime {
+struct PTO2Runtime
+{
     // Ops table (first field — used by orchestration .so via function pointers)
     const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
@@ -93,14 +95,9 @@ struct PTO2Runtime {
     PTO2RuntimeArenaLayout prebuilt_layout;
 };
 
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
+PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
-PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
-    void *gm_heap_dev_base, uint64_t heap_size
-);
+PTO2Runtime *runtime_init_data_from_layout(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size, void *gm_heap_dev_base, uint64_t heap_size);
 
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
@@ -124,7 +121,8 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
 
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
-struct PTO2OrchestrationConfig {
+struct PTO2OrchestrationConfig
+{
     int expected_arg_count;
 };
 #endif

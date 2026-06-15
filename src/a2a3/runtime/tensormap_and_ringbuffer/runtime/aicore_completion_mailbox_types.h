@@ -26,7 +26,8 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 #define COMPLETION_TYPE_COUNTER 0
 #define COMPLETION_TYPE_SDMA_EVENT_RECORD 1
 
-struct DeferredCompletionEntry {
+struct DeferredCompletionEntry
+{
     uint64_t addr;
     uint32_t expected_value;
     uint32_t engine;
@@ -36,15 +37,13 @@ struct DeferredCompletionEntry {
 
 static_assert(sizeof(DeferredCompletionEntry) == 24, "DeferredCompletionEntry layout drift");
 
-struct alignas(PTO2_ALIGN_SIZE) DeferredCompletionSlab {
+struct alignas(PTO2_ALIGN_SIZE) DeferredCompletionSlab
+{
     volatile uint32_t count;
     volatile int32_t error_code;
     DeferredCompletionEntry entries[MAX_COMPLETIONS_PER_TASK];
 };
 
-static_assert(
-    sizeof(DeferredCompletionSlab) % PTO2_ALIGN_SIZE == 0,
-    "DeferredCompletionSlab size must preserve array element cache-line boundaries"
-);
+static_assert(sizeof(DeferredCompletionSlab) % PTO2_ALIGN_SIZE == 0, "DeferredCompletionSlab size must preserve array element cache-line boundaries");
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_

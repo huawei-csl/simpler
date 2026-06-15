@@ -14,7 +14,8 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
-Runtime::Runtime() {
+Runtime::Runtime()
+{
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
@@ -48,48 +49,90 @@ Runtime::Runtime() {
     registered_kernel_count_ = 0;
 
     // Initialize function address mapping
-    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        func_id_to_addr_[i] = 0;
-    }
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) func_id_to_addr_[i] = 0;
 }
 
-void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
-void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
-const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
-void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
-void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
-void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
-void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
+void *Runtime::get_gm_sm_ptr() const
+{
+    return gm_sm_ptr_;
+}
+void *Runtime::get_gm_heap_ptr() const
+{
+    return gm_heap_ptr_;
+}
+const ChipStorageTaskArgs &Runtime::get_orch_args() const
+{
+    return orch_args_storage_;
+}
+void Runtime::set_gm_sm_ptr(void *p)
+{
+    gm_sm_ptr_ = p;
+}
+void Runtime::set_gm_heap(void *p)
+{
+    gm_heap_ptr_ = p;
+}
+void Runtime::set_slot_states_ptr(void *p)
+{
+    slot_states_ptr_ = p;
+}
+void Runtime::set_orch_args(const ChipStorageTaskArgs &args)
+{
+    orch_args_storage_ = args;
+}
 
-void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
+void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off)
+{
     prebuilt_arena_base_ = arena_base;
     prebuilt_runtime_offset_ = runtime_off;
 }
-void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
-size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
+void *Runtime::get_prebuilt_arena_base() const
+{
+    return prebuilt_arena_base_;
+}
+size_t Runtime::get_prebuilt_runtime_offset() const
+{
+    return prebuilt_runtime_offset_;
+}
 
 // Device orchestration SO metadata (bytes live in a separate device buffer
 // owned by DeviceRunner; only the address/size travels in Runtime).
-void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
+void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size)
+{
     dev_orch_so_addr_ = dev_addr;
     dev_orch_so_size_ = size;
 }
 
-uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
+uint64_t Runtime::get_dev_orch_so_addr() const
+{
+    return dev_orch_so_addr_;
+}
 
-uint64_t Runtime::get_dev_orch_so_size() const { return dev_orch_so_size_; }
+uint64_t Runtime::get_dev_orch_so_size() const
+{
+    return dev_orch_so_size_;
+}
 
-void Runtime::set_active_callable_id(int32_t callable_id, bool is_new) {
+void Runtime::set_active_callable_id(int32_t callable_id, bool is_new)
+{
     active_callable_id_ = callable_id;
     register_new_callable_id_ = is_new;
 }
 
-int32_t Runtime::get_active_callable_id() const { return active_callable_id_; }
+int32_t Runtime::get_active_callable_id() const
+{
+    return active_callable_id_;
+}
 
-bool Runtime::register_new_callable_id() const { return register_new_callable_id_; }
+bool Runtime::register_new_callable_id() const
+{
+    return register_new_callable_id_;
+}
 
-void Runtime::set_device_orch_func_name(const char *name) {
-    if (name == nullptr) {
+void Runtime::set_device_orch_func_name(const char *name)
+{
+    if (name == nullptr)
+    {
         device_orch_func_name_[0] = '\0';
         return;
     }
@@ -97,10 +140,15 @@ void Runtime::set_device_orch_func_name(const char *name) {
     device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
 }
 
-const char *Runtime::get_device_orch_func_name() const { return device_orch_func_name_; }
+const char *Runtime::get_device_orch_func_name() const
+{
+    return device_orch_func_name_;
+}
 
-void Runtime::set_device_orch_config_name(const char *name) {
-    if (name == nullptr) {
+void Runtime::set_device_orch_config_name(const char *name)
+{
+    if (name == nullptr)
+    {
         device_orch_config_name_[0] = '\0';
         return;
     }
@@ -108,38 +156,50 @@ void Runtime::set_device_orch_config_name(const char *name) {
     device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
 }
 
-const char *Runtime::get_device_orch_config_name() const { return device_orch_config_name_; }
+const char *Runtime::get_device_orch_config_name() const
+{
+    return device_orch_config_name_;
+}
 
-uint64_t Runtime::get_function_bin_addr(int func_id) const {
+uint64_t Runtime::get_function_bin_addr(int func_id) const
+{
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
     return func_id_to_addr_[func_id];
 }
 
-void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        return;
-    }
-    if (addr != 0 && func_id_to_addr_[func_id] == 0) {
-        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+void Runtime::set_function_bin_addr(int func_id, uint64_t addr)
+{
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+    if (addr != 0 && func_id_to_addr_[func_id] == 0)
+    {
+        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID)
+        {
             registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
-        } else {
         }
+        else
+        {}
     }
     func_id_to_addr_[func_id] = addr;
 }
 
-void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        return;
-    }
+void Runtime::replay_function_bin_addr(int func_id, uint64_t addr)
+{
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
     func_id_to_addr_[func_id] = addr;
 }
 
-int Runtime::get_registered_kernel_count() const { return registered_kernel_count_; }
+int Runtime::get_registered_kernel_count() const
+{
+    return registered_kernel_count_;
+}
 
-int Runtime::get_registered_kernel_func_id(int index) const {
+int Runtime::get_registered_kernel_func_id(int index) const
+{
     if (index < 0 || index >= registered_kernel_count_) return -1;
     return registered_kernel_func_ids_[index];
 }
 
-void Runtime::clear_registered_kernels() { registered_kernel_count_ = 0; }
+void Runtime::clear_registered_kernels()
+{
+    registered_kernel_count_ = 0;
+}

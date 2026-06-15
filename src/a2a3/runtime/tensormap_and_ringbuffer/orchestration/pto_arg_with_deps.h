@@ -19,7 +19,8 @@
 #include "pto_orchestration_api.h"  // Arg, MixedKernels, rt_submit_* primitives
 
 template <size_t MAX_DEP_COUNT = 16>
-class ArgWithDeps : private Arg {
+class ArgWithDeps : private Arg
+{
 public:
     // Tensor / scalar setters — forward to Arg
     using Arg::add_inout;
@@ -38,24 +39,26 @@ public:
     using Arg::set_error;
 
     template <typename... Ids>
-    void add_dep(Ids... ids) {
+    void add_dep(Ids... ids)
+    {
         static_assert(sizeof...(Ids) >= 1, "add_dep: at least one task id is required");
-        static_assert(
-            (std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
-        );
-        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT) {
+        static_assert((std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId");
+        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT)
+        {
             Arg::set_error("ArgWithDeps::add_dep: dep count exceeds MAX_DEP_COUNT (bump the template arg)");
             return;
         }
         ((deps_[count_++] = ids), ...);
     }
 
-    void reset() {
+    void reset()
+    {
         Arg::reset();
         count_ = 0;
     }
 
-    Arg &finalize_for_submit() {
+    Arg &finalize_for_submit()
+    {
         Arg::set_dependencies(nullptr, 0);
         Arg::set_dependencies(deps_, count_);
         return *this;
@@ -67,16 +70,19 @@ private:
 };
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, ArgWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, ArgWithDeps<N> &awd)
+{
     return rt_submit_task(mixed_kernels, awd.finalize_for_submit());
 }
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, ArgWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, ArgWithDeps<N> &awd)
+{
     return rt_submit_aic_task(kernel_id, awd.finalize_for_submit());
 }
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, ArgWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, ArgWithDeps<N> &awd)
+{
     return rt_submit_aiv_task(kernel_id, awd.finalize_for_submit());
 }

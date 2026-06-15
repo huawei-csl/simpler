@@ -16,14 +16,16 @@
 
 struct PTO2SharedMemoryHandle;
 
-struct alignas(64) PTO2RingFlowControl {
+struct alignas(64) PTO2RingFlowControl
+{
     // === Cache Line 0: Written by Orchestrator, Read by Scheduler ===
     alignas(64) std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
 
     // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
     alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
 
-    void init() {
+    void init()
+    {
         current_task_index.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
     }
@@ -33,7 +35,8 @@ struct alignas(64) PTO2RingFlowControl {
 
 static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be exactly 2 cache lines (128B)");
 
-struct alignas(64) PTO2SharedMemoryRingHeader {
+struct alignas(64) PTO2SharedMemoryRingHeader
+{
     PTO2RingFlowControl fc;
 
     // Layout metadata (set once at init)
@@ -47,20 +50,39 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
-    PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
+    PTO2TaskDescriptor &get_task_by_slot(int32_t slot)
+    {
+        return task_descriptors[slot];
+    }
 
-    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) { return task_descriptors[local_id & task_window_mask]; }
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id)
+    {
+        return task_descriptors[local_id & task_window_mask];
+    }
 
-    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot)
+    {
+        return task_payloads[slot];
+    }
 
-    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[local_id & task_window_mask]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id)
+    {
+        return task_payloads[local_id & task_window_mask];
+    }
 
-    PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
+    PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot)
+    {
+        return slot_states[slot];
+    }
 
-    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) { return slot_states[local_id & task_window_mask]; }
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id)
+    {
+        return slot_states[local_id & task_window_mask];
+    }
 };
 
-struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
+struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader
+{
     // === PER-RING FLOW CONTROL + LAYOUT INFO (set once at init) ===
     PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
 
@@ -88,12 +110,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
-static_assert(
-    (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
-    "PTO2SharedMemoryHeader should be reasonably sized"
-);
+static_assert((sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096), "PTO2SharedMemoryHeader should be reasonably sized");
 
-struct PTO2SharedMemoryHandle {
+struct PTO2SharedMemoryHandle
+{
     void *sm_base;     // Base address of shared memory
     uint64_t sm_size;  // Total size of shared memory
 
@@ -119,49 +139,40 @@ struct PTO2SharedMemoryHandle {
 
 private:
     void init_header(uint64_t task_window_size, uint64_t heap_size);
-    void init_header_per_ring(
-        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-    );
+    void init_header_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]);
     void setup_pointers(uint64_t task_window_size);
     void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
 
 namespace pto2_sm_layout {
 
-inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept {
-    return reinterpret_cast<std::atomic<int32_t> *>(
-        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, orch_error_code)
-    );
+inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept
+{
+    return reinterpret_cast<std::atomic<int32_t> *>(static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, orch_error_code));
 }
 
-inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base, int ring_id) noexcept {
-    return reinterpret_cast<PTO2SharedMemoryRingHeader *>(
-        static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, rings) +
-        static_cast<size_t>(ring_id) * sizeof(PTO2SharedMemoryRingHeader)
-    );
+inline PTO2SharedMemoryRingHeader *ring_header_addr(void *sm_dev_base, int ring_id) noexcept
+{
+    return reinterpret_cast<PTO2SharedMemoryRingHeader *>(static_cast<char *>(sm_dev_base) + offsetof(PTO2SharedMemoryHeader, rings) + static_cast<size_t>(ring_id) * sizeof(PTO2SharedMemoryRingHeader));
 }
 
-inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base, int ring_id) noexcept {
-    return reinterpret_cast<std::atomic<int32_t> *>(
-        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
-        offsetof(PTO2RingFlowControl, current_task_index)
-    );
+inline std::atomic<int32_t> *ring_current_task_index_addr(void *sm_dev_base, int ring_id) noexcept
+{
+    return reinterpret_cast<std::atomic<int32_t> *>(reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) + offsetof(PTO2RingFlowControl, current_task_index));
 }
 
-inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ring_id) noexcept {
-    return reinterpret_cast<std::atomic<int32_t> *>(
-        reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) +
-        offsetof(PTO2RingFlowControl, last_task_alive)
-    );
+inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ring_id) noexcept
+{
+    return reinterpret_cast<std::atomic<int32_t> *>(reinterpret_cast<char *>(ring_header_addr(sm_dev_base, ring_id)) + offsetof(PTO2SharedMemoryRingHeader, fc) + offsetof(PTO2RingFlowControl, last_task_alive));
 }
 
-inline PTO2TaskDescriptor *ring_task_descriptors_addr(
-    void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id
-) noexcept {
+inline PTO2TaskDescriptor *ring_task_descriptors_addr(void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id) noexcept
+{
     assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
     char *p = static_cast<char *>(sm_dev_base);
     p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    for (int r = 0; r < ring_id; r++) {
+    for (int r = 0; r < ring_id; r++)
+    {
         p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
         p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
         p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);

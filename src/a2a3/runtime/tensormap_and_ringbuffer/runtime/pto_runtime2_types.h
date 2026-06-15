@@ -65,22 +65,28 @@
 // ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
 constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 
-typedef enum {
+typedef enum
+{
     PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
     PTO2_TASK_COMPLETED = 1,  // Execution finished, output may still be in use
     PTO2_TASK_CONSUMED = 2    // Output fully consumed, buffers can be released
 } PTO2TaskState;
 
-struct PTO2TaskAllocResult {
+struct PTO2TaskAllocResult
+{
     int32_t task_id;    // Absolute task ID (not wrapped)
     int32_t slot;       // task_id & (window_size - 1)
     void *packed_base;  // Heap allocation result (nullptr if failure)
     void *packed_end;   // packed_base + aligned output_size
 
-    bool failed() const { return task_id < 0; }
+    bool failed() const
+    {
+        return task_id < 0;
+    }
 };
 
-struct PTO2OutputLayout {
+struct PTO2OutputLayout
+{
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
     int32_t total_output_size = 0;
@@ -88,17 +94,20 @@ struct PTO2OutputLayout {
 
 struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2FaninPool;      // Forward declaration
-struct PTO2FaninSpillEntry {
+struct PTO2FaninSpillEntry
+{
     PTO2TaskSlotState *slot_state;
 };
 static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
 
-struct PTO2DepListEntry {
+struct PTO2DepListEntry
+{
     PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
     PTO2DepListEntry *next;         // next entry
 };
 
-struct PTO2TaskDescriptor {
+struct PTO2TaskDescriptor
+{
     // Mixed-task identification (encodes ring_id in upper 32 bits)
     PTO2TaskId task_id;  // raw: (ring_id << 32) | local_id
 
@@ -110,7 +119,8 @@ struct PTO2TaskDescriptor {
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-struct PTO2TaskPayload {
+struct PTO2TaskPayload
+{
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
@@ -127,20 +137,21 @@ struct PTO2TaskPayload {
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
 
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout)
+    {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
         // int32_t out_idx = 0;
-        for (int32_t i = 0; i < args.tensor_count(); i++) {
-            if (args.tag(i) != TensorArgType::OUTPUT) {
+        for (int32_t i = 0; i < args.tensor_count(); i++)
+        {
+            if (args.tag(i) != TensorArgType::OUTPUT)
+            {
                 tensors[i].copy(*args.tensor(i).ptr);
-            } else {
-                tensors[i].init_from_create_info(
-                    *args.tensor(i).create_info,
-                    reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
-                    layout.buffer_sizes[i]
-                );
+            }
+            else
+            {
+                tensors[i].init_from_create_info(*args.tensor(i).create_info, reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]), layout.buffer_sizes[i]);
                 tensors[i].owner_task_id = result.task_id();
                 result.materialize_output(tensors[i]);
             }
@@ -153,20 +164,13 @@ struct PTO2TaskPayload {
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
 static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
-static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
-);
+static_assert(offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata");
 static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
-static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
-    "scalars must immediately follow tensors"
-);
-static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
-);
+static_assert(offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor), "scalars must immediately follow tensors");
+static_assert(sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t), "PTO2TaskPayload size must stay on the baseline cache-line footprint");
 
-struct alignas(64) PTO2TaskSlotState {
+struct alignas(64) PTO2TaskSlotState
+{
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
     int32_t fanout_count;              // 1 (owning scope) + number of consumers
@@ -198,14 +202,19 @@ struct alignas(64) PTO2TaskSlotState {
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 
-    void bind_ring(uint8_t rid) { ring_id = rid; }
+    void bind_ring(uint8_t rid)
+    {
+        ring_id = rid;
+    }
 
-    void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
+    void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t)
+    {
         payload = p;
         task = t;
     }
 
-    void reset_for_reuse() {
+    void reset_for_reuse()
+    {
         fanout_lock.store(0, std::memory_order_relaxed);
         fanout_count = 1;
         fanout_head = nullptr;
@@ -216,19 +225,20 @@ struct alignas(64) PTO2TaskSlotState {
         any_subtask_deferred.store(false, std::memory_order_relaxed);
     }
 
-    void lock_fanout() {
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                SPIN_WAIT_HINT();
-            }
+    void lock_fanout()
+    {
+        for (;;)
+        {
+            while (fanout_lock.load(std::memory_order_acquire) != 0) SPIN_WAIT_HINT();
             int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                return;
-            }
+            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
         }
     }
 
-    void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
+    void unlock_fanout()
+    {
+        fanout_lock.store(0, std::memory_order_release);
+    }
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

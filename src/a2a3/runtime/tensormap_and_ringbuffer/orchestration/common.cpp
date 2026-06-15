@@ -28,16 +28,21 @@ namespace {
 PTO2Runtime *g_current_runtime = nullptr;
 }  // namespace
 
-extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PTO2Runtime *rt) {
+extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PTO2Runtime *rt)
+{
     g_current_runtime = rt;
 }
 
 // Keep current_runtime local to this .so so orchestration helpers do not
 // accidentally bind to the AICPU binary's same-named symbol.
-extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() { return g_current_runtime; }
+extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime()
+{
+    return g_current_runtime;
+}
 
 #ifdef __linux__
-static std::string addr_to_line(const char *executable, void *addr, std::string *inline_chain = nullptr) {
+static std::string addr_to_line(const char *executable, void *addr, std::string *inline_chain = nullptr)
+{
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p -i %p 2>/dev/null", executable, addr);
 
@@ -45,26 +50,23 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
     std::string raw_output;
 
     FILE *pipe = popen(cmd, "r");
-    if (pipe) {
-        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-            raw_output += buffer.data();
-        }
+    if (pipe)
+    {
+        while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) raw_output += buffer.data();
         pclose(pipe);
     }
 
-    if (raw_output.empty() || raw_output.find("??") != std::string::npos) {
-        return "";
-    }
+    if (raw_output.empty() || raw_output.find("??") != std::string::npos) return "";
 
     // Split by lines
     std::vector<std::string> lines;
     size_t pos = 0;
-    while (pos < raw_output.size()) {
+    while (pos < raw_output.size())
+    {
         size_t nl = raw_output.find('\n', pos);
         if (nl == std::string::npos) nl = raw_output.size();
         std::string line = raw_output.substr(pos, nl - pos);
-        while (!line.empty() && line.back() == '\r')
-            line.pop_back();
+        while (!line.empty() && line.back() == '\r') line.pop_back();
         if (!line.empty()) lines.push_back(line);
         pos = nl + 1;
     }
@@ -72,18 +74,18 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
     if (lines.empty()) return "";
 
     // First line is the innermost actual code location; subsequent lines are outer inline callers
-    if (inline_chain && lines.size() > 1) {
+    if (inline_chain && lines.size() > 1)
+    {
         *inline_chain = "";
-        for (size_t j = 1; j < lines.size(); j++) {
-            *inline_chain += "    [inlined by] " + lines[j] + "\n";
-        }
+        for (size_t j = 1; j < lines.size(); j++) *inline_chain += "    [inlined by] " + lines[j] + "\n";
     }
 
     return lines.front();
 }
 #endif
 
-std::string get_stacktrace(int skip_frames) {
+std::string get_stacktrace(int skip_frames)
+{
     (void)skip_frames;  // May be unused on non-Linux platforms
     std::string result;
 #ifdef __linux__
@@ -92,38 +94,40 @@ std::string get_stacktrace(int skip_frames) {
     int nframes = backtrace(buffer, max_frames);
     char **symbols = backtrace_symbols(buffer, nframes);
 
-    if (symbols) {
+    if (symbols)
+    {
         result = "Stack trace:\n";
-        for (int i = skip_frames; i < nframes; i++) {
+        for (int i = skip_frames; i < nframes; i++)
+        {
             std::string frame_info;
 
             void *addr = (void *)((char *)buffer[i] - 1);
 
             Dl_info dl_info;
             std::string inline_chain;
-            if (dladdr(addr, &dl_info) && dl_info.dli_fname) {
+            if (dladdr(addr, &dl_info) && dl_info.dli_fname)
+            {
                 void *rel_addr = (void *)((char *)addr - (char *)dl_info.dli_fbase);
                 std::string addr2line_result = addr_to_line(dl_info.dli_fname, rel_addr, &inline_chain);
 
-                if (addr2line_result.empty()) {
-                    addr2line_result = addr_to_line(dl_info.dli_fname, addr, &inline_chain);
-                }
+                if (addr2line_result.empty()) addr2line_result = addr_to_line(dl_info.dli_fname, addr, &inline_chain);
 
-                if (!addr2line_result.empty()) {
-                    frame_info = std::string(dl_info.dli_fname) + ": " + addr2line_result;
-                }
+                if (!addr2line_result.empty()) frame_info = std::string(dl_info.dli_fname) + ": " + addr2line_result;
             }
 
-            if (frame_info.empty()) {
+            if (frame_info.empty())
+            {
                 std::string frame(symbols[i]);
 
                 size_t start = frame.find('(');
                 size_t end = frame.find('+', start);
-                if (start != std::string::npos && end != std::string::npos) {
+                if (start != std::string::npos && end != std::string::npos)
+                {
                     std::string mangled = frame.substr(start + 1, end - start - 1);
                     int status;
                     char *demangled = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
-                    if (status == 0 && demangled) {
+                    if (status == 0 && demangled)
+                    {
                         frame = frame.substr(0, start + 1) + demangled + frame.substr(end);
                         free(demangled);
                     }
@@ -134,9 +138,7 @@ std::string get_stacktrace(int skip_frames) {
             char buf[16];
             snprintf(buf, sizeof(buf), "  #%d ", i - skip_frames);
             result += buf + frame_info + "\n";
-            if (!inline_chain.empty()) {
-                result += inline_chain;
-            }
+            if (!inline_chain.empty()) result += inline_chain;
         }
         free(symbols);
     }
@@ -147,7 +149,8 @@ std::string get_stacktrace(int skip_frames) {
 }
 
 // AssertionError constructor
-static std::string build_assert_message(const char *condition, const char *file, int line) {
+static std::string build_assert_message(const char *condition, const char *file, int line)
+{
     std::string msg = "Assertion failed: " + std::string(condition) + "\n";
     msg += "  Location: " + std::string(file) + ":" + std::to_string(line) + "\n";
     msg += get_stacktrace(3);
@@ -158,9 +161,10 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
     std::runtime_error(build_assert_message(condition, file, line)),
     condition_(condition),
     file_(file),
-    line_(line) {}
+    line_(line)
+{}
 
-[[noreturn]] void assert_impl(const char *condition, const char *file, int line) {
-
+[[noreturn]] void assert_impl(const char *condition, const char *file, int line)
+{
     throw AssertionError(condition, file, line);
 }

@@ -25,17 +25,13 @@
 #endif
 
 // Verify hardcoded indices in intrinsic.h match the computed values.
-static_assert(
-    (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) == SPMD_LOCAL_CONTEXT_INDEX, "LOCAL_CONTEXT_INDEX out of sync with intrinsic.h"
-);
-static_assert(
-    (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS + 1) == SPMD_GLOBAL_CONTEXT_INDEX,
-    "GLOBAL_CONTEXT_INDEX out of sync with intrinsic.h"
-);
+static_assert((MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) == SPMD_LOCAL_CONTEXT_INDEX, "LOCAL_CONTEXT_INDEX out of sync with intrinsic.h");
+static_assert((MAX_TENSOR_ARGS + MAX_SCALAR_ARGS + 1) == SPMD_GLOBAL_CONTEXT_INDEX, "GLOBAL_CONTEXT_INDEX out of sync with intrinsic.h");
 
-struct alignas(64) PTO2DispatchPayload {
-    uint64_t function_bin_addr;            
-    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; 
+struct alignas(64) PTO2DispatchPayload
+{
+    uint64_t function_bin_addr;
+    uint64_t args[PTO2_DISPATCH_MAX_ARGS];
 
     LocalContext local_context;
 
@@ -44,10 +40,7 @@ struct alignas(64) PTO2DispatchPayload {
     uint8_t reserved_payload_abi_pad[8];
 
     static_assert(sizeof(args[0]) == 8);
-    static_assert(
-        PTO2_ALIGN_UP((MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0]), 64) ==
-        (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0])
-    );
+    static_assert(PTO2_ALIGN_UP((MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0]), 64) == (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0]));
 };
 
 static_assert(sizeof(PTO2DispatchPayload) == 512, "PTO2DispatchPayload hardware ABI size drift");

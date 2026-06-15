@@ -22,7 +22,8 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"
 
-struct PTO2OrchestratorLayout {
+struct PTO2OrchestratorLayout
+{
     size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
     size_t off_scope_tasks;
     size_t off_scope_begins;
@@ -32,7 +33,8 @@ struct PTO2OrchestratorLayout {
     uint64_t scope_stack_capacity;
 };
 
-struct PTO2OrchestratorState {
+struct PTO2OrchestratorState
+{
     // === SHARED MEMORY ACCESS ===
     PTO2SharedMemoryHeader *sm_header;
 
@@ -66,25 +68,23 @@ struct PTO2OrchestratorState {
 
     // === STATISTICS ===
 
-    uint8_t current_ring_id() const {
+    uint8_t current_ring_id() const
+    {
         int32_t depth = scope_stack_top;
         if (depth < 0) depth = 0;
         return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
     }
 
-    bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
+    bool in_manual_scope() const
+    {
+        return scope_stack_top >= manual_begin_depth;
+    }
 
     // === Cold-path API (defined in pto_orchestrator.cpp) ===
 
-    static PTO2OrchestratorLayout reserve_layout(
-        DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-        int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-    );
+    static PTO2OrchestratorLayout reserve_layout(DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
-    bool init_data_from_layout(
-        const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size,
-        uint64_t task_window_size
-    );
+    bool init_data_from_layout(const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap, uint64_t heap_size, uint64_t task_window_size);
 
     void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler);
 

@@ -29,7 +29,8 @@ struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 
-inline uintptr_t mailbox_cache_line(const volatile void *addr) {
+inline uintptr_t mailbox_cache_line(const volatile void *addr)
+{
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
 
@@ -38,12 +39,14 @@ struct CompletionCondition;
 using CompletionPollFn = CompletionPollResult (*)(const CompletionCondition &);
 using CompletionRetireFn = void (*)(CompletionCondition &);
 
-struct CompletionBackendOps {
+struct CompletionBackendOps
+{
     CompletionPollFn poll;
     CompletionRetireFn retire;
 };
 
-struct CompletionCondition {
+struct CompletionCondition
+{
     AsyncEngine engine{ASYNC_ENGINE_SDMA};
     int32_t completion_type{COMPLETION_TYPE_COUNTER};
     bool satisfied{false};
@@ -56,25 +59,27 @@ struct CompletionCondition {
     void retire();
 };
 
-inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
-    if (cond.counter_addr == nullptr) {
-        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
-    }
-    return {
-        *cond.counter_addr >= cond.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING,
-        PTO2_ERROR_NONE
-    };
+inline CompletionPollResult counter_poll_op(const CompletionCondition &cond)
+{
+    if (cond.counter_addr == nullptr) return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
+    return {*cond.counter_addr >= cond.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING, PTO2_ERROR_NONE};
 }
 
-inline void counter_retire_op(CompletionCondition &) {}
+inline void counter_retire_op(CompletionCondition &)
+{}
 
-inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond) {
+inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond)
+{
     return poll_sdma_event_record(cond.addr);
 }
 
-inline void sdma_event_record_retire_op(CompletionCondition &cond) { retire_sdma_event_record(cond.addr); }
+inline void sdma_event_record_retire_op(CompletionCondition &cond)
+{
+    retire_sdma_event_record(cond.addr);
+}
 
-inline const CompletionBackendOps *completion_backend_ops_for(int completion_type) {
+inline const CompletionBackendOps *completion_backend_ops_for(int completion_type)
+{
     static const CompletionBackendOps kOps[] = {
         {counter_poll_op, counter_retire_op},                      // COMPLETION_TYPE_COUNTER = 0
         {sdma_event_record_poll_op, sdma_event_record_retire_op},  // COMPLETION_TYPE_SDMA_EVENT_RECORD = 1
@@ -84,27 +89,24 @@ inline const CompletionBackendOps *completion_backend_ops_for(int completion_typ
     return &kOps[completion_type];
 }
 
-inline CompletionPollResult CompletionCondition::test() const {
-    if (satisfied) {
-        return {CompletionPollState::READY, PTO2_ERROR_NONE};
-    }
+inline CompletionPollResult CompletionCondition::test() const
+{
+    if (satisfied) return {CompletionPollState::READY, PTO2_ERROR_NONE};
     const CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
-    if (ops == nullptr || ops->poll == nullptr) {
-        return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
-    }
+    if (ops == nullptr || ops->poll == nullptr) return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
     return ops->poll(*this);
 }
 
-inline void CompletionCondition::retire() {
+inline void CompletionCondition::retire()
+{
     if (retired) return;
     const CompletionBackendOps *ops = completion_backend_ops_for(completion_type);
-    if (ops != nullptr && ops->retire != nullptr) {
-        ops->retire(*this);
-    }
+    if (ops != nullptr && ops->retire != nullptr) ops->retire(*this);
     retired = true;
 }
 
-struct AsyncWaitEntry {
+struct AsyncWaitEntry
+{
     PTO2TaskSlotState *slot_state{nullptr};
     PTO2TaskId task_token{PTO2TaskId::invalid()};
     CompletionCondition conditions[MAX_COMPLETIONS_PER_TASK];
@@ -113,14 +115,17 @@ struct AsyncWaitEntry {
     bool normal_done{false};
 };
 
-struct AsyncPollResult {
+struct AsyncPollResult
+{
     int32_t completed{0};
     int32_t error_code{PTO2_ERROR_NONE};
     PTO2TaskSlotState *failed_slot_state{nullptr};
 };
 
-inline const char *async_engine_name(AsyncEngine engine) {
-    switch (engine) {
+inline const char *async_engine_name(AsyncEngine engine)
+{
+    switch (engine)
+    {
     case ASYNC_ENGINE_SDMA:
         return "SDMA";
     case ASYNC_ENGINE_ROCE:
@@ -134,27 +139,33 @@ inline const char *async_engine_name(AsyncEngine engine) {
     }
 }
 
-struct AsyncWaitList {
+struct AsyncWaitList
+{
     std::atomic<int32_t> busy{0};
     AsyncWaitEntry entries[MAX_ASYNC_WAITS];
     int32_t count{0};
     std::atomic<uint64_t> mpsc_skipped_count{0};
 
-    bool try_lock() {
+    bool try_lock()
+    {
         int32_t expected = 0;
         return busy.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
     }
 
-    void unlock() { busy.store(0, std::memory_order_release); }
+    void unlock()
+    {
+        busy.store(0, std::memory_order_release);
+    }
 
-    AsyncWaitEntry *find_entry_by_token(PTO2TaskId token) {
-        for (int32_t i = 0; i < count; i++) {
+    AsyncWaitEntry *find_entry_by_token(PTO2TaskId token)
+    {
+        for (int32_t i = 0; i < count; i++)
             if (entries[i].task_token == token) return &entries[i];
-        }
         return nullptr;
     }
 
-    struct DrainCompletionSink {
+    struct DrainCompletionSink
+    {
         PTO2SchedulerState *sched{nullptr};
         PTO2LocalReadyBuffer *local_bufs{nullptr};
         PTO2TaskSlotState **deferred_release_slot_states{nullptr};
@@ -162,27 +173,33 @@ struct AsyncWaitList {
         int32_t deferred_release_capacity{0};
         int32_t inline_completed{0};
 
-        bool can_inline_complete() const { return sched != nullptr; }
+        bool can_inline_complete() const
+        {
+            return sched != nullptr;
+        }
     };
 
     // Inline-complete a NotDeferred task during drain. Returns false on
     // deferred_release_slot_states overflow.
     bool try_inline_complete_locked(DrainCompletionSink &sink, PTO2TaskSlotState &slot_state);
 
-    int32_t drain_aicore_completion_mailbox_locked(
-        AICoreCompletionMailbox *aicore_mailbox, DrainCompletionSink &sink, int32_t &error_code
-    ) {
+    int32_t drain_aicore_completion_mailbox_locked(AICoreCompletionMailbox *aicore_mailbox, DrainCompletionSink &sink, int32_t &error_code)
+    {
         error_code = PTO2_ERROR_NONE;
         if (aicore_mailbox == nullptr) return 0;
 
         int32_t drained = 0;
         AICoreCompletionMsgView msg;
-        while (aicore_mailbox->try_pop(msg)) {
+        while (aicore_mailbox->try_pop(msg))
+        {
             drained++;
-            if (msg.kind == MSG_KIND_CONDITION) {
+            if (msg.kind == MSG_KIND_CONDITION)
+            {
                 AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
-                if (entry == nullptr) {
-                    if (count >= MAX_ASYNC_WAITS) {
+                if (entry == nullptr)
+                {
+                    if (count >= MAX_ASYNC_WAITS)
+                    {
                         error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
@@ -193,22 +210,21 @@ struct AsyncWaitList {
                     entry->waiting_completion_count = 0;
                     entry->normal_done = false;
                 }
-                if (!append_condition_locked(
-                        *entry, msg.addr, msg.expected_value, static_cast<AsyncEngine>(msg.engine), msg.completion_type,
-                        error_code
-                    )) {
-                    return drained;
-                }
-            } else if (msg.kind == MSG_KIND_TASK_NORMAL_DONE) {
-                PTO2TaskSlotState *slot_state_ptr =
-                    reinterpret_cast<PTO2TaskSlotState *>(static_cast<uintptr_t>(msg.addr));
+                if (!append_condition_locked(*entry, msg.addr, msg.expected_value, static_cast<AsyncEngine>(msg.engine), msg.completion_type, error_code)) return drained;
+            }
+            else if (msg.kind == MSG_KIND_TASK_NORMAL_DONE)
+            {
+                PTO2TaskSlotState *slot_state_ptr = reinterpret_cast<PTO2TaskSlotState *>(static_cast<uintptr_t>(msg.addr));
                 AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
-                if (entry == nullptr) {
-                    if (sink.can_inline_complete()) {
+                if (entry == nullptr)
+                {
+                    if (sink.can_inline_complete())
+                    {
                         (void)try_inline_complete_locked(sink, *slot_state_ptr);
                         continue;
                     }
-                    if (count >= MAX_ASYNC_WAITS) {
+                    if (count >= MAX_ASYNC_WAITS)
+                    {
                         error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
@@ -218,13 +234,15 @@ struct AsyncWaitList {
                     entry->condition_count = 0;
                     entry->waiting_completion_count = 0;
                     entry->normal_done = true;
-                } else {
-                    if (entry->slot_state == nullptr) {
-                        entry->slot_state = slot_state_ptr;
-                    }
+                }
+                else
+                {
+                    if (entry->slot_state == nullptr) entry->slot_state = slot_state_ptr;
                     entry->normal_done = true;
                 }
-            } else {
+            }
+            else
+            {
                 error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
                 return drained;
             }
@@ -232,11 +250,10 @@ struct AsyncWaitList {
         return drained;
     }
 
-    bool append_condition_locked(
-        AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine, int32_t completion_type,
-        int32_t &error_code
-    ) {
-        if (entry.condition_count >= MAX_COMPLETIONS_PER_TASK) {
+    bool append_condition_locked(AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, AsyncEngine engine, int32_t completion_type, int32_t &error_code)
+    {
+        if (entry.condition_count >= MAX_COMPLETIONS_PER_TASK)
+        {
             error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
             return false;
         }
@@ -246,20 +263,14 @@ struct AsyncWaitList {
         cond.satisfied = false;
         cond.retired = false;
         cond.addr = addr;
-        cond.counter_addr = completion_type == COMPLETION_TYPE_COUNTER ?
-                                reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr)) :
-                                nullptr;
+        cond.counter_addr = completion_type == COMPLETION_TYPE_COUNTER ? reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr)) : nullptr;
         cond.expected_value = expected_value;
         entry.waiting_completion_count++;
         return true;
     }
 
     template <bool Profiling>
-    AsyncPollResult poll_and_complete(
-        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
-        PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
-        int32_t deferred_release_capacity
-    );
+    AsyncPollResult poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity);
 };
 
 #endif  // PTO_ASYNC_WAIT_H

@@ -34,7 +34,8 @@
 // Default ready queue shards: one shard per worker thread (total minus orchestrator)
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
-struct Handshake {
+struct Handshake
+{
     volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
     volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
     volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
@@ -44,13 +45,15 @@ struct Handshake {
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
-struct TensorPair {
+struct TensorPair
+{
     void *host_ptr;
     void *dev_ptr;
     size_t size;
 };
 
-struct HostApi {
+struct HostApi
+{
     void *(*device_malloc)(size_t size);
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
@@ -62,12 +65,14 @@ struct HostApi {
     uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
-struct Task {
+struct Task
+{
     int func_id;
     uint64_t function_bin_addr;
 };
 
-class Runtime {
+class Runtime
+{
 public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
@@ -142,9 +147,15 @@ public:
     int get_registered_kernel_func_id(int index) const;
     void clear_registered_kernels();
 
-    int get_task_count() const { return 0; }
+    int get_task_count() const
+    {
+        return 0;
+    }
 
-    Task *get_task([[maybe_unused]] int taskId) { return nullptr; }
+    Task *get_task([[maybe_unused]] int taskId)
+    {
+        return nullptr;
+    }
 
     // Host API function pointers for device memory operations
     // NOTE: Placed at end of class to avoid affecting device memory layout

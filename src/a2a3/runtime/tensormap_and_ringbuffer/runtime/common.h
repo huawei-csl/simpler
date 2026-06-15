@@ -19,13 +19,23 @@
 
 std::string get_stacktrace(int skip_frames = 1);
 
-class AssertionError : public std::runtime_error {
+class AssertionError : public std::runtime_error
+{
 public:
     AssertionError(const char *condition, const char *file, int line);
 
-    const char *condition() const { return condition_; }
-    const char *file() const { return file_; }
-    int line() const { return line_; }
+    const char *condition() const
+    {
+        return condition_;
+    }
+    const char *file() const
+    {
+        return file_;
+    }
+    int line() const
+    {
+        return line_;
+    }
 
 private:
     const char *condition_;
@@ -40,7 +50,8 @@ private:
 #else
 #define debug_assert(cond)                          \
     do {                                            \
-        if (!(cond)) {                              \
+        if (!(cond))                                \
+        {                                           \
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)
@@ -48,7 +59,8 @@ private:
 
 #define always_assert(cond)                         \
     do {                                            \
-        if (!(cond)) {                              \
+        if (!(cond))                                \
+        {                                           \
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)

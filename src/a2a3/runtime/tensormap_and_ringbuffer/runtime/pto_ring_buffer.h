@@ -27,13 +27,11 @@
 // Dep pool spin limit - if exceeded, dep pool capacity too small for workload
 #define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
-class PTO2TaskAllocator {
+class PTO2TaskAllocator
+{
 public:
-    void init(
-        PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
-        std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
-        int32_t initial_local_task_id = 0
-    ) {
+    void init(PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr, std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr, int32_t initial_local_task_id = 0)
+    {
         descriptors_ = descriptors;
         window_size_ = window_size;
         window_mask_ = window_size - 1;
@@ -48,9 +46,9 @@ public:
         last_alive_seen_ = 0;
     }
 
-    PTO2TaskAllocResult alloc(int32_t output_size) {
-        uint64_t aligned_size =
-            output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
+    PTO2TaskAllocResult alloc(int32_t output_size)
+    {
+        uint64_t aligned_size = output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
         int spin_count = 0;
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
@@ -58,16 +56,21 @@ public:
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
 
-        while (true) {
+        while (true)
+        {
             // Check both resources; commit only if both available
-            if (local_task_id_ - last_alive + 1 < window_size_) {
+            if (local_task_id_ - last_alive + 1 < window_size_)
+            {
                 void *heap_ptr = try_bump_heap(aligned_size);
-                if (heap_ptr) {
+                if (heap_ptr)
+                {
                     int32_t task_id = commit_task();
                     return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
                 }
                 blocked_on_heap = true;
-            } else {
+            }
+            else
+            {
                 blocked_on_heap = false;
             }
 
@@ -75,13 +78,17 @@ public:
             spin_count++;
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
-            if (last_alive > prev_last_alive) {
+            if (last_alive > prev_last_alive)
+            {
                 spin_count = 0;
                 prev_last_alive = last_alive;
-            } else {
-                if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
-                }
-                if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
+            }
+            else
+            {
+                if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0)
+                {}
+                if (spin_count >= PTO2_ALLOC_SPIN_LIMIT)
+                {
                     report_deadlock(blocked_on_heap);
                     return {-1, -1, nullptr, nullptr};
                 }
@@ -90,21 +97,33 @@ public:
         }
     }
 
-    int32_t active_count() const {
+    int32_t active_count() const
+    {
         int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         return local_task_id_ - last_alive;
     }
 
     // Task ring start/end: tail = oldest live task (last_task_alive), head =
     // next task id to allocate. head - tail == active_count().
-    int32_t task_tail() const { return last_alive_ptr_->load(std::memory_order_acquire); }
-    int32_t task_head() const { return local_task_id_; }
+    int32_t task_tail() const
+    {
+        return last_alive_ptr_->load(std::memory_order_acquire);
+    }
+    int32_t task_head() const
+    {
+        return local_task_id_;
+    }
 
-    int32_t window_size() const { return window_size_; }
+    int32_t window_size() const
+    {
+        return window_size_;
+    }
 
-    uint64_t heap_available() const {
+    uint64_t heap_available() const
+    {
         uint64_t tail = heap_tail_;
-        if (heap_top_ >= tail) {
+        if (heap_top_ >= tail)
+        {
             uint64_t at_end = heap_size_ - heap_top_;
             uint64_t at_begin = tail;
             return at_end > at_begin ? at_end : at_begin;
@@ -112,12 +131,22 @@ public:
         return tail - heap_top_;
     }
 
-    uint64_t heap_top() const { return heap_top_; }
+    uint64_t heap_top() const
+    {
+        return heap_top_;
+    }
     // Heap ring start: reclaim pointer (oldest byte still live). heap_top() is
     // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
-    uint64_t heap_tail() const { return heap_tail_; }
-    uint64_t heap_capacity() const { return heap_size_; }
-    uint64_t heap_used_bytes() const {
+    uint64_t heap_tail() const
+    {
+        return heap_tail_;
+    }
+    uint64_t heap_capacity() const
+    {
+        return heap_size_;
+    }
+    uint64_t heap_used_bytes() const
+    {
         if (heap_size_ == 0) return 0;
         return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
     }
@@ -143,61 +172,72 @@ private:
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
 
-    int32_t commit_task() {
+    int32_t commit_task()
+    {
         int32_t task_id = local_task_id_++;
         current_index_ptr_->store(local_task_id_, std::memory_order_release);
         return task_id;
     }
 
-    void update_heap_tail(int32_t last_alive) {
+    void update_heap_tail(int32_t last_alive)
+    {
         if (last_alive <= last_alive_seen_) return;
         last_alive_seen_ = last_alive;
 
         PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
-        heap_tail_ =
-            static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
+        heap_tail_ = static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
     }
 
-    void *try_bump_heap(uint64_t alloc_size) {
+    void *try_bump_heap(uint64_t alloc_size)
+    {
         uint64_t top = heap_top_;
-        if (alloc_size == 0) {
-            return static_cast<char *>(heap_base_) + top;
-        }
+        if (alloc_size == 0) return static_cast<char *>(heap_base_) + top;
         uint64_t tail = heap_tail_;
         void *result;
 
-        if (top >= tail) {
+        if (top >= tail)
+        {
             uint64_t space_at_end = heap_size_ - top;
-            if (space_at_end >= alloc_size) {
+            if (space_at_end >= alloc_size)
+            {
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
-            } else if (tail > alloc_size) {
+            }
+            else if (tail > alloc_size)
+            {
                 result = heap_base_;
                 heap_top_ = alloc_size;
-            } else {
+            }
+            else
+            {
                 return nullptr;
             }
-        } else {
-            if (tail - top > alloc_size) {
-                result = static_cast<char *>(heap_base_) + top;
-                heap_top_ = top + alloc_size;
-            } else {
-                return nullptr;
-            }
+        }
+        else if (tail - top > alloc_size)
+        {
+            result = static_cast<char *>(heap_base_) + top;
+            heap_top_ = top + alloc_size;
+        }
+        else
+        {
+            return nullptr;
         }
 
         return result;
     }
 
-    void report_deadlock(bool heap_blocked) {
-        if (error_code_ptr_) {
+    void report_deadlock(bool heap_blocked)
+    {
+        if (error_code_ptr_)
+        {
             int32_t code = heap_blocked ? PTO2_ERROR_HEAP_RING_DEADLOCK : PTO2_ERROR_FLOW_CONTROL_DEADLOCK;
             error_code_ptr_->store(code, std::memory_order_release);
         }
     }
 };
 
-struct PTO2FaninPool {
+struct PTO2FaninPool
+{
     PTO2FaninSpillEntry *base;       // Pool base address
     int32_t capacity;                // Total number of entries
     int32_t top;                     // Linear next-allocation counter (starts from 1)
@@ -207,7 +247,8 @@ struct PTO2FaninPool {
 
     std::atomic<int32_t> *error_code_ptr = nullptr;
 
-    void init(PTO2FaninSpillEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
+    void init(PTO2FaninSpillEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr)
+    {
         base = in_base;
         capacity = in_capacity;
         top = 1;
@@ -222,12 +263,12 @@ struct PTO2FaninPool {
 
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
-    PTO2FaninSpillEntry *alloc() {
+    PTO2FaninSpillEntry *alloc()
+    {
         int32_t used = top - tail;
-        if (used >= capacity) {
-            if (error_code_ptr) {
-                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
-            }
+        if (used >= capacity)
+        {
+            if (error_code_ptr) error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
             return nullptr;
         }
         int32_t idx = top % capacity;
@@ -237,15 +278,20 @@ struct PTO2FaninPool {
         return &base[idx];
     }
 
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
+    void advance_tail(int32_t new_tail)
+    {
+        if (new_tail > tail) tail = new_tail;
     }
 
-    int32_t used() const { return top - tail; }
+    int32_t used() const
+    {
+        return top - tail;
+    }
 
-    int32_t available() const { return capacity - used(); }
+    int32_t available() const
+    {
+        return capacity - used();
+    }
 };
 
 template <typename Fn>
@@ -255,79 +301,58 @@ template <typename Fn>
 using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
 
 template <typename InlineSlots, typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
-    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
-) {
+inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn)
+{
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
-    static_assert(
-        std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>,
-        "fanin callback must return void or bool"
-    );
+    static_assert(std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>, "fanin callback must return void or bool");
 
-    if constexpr (std::is_void_v<FaninCallbackResult>) {
+    if constexpr (std::is_void_v<FaninCallbackResult>)
+    {
         int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            fn(inline_slot_states[i]);
-        }
+        for (int32_t i = 0; i < inline_count; i++) fn(inline_slot_states[i]);
 
         int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return;
-        }
+        if (spill_count <= 0) return;
 
         int32_t start_idx = spill_start % spill_pool.capacity;
         int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
         PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            fn(first[i].slot_state);
-        }
+        for (int32_t i = 0; i < first_count; i++) fn(first[i].slot_state);
 
         int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            fn(spill_pool.base[i].slot_state);
-        }
+        for (int32_t i = 0; i < second_count; i++) fn(spill_pool.base[i].slot_state);
         return;
-    } else {
+    }
+    else
+    {
         int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            if (!fn(inline_slot_states[i])) {
-                return false;
-            }
-        }
+        for (int32_t i = 0; i < inline_count; i++)
+            if (!fn(inline_slot_states[i])) return false;
 
         int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return true;
-        }
+        if (spill_count <= 0) return true;
 
         int32_t start_idx = spill_start % spill_pool.capacity;
         int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
         PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            if (!fn(first[i].slot_state)) {
-                return false;
-            }
-        }
+        for (int32_t i = 0; i < first_count; i++)
+            if (!fn(first[i].slot_state)) return false;
 
         int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            if (!fn(spill_pool.base[i].slot_state)) {
-                return false;
-            }
-        }
+        for (int32_t i = 0; i < second_count; i++)
+            if (!fn(spill_pool.base[i].slot_state)) return false;
         return true;
     }
 }
 
 template <typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
-    return for_each_fanin_storage(
-        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
-    );
+inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn)
+{
+    return for_each_fanin_storage(payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start, *payload.fanin_spill_pool, static_cast<Fn &&>(fn));
 }
 
-struct PTO2DepListPool {
+struct PTO2DepListPool
+{
     PTO2DepListEntry *base;     // Pool base address
     int32_t capacity;           // Total number of entries
     int32_t top;                // Linear next-allocation counter (starts from 1)
@@ -338,7 +363,8 @@ struct PTO2DepListPool {
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t> *error_code_ptr = nullptr;
 
-    void init(PTO2DepListEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
+    void init(PTO2DepListEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr)
+    {
         base = in_base;
         capacity = in_capacity;
         top = 1;   // Start from 1, 0 means NULL/empty
@@ -357,12 +383,12 @@ struct PTO2DepListPool {
 
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
-    PTO2DepListEntry *alloc() {
+    PTO2DepListEntry *alloc()
+    {
         int32_t used = top - tail;
-        if (used >= capacity) {
-            if (error_code_ptr) {
-                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
-            }
+        if (used >= capacity)
+        {
+            if (error_code_ptr) error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
             return nullptr;
         }
         int32_t idx = top % capacity;
@@ -372,13 +398,13 @@ struct PTO2DepListPool {
         return &base[idx];
     }
 
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
+    void advance_tail(int32_t new_tail)
+    {
+        if (new_tail > tail) tail = new_tail;
     }
 
-    PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state) {
+    PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state)
+    {
         PTO2DepListEntry *new_entry = alloc();
         if (!new_entry) return nullptr;
         new_entry->slot_state = slot_state;
@@ -386,12 +412,19 @@ struct PTO2DepListPool {
         return new_entry;
     }
 
-    int32_t used() const { return top - tail; }
+    int32_t used() const
+    {
+        return top - tail;
+    }
 
-    int32_t available() const { return capacity - used(); }
+    int32_t available() const
+    {
+        return capacity - used();
+    }
 };
 
-struct PTO2RingSet {
+struct PTO2RingSet
+{
     PTO2TaskAllocator task_allocator;
     PTO2FaninPool fanin_pool;
 };

@@ -31,13 +31,15 @@
 // <pto/npu/comm/async/sdma/sdma_types.hpp> just to spell their scratch tile.
 inline constexpr uint32_t SDMA_SCRATCH_ALIGNMENT = pto::comm::sdma::UB_ALIGN_SIZE;
 
-enum class SdmaOp : uint8_t {
+enum class SdmaOp : uint8_t
+{
     TGET = 0,
     TPUT = 1,
 };
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-struct SdmaRequestDescriptor {
+struct SdmaRequestDescriptor
+{
     SdmaOp op;
     DstTensor dst;
     SrcTensor src;
@@ -47,45 +49,38 @@ struct SdmaRequestDescriptor {
 };
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTget(
-    const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
-    uint32_t sync_id = 0
-) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst,       src,
-                                                                     scratch,      workspace, sync_id};
+inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTget(const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace, uint32_t sync_id = 0)
+{
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TGET, dst, src, scratch, workspace, sync_id};
 }
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTput(
-    const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace,
-    uint32_t sync_id = 0
-) {
-    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst,       src,
-                                                                     scratch,      workspace, sync_id};
+inline __aicore__ SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> SdmaTput(const DstTensor &dst, const SrcTensor &src, const ScratchTileT &scratch, __gm__ uint8_t *workspace, uint32_t sync_id = 0)
+{
+    return SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT>{SdmaOp::TPUT, dst, src, scratch, workspace, sync_id};
 }
 
 namespace pto2::detail {
 
-inline __aicore__ void register_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr) {
-    CompletionToken token{
-        reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, 0
-    };
+inline __aicore__ void register_sdma_event_record(AsyncCtx &ctx, volatile __gm__ void *record_addr)
+{
+    CompletionToken token{reinterpret_cast<uint64_t>(record_addr), 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, 0};
     (void)register_completion_condition(ctx, token);
 }
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void
-register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
-    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
+inline __aicore__ void register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session)
+{
+    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr)
+    {
         (void)event.Wait(session);
         return;
     }
-    if (event.handle == 0) {
-        return;
-    }
+    if (event.handle == 0) return;
 
     const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA)) {
+    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::SDMA))
+    {
         defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
         return;
     }
@@ -94,34 +89,29 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
     uint32_t sync_id = 0;
     __gm__ uint8_t *recv_workspace = nullptr;
     uint32_t queue_num = 0;
-    if (!::pto::comm::sdma::detail::PrepareEventCheck(
-            session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num
-        )) {
+    if (!::pto::comm::sdma::detail::PrepareEventCheck(session.sdmaSession, tmp_buf, sync_id, recv_workspace, queue_num))
+    {
         defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
         return;
     }
-    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
-        register_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
-    }
+    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) register_sdma_event_record(ctx, ::pto::comm::sdma::detail::GetEventRecord(recv_workspace, queue_id));
 }
 
 }  // namespace pto2::detail
 
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
-inline __aicore__ bool
-send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
+inline __aicore__ bool send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc)
+{
     pto::comm::AsyncSession session;
-    if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id)) {
+    if (!pto::comm::BuildAsyncSession(desc.scratch, desc.workspace, session, desc.sync_id))
+    {
         pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
 
     pto::comm::AsyncEvent event;
-    if (desc.op == SdmaOp::TGET) {
-        event = pto::comm::TGET_ASYNC(desc.dst, desc.src, session);
-    } else {
-        event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
-    }
+    if (desc.op == SdmaOp::TGET) event = pto::comm::TGET_ASYNC(desc.dst, desc.src, session);
+    else event = pto::comm::TPUT_ASYNC(desc.dst, desc.src, session);
     pto2::detail::register_pto_async_event(ctx, event, session);
     pto2::detail::defer_flush(ctx);
     return true;
