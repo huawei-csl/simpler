@@ -19,29 +19,6 @@
 #include "pto_runtime2_types.h"
 #include "spin_hint.h"
 
-// =============================================================================
-// Profiling macros (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-#include "aicpu/device_time.h"
-// Accumulated nanoseconds per sub-step
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc)       \
-    do {                           \
-        _t1 = get_sys_cnt_aicpu(); \
-        acc += (_t1 - _t0);        \
-        _t0 = _t1;                 \
-    } while (0)
-#else
-#define CYCLE_COUNT_START()
-#define CYCLE_COUNT_LAP(acc)
-#endif
-
-// =============================================================================
-// Scheduler constants
-// =============================================================================
-
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = PLATFORM_MAX_IDLE_ITERATIONS;  // platform-defined cap (sim vs onboard)
@@ -49,17 +26,6 @@ constexpr int32_t STALL_LOG_INTERVAL =
     MAX_IDLE_ITERATIONS * 6 / 10;                     // derived: ~one stall diagnostic halfway to timeout
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
-// Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
-// the per-thread iteration-count cap for the fatal-latch decision; the
-// iteration cap still drives the STALL diagnostic cadence (which is per-thread
-// observability and benefits from running at the thread's own pace).
-//
-// Using wall-clock here is load-bearing for distributed runs: with per-thread
-// iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
-// ~92 ms while a sibling thread polling a RUNNING task takes ~200 ms for the
-// same iteration count. The fast spinner racing ahead and latching fatal
-// kills the slower-but-correct poller mid-poll — see the distributed
-// startup-skew scenario in issue #897.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = 5000;  // 5 s; > worst observed distributed-init skew + HCCL wait
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
@@ -69,20 +35,10 @@ constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
-// =============================================================================
-// Control flow signal from cold-path helpers back to the main dispatch loop.
-// =============================================================================
-
 enum class LoopAction : int8_t {
     NONE,        // cold path did not trigger; proceed normally
     BREAK_LOOP,  // equivalent to 'break' from the while(true) loop
 };
-
-// =============================================================================
-// Per-core state: one cache line per core to eliminate false sharing
-// and co-locate all hot-path fields for minimal cache misses.
-// Dual-slot layout: running (currently executing) + pending (pre-loaded, awaiting hardware pickup).
-// =============================================================================
 
 struct alignas(64) CoreExecState {
     // --- Hot fields (completion + dispatch, every iteration) ---
@@ -95,33 +51,14 @@ struct alignas(64) CoreExecState {
     PTO2SubtaskSlot running_subslot;        // offset 36: which subtask slot is running
     PTO2SubtaskSlot pending_subslot;        // offset 37: which subtask slot is pending
     uint8_t pad0_[2];                       // offset 38: alignment padding
-    // Precomputed COND register pointer; resolved once in handshake so the
-    // hot completion poll does a single volatile load instead of recomputing
-    // reg_base + reg_offset(COND) on every iteration.
     volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
-    // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
-#else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
     int32_t worker_id;          // offset 48: index in runtime.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
     uint8_t pad2_[4];           // offset 60: pad to 64 bytes
-#endif
 };
 static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");
-
-// =============================================================================
-// CoreTracker: cluster-based bitmask tracker for idle/running core state.
-//
-// core_states_ encodes per-cluster core idle/running in 3 bits per cluster:
-//   bit i*3   = AIC of cluster i   (1 = idle, 0 = running)
-//   bit i*3+1 = AIV0 of cluster i
-//   bit i*3+2 = AIV1 of cluster i
-// Max 21 clusters per tracker (63 bits in uint64_t).
-// =============================================================================
 
 class alignas(64) CoreTracker {
 public:
@@ -262,10 +199,6 @@ public:
     // Toggle bit at the given bit offset (running <-> idle)
     void change_core_state(int32_t bit_offset) { core_states_ ^= BitStates(1ULL << bit_offset); }
 
-    // --- Pending-occupied tracking ---
-    // Tracks whether a core's pending payload slot is occupied (awaiting hardware ACK).
-    // SET on dispatch (both running-first and pending), CLEAR on idle or pending_freed.
-
     void set_pending_occupied(int32_t bit_offset) { pending_occupied_ |= BitStates(1ULL << bit_offset); }
     void clear_pending_occupied(int32_t bit_offset) {
         pending_occupied_ ^= (pending_occupied_ & BitStates(1ULL << bit_offset));
@@ -273,13 +206,6 @@ public:
 
     // --- Two-phase dispatch queries ---
 
-    // Idle dispatch: returns bit offsets of idle cores for the given shape.
-    // For AIC: 1 bit per cluster (core offset == cluster offset).
-    // For AIV: 1 bit per AIV core (2 bits per cluster at aiv_mask_ positions).
-    // Only AIC needs pending_occupied filtering: by invariant, idle cores (core_states_ bit=1)
-    // always have pending_occupied=0, so AIV/MIX need no extra filtering.
-    // Skipping the AIC-centric filter also fixes a latent bug where a running+pending AIC core
-    // would incorrectly block AIV idle dispatch on the same cluster.
     BitStates get_idle_core_offset_states(PTO2ResourceShape shape) const {
         if (shape == PTO2ResourceShape::AIC) {
             return get_valid_cluster_offset_states(shape) & ~(pending_occupied_ & aic_mask_);
@@ -290,10 +216,6 @@ public:
         return get_valid_cluster_offset_states(shape);  // MIX: cluster-level
     }
 
-    // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
-    // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
-    // MIX: 1 bit per cluster where ALL 3 cores have free pending slots AND at least one is running.
-    //       Idle cores participate via to_pending=false in the MIX prepare path.
     BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
         if (shape == PTO2ResourceShape::MIX) {
             // Any core without a pending payload can accept a dispatch (idle or running).
@@ -338,11 +260,6 @@ private:
     int32_t core_id_map_[63];  // bit_position -> worker_id, max 21 clusters * 3
 };
 
-// =============================================================================
-// SlotTransition: pure event signals from a single register poll.
-// true = event occurred, false = no-op (maintain current state).
-// =============================================================================
-
 struct SlotTransition {
     bool running_done = false;   // running task completed
     bool pending_done = false;   // pending task completed
@@ -350,43 +267,6 @@ struct SlotTransition {
     bool pending_freed = false;  // pending_occupied can be cleared
     bool matched = false;        // some case was hit (otherwise skip apply)
 };
-
-// =============================================================================
-// Profiling counters (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-struct alignas(64) SchedL2SwimlaneCounters {
-    bool l2_swimlane_enabled{false};
-    uint64_t sched_start_ts{0};
-    uint64_t sched_complete_cycle{0};
-    uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
-    uint64_t sched_idle_cycle{0};
-    uint64_t sched_loop_count{0};
-    uint32_t phase_complete_count{0};
-    uint32_t phase_dispatch_count{0};
-    // Per-emit delta is (current - *_at_last_emit). Accumulated only when
-    // l2_swimlane_level_ >= SCHED_PHASES.
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
-    uint64_t pop_hit_at_last_emit{0};
-    uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
-    uint64_t complete_probe_count{0};
-    uint64_t complete_hit_count{0};
-    uint64_t sched_complete_perf_cycle{0};
-    uint64_t sched_dispatch_pop_cycle{0};
-    uint64_t sched_dispatch_setup_cycle{0};
-#endif
-    void reset() { *this = SchedL2SwimlaneCounters{}; }
-};
-#endif
-
-// =============================================================================
-// sync_start drain coordination
-// =============================================================================
 
 // When sync_start_pending != 0, all scheduler threads skip dispatch
 // (only process completions) until the drain worker finishes launching all blocks.

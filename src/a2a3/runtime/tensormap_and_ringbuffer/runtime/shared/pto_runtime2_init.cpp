@@ -8,16 +8,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Host/AICPU shared runtime-arena layout, init_data and wire implementations.
- *
- * Lives under runtime/shared/ so it is included in both the host_runtime.so
- * build (host pre-populates the prebuilt arena image) and the aicpu_runtime
- * build (AICPU runs wire_arena_pointers + destroy after attach). The
- * device-only parts of pto_runtime2.cpp / pto_orchestrator.cpp / pto_scheduler.cpp
- * (ops table, scope/submit/dispatch business logic, profiling) stay in their
- * original files and the aicpu build only.
- */
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,14 +19,7 @@
 #include "pto_tensormap.h"
 #include "scheduler/pto_scheduler.h"
 
-// =============================================================================
-// Ready queue
-// =============================================================================
-
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
-    // Align the slots[] base to a full cache line so MPMC CAS traffic on the
-    // first slot cannot false-share with whatever region sits in front of us
-    // (e.g. orchestrator tensormap heads written by the orch thread).
     return arena.reserve(capacity * sizeof(PTO2ReadyQueueSlot), PTO2_ALIGN_SIZE);
 }
 
@@ -66,25 +49,12 @@ void ready_queue_destroy(PTO2ReadyQueue *queue) {
     queue->slots = nullptr;
 }
 
-// =============================================================================
-// Scheduler
-// =============================================================================
-
 bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base, int32_t ring_id) {
     // ring stores the device address of the SM ring header — pure offset
     // arithmetic, no SM load.
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base, ring_id);
     last_task_alive = 0;
     advance_lock.store(0, std::memory_order_relaxed);
-#if PTO2_PROFILING
-    dep_pool_snapshot_tail.store(1, std::memory_order_relaxed);
-    dep_pool_snapshot_top.store(1, std::memory_order_relaxed);
-#endif
-
-    // Per-slot SM-side initialization (bind_ring + reset_for_reuse +
-    // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::
-    // init_header_per_ring so the AICPU performs it during SM reset; host
-    // prebuilt-arena init skips SM access here.
 
     return true;
 }
@@ -102,9 +72,6 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32
     }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        // Force a cache-line base so writes from scheduler thread 0 (sole
-        // writer of this ring's dep_pool) do not invalidate adjacent
-        // multi-threaded regions like ready_queue.slots.
         layout.off_dep_pool_entries[r] =
             arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
     }
@@ -117,10 +84,6 @@ bool PTO2SchedulerState::init_data_from_layout(
 ) {
     PTO2SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
-#if PTO2_SCHED_PROFILING
-    sched->tasks_completed.store(0, std::memory_order_relaxed);
-    sched->tasks_consumed.store(0, std::memory_order_relaxed);
-#endif
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (!sched->ring_sched_states[r].init_data_from_layout(sm_dev_base, r)) {
@@ -183,10 +146,6 @@ void PTO2SchedulerState::destroy() {
     }
     ready_queue_destroy(&sched->dummy_ready_queue);
 }
-
-// =============================================================================
-// Orchestrator
-// =============================================================================
 
 PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
     DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity
@@ -285,10 +244,6 @@ void PTO2OrchestratorState::destroy() {
 
 void PTO2OrchestratorState::set_scheduler(PTO2SchedulerState *scheduler) { this->scheduler = scheduler; }
 
-// =============================================================================
-// Top-level runtime arena
-// =============================================================================
-
 PTO2RuntimeArenaLayout
 runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity) {
     PTO2RuntimeArenaLayout layout{};
@@ -312,7 +267,7 @@ runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t de
 
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base,
-    uint64_t /*sm_size*/, void *gm_heap_dev_base, uint64_t heap_size
+    uint64_t , void *gm_heap_dev_base, uint64_t heap_size
 ) {
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.off_runtime));
     memset(rt, 0, sizeof(*rt));
@@ -349,7 +304,7 @@ void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayou
     rt->scheduler.wire_arena_pointers(layout.sched, arena);
 }
 
-void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/) {
+void runtime_destroy(PTO2Runtime *rt) {
     // Arena buffer is pooled across runs by DeviceRunner — never freed here.
     if (!rt) return;
     rt->scheduler.destroy();

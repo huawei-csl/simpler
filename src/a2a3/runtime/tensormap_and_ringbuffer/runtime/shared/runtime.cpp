@@ -8,22 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Runtime Class - Implementation
- *
- * Device execution and handshake control.
- * Task graph construction is handled by PTO2Runtime.
- */
 
 #include "runtime.h"
 
-#include "common/unified_log.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
-
-// =============================================================================
-// Constructor
-// =============================================================================
 
 Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
@@ -63,10 +52,6 @@ Runtime::Runtime() {
         func_id_to_addr_[i] = 0;
     }
 }
-
-// =============================================================================
-// Device orchestration
-// =============================================================================
 
 void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
 void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
@@ -132,17 +117,12 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
 
 void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
         return;
     }
     if (addr != 0 && func_id_to_addr_[func_id] == 0) {
         if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
             registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
         } else {
-            LOG_ERROR(
-                "[Runtime] Registration limit reached (%d). Cannot track func_id=%d for cleanup.", RUNTIME_MAX_FUNC_ID,
-                func_id
-            );
         }
     }
     func_id_to_addr_[func_id] = addr;
@@ -150,7 +130,6 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
 
 void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
         return;
     }
     func_id_to_addr_[func_id] = addr;

@@ -29,11 +29,6 @@ struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 
-// The mailbox transport (has_pending / try_push_condition /
-// try_push_normal_done / try_pop) lives as AICoreCompletionMailbox member
-// functions in aicore_completion_mailbox.h. This file only holds the
-// application layer: translating drained messages into wait-list state.
-
 inline uintptr_t mailbox_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
@@ -61,9 +56,6 @@ struct CompletionCondition {
     void retire();
 };
 
-// Per-completion-type ops. SDMA_EVENT_RECORD detail lives in
-// backend/sdma/sdma_completion_scheduler.h; the op wrappers below are thin
-// glue mapping CompletionCondition.addr into the backend's raw-addr helpers.
 inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     if (cond.counter_addr == nullptr) {
         return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
@@ -74,7 +66,7 @@ inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     };
 }
 
-inline void counter_retire_op(CompletionCondition & /*cond*/) {}
+inline void counter_retire_op(CompletionCondition &) {}
 
 inline CompletionPollResult sdma_event_record_poll_op(const CompletionCondition &cond) {
     return poll_sdma_event_record(cond.addr);
@@ -146,10 +138,6 @@ struct AsyncWaitList {
     std::atomic<int32_t> busy{0};
     AsyncWaitEntry entries[MAX_ASYNC_WAITS];
     int32_t count{0};
-    // Diagnostic: counts every FIN-side try_push that hit a full mailbox.
-    // Expected to stay zero on real workloads (ring is 4096 entries); a
-    // non-zero value means consumers are too slow or the ring is undersized.
-    // Read by scheduler shutdown / l2 perf summary; not on the hot path.
     std::atomic<uint64_t> mpsc_skipped_count{0};
 
     bool try_lock() {
@@ -166,9 +154,6 @@ struct AsyncWaitList {
         return nullptr;
     }
 
-    // Captures the side-channel a scheduler-aware drain needs to complete
-    // NotDeferred tasks inline (without storing a transient entry in
-    // entries[]).
     struct DrainCompletionSink {
         PTO2SchedulerState *sched{nullptr};
         PTO2LocalReadyBuffer *local_bufs{nullptr};
@@ -176,9 +161,6 @@ struct AsyncWaitList {
         int32_t *deferred_release_count{nullptr};
         int32_t deferred_release_capacity{0};
         int32_t inline_completed{0};
-#if PTO2_SCHED_PROFILING
-        int32_t thread_idx{0};
-#endif
 
         bool can_inline_complete() const { return sched != nullptr; }
     };
@@ -187,10 +169,6 @@ struct AsyncWaitList {
     // deferred_release_slot_states overflow.
     bool try_inline_complete_locked(DrainCompletionSink &sink, PTO2TaskSlotState &slot_state);
 
-    // Single-consumer drain: pop each published message in tail order and
-    // translate it into wait-list state. An empty sink (sched == nullptr) just
-    // materializes entries; a sched-aware sink additionally inline-completes
-    // lonely NotDeferred NORMAL_DONEs without ever growing entries[].
     int32_t drain_aicore_completion_mailbox_locked(
         AICoreCompletionMailbox *aicore_mailbox, DrainCompletionSink &sink, int32_t &error_code
     ) {
@@ -199,17 +177,11 @@ struct AsyncWaitList {
 
         int32_t drained = 0;
         AICoreCompletionMsgView msg;
-        // try_pop is the transport layer (seq-gated, in-order dequeue); this
-        // loop is the application layer (translate each message into wait-list
-        // state). try_pop returns false at the first gap or when empty.
         while (aicore_mailbox->try_pop(msg)) {
             drained++;
             if (msg.kind == MSG_KIND_CONDITION) {
                 AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
                 if (entry == nullptr) {
-                    // First message for this task — materialize the entry here.
-                    // slot_state stays null until the matching TASK_NORMAL_DONE
-                    // sentinel arrives.
                     if (count >= MAX_ASYNC_WAITS) {
                         error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
@@ -232,12 +204,6 @@ struct AsyncWaitList {
                     reinterpret_cast<PTO2TaskSlotState *>(static_cast<uintptr_t>(msg.addr));
                 AsyncWaitEntry *entry = find_entry_by_token(msg.task_token);
                 if (entry == nullptr) {
-                    // Producers strictly order: all CONDITIONs for token T are
-                    // pushed before the matching NORMAL_DONE (the acq_rel on
-                    // on_subtask_complete enforces this across producers). So
-                    // observing NORMAL_DONE first => the task registered no
-                    // conditions => NotDeferred. Complete it inline when the
-                    // sink allows; otherwise fall back to the entry-store path.
                     if (sink.can_inline_complete()) {
                         (void)try_inline_complete_locked(sink, *slot_state_ptr);
                         continue;
@@ -293,10 +259,6 @@ struct AsyncWaitList {
         AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
         PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
         int32_t deferred_release_capacity
-#if PTO2_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
     );
 };
 

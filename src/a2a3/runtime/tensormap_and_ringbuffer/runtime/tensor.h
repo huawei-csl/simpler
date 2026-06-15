@@ -24,12 +24,6 @@
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
-/**
- * Buffer Handle
- *
- * Represents a device memory buffer with address and total size in bytes.
- * This is the underlying memory allocation that a Tensor describes access patterns for.
- */
 struct PTOBufferHandle {
     uint64_t addr;  // Device memory address (bytes)
     uint64_t size;  // Total buffer size in bytes
@@ -49,20 +43,6 @@ struct Segment {
     bool contains(const Segment &other) const { return begin <= other.begin && other.end <= end; }
 };
 
-/**
- * TensorCreateInfo — submit-time create-info for runtime-allocated outputs.
- *
- * Carries the metadata required to materialize a fresh contiguous output:
- * dtype, ndims, shapes, manual_dep, and an optional initial value fill.
- *
- * Layout (64B) is aligned with Tensor cache line 1 so that
- * init_from_create_info() can copy the entire cache line with a single memcpy,
- * then overwrite buffer/owner metadata and compute the contiguous stride in
- * cache line 2.
- *
- * Arg::add_output() stores a pointer to this object, so the original
- * must remain valid (not a temporary) until after the submit call.
- */
 class alignas(64) TensorCreateInfo {
 public:
     TensorCreateInfo(
@@ -100,10 +80,6 @@ public:
     }
 
 public:
-    // --- Bytes [0, 32): TensorCreateInfo-only fields ---
-    // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
-    // and Tensor::start_offset. The runtime overwrites owner metadata after the
-    // memcpy and recomputes start_offset / stride during payload materialization.
     uint64_t initial_value;
     bool has_initial_value;
     uint8_t __pad1__[7];
@@ -126,42 +102,6 @@ public:
 
 static_assert(sizeof(TensorCreateInfo) == 64);
 
-/**
- * Tensor descriptor for Task input/output (128B = 2 cache lines)
- *
- * Describes a strided memory access pattern on Global Memory (GM) using:
- *   - `buffer`: underlying memory allocation (addr/size in bytes)
- *   - `start_offset`: 1D element offset of the view origin from `buffer.addr`
- *   - `shapes[i]`, `strides[i]`: per-dim view shape and **element** stride
- *
- * Stride semantics:
- *   - Element-granularity (matches start_offset). Byte offset of element
- *     `coords[]` is `(start_offset + Σ coords[i] · strides[i]) · dtype_bytes`.
- *   - strides[i] > 0 STRICTLY. Broadcast (stride=0) and negative slice step
- *     (stride<0) are NOT supported.
- *
- * Fast-path flags on cache line 1:
- *   - manual_dep: when true, dependency tracking is creator-only (skip OverlapMap)
- *   - is_contiguous: cached PyTorch-style contiguous flag — i.e.
- *     `strides[i] == prod(shapes[i+1..ndims-1])`. When true AND start_offset==0,
- *     all hot paths can compute extent_elem from `shapes` alone and never read
- *     cache line 2. NOTE: this is strictly tighter than the pre-#808
- *     `shapes[i] == raw_shapes[i]` test, but equivalent on every view the old
- *     (raw_shapes-based) encoding could express; the two only diverge on
- *     post-#808-only views (transpose / permute / slice-with-step results).
- *
- * Layout: cache line 1 holds hot-path fields (buffer, owner_task_id,
- * start_offset, version, ndims, dtype, flags, shapes); cache line 2 holds
- * stride + cached extent_elem.
- *
- * Construction:
- * Users cannot default-construct or directly construct a Tensor.
- * Valid Tensors are obtained only through controlled entry points:
- *   - make_tensor_external(...)
- *   - from_tensor_arg(...)
- *   - TaskOutputTensors returned by submit(...)
- *   - Tensor::view() / reshape() / transpose() / permute() / slice() on an existing valid Tensor
- */
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
     PTOBufferHandle buffer;    // Underlying memory buffer (addr in bytes, size in bytes)
@@ -175,32 +115,16 @@ struct alignas(64) Tensor {
     uint8_t _pad_cl1;          // Pad to align shapes[5] at byte 44
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
-    // === Cache line 2 (64B) — warm path (view metadata) ===
-    // Field order: place the 8B-aligned cache before the 4B-aligned strides[]
-    // to avoid 4B padding between them (sizeof(Tensor) must stay 128).
     uint64_t extent_elem_cache;                 // Cached extent_elem (see extent_elem()); maintained by ops
     uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
     uint8_t _pad_cl2[36];                       // Reserved for future extension
 
-    // --- Copy / move / destroy ---
-    // Kept trivially copyable (default copy = byte-for-byte) so other modules
-    // (PTO2TensorMapEntry::copy_from_tensor, TensorCreateInfo memcpy path)
-    // can rely on memcpy semantics. The contiguous fast-path optimization
-    // lives in `init(const Tensor&)`; call sites that care should use
-    // `result.init(*this)` instead of the default copy ctor.
     Tensor(const Tensor &) = default;
     Tensor &operator=(const Tensor &) = default;
     Tensor(Tensor &&) = default;
     Tensor &operator=(Tensor &&) = default;
     ~Tensor() = default;
 
-    // ========================================================================
-    // Accessors / helpers
-    // ========================================================================
-
-    /// Number of logical elements covered by the view (NOT the extent).
-    /// ndims > 0 is a construction-time invariant (see init_external /
-    /// init_from_create_info), so the loop always runs at least once.
     uint64_t numel() const {
         uint64_t total = 1;
         for (uint32_t i = 0; i < ndims; i++)
@@ -215,13 +139,6 @@ struct alignas(64) Tensor {
         return extent_elem_cache;
     }
 
-    // ========================================================================
-    // Initialization (operates on already-constructed Tensor)
-    // ========================================================================
-
-    /// Initialize as a contiguous tensor that covers `shapes[]` starting at `addr`.
-    /// stride is set to row_major(shapes); start_offset = 0; is_contiguous = true.
-    /// Enforces the ndims > 0 invariant relied upon by every downstream op.
     void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
         int32_t in_version, bool in_manual_dep = false
@@ -236,9 +153,6 @@ struct alignas(64) Tensor {
         _pad_cl1 = 0;
         start_offset = 0;
         owner_task_id = PTO2TaskId::invalid();
-        // Single reverse pass: write shapes, accumulate row-major stride, and
-        // track numel — `s` ends as prod(shapes) which is also extent_elem
-        // for a contiguous view.
         uint32_t s = 1;
         for (int32_t i = static_cast<int32_t>(in_ndims) - 1; i >= 0; --i) {
             shapes[i] = in_shapes[i];
@@ -248,14 +162,6 @@ struct alignas(64) Tensor {
         extent_elem_cache = s;
     }
 
-    /// Deep copy with contiguous fast-path optimization.
-    ///
-    /// Always copies cache line 1 (always needed: buffer, shapes, dtype, ...).
-    /// When `other` is in canonical contiguous form (is_contiguous &&
-    /// start_offset == 0), cache line 2 (stride / extent_elem_cache) is fully
-    /// derivable from line 1, so we **skip reading other's cache line 2** and
-    /// write dst's line 2 from the local shapes instead. Non-contiguous source
-    /// pays one line 2 read; contiguous source does not.
     void init_from(const Tensor &other) {
         init_from_line1(other);
         if (other.is_contiguous && other.start_offset == 0) {
@@ -276,21 +182,12 @@ struct alignas(64) Tensor {
         }
     }
 
-    /// View ops use this: copy cache line 1 only, leaving cache line 2 (stride,
-    /// extent_elem_cache) untouched. The op then mutates shapes / start_offset
-    /// in place and calls `refresh_derived()` to recompute line 2 once. This
-    /// avoids the wasted line 2 writes that `init_from()` would do just before
-    /// the op overwrites them.
     void init_from_line1(const Tensor &other) { memcpy(this, &other, 64); }
 
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
     void copy(const Tensor &other) { init_from(other); }
 
-    /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
-    /// Single 64B memcpy covers cache line 1; ci pre-initialises start_offset (=0)
-    /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
-    /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
     void init_from_create_info(const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
         always_assert(ci.ndims > 0 && ci.ndims <= RUNTIME_MAX_TENSOR_DIMS);
         memcpy(this, &ci, 64);
@@ -324,13 +221,6 @@ struct alignas(64) Tensor {
         }
     }
 
-    // ========================================================================
-    // Address / offset computation
-    // ========================================================================
-
-    /// Compute 1D flat ELEMENT offset of `indices[]` from `buffer.addr`.
-    /// Callers multiply by `get_element_size(dtype)` to obtain a byte offset.
-    /// Works for any view (transpose / permute / slice / reshape).
     uint64_t compute_flat_offset(const uint32_t indices[], uint32_t in_ndims) const {
         uint64_t elem_off = start_offset;
         for (uint32_t d = 0; d < in_ndims; d++) {
@@ -339,14 +229,6 @@ struct alignas(64) Tensor {
         return elem_off;
     }
 
-    // ========================================================================
-    // View operations (zero-copy metadata rewrites)
-    // ========================================================================
-
-    /// Sub-tensor at per-dim offsets, with new per-dim shape.
-    /// Updates start_offset += Σ off[i]·strides[i]; shapes := new_shape; stride unchanged.
-    /// Each (offset[i], new_shape[i]) must stay within the current shapes[i] —
-    /// i.e. a view cannot expand any dimension beyond what the parent view sees.
     Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
         Tensor result;
         // Copy line 1 only; stride from *this is still in result's line 2 garbage
@@ -427,10 +309,6 @@ struct alignas(64) Tensor {
         return x == y;
     }
 
-    /// Reshape — zero-copy only if source is_contiguous; otherwise asserts.
-    /// Materialize fallback (allocating a contiguous copy) is NOT in this op;
-    /// callers must reach contiguous via a copy before calling reshape on a
-    /// non-contiguous view.
     Tensor reshape(const uint32_t new_shapes[], uint32_t new_ndims, bool in_manual_dep = false) const {
         debug_assert(valid_reshape(new_shapes, new_ndims));
         always_assert(is_contiguous);
@@ -449,10 +327,6 @@ struct alignas(64) Tensor {
         result.extent_elem_cache = s;
         return result;
     }
-
-    // ========================================================================
-    // Dump for diagnostics
-    // ========================================================================
 
     std::string dump() const {
         std::stringstream ss;
@@ -493,14 +367,6 @@ private:
         init_external(addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep);
     }
 
-    // ------------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------------
-
-    /// Recompute extent_elem_cache and is_contiguous from current shapes / stride.
-    /// Called after any op that mutates view metadata. Single reverse pass:
-    ///   extent_elem += (shapes[i] - 1) · strides[i]
-    ///   is_contiguous &&= (strides[i] == prod(shapes[i+1..]))
     void refresh_derived() {
         uint64_t e = 1;
         uint64_t expected = 1;

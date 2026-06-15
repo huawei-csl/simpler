@@ -9,27 +9,10 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * PTO2TaskId — minimal standalone header.
- *
- * Factored out of pto_runtime2_types.h so that tensor.h can include it
- * without pulling in scheduler-internal constants (heap sizes, timeouts, etc.).
- */
-
 #pragma once
 
 #include <cstdint>
 
-/**
- * TaskId: 64-bit encoding used across Runtime2.
- *
- * raw encoding: (ring_id << 32) | local_id
- *
- * ring_id:  which ring layer (0..PTO2_MAX_RING_DEPTH-1)
- * local_id: per-ring monotonic counter
- *
- * Invalid sentinel: raw == UINT64_MAX (no valid task has this encoding).
- */
 struct PTO2TaskId {
     uint64_t raw;
 

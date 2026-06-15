@@ -8,20 +8,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - TensorMap Implementation
- *
- * Implements TensorMap with ring buffer pool, lazy invalidation,
- * and chain truncation optimization.
- *
- * Key features:
- * 1. O(1) insert at bucket head
- * 2. O(valid_entries) lookup with chain truncation
- * 3. Automatic stale entry cleanup during lookup
- * 4. Periodic explicit cleanup for long chains
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #include "pto_tensormap.h"
 
@@ -29,23 +15,6 @@
 #include <string.h>
 
 #include "common.h"
-#include "common/unified_log.h"
-
-// =============================================================================
-// TensorMap Lookup Chain Length Statistics (compile-time toggle)
-// =============================================================================
-#if PTO2_TENSORMAP_PROFILING
-uint64_t g_lookup_chain_total = 0;
-uint64_t g_lookup_count = 0;
-int32_t g_lookup_chain_max = 0;
-uint64_t g_lookup_overlap_checks = 0;
-uint64_t g_lookup_overlap_hits = 0;
-uint64_t g_insert_count = 0;
-#endif
-
-// =============================================================================
-// Initialization and Destruction
-// =============================================================================
 
 PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
     DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size,
@@ -96,9 +65,6 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
         buckets_arena[i] = nullptr;
     }
 
-    // entry_pool: zero-init equivalent to the previous calloc(entry_pool, ...).
-    // The pool's persistent invariant after init is "bucket_index == -1 means
-    // not linked", set explicitly below.
     memset(entry_pool_arena, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry));
     for (int32_t i = 0; i < pool_size; i++) {
         entry_pool_arena[i].bucket_index = -1;
@@ -139,9 +105,6 @@ void PTO2TensorMap::wire_arena_pointers(const PTO2TensorMapLayout &layout, Devic
 }
 
 void PTO2TensorMap::destroy() {
-    // Arena owns the backing memory; here we only forget our pointers so any
-    // stray post-destroy access trips a nullptr dereference instead of reading
-    // a recycled allocation.
     buckets = nullptr;
     entry_pool = nullptr;
     free_entry_list = nullptr;
@@ -149,10 +112,6 @@ void PTO2TensorMap::destroy() {
         task_entry_heads[r] = nullptr;
     }
 }
-
-// =============================================================================
-// Debug Utilities
-// =============================================================================
 
 void PTO2TensorMap::print_stats() {
     int32_t valid = 0;
@@ -194,20 +153,8 @@ void PTO2TensorMap::print_stats() {
         }
     }
 
-    LOG_INFO_V0("=== TensorMap Statistics ===");
-    LOG_INFO_V0("Pool size:           %d", pool_size);
-    LOG_INFO_V0("Pool next entry idx: %d", next_entry_idx);
-    LOG_INFO_V0("Pool free_num:       %d", free_num);
-    LOG_INFO_V0("Num buckets:         %d", num_buckets);
-    LOG_INFO_V0("Valid entries:       %d", valid);
-    LOG_INFO_V0("Stale entries:       %d", stale);
-    LOG_INFO_V0("Empty buckets:       %d", empty_buckets);
-    LOG_INFO_V0("Max chain len:       %d", max_chain);
-    LOG_INFO_V0("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        LOG_INFO_V0("Last task alive[%d]: %d", r, last_task_alives[r]);
     }
-    LOG_INFO_V0("============================");
 }
 
 int32_t PTO2TensorMap::valid_count() {
@@ -236,26 +183,3 @@ void PTO2TensorMap::sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_aliv
     }
 }
 
-// =============================================================================
-// TensorMap Lookup Profiling
-// =============================================================================
-#if PTO2_TENSORMAP_PROFILING
-PTO2TensorMapProfilingData pto2_tensormap_get_profiling() {
-    PTO2TensorMapProfilingData d;
-    d.lookup_chain_total = g_lookup_chain_total;
-    d.lookup_count = g_lookup_count;
-    d.lookup_chain_max = g_lookup_chain_max;
-    d.overlap_checks = g_lookup_overlap_checks;
-    d.overlap_hits = g_lookup_overlap_hits;
-    d.insert_count = g_insert_count;
-
-    // Reset
-    g_lookup_chain_total = 0;
-    g_lookup_count = 0;
-    g_lookup_chain_max = 0;
-    g_lookup_overlap_checks = 0;
-    g_lookup_overlap_hits = 0;
-    g_insert_count = 0;
-    return d;
-}
-#endif

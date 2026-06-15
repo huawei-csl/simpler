@@ -8,28 +8,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - Ring Buffer Data Structures
- *
- * Implements ring buffer designs for zero-overhead memory management:
- *
- * 1. TaskAllocator - Unified task slot + output buffer allocation
- *    - Combines task ring (slot allocation) and heap ring (output buffer allocation)
- *    - Single spin-wait loop with unified back-pressure and deadlock detection
- *    - O(1) bump allocation for both task slots and heap buffers
- *
- * 2. FaninPool - Fanin spill entry allocation
- *    - Ring buffer for spilled fanin entries
- *    - O(1) append allocation
- *    - Implicit reclamation with task ring
- *
- * 3. DepListPool - Dependency list entry allocation
- *    - Ring buffer for linked list entries
- *    - O(1) prepend operation
- *    - Implicit reclamation with task ring
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #ifndef PTO_RING_BUFFER_H
 #define PTO_RING_BUFFER_H
@@ -40,7 +18,6 @@
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
-#include "common/unified_log.h"
 
 // Block notification interval (in spin counts)
 #define PTO2_BLOCK_NOTIFY_INTERVAL 10000
@@ -50,36 +27,8 @@
 // Dep pool spin limit - if exceeded, dep pool capacity too small for workload
 #define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
-// =============================================================================
-// Task Allocator (unified task slot + heap buffer allocation)
-// =============================================================================
-
-/**
- * Unified task slot + heap buffer allocator.
- *
- * Since task and heap are always allocated together and the orchestrator is
- * single-threaded, both pointers (task index, heap top) are tracked locally
- * and published to shared memory via plain store — no fetch_add or CAS needed.
- *
- * The alloc() method checks both resources BEFORE committing to either,
- * eliminating the need for rollback on partial failure.
- */
 class PTO2TaskAllocator {
 public:
-    /**
-     * Initialize the allocator with task ring and heap ring resources.
-     *
-     * All pointer arguments are device addresses (live in SM / GM heap); this
-     * function only stores them, no dereferences, so it is safe to invoke
-     * from host code that constructs a prebuilt arena image.
-     *
-     * Production callers leave `initial_local_task_id` at 0: the SM ring
-     * flow-control counters that current_index_ptr / last_alive_ptr point at
-     * start at zero (PTO2RingFlowControl::init() runs on the AICPU during SM
-     * reset), so we keep local_task_id_ aligned with that without reading the
-     * SM. Tests that drive SM state directly may pass a non-zero seed to
-     * exercise corner cases like task IDs near INT32_MAX.
-     */
     void init(
         PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
         std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
@@ -99,16 +48,6 @@ public:
         last_alive_seen_ = 0;
     }
 
-    /**
-     * Allocate a task slot and its associated output buffer in one call.
-     *
-     * Both task index and heap top are maintained as local counters and
-     * published to shared memory only on success. Since the orchestrator is
-     * single-threaded, no CAS or fetch_add is needed — just check-then-commit.
-     *
-     * @param output_size  Total packed output size in bytes (0 = no heap needed)
-     * @return Allocation result; check failed() for errors
-     */
     PTO2TaskAllocResult alloc(int32_t output_size) {
         uint64_t aligned_size =
             output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
@@ -118,10 +57,6 @@ public:
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
-#if PTO2_ORCH_PROFILING
-        uint64_t wait_start = 0;
-        bool waiting = false;
-#endif
 
         while (true) {
             // Check both resources; commit only if both available
@@ -129,9 +64,6 @@ public:
                 void *heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
-#if PTO2_ORCH_PROFILING
-                    record_wait(spin_count, wait_start, waiting);
-#endif
                     return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
                 }
                 blocked_on_heap = true;
@@ -141,12 +73,6 @@ public:
 
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
-#if PTO2_ORCH_PROFILING
-            if (!waiting) {
-                wait_start = get_sys_cnt_aicpu();
-                waiting = true;
-            }
-#endif
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
             if (last_alive > prev_last_alive) {
@@ -154,24 +80,15 @@ public:
                 prev_last_alive = last_alive;
             } else {
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
-                    LOG_WARN(
-                        "[TaskAllocator] BLOCKED: tasks=%d/%d, heap=%" PRIu64 "/%" PRIu64 ", on=%s, spins=%d",
-                        local_task_id_ - last_alive, window_size_, heap_top_, heap_size_,
-                        blocked_on_heap ? "heap" : "task", spin_count
-                    );
                 }
                 if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
-                    report_deadlock(output_size, blocked_on_heap);
+                    report_deadlock(blocked_on_heap);
                     return {-1, -1, nullptr, nullptr};
                 }
             }
             SPIN_WAIT_HINT();
         }
     }
-
-    // =========================================================================
-    // State queries
-    // =========================================================================
 
     int32_t active_count() const {
         int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
@@ -226,27 +143,12 @@ private:
     // --- Shared ---
     std::atomic<int32_t> *error_code_ptr_ = nullptr;
 
-    // =========================================================================
-    // Internal helpers
-    // =========================================================================
-
-    /**
-     * Commit a task slot: bump local counter and publish to shared memory.
-     * Must only be called after space check has passed.
-     */
     int32_t commit_task() {
         int32_t task_id = local_task_id_++;
         current_index_ptr_->store(local_task_id_, std::memory_order_release);
         return task_id;
     }
 
-    /**
-     * Derive heap_tail_ from the last consumed task's packed_buffer_end.
-     *
-     * Every task has a valid packed_buffer_end (equal to packed_buffer_base
-     * for zero-size allocations), so the last consumed task always determines
-     * the correct heap_tail — no backward scan needed.
-     */
     void update_heap_tail(int32_t last_alive) {
         if (last_alive <= last_alive_seen_) return;
         last_alive_seen_ = last_alive;
@@ -256,11 +158,6 @@ private:
             static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
     }
 
-    /**
-     * Bump the heap pointer for the given allocation size.
-     * Returns the allocated pointer, or nullptr if insufficient space.
-     * When alloc_size == 0, returns current position without advancing.
-     */
     void *try_bump_heap(uint64_t alloc_size) {
         uint64_t top = heap_top_;
         if (alloc_size == 0) {
@@ -275,18 +172,9 @@ private:
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
             } else if (tail > alloc_size) {
-                LOG_DEBUG(
-                    "try_bump_heap wrap-around alloc: top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64, top, tail,
-                    alloc_size
-                );
                 result = heap_base_;
                 heap_top_ = alloc_size;
             } else {
-                LOG_DEBUG(
-                    "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
-                    ", heap_size=%" PRIu64,
-                    top, tail, alloc_size, heap_size_
-                );
                 return nullptr;
             }
         } else {
@@ -294,11 +182,6 @@ private:
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
             } else {
-                LOG_DEBUG(
-                    "try_bump_heap failed (top<tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
-                    ", free_gap=%" PRIu64,
-                    top, tail, alloc_size, tail - top
-                );
                 return nullptr;
             }
         }
@@ -306,66 +189,7 @@ private:
         return result;
     }
 
-#if PTO2_ORCH_PROFILING
-    void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
-        if (waiting) {
-            extern uint64_t g_orch_alloc_wait_cycle;
-            g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
-        }
-        {
-            extern uint64_t g_orch_alloc_atomic_count;
-            g_orch_alloc_atomic_count += spin_count + 1;
-        }
-    }
-#endif
-
-    /**
-     * Report deadlock with targeted diagnostics.
-     */
-    void report_deadlock(int32_t requested_output_size, bool heap_blocked) {
-        int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
-        int32_t active_tasks = local_task_id_ - last_alive;
-        uint64_t htail = heap_tail_;
-
-        LOG_ERROR("========================================");
-        if (heap_blocked) {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted!");
-        } else {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full!");
-        }
-        LOG_ERROR("========================================");
-        LOG_ERROR("No progress after %d spins.", PTO2_ALLOC_SPIN_LIMIT);
-        LOG_ERROR(
-            "  Task ring:  current=%d, last_alive=%d, active=%d/%d (%.1f%%)", local_task_id_, last_alive, active_tasks,
-            window_size_, 100.0 * active_tasks / window_size_
-        );
-        LOG_ERROR(
-            "  Heap ring:  top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", available=%" PRIu64, heap_top_, htail,
-            heap_size_, heap_available()
-        );
-        if (heap_blocked) {
-            LOG_ERROR("  Requested:  %d bytes", requested_output_size);
-        }
-        LOG_ERROR("Diagnosis:");
-        LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d", last_alive, last_alive);
-        LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
-        LOG_ERROR("  1. Task %d still executing (subtasks not complete)", last_alive);
-        LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", last_alive);
-        LOG_ERROR("  3. Scope reference not released (scope_end not called)");
-        LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
-        LOG_ERROR("Solution:");
-        if (heap_blocked) {
-            LOG_ERROR(
-                "  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2
-            );
-            LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
-        } else {
-            LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, active_tasks * 2);
-            LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_tasks * 2);
-        }
-        LOG_ERROR("========================================");
+    void report_deadlock(bool heap_blocked) {
         if (error_code_ptr_) {
             int32_t code = heap_blocked ? PTO2_ERROR_HEAP_RING_DEADLOCK : PTO2_ERROR_FLOW_CONTROL_DEADLOCK;
             error_code_ptr_->store(code, std::memory_order_release);
@@ -373,19 +197,6 @@ private:
     }
 };
 
-// =============================================================================
-// Fanin Spill Pool
-// =============================================================================
-
-/**
- * Fanin spill pool structure
- *
- * True ring buffer for allocating spilled fanin entries.
- * Entries are reclaimed when their consumer tasks become CONSUMED.
- *
- * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
- */
 struct PTO2FaninPool {
     PTO2FaninSpillEntry *base;       // Pool base address
     int32_t capacity;                // Total number of entries
@@ -414,18 +225,6 @@ struct PTO2FaninPool {
     PTO2FaninSpillEntry *alloc() {
         int32_t used = top - tail;
         if (used >= capacity) {
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Fanin Spill Pool Overflow!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("Fanin spill pool exhausted: %d entries alive (capacity=%d).", used, capacity);
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase fanin spill pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
-            LOG_ERROR("========================================");
             if (error_code_ptr) {
                 error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
             }
@@ -528,20 +327,6 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayloa
     );
 }
 
-// =============================================================================
-// Dependency List Pool
-// =============================================================================
-
-/**
- * Dependency list pool structure
- *
- * True ring buffer for allocating linked list entries.
- * Entries are reclaimed when their producer tasks become CONSUMED,
- * as tracked by the orchestrator via dep_pool_mark per task.
- *
- * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
- */
 struct PTO2DepListPool {
     PTO2DepListEntry *base;     // Pool base address
     int32_t capacity;           // Total number of entries
@@ -553,12 +338,6 @@ struct PTO2DepListPool {
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t> *error_code_ptr = nullptr;
 
-    /**
-     *
-     * Initialize dependency list pool
-     * @param base      Pool base address from shared memory
-     * @param capacity  Total number of entries
-     */
     void init(PTO2DepListEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
         base = in_base;
         capacity = in_capacity;
@@ -574,41 +353,13 @@ struct PTO2DepListPool {
         error_code_ptr = in_error_code_ptr;
     }
 
-    /**
-     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
-     * Safe to call multiple times — only advances tail forward.
-     *
-     * @param ring             Ring header (for reading slot dep_pool_mark)
-     * @param sm_last_task_alive Current last_task_alive from shared memory
-     */
     void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
 
-    /**
-     * Ensure dep pool for a specific ring has at least `needed` entries available.
-     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
-     */
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
-    /**
-     * Allocate a single entry from the pool (single-thread per pool instance)
-     *
-     * @return Pointer to allocated entry, or nullptr on fatal error
-     */
     PTO2DepListEntry *alloc() {
         int32_t used = top - tail;
         if (used >= capacity) {
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Dependency Pool Overflow!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("DepListPool exhausted: %d entries alive (capacity=%d).", used, capacity);
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
-            LOG_ERROR("========================================");
             if (error_code_ptr) {
                 error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
             }
@@ -621,25 +372,12 @@ struct PTO2DepListPool {
         return &base[idx];
     }
 
-    /**
-     * Advance the tail pointer, reclaiming dead entries.
-     * Called by the orchestrator based on last_task_alive advancement.
-     */
     void advance_tail(int32_t new_tail) {
         if (new_tail > tail) {
             tail = new_tail;
         }
     }
 
-    /**
-     * Prepend a task ID to a dependency list
-     *
-     * O(1) operation: allocates new entry and links to current head.
-     *
-     * @param current_head  Current list head offset (0 = empty list)
-     * @param task_slot     Task slot to prepend
-     * @return New head offset
-     */
     PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state) {
         PTO2DepListEntry *new_entry = alloc();
         if (!new_entry) return nullptr;
@@ -653,14 +391,6 @@ struct PTO2DepListPool {
     int32_t available() const { return capacity - used(); }
 };
 
-// =============================================================================
-// Ring Set (per-depth aggregate)
-// =============================================================================
-
-/**
- * Groups a TaskAllocator and DepPool into one per-depth unit.
- * PTO2_MAX_RING_DEPTH instances provide independent reclamation per scope depth.
- */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
     PTO2FaninPool fanin_pool;

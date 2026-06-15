@@ -9,53 +9,25 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * PTO Submit Types - Shared submit-contract definitions
- *
- * Header-only definitions shared by orchestration-facing and runtime-facing
- * headers. Keeps orchestration slim (no dependency on pto_runtime2_types.h).
- */
-
 #pragma once
 
 #include <stdint.h>
 
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
 
-/**
- * Subtask slot count: AIC, AIV0, AIV1
- */
 inline constexpr int32_t PTO2_SUBTASK_SLOT_COUNT = 3;
 
-/**
- * Subtask slot indices
- */
 enum class PTO2SubtaskSlot : uint8_t {
     AIC = 0,
     AIV0 = 1,
     AIV1 = 2,
 };
 
-/**
- * Subtask mask bits (for ActiveMask)
- */
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);        // 0x4
 inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all blocks must launch atomically
 
-/**
- * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
- *
- * Multi-subtask tasks (2+ active slots) are all scheduled as MIX, which
- * requires a fully-idle cluster (1 AIC + 2 AIV).  The actual cores used
- * are determined at dispatch time by active_mask — unused cores in the
- * cluster remain idle and available for single-core tasks.
- *
- * DUMMY is a synthetic shape for dep-only tasks (no AICore dispatch). Tasks
- * with an empty core_mask route to a dedicated DUMMY ready queue and are
- * completed inline by the scheduler dispatch loop, bypassing core allocation.
- */
 enum class PTO2ResourceShape : uint8_t {
     AIC = 0,    // Single AIC
     AIV = 1,    // Single AIV
@@ -63,14 +35,8 @@ enum class PTO2ResourceShape : uint8_t {
     DUMMY = 3,  // Dependency-only (no AICore dispatch)
 };
 
-// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
-// allocate a per-shape ready_queue entry / local buffer — it lives in a
-// dedicated queue inside PTO2SchedulerState.
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
-/**
- * Bitmask of active subtask slots + flags, sizeof == 1.
- */
 class ActiveMask {
 public:
     constexpr ActiveMask() = default;
@@ -117,12 +83,6 @@ private:
 
 static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
 
-/**
- * Mixed-task submit contract.
- *
- * Each field holds either a valid kernel ID or INVALID_KERNEL_ID (inactive).
- * At least one slot must be valid.
- */
 struct MixedKernels {
     int32_t aic_kernel_id{INVALID_KERNEL_ID};
     int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
@@ -137,13 +97,6 @@ struct MixedKernels {
     }
 };
 
-/**
- * SPMD launch parameters carried inside Arg.
- *
- * Controls how many logical blocks (SPMD dimension) a single task
- * is expanded into at dispatch time.  Each block receives a unique
- * block_idx in [0, block_num) via the per-dispatch LocalContext.
- */
 class PTO2LaunchSpec {
 public:
     constexpr PTO2LaunchSpec() = default;

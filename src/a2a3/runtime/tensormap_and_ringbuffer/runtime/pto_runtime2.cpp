@@ -9,14 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * PTO Runtime2 - Main Implementation
- *
- * Implements the unified runtime API that combines orchestrator and scheduler.
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
-
 #include "pto_runtime2.h"
 
 #include <stdarg.h>
@@ -27,19 +19,8 @@
 #include <algorithm>
 
 #include "aicpu/device_time.h"
-#include "common/unified_log.h"
-#if PTO2_PROFILING
-#include "aicpu/scope_stats_collector_aicpu.h"
-#endif
 
-// Weak fallback for HOST .so builds (never called, but satisfies linker).
-// The AICPU build links the strong symbol from platform/.../device_time.cpp.
-// Hidden visibility prevents HOST .so from polluting global symbol table.
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-
-// =============================================================================
-// Orchestration Ops Table (function-pointer dispatch for orchestration .so)
-// =============================================================================
 
 static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
     return rt->orchestrator.submit_task(mixed_kernels, args);
@@ -78,24 +59,11 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
     va_end(args);
 }
 
-// Wait for all producers of this tensor to be safe for data access.
-// Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
-// For reads: wait until each producer COMPLETED (done writing).
-// For writes: also wait until all consumers done reading
-//   (fanout_refcount >= fanout_count - 1, excluding scope reference).
-// Uses cycle-based timeout (checked every 1024 spins).
-// Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
     PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
 
-    // Segmented wait: collect up to kSegmentCap producer slots, then flush by
-    // spinning on each. When the segment fills, we wait for the accumulated
-    // batch before continuing to gather more. Dedup is per-segment only; a
-    // producer that appears in two segments is waited on twice, which is
-    // idempotent (task_state is monotonic) and only adds one atomic load on
-    // the second encounter.
     constexpr int kSegmentCap = 64;
     const PTO2TaskSlotState *seg[kSegmentCap];
     int seg_count = 0;
@@ -195,10 +163,6 @@ MAYBE_UNINITIALIZED_END
 
 uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) {
-        unified_log_error(
-            __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
-                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
-        );
         return 0;
     }
 
@@ -216,10 +180,6 @@ uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, 
 
 void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
     if (tensor.buffer.addr == 0) {
-        unified_log_error(
-            __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
-                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
-        );
         return;
     }
 
@@ -234,14 +194,6 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
     memcpy(ptr, &value, elem_size);
 }
 
-// Ops-table entry that hands the call-site captured by PTO2ScopeGuard to the
-// [ScopeStats] collector. The slot is always present in the struct to keep
-// the layout stable; at PTO2_PROFILING=0 we fill nullptr so the orchestration
-// .so's null-check skips it.
-#if PTO2_PROFILING
-static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
-#endif
-
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
     .scope_begin = rt_scope_begin,
@@ -249,30 +201,12 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
     .report_fatal = rt_report_fatal,
-    .log_error = unified_log_error,
-    .log_warn = unified_log_warn,
-    .log_debug = unified_log_debug,
-    .log_info_v = unified_log_info_v,
     .get_tensor_data = get_tensor_data,
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
-#if PTO2_PROFILING
-    .scope_set_site = scope_set_site_impl,
-#else
     .scope_set_site = nullptr,
-#endif
 };
-
-// =============================================================================
-// Runtime Lifecycle (AICPU-only fixup)
-// =============================================================================
-//
-// Layout / init_data / wire / destroy live in
-// runtime/shared/pto_runtime2_init.cpp so the host build can pre-populate the
-// prebuilt arena image. The pieces below — wiring the ops table and the
-// SPMD core counts — depend on the device-side s_runtime_ops global and the
-// AICPU SchedulerContext respectively, so they remain in the AICPU build.
 
 void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;

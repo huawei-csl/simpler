@@ -19,9 +19,6 @@
 #include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
-// runtime-side mirror of the PTO-ISA SdmaEventRecord. SDMA backend is the only
-// allowed holder of this ABI knowledge; the generic scheduler dispatches into
-// the helpers below through the completion ops table.
 struct SdmaEventRecord {
     uint32_t flag;
     uint32_t sq_tail;

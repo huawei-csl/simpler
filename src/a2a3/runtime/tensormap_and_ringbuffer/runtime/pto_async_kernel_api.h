@@ -29,10 +29,6 @@
 #define __gm__
 #endif
 
-// Public surface: get_async_ctx, async_ctx_is_deferred,
-// register_completion_condition, send_notification,
-// save_expected_notification_counter. Everything else lives in
-// pto2::detail and is reserved for backend adapters / internal use.
 namespace pto2::detail {
 
 inline __aicore__ void defer_load_slab(AsyncCtx &ctx) {
@@ -110,11 +106,6 @@ inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
 
 inline __aicore__ bool async_ctx_is_deferred(const AsyncCtx &ctx) { return ctx.task_token.is_valid(); }
 
-// Canonical writer: backend submit handlers build a CompletionToken and pass
-// it here. Writes one DeferredCompletionEntry to the AsyncCtx slab and
-// bumps completion_count. Returns false on overflow (also stores
-// PTO2_ERROR_ASYNC_WAIT_OVERFLOW in ctx.completion_error_code) or when ctx is
-// not currently a deferred context.
 inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const CompletionToken &token) {
     if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         return false;

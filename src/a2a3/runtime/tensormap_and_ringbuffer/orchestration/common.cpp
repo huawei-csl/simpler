@@ -25,10 +25,6 @@
 struct PTO2Runtime;
 
 namespace {
-// Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
-// crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
-// between execution rounds.  All orchestrator threads bind the same rt
-// value, so per-thread storage is unnecessary.
 PTO2Runtime *g_current_runtime = nullptr;
 }  // namespace
 
@@ -40,11 +36,6 @@ extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PT
 // accidentally bind to the AICPU binary's same-named symbol.
 extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() { return g_current_runtime; }
 
-/**
- * Use addr2line to convert an address to file:line information.
- * Uses the -i flag to expand inlines; returns the first line (innermost actual code location).
- * If inlining is present, also returns the outer call chain via inline_chain.
- */
 #ifdef __linux__
 static std::string addr_to_line(const char *executable, void *addr, std::string *inline_chain = nullptr) {
     char cmd[512];
@@ -92,10 +83,6 @@ static std::string addr_to_line(const char *executable, void *addr, std::string 
 }
 #endif
 
-/**
- * Get current stack trace information (including file paths and line numbers).
- * Uses dladdr to locate the shared library for each stack frame, then calls addr2line with relative addresses.
- */
 std::string get_stacktrace(int skip_frames) {
     (void)skip_frames;  // May be unused on non-Linux platforms
     std::string result;
@@ -174,11 +161,6 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
     line_(line) {}
 
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line) {
-    LOG_ERROR("\n========================================");
-    LOG_ERROR("Assertion failed: %s", condition);
-    LOG_ERROR("Location: %s:%d", file, line);
-    LOG_ERROR("%s", get_stacktrace(2).c_str());
-    LOG_ERROR("========================================\n");
 
     throw AssertionError(condition, file, line);
 }

@@ -8,24 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - Shared Memory Implementation
- *
- * Implements shared memory allocation, initialization, and management
- * for Orchestrator-Scheduler communication.
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #include "pto_shared_memory.h"
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include "common/unified_log.h"
-
-// =============================================================================
-// Size Calculation
-// =============================================================================
 
 uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
@@ -50,10 +37,6 @@ uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_win
 
     return size;
 }
-
-// =============================================================================
-// Creation and Destruction
-// =============================================================================
 
 void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
     char *ptr = (char *)sm_base;
@@ -121,11 +104,6 @@ void PTO2SharedMemoryHandle::destroy() {
     }
 }
 
-// =============================================================================
-// Initialization
-// =============================================================================
-//
-// no need init data in pool, init pool data when used
 void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
@@ -168,13 +146,6 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
 
-    // Per-ring slot_states reset. Previously lived in
-    // PTO2SchedulerState::RingSchedState::init(), but it writes into
-    // ring->slot_states[] which is SM-side storage — keeping it here lets
-    // host-side prebuilt-arena init skip all SM dereferences.
-    // bind_ring() pins the ring_id (slot-invariant after this point);
-    // reset_for_reuse() prepares dynamic fanout/refcount fields so the first
-    // submit doesn't need an explicit reset.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto &ring = header->rings[r];
         for (uint64_t i = 0; i < task_window_sizes[r]; i++) {
@@ -186,37 +157,11 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     }
 }
 
-// =============================================================================
-// Debug Utilities
-// =============================================================================
-
 void PTO2SharedMemoryHandle::print_layout() {
     if (!header) return;
 
-    PTO2SharedMemoryHeader *h = header;
-
-    LOG_INFO_V0("=== PTO2 Shared Memory Layout ===");
-    LOG_INFO_V0("Base address:       %p", sm_base);
-    LOG_INFO_V0("Total size:         %" PRIu64 " bytes", h->total_size);
-    LOG_INFO_V0("Ring depth:         %d", PTO2_MAX_RING_DEPTH);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        LOG_INFO_V0("Ring %d:", r);
-        LOG_INFO_V0("  task_window_size: %" PRIu64, h->rings[r].task_window_size);
-        LOG_INFO_V0("  heap_size:        %" PRIu64 " bytes", h->rings[r].heap_size);
-        LOG_INFO_V0(
-            "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->rings[r].task_descriptors_offset,
-            h->rings[r].task_descriptors_offset
-        );
-        LOG_INFO_V0("  current_task_idx: %d", h->rings[r].fc.current_task_index.load(std::memory_order_acquire));
-        LOG_INFO_V0("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
     }
-    LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
-    LOG_INFO_V0("Error state:");
-    LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_code:   %d", h->sched_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_thread: %d", h->sched_error_thread.load(std::memory_order_relaxed));
-    LOG_INFO_V0("================================");
 }
 
 bool PTO2SharedMemoryHandle::validate() {

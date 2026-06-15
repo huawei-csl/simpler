@@ -17,15 +17,8 @@
 #include <stdexcept>
 #include <string>
 
-/**
- * Get the current stack trace, including file paths and line numbers.
- * Implemented in common.cpp.
- */
 std::string get_stacktrace(int skip_frames = 1);
 
-/**
- * Assertion failure exception with condition, file, line, and stack trace.
- */
 class AssertionError : public std::runtime_error {
 public:
     AssertionError(const char *condition, const char *file, int line);
@@ -40,17 +33,8 @@ private:
     int line_;
 };
 
-/**
- * Assertion failure handler.
- * Implemented in common.cpp.
- */
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line);
 
-/**
- * debug_assert macro:
- * checks the condition in debug builds and throws with a stack trace on failure.
- * It is a no-op in release builds (NDEBUG).
- */
 #ifdef NDEBUG
 #define debug_assert(cond) ((void)0)
 #else
@@ -62,10 +46,6 @@ private:
     } while (0)
 #endif
 
-/**
- * always_assert macro:
- * checks the condition in both debug and release builds.
- */
 #define always_assert(cond)                         \
     do {                                            \
         if (!(cond)) {                              \

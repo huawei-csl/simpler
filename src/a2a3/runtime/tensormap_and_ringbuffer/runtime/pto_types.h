@@ -8,19 +8,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Orchestration Build Graph Types - Data structures for orchestration runtime extensions
- *
- * Standalone header defining orchestration-specific types for:
- * - TaskOutputTensors: Return value from submit containing materialized output Tensors
- * - Arg: Aggregated argument container for pto_submit_task API
- *
- * Tensor descriptor types (Tensor, PTOBufferHandle, TensorCreateInfo) are
- * defined in tensor.h.
- *
- * This header is independent of orch_build_graph_runtime.h to allow inclusion from runtime.h
- * without type conflicts (Handshake, TensorPair, HostApi).
- */
 
 #ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_
 #define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_
@@ -37,11 +24,6 @@
 #include "tensor.h"
 #include "tensor_arg.h"
 
-// Task arguments — alias the common CORE_MAX_* constants (single source of
-// truth in src/common/task_interface/arg_direction.h, transitively included
-// via task_args.h above). Keeping the MAX_TENSOR_ARGS / MAX_SCALAR_ARGS names
-// because they are referenced widely in this runtime (pto_runtime2_types.h,
-// pto2_dispatch_payload.h, intrinsic.h comments).
 #define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
 #define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 
@@ -57,44 +39,11 @@ enum class CompletionType : int32_t {
     COUNTER = 0,
 };
 
-// =============================================================================
-// Task Output Tensors (return value from submit)
-// =============================================================================
-
 enum class PTO2ScopeMode : uint8_t {
     AUTO = 0,
     MANUAL = 1,
 };
 
-/**
- * TaskOutputTensors — returned by submit, holds materialized output Tensors.
- *
- * Only runtime-created outputs are stored here, indexed in add_output order.
- *
- * The underlying storage is uninitialized; only output_count elements are
- * valid after submit returns.  This avoids default-constructing Tensor[]
- * on the hot path (2 KB of unnecessary zeroing per submit).
- *
- * Users must hold a named TaskOutputTensors variable and borrow via get_ref();
- * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
- *
- * LIFETIME — single-scope only:
- *   Internally this class stores pointers into the submitting task's payload
- *   (PTO2TaskPayload::tensors[]), which lives in a ring-buffer slot. After
- *   scope_end the slot becomes eligible for reuse, and a later submit will
- *   overwrite the same Tensor storage in place. Therefore the
- *   TaskOutputTensors instance, the const Tensor& returned by get_ref(), and
- *   any pointer derived from either MUST NOT outlive the PTO2_SCOPE in which
- *   submit was called — do not move/copy them to outer-scope variables, do
- *   not capture references by std::reference_wrapper or raw pointers across
- *   scope boundaries.
- *
- *   This invariant is intentionally not enforced at runtime: a reused slot
- *   simply carries a different but valid owner_task_id, so checking
- *   owner_task_id cannot distinguish "still mine" from "silently aliased to
- *   an unrelated task". Misuse manifests as a wrong-tensor read with no
- *   diagnostic.
- */
 class TaskOutputTensors {
 public:
     TaskOutputTensors() :
@@ -131,16 +80,8 @@ private:
 
 using TaskSubmitResult = TaskOutputTensors;
 
-// =============================================================================
-// Argument Types (for pto_submit_task API)
-// =============================================================================
-
 // TensorArgType is defined in tensor_arg.h (included above)
 
-/**
- * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.
- * The active member is determined by TensorArgType (OUTPUT → create_info, else → ptr).
- */
 union TensorRef {
     const Tensor *ptr;
     const TensorCreateInfo *create_info;
@@ -148,29 +89,6 @@ union TensorRef {
         ptr(nullptr) {}
 };
 
-/**
- * Aggregated argument container for pto_submit_task
- *
- * Inherits storage from TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>.
- * Each tensor slot stores a TensorRef union (Tensor* or TensorCreateInfo)
- * discriminated by the corresponding tag().
- * Tensors are dispatched first in kernel args, followed by scalars.
- *
- * Output arguments follow two distinct ownership models:
- * - add_output(const TensorCreateInfo&): OUTPUT — runtime allocates buffer
- *   and materializes a new Tensor, returned via TaskOutputTensors.
- * - add_inout(const Tensor&): INOUT — reuses an existing Tensor as the write target.
- *
- * Example:
- *   Tensor x = make_tensor_external(dev_a, shapes, 2);
- *   TensorCreateInfo ci(shapes, 2);  // must outlive submit
- *   Arg args;
- *   args.add_input(x);
- *   args.add_output(ci);
- *   args.add_scalar(some_value);
- *   TaskOutputTensors outs = rt_submit_aic_task(kernel_id, args);
- *   const Tensor& y = outs.get_ref(0);
- */
 struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
     bool has_error{false};
     const char *error_msg{nullptr};
@@ -220,9 +138,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
     }
 
-    /// Batch add outputs — all Tensor or all TensorCreateInfo:
-    ///   add_output(ci1, ci2)         — runtime allocates buffers (OUTPUT)
-    ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
     template <typename... Args>
     void add_output(Args &&...args) {
         if (!check_add_tensor_valid<true>(args...)) return;
@@ -252,24 +167,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
-    /**
-     * Attach an explicit dependency array. The Arg stores (ptr, count) without
-     * copying — the caller's array must outlive the submit (same lifetime rule
-     * as add_input/add_output, which also store pointers).
-     *
-     * count == 0 is a valid "set empty" — it clears any previously stored deps
-     * and returns. This lets callers that build the dep set conditionally pass
-     * the result through unguarded, including in the no-dep branch:
-     *   PTO2TaskId deps[3];
-     *   uint32_t n = 0;
-     *   if (have_prev) deps[n++] = prev;
-     *   if (is_last)   deps[n++] = alloc;
-     *   args.set_dependencies(deps, n);    // safe even if n == 0
-     *
-     * For count > 0, the call is single-shot: a second non-empty call after
-     * deps are already set will fail with set_error(). Use count == 0 first
-     * if you need to re-set.
-     */
     void set_dependencies(const PTO2TaskId *deps, uint32_t count) {
         if (count == 0) {
             explicit_deps_ = nullptr;
@@ -297,13 +194,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
 
-    /**
-     * Add scalar values. Types are deduced per argument; each value is
-     * bit-cast to uint64_t for storage. Mixed types are allowed:
-     *
-     *   args.add_scalar(uint64_val);                  // single
-     *   args.add_scalar(3.14f, int32_t(42), 7u);     // mixed batch
-     */
     template <typename... Args>
     void add_scalar(Args... args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
@@ -324,12 +214,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         scalar_count_ += count;
     }
 
-    /**
-     * Zero-extend int32 bit patterns into uint64 scalar slots.
-     * Negative values are treated as their unsigned 32-bit representation
-     * (e.g., -1 → 0x00000000FFFFFFFF, not 0xFFFFFFFFFFFFFFFF).
-     * Uses NEON to process 4 elements per iteration on aarch64.
-     */
     void add_scalars_i32(const int32_t *values, int count) {
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
@@ -356,10 +240,6 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         scalar_count_ += count;
     }
 
-    /**
-     * Copy scalars from another Arg's scalar array.
-     * Useful when multiple tasks share the same scalar data (e.g., block indices).
-     */
     void copy_scalars_from(const Arg &src, int src_offset, int count) {
         if (src_offset + count > src.scalar_count_) {
             set_error("Source scalar range out of bounds in copy_scalars_from");

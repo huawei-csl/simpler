@@ -36,17 +36,6 @@ enum class SdmaOp : uint8_t {
     TPUT = 1,
 };
 
-// SdmaRequestDescriptor bundles everything send_request_entry needs to drive
-// one SDMA transfer + completion registration. It is a template because the
-// destination / source / scratch types carry tensor shape & stride at compile
-// time; the SdmaTget() / SdmaTput() helpers below let callers skip the
-// template arguments.
-//
-// sync_id selects which event-record slot inside the workspace the engine
-// writes into. Concurrent dispatches must use distinct sync_ids; today every
-// caller submits one request per kernel invocation so passing 0 is safe.
-// Future work (see .docs/25.comm-api-refactor/03.implementation-plan.md §5.2)
-// will fold sync_id allocation into the adapter.
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 struct SdmaRequestDescriptor {
     SdmaOp op;
@@ -118,10 +107,6 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
 
 }  // namespace pto2::detail
 
-// SDMA overload of the runtime's send_request_entry. Submits the descriptor
-// to PTO-ISA, then registers the resulting AsyncEvent's GM flag(s) into the
-// AsyncCtx deferred-wait slab and flushes. Returns false on submit/session
-// failure (also records the error in ctx.completion_error_code).
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 inline __aicore__ bool
 send_request_entry(AsyncCtx &ctx, SdmaRequestDescriptor<DstTensor, SrcTensor, ScratchTileT> desc) {
