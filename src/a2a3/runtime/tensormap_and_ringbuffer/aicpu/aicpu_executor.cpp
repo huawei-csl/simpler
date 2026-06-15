@@ -22,6 +22,9 @@
 #include <sys/mman.h>
 #endif
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
@@ -172,6 +175,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return 0;
     }
 
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, uint32_t(sched_getcpu()));
+
     LOG_INFO_V0("AicpuExecutor: Initializing");
 
     if (runtime == nullptr) {
@@ -240,6 +245,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
             DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
             const bool reload_so = runtime->register_new_callable_id();
+
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, DLL_loading, reload_so);
 
             if (reload_so) {
                 LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
@@ -432,6 +439,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
             }
 
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Allocating, 0);
+
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
             // reused above.
@@ -573,6 +582,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, thread_idx);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
@@ -710,6 +720,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
@@ -724,6 +735,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
@@ -797,6 +809,58 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 // ===== Public Entry Point =====
 
 /**
+ * init tracr profiler
+ * 
+ * NOTE: make sure g_TraCR_thread_idx starts at 0 and follows in the positive direction
+ */
+inline void TRACR_START() {
+    g_TraCR_thread_idx = g_TraCR_thread_idx_counter.fetch_add(1, std::memory_order_relaxed);
+
+    if (g_TraCR_thread_idx == 0) {
+        INSTRUMENTATION_START();
+    } else {
+        INSTRUMENTATION_THREAD_INIT();
+    }
+}
+
+/**
+ * finalizing tracr function
+ * 
+ * NOTE: make shure g_TraCR_thread_idx starts at 0 and follows in the positive direction
+ */
+inline void TRACR_FINALIZE(Runtime *runtime) {
+    (void)(runtime);
+
+#ifdef ENABLE_TRACR
+    LOG_INFO_V9("[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx, runtime->tracrData_);
+
+    if (tracrThread->_traceIdx > 0) {
+        TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->tracrData_);
+        const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
+
+        std::memcpy(
+            &tracrData[g_TraCR_thread_idx * TraCR::CAPACITY], 
+            tracrThread->_traces.data(),
+            payload_size
+        );
+    }
+
+    size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->tracrDataSizes_);
+    tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
+#endif
+
+    if (g_TraCR_thread_idx == 0) {
+        INSTRUMENTATION_END();
+        g_TraCR_thread_idx_counter.store(0, std::memory_order_relaxed);
+    } else {
+        INSTRUMENTATION_THREAD_FINALIZE();
+    }
+
+    g_TraCR_thread_idx = -1;
+}
+
+
+/**
  * aicpu_execute - Main AICPU kernel execution entry point
  *
  * This is called by DynTileFwkBackendKernelServer in kernel.cpp.
@@ -816,6 +880,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
+
+    // INIT TraCR all threads coming in
+    TRACR_START();
+    LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, sched_getcpu(), INSTRUMENTATION_ACTIVE);
 
     g_aicpu_executor.init(runtime);
 
@@ -838,6 +906,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
+
+    INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
+    // Finalize TraCR all threads coming in
+    TRACR_FINALIZE(runtime);
 
     if (runtime_rc != 0) {
         LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
