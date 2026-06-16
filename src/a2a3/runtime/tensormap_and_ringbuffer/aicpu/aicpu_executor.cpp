@@ -52,10 +52,10 @@
 #include "callable.h"
 
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
-#include "scheduler/scheduler_types.h"
+#include "scheduler_types.h"
 
 // Scheduler context class
-#include "scheduler/scheduler_context.h"
+#include "scheduler_context.h"
 
 typedef void (*DeviceOrchestrationFunc)(const ChipStorageTaskArgs &orch_args);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);

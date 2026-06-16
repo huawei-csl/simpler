@@ -15,7 +15,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "scheduler_types.h"
 
-#include "scheduler/pto_scheduler.h"
+#include "pto_scheduler.h"
 
 #include "aicore_completion_mailbox.h"
 #include "pto2_dispatch_payload.h"

@@ -436,7 +436,7 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 ### Code Locations
 
 - Macro definitions: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2_types.h`
-- Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_context.h`
+- Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler_context.h`
 - Orchestrator profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
 - TensorMap profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h`
 

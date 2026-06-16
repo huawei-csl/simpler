@@ -538,7 +538,7 @@ This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, e
 
 ### 8.5 SchedulerContext
 
-All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
+All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
 
 Public surface (called from `AicpuExecutor::init/run/deinit`):
 

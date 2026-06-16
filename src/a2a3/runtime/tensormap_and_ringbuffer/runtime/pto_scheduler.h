@@ -367,8 +367,15 @@ struct PTO2SchedulerState
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
 
-        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
-        void destroy();
+        bool init_data_from_layout(void *sm_dev_base, int32_t ring_id)
+        {
+            ring = pto2_sm_layout::ring_header_addr(sm_dev_base, ring_id);
+            last_task_alive = 0;
+            advance_lock.store(0, std::memory_order_relaxed);
+            return true;
+        }
+
+        void destroy() { ring = nullptr; }
 
         void sync_to_sm()
         {
