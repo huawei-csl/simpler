@@ -54,8 +54,8 @@
 // Wiring queue
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
 
-// Fanin storage
-#define PTO2_FANIN_INLINE_CAP 64
+// Fanin storage — absolute max number of unique fanin dependencies per task.
+#define PTO2_MAX_FANIN 16
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
@@ -93,12 +93,6 @@ struct PTO2OutputLayout
 };
 
 struct PTO2TaskSlotState;  // Forward declaration
-struct PTO2FaninPool;      // Forward declaration
-struct PTO2FaninSpillEntry
-{
-    PTO2TaskSlotState *slot_state;
-};
-static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
 
 struct PTO2DepListEntry
 {
@@ -121,14 +115,12 @@ struct PTO2TaskDescriptor
 
 struct PTO2TaskPayload
 {
-    // === Cache lines 0-8 (576B) — metadata + inline fanin ===
+    // === Cache lines 0-2 (192B) — metadata + fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
-    PTO2FaninPool *fanin_spill_pool{nullptr};
-    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
+    int32_t fanin_count{0};  // Number of valid entries in fanin_slot_states
+    PTO2TaskSlotState *fanin_slot_states[PTO2_MAX_FANIN];
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 41-44 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
@@ -163,11 +155,9 @@ struct PTO2TaskPayload
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
-static_assert(offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata");
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
-static_assert(offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor), "scalars must immediately follow tensors");
-static_assert(sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t), "PTO2TaskPayload size must stay on the baseline cache-line footprint");
+static_assert(offsetof(PTO2TaskPayload, fanin_slot_states) == 16, "fanin array must follow metadata words");
+static_assert(offsetof(PTO2TaskPayload, scalars) == offsetof(PTO2TaskPayload, tensors) + MAX_TENSOR_ARGS * sizeof(Tensor), "scalars must immediately follow tensors");
+static_assert(sizeof(PTO2TaskPayload) == offsetof(PTO2TaskPayload, scalars) + MAX_SCALAR_ARGS * sizeof(uint64_t), "no trailing padding after scalars");
 
 struct alignas(64) PTO2TaskSlotState
 {

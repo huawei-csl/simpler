@@ -243,154 +243,26 @@ private:
     }
 };
 
-struct PTO2FaninPool
-{
-    PTO2FaninSpillEntry *base;       // Pool base address
-    int32_t capacity;                // Total number of entries
-    int32_t top;                     // Linear next-allocation counter (starts from 1)
-    int32_t tail;                    // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;              // Peak concurrent usage (top - tail)
-    int32_t reclaim_task_cursor{0};  // Last task id scanned for reclaim on this pool
-
-    std::atomic<int32_t> *error_code_ptr = nullptr;
-
-    void init(PTO2FaninSpillEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr)
-    {
-        base = in_base;
-        capacity = in_capacity;
-        top = 1;
-        tail = 1;
-        high_water = 0;
-        reclaim_task_cursor = 0;
-        base[0].slot_state = nullptr;
-        error_code_ptr = in_error_code_ptr;
-    }
-
-    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive)
-    {
-        if (sm_last_task_alive <= reclaim_task_cursor) return;
-
-        int32_t scan_end = sm_last_task_alive;
-        for (int32_t task_id = reclaim_task_cursor; task_id < scan_end; ++task_id)
-        {
-            PTO2TaskPayload &payload = ring.get_payload_by_task_id(task_id);
-            if (payload.fanin_spill_pool != this) continue;
-
-            int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
-            int32_t spill_edge_count = payload.fanin_actual_count - inline_count;
-            if (spill_edge_count > 0) advance_tail(payload.fanin_spill_start + spill_edge_count);
-        }
-        reclaim_task_cursor = scan_end;
-    }
-
-    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed)
-    {
-        if (available() >= needed) return true;
-
-        int spin_count = 0;
-        int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
-        while (available() < needed)
-        {
-            reclaim(ring, prev_last_alive);
-            if (available() >= needed) return true;
-
-            spin_count++;
-
-            int32_t cur_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
-            if (cur_last_alive > prev_last_alive)
-            {
-                spin_count = 0;
-                prev_last_alive = cur_last_alive;
-            }
-
-            if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT)
-            {
-                latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
-                return false;
-            }
-            SPIN_WAIT_HINT();
-        }
-        return true;
-    }
-
-    PTO2FaninSpillEntry *alloc()
-    {
-        int32_t used = top - tail;
-        if (used >= capacity)
-        {
-            if (error_code_ptr) error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
-            return nullptr;
-        }
-        int32_t idx = top % capacity;
-        top++;
-        used++;
-        if (used > high_water) high_water = used;
-        return &base[idx];
-    }
-
-    void advance_tail(int32_t new_tail)
-    {
-        if (new_tail > tail) tail = new_tail;
-    }
-
-    int32_t used() const
-    {
-        return top - tail;
-    }
-
-    int32_t available() const
-    {
-        return capacity - used();
-    }
-};
-
 template <typename Fn>
 using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
 
 template <typename Fn>
 using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
 
-template <typename InlineSlots, typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn)
+template <typename Slots, typename Fn>
+inline PTO2FaninForEachReturn<Fn> for_each_fanin_in(Slots &&slot_states, int32_t fanin_count, Fn &&fn)
 {
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
     static_assert(std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>, "fanin callback must return void or bool");
 
     if constexpr (std::is_void_v<FaninCallbackResult>)
     {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) fn(inline_slot_states[i]);
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) return;
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) fn(first[i].slot_state);
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) fn(spill_pool.base[i].slot_state);
-        return;
+        for (int32_t i = 0; i < fanin_count; i++) fn(slot_states[i]);
     }
     else
     {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++)
-            if (!fn(inline_slot_states[i])) return false;
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) return true;
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++)
-            if (!fn(first[i].slot_state)) return false;
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++)
-            if (!fn(spill_pool.base[i].slot_state)) return false;
+        for (int32_t i = 0; i < fanin_count; i++)
+            if (!fn(slot_states[i])) return false;
         return true;
     }
 }
@@ -398,7 +270,7 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(InlineSlots &&inline_sl
 template <typename Fn>
 inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn)
 {
-    return for_each_fanin_storage(payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start, *payload.fanin_spill_pool, static_cast<Fn &&>(fn));
+    return for_each_fanin_in(payload.fanin_slot_states, payload.fanin_count, static_cast<Fn &&>(fn));
 }
 
 struct PTO2DepListPool
@@ -513,7 +385,6 @@ struct PTO2DepListPool
 struct PTO2RingSet
 {
     PTO2TaskAllocator task_allocator;
-    PTO2FaninPool fanin_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H

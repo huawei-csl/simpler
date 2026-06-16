@@ -459,7 +459,7 @@ struct PTO2SchedulerState
             PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
             int ring_id = ws->ring_id;
             auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
+            int32_t wfanin = ws->payload->fanin_count;
 
             if (wfanin > 0 && rss.dep_pool.available() < wfanin)
             {
@@ -602,7 +602,7 @@ struct PTO2SchedulerState
 
         // Self consumed check
         check_and_handle_consumed(slot_state);
-        return payload->fanin_actual_count;
+        return payload->fanin_count;
     }
 
     // === Cold-path API ===

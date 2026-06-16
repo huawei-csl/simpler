@@ -46,34 +46,20 @@ struct PTO2PreparedTask
 
 struct PTO2FaninBuilder
 {
-    PTO2FaninBuilder(PTO2FaninPool &spill_pool) :
-        count(0),
-        spill_start(0),
-        spill_pool(spill_pool)
-    {}
     int32_t count{0};
-    int32_t spill_start{0};
-    PTO2FaninPool &spill_pool;
-    PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
+    PTO2TaskSlotState *slots[PTO2_MAX_FANIN];
 
     template <typename Fn>
     PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const
     {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+        return for_each_fanin_in(slots, count, static_cast<Fn &&>(fn));
     }
 
     bool contains(PTO2TaskSlotState *prod_state) const
     {
-        bool found = false;
-        for_each([&](PTO2TaskSlotState *slot_state) {
-            if (slot_state == prod_state)
-            {
-                found = true;
-                return false;
-            }
-            return true;
-        });
-        return found;
+        for (int32_t i = 0; i < count; i++)
+            if (slots[i] == prod_state) return true;
+        return false;
     }
 };
 
@@ -84,14 +70,13 @@ inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code,
 inline void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 inline bool prepare_task(PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask, PTO2PreparedTask *out);
 inline PTO2OutputLayout calculate_output_layout(const Arg &args);
-inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id);
+inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder);
 inline bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator);
 inline void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int32_t scalar_count);
 inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id);
 
 struct PTO2OrchestratorLayout
 {
-    size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
@@ -156,11 +141,6 @@ struct PTO2OrchestratorState
         layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
         layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
 
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            const size_t fanin_pool_bytes = PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-            layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
-        }
         layout.off_scope_tasks = arena.reserve(static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *));
         layout.off_scope_begins = arena.reserve(static_cast<size_t>(layout.scope_stack_capacity) * sizeof(int32_t), alignof(int32_t));
         layout.tensor_map = PTO2TensorMap::reserve_layout_default(arena, task_window_sizes);
@@ -191,11 +171,6 @@ struct PTO2OrchestratorState
             auto *last_alive_dev = pto2_sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
 
             orch->rings[r].task_allocator.init(task_descs_dev, static_cast<int32_t>(task_window_size), cur_idx_dev, last_alive_dev, ring_heap_base, heap_size, orch_err);
-
-            const size_t fanin_pool_bytes = PTO2_ALIGN_UP(static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
-            auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-            memset(fanin_entries, 0, fanin_pool_bytes);
-            orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
         }
 
         if (!orch->tensor_map.init_data_from_layout(layout.tensor_map, arena)) return false;
@@ -212,7 +187,6 @@ struct PTO2OrchestratorState
     void wire_arena_pointers(const PTO2OrchestratorLayout &layout, DeviceArena &arena, PTO2SchedulerState *scheduler_arg)
     {
         auto *orch = this;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) orch->rings[r].fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
         orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
         orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
         orch->scope_begins = static_cast<int32_t *>(arena.region_ptr(layout.off_scope_begins));
@@ -224,7 +198,6 @@ struct PTO2OrchestratorState
     {
         auto *orch = this;
         orch->tensor_map.destroy();
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) orch->rings[r].fanin_pool.base = nullptr;
         orch->scope_tasks = nullptr;
         orch->scope_begins = nullptr;
     }
@@ -384,9 +357,7 @@ struct PTO2OrchestratorState
         TaskOutputTensors outputs;
         outputs.set_task_id(prepared.task_id);
         payload.init(args, outputs, prepared.alloc_result, layout);
-        payload.fanin_actual_count = 0;
-        payload.fanin_spill_start = 0;
-        payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
+        payload.fanin_count = 0;
 
         if (prepared.slot_state != nullptr) prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
         orch->inline_completed_tasks++;
@@ -396,15 +367,6 @@ struct PTO2OrchestratorState
     void mark_done()
     {
         auto *orch = this;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            int32_t total_tasks = orch->rings[r].task_allocator.active_count();
-            if (total_tasks > 0)
-            {}
-            auto &fanin_pool = orch->rings[r].fanin_pool;
-            if (fanin_pool.top > 1)
-            {}
-        }
         orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
         orch->scope_tasks_size = 0;
         orch->scope_stack_top = -1;
@@ -440,32 +402,15 @@ inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code,
     (void)message;
 }
 
-inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id)
+inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder)
 {
     if (fanin_builder->contains(prod_state)) return true;
-
-    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP)
+    if (fanin_builder->count >= PTO2_MAX_FANIN)
     {
-        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
-        return true;
-    }
-
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1))
-    {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+        orch_mark_fatal(orch, PTO2_ERROR_DEPENDENCY_OVERFLOW);
         return false;
     }
-    int32_t spill_idx = fanin_pool.top;
-    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
-    if (entry == nullptr)
-    {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
-    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) fanin_builder->spill_start = spill_idx;
-    entry->slot_state = prod_state;
-    fanin_builder->count++;
+    fanin_builder->slots[fanin_builder->count++] = prod_state;
     return true;
 }
 
@@ -579,7 +524,7 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
         dep_gen_aicpu_record_submit(task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8, static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data()), kernel_ids_capture);
     }
 
-    PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
+    PTO2FaninBuilder fanin_builder;
 
     int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
     orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
@@ -597,7 +542,7 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) continue;
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(orch, producer_slot_state, &fanin_builder, ring_id)) return result;
+        if (!append_fanin_or_fail(orch, producer_slot_state, &fanin_builder)) return result;
     }
 
     DepInputs dep_inputs{
@@ -606,7 +551,7 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
         PTO2TaskSlotState *prod_state = &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
+        return append_fanin_or_fail(orch, prod_state, &fanin_builder);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) return result;
@@ -621,15 +566,10 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    for_each_fanin_storage(fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool, [](PTO2TaskSlotState *producer) {
-        producer->fanout_count++;
-    });
+    for (int32_t i = 0; i < fanin_builder.count; i++) fanin_builder.slots[i]->fanout_count++;
 
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    payload.fanin_actual_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+    payload.fanin_count = fanin_builder.count;
+    for (int32_t i = 0; i < fanin_builder.count; i++) payload.fanin_slot_states[i] = fanin_builder.slots[i];
 
     payload.init(args, result, prepared.alloc_result, layout);
 
