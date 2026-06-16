@@ -63,7 +63,7 @@
  *     compiled, ran without error, and produced wrong output. Use
  *     `get_sub_block_id(args)` instead, which reads from the runtime's
  *     `GlobalContext.sub_block_id` that the scheduler initializes per
- *     AIV core in `scheduler_cold_path.cpp::SchedulerContext::init`.
+ *     AIV core in `scheduler_context.h::SchedulerContext::init`.
  *
  *   - `get_block_idx()` and `get_block_num()` are not redirected to
  *     simpler's LocalContext either — use the `(args)` variants below

@@ -147,7 +147,7 @@ struct PTO2OrchestratorState
         return scope_stack_top >= manual_begin_depth;
     }
 
-    // === Cold-path API (defined in pto_orchestrator.cpp) ===
+    // === Cold-path API ===
 
     static PTO2OrchestratorLayout reserve_layout(DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH], int32_t dep_pool_capacity)
     {
@@ -413,7 +413,7 @@ struct PTO2OrchestratorState
 };
 
 // -----------------------------------------------------------------------------
-// Helpers moved from pto_orchestrator.cpp
+// Helpers
 // -----------------------------------------------------------------------------
 
 inline int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code)

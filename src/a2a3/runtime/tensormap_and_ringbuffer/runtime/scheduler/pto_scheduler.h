@@ -598,7 +598,7 @@ struct PTO2SchedulerState
         return payload->fanin_actual_count;
     }
 
-    // === Cold-path API (defined in pto_scheduler.cpp) ===
+    // === Cold-path API ===
 
     static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity)
     {
