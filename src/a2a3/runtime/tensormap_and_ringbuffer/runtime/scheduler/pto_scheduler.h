@@ -56,12 +56,18 @@ extern "C" bool is_scope_stats_enabled();
 #endif
 
 
-// Implementation for the pending task queue, it's circular because there is no upper bound on tasks pushed here
+// Implementation for the pending task queue, it's circular because there is no upper bound on tasks pushed here.
+// MAX_QUEUE_SIZE must be >= the maximum simultaneous occupancy: with INDEP_ORCH all tasks pile up before any
+// dispatch, so the worst case is PTO2_SCOPE_TASKS_CAP (= PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH).
 template <class T> class circularBufferQueue
 {
-    private: 
+    private:
 
+#ifdef INDEP_ORCH
+    static constexpr size_t MAX_QUEUE_SIZE = PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH;
+#else
     static constexpr size_t MAX_QUEUE_SIZE = 2048;
+#endif
     uint64_t front = 0;
     uint64_t rear = 0;
     T*  arr[MAX_QUEUE_SIZE];
@@ -82,7 +88,11 @@ template <class T> class arrayQueue
 {
     private:
     
+#ifdef INDEP_ORCH
+    static constexpr size_t MAX_QUEUE_SIZE = PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH;
+#else
     static constexpr size_t MAX_QUEUE_SIZE = 65536;
+#endif
 
     uint64_t front  = 0;
     uint64_t rear = 0;
