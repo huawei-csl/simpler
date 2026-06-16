@@ -94,12 +94,6 @@ struct PTO2OutputLayout
 
 struct PTO2TaskSlotState;  // Forward declaration
 
-struct PTO2DepListEntry
-{
-    PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
-    PTO2DepListEntry *next;         // next entry
-};
-
 struct PTO2TaskDescriptor
 {
     // Mixed-task identification (encodes ring_id in upper 32 bits)
@@ -161,31 +155,27 @@ static_assert(sizeof(PTO2TaskPayload) == offsetof(PTO2TaskPayload, scalars) + MA
 
 struct alignas(64) PTO2TaskSlotState
 {
-    // Fanout lock + list (accessed together under lock in on_task_complete)
-    std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;              // 1 (owning scope) + number of consumers
+    // Fanout: tracks producer->CONSUMED transition. Incremented by the
+    // orchestrator (+1 sentinel and once per consumer of this slot) and
+    // matched by release_producer in on_task_release.
+    int32_t fanout_count;
+    std::atomic<int32_t> fanout_refcount;
 
-    PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
-
-    // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED/CONSUMED
-
-    // Fanin (accessed together in release_fanin_and_check_ready)
-    std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
-    int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
-
-    // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+    // Task state (PENDING/COMPLETED/CONSUMED). Polling readiness reads
+    // task_state on producer slots.
+    std::atomic<PTO2TaskState> task_state;
 
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
+
+    // Intrusive linkage for the thread-0 pending-readiness queue.
+    PTO2TaskSlotState *next_pending{nullptr};
 
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     uint8_t ring_id;         // Ring layer (immutable after init)
     std::atomic<bool> any_subtask_deferred{false};
     uint8_t _async_pad{0};
-    int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -205,32 +195,15 @@ struct alignas(64) PTO2TaskSlotState
 
     void reset_for_reuse()
     {
-        fanout_lock.store(0, std::memory_order_relaxed);
         fanout_count = 1;
-        fanout_head = nullptr;
-        fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-    }
-
-    void lock_fanout()
-    {
-        for (;;)
-        {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) SPIN_WAIT_HINT();
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
-        }
-    }
-
-    void unlock_fanout()
-    {
-        fanout_lock.store(0, std::memory_order_release);
+        next_pending = nullptr;
     }
 };
 
-static_assert(sizeof(PTO2TaskSlotState) == 64);
+static_assert(sizeof(PTO2TaskSlotState) <= 128, "slot state should fit in two cache lines");
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

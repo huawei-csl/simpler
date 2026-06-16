@@ -1440,8 +1440,7 @@ private:
                 {
                     PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
                     PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-                    int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-                    int32_t fi = slot_state.fanin_count;
+                    bool fanin_ready = sched_->fanin_satisfied(&slot_state);
                     if (st >= PTO2_TASK_COMPLETED) continue;
                     char running_on[192] = {0};
                     int32_t owner = -1;
@@ -1463,7 +1462,7 @@ private:
                         if (cnt_running > STALL_DUMP_READY_MAX) continue;
                         continue;
                     }
-                    if (rc >= fi)
+                    if (fanin_ready)
                     {
                         cnt_ready++;
                         if (cnt_ready > STALL_DUMP_READY_MAX) continue;

@@ -344,11 +344,9 @@ struct PTO2SchedulerLayout
 {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
-    size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
-    size_t off_wiring_spsc_buffer;
+    size_t off_pending_spsc_buffer;
     uint64_t ready_queue_capacity;
     uint64_t spsc_capacity;
-    int32_t dep_pool_capacity;
 };
 
 struct PTO2SchedulerState
@@ -359,13 +357,9 @@ struct PTO2SchedulerState
     // Per-ring state
     struct alignas(64) RingSchedState
     {
-        // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
         int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
-
-        // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
-        alignas(64) PTO2DepListPool dep_pool;
 
         bool init_data_from_layout(void *sm_dev_base, int32_t ring_id)
         {
@@ -407,16 +401,21 @@ struct PTO2SchedulerState
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    struct alignas(64) WiringState
+    // Thread 0 exclusive: intrusive pending list of tasks awaiting fanin
+    // readiness. SPSC queue receives slot_states from the orchestrator; thread 0
+    // drains them into the pending list and polls fanin producers' task_state.
+    struct alignas(64) PendingState
     {
-        static constexpr uint64_t BATCH_SIZE = 30;
         static constexpr int BACKOFF_LIMIT = 32;
+        static constexpr int DRAIN_BATCH = 30;
+        static constexpr int POLL_MAX_PER_ITER = 128;
 
-        // --- Thread 0 exclusive: local batch buffer + backoff ---
-        int batch_count = 0;
-        int batch_index = 0;
-        int backoff_counter = 0;
-        PTO2TaskSlotState *batch[BATCH_SIZE];
+        // --- Thread 0 exclusive ---
+        PTO2TaskSlotState *pending_head{nullptr};
+        PTO2TaskSlotState *pending_tail{nullptr};
+        int32_t pending_count{0};
+        int backoff_counter{0};
+        PTO2TaskSlotState *drain_buf[DRAIN_BATCH];
 
         // --- SPSC queue: orchestrator (push) ↔ thread 0 (pop) ---
         PTO2SpscQueue queue;
@@ -425,55 +424,7 @@ struct PTO2SchedulerState
         alignas(64) std::atomic<bool> orch_needs_drain{false};
     } wiring;
 
-    static_assert(offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue");
-    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
-
     alignas(64) AsyncWaitList async_wait_list;
-
-    int drain_wiring_queue(bool force_drain = false)
-    {
-        int wired = 0;
-
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count)
-        {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE)
-            {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) && wiring.backoff_counter < WiringState::BACKOFF_LIMIT)
-                {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
-            }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
-        }
-
-        // Process tasks from local buffer in strict FIFO order.
-        while (wiring.batch_index < wiring.batch_count)
-        {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_count;
-
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin)
-            {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (rss.dep_pool.available() < wfanin) break;  // not enough dep_pool space — keep remainder for next call
-            }
-
-            wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
-            wired++;
-        }
-
-        return wired;
-    }
 
     void push_ready_routed(PTO2TaskSlotState *slot_state)
     {
@@ -482,33 +433,77 @@ struct PTO2SchedulerState
         else ready_queues[static_cast<int32_t>(shape)].push(slot_state);
     }
 
-    void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin)
+    // Append slot to the tail of the intrusive pending list.
+    void pending_push_back(PTO2TaskSlotState *s)
     {
-        PTO2TaskPayload *wp = ws->payload;
-        ws->fanin_count = wfanin + 1;
+        s->next_pending = nullptr;
+        if (wiring.pending_tail) wiring.pending_tail->next_pending = s;
+        else wiring.pending_head = s;
+        wiring.pending_tail = s;
+        wiring.pending_count++;
+    }
 
-        if (wfanin != 0)
+    // Pop the head of the pending list (or nullptr).
+    PTO2TaskSlotState *pending_pop_front()
+    {
+        PTO2TaskSlotState *s = wiring.pending_head;
+        if (s == nullptr) return nullptr;
+        wiring.pending_head = s->next_pending;
+        if (wiring.pending_head == nullptr) wiring.pending_tail = nullptr;
+        s->next_pending = nullptr;
+        wiring.pending_count--;
+        return s;
+    }
+
+    bool fanin_satisfied(PTO2TaskSlotState *s) const
+    {
+        const PTO2TaskPayload &p = *s->payload;
+        for (int32_t i = 0; i < p.fanin_count; i++)
+            if (p.fanin_slot_states[i]->task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) return false;
+        return true;
+    }
+
+    // Thread 0 entry point: drain SPSC into pending list, then poll pending
+    // for newly-ready tasks. Not-ready tasks rotate to the tail.
+    // Returns >0 if anything moved (SPSC drained OR tasks routed to ready);
+    // 0 signals no productive work.
+    int drain_wiring_queue(bool force_drain = false)
+    {
+        // Stage 1: drain SPSC → pending list tail
+        int drained = wiring.queue.pop_batch(wiring.drain_buf, PendingState::DRAIN_BATCH);
+        for (int i = 0; i < drained; i++) pending_push_back(wiring.drain_buf[i]);
+
+        // Backoff when nothing to do and orchestrator isn't pressing
+        if (drained == 0 && wiring.pending_head == nullptr)
         {
-            int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
-                producer->lock_fanout();
-                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
-                if (pstate >= PTO2_TASK_COMPLETED) early_finished++;
-                else producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
-                producer->unlock_fanout();
-            });
-
-            int32_t init_rc = early_finished + 1;
-            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
-            if (new_rc >= ws->fanin_count) push_ready_routed(ws);
+            if (!force_drain && !wiring.orch_needs_drain.load(std::memory_order_acquire) && wiring.backoff_counter < PendingState::BACKOFF_LIMIT)
+            {
+                wiring.backoff_counter++;
+                return 0;
+            }
         }
-        else
+        wiring.backoff_counter = 0;
+
+        // Stage 2: poll pending list, route ready tasks
+        int routed = 0;
+        int to_visit = wiring.pending_count;
+        if (to_visit > PendingState::POLL_MAX_PER_ITER) to_visit = PendingState::POLL_MAX_PER_ITER;
+        for (int i = 0; i < to_visit; i++)
         {
-            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
-            push_ready_routed(ws);
+            PTO2TaskSlotState *s = pending_pop_front();
+            if (s == nullptr) break;
+            if (fanin_satisfied(s))
+            {
+                push_ready_routed(s);
+                routed++;
+            }
+            else
+            {
+                pending_push_back(s);
+            }
         }
 
-        ws->dep_pool_mark = rss.dep_pool.top;
+        return drained + routed;
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state)
@@ -532,20 +527,6 @@ struct PTO2SchedulerState
     {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         check_and_handle_consumed(slot_state);
-    }
-
-    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr)
-    {
-        int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
-
-        if (new_refcount == slot_state.fanin_count)
-        {
-            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (shape == PTO2ResourceShape::DUMMY) dummy_ready_queue.push(&slot_state);
-            else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
-            return true;
-        }
-        return false;
     }
 
     int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count)
@@ -576,21 +557,13 @@ struct PTO2SchedulerState
     void on_mixed_task_complete(
         PTO2TaskSlotState &slot_state,
 
-        PTO2LocalReadyBuffer *local_bufs = nullptr
+        [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr
     )
     {
-        slot_state.lock_fanout();
+        // Polling model: just publish COMPLETED. Thread 0's pending-poll loop
+        // observes producer task_state and routes consumers when their fanin
+        // is satisfied.
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        slot_state.unlock_fanout();
-
-        // Fanout: notify consumers
-        while (current != nullptr)
-        {
-            PTO2TaskSlotState &consumer_slot = *current->slot_state;
-            release_fanin_and_check_ready(consumer_slot, local_bufs);
-            current = current->next;
-        }
     }
 
     int32_t on_task_release(PTO2TaskSlotState &slot_state)
@@ -607,17 +580,15 @@ struct PTO2SchedulerState
 
     // === Cold-path API ===
 
-    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity)
+    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t /*dep_pool_capacity*/)
     {
         PTO2SchedulerLayout layout{};
         layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
         layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
-        layout.dep_pool_capacity = dep_pool_capacity;
 
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
         layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) layout.off_dep_pool_entries[r] = arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
-        layout.off_wiring_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
+        layout.off_pending_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
         return layout;
     }
 
@@ -633,17 +604,10 @@ struct PTO2SchedulerState
             if (!ready_queue_init_data_from_layout(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity)) return false;
         if (!ready_queue_init_data_from_layout(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity)) return false;
 
-        auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
-            memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
-            sched->ring_sched_states[r].dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
-        }
-
-        if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) return false;
-        sched->wiring.batch_count = 0;
-        sched->wiring.batch_index = 0;
+        if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_pending_spsc_buffer, layout.spsc_capacity)) return false;
+        sched->wiring.pending_head = nullptr;
+        sched->wiring.pending_tail = nullptr;
+        sched->wiring.pending_count = 0;
         sched->wiring.backoff_counter = 0;
 
         return true;
@@ -654,19 +618,14 @@ struct PTO2SchedulerState
         PTO2SchedulerState *sched = this;
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
         ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) sched->ring_sched_states[r].dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
-        sched->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
+        sched->wiring.queue.wire_arena_pointers(arena, layout.off_pending_spsc_buffer);
     }
 
     // Forget per-region pointers; arena owns the backing memory.
     void destroy()
     {
         PTO2SchedulerState *sched = this;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            sched->ring_sched_states[r].destroy();
-            sched->ring_sched_states[r].dep_pool.base = nullptr;
-        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) sched->ring_sched_states[r].destroy();
         sched->wiring.queue.destroy();
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
         ready_queue_destroy(&sched->dummy_ready_queue);

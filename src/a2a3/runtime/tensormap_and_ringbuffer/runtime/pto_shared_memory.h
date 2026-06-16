@@ -257,7 +257,6 @@ private:
             {
                 ring.slot_states[i].bind_ring(static_cast<uint8_t>(r));
                 ring.slot_states[i].reset_for_reuse();
-                ring.slot_states[i].fanin_count = 0;
                 ring.slot_states[i].active_mask = ActiveMask{};
             }
         }
