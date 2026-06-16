@@ -12,9 +12,3 @@
 #include "pto_scheduler.h"
 #include <inttypes.h>
 #include <stdlib.h>
-
-void PTO2SchedulerState::print_stats()
-{}
-
-void PTO2SchedulerState::print_queues()
-{}

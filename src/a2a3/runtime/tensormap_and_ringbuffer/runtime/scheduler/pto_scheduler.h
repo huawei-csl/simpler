@@ -206,11 +206,38 @@ struct alignas(64) PTO2ReadyQueue
     }
 };
 
-size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
-bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
+inline size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity)
+{
+    return arena.reserve(capacity * sizeof(PTO2ReadyQueueSlot), PTO2_ALIGN_SIZE);
+}
+inline bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity)
+{
+    // Address the slots region for data writes without storing the pointer in
+    // queue->slots — that field is set by ready_queue_wire_arena_pointers.
+    auto *slots_arena = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
+    queue->capacity = capacity;
+    queue->mask = capacity - 1;
+    queue->enqueue_pos.store(0, std::memory_order_relaxed);
+    queue->dequeue_pos.store(0, std::memory_order_relaxed);
+
+    for (uint64_t i = 0; i < capacity; i++)
+    {
+        slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
+        slots_arena[i].slot_state = nullptr;
+    }
+
+    return true;
+}
 // Stores queue->slots = arena.region_ptr(slots_off). Idempotent.
-void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
-void ready_queue_destroy(PTO2ReadyQueue *queue);
+inline void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off)
+{
+    queue->slots = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
+}
+inline void ready_queue_destroy(PTO2ReadyQueue *queue)
+{
+    // Arena owns the slots[] buffer; just forget the pointer.
+    queue->slots = nullptr;
+}
 
 struct alignas(64) PTO2SpscQueue
 {
@@ -573,16 +600,74 @@ struct PTO2SchedulerState
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
 
-    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity)
+    {
+        PTO2SchedulerLayout layout{};
+        layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
+        layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
+        layout.dep_pool_capacity = dep_pool_capacity;
 
-    bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+        layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) layout.off_dep_pool_entries[r] = arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
+        layout.off_wiring_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
+        return layout;
+    }
 
-    void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
+    bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base)
+    {
+        PTO2SchedulerState *sched = this;
+        sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
+
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+            if (!sched->ring_sched_states[r].init_data_from_layout(sm_dev_base, r)) return false;
+
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++)
+            if (!ready_queue_init_data_from_layout(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity)) return false;
+        if (!ready_queue_init_data_from_layout(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity)) return false;
+
+        auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        {
+            auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
+            memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
+            sched->ring_sched_states[r].dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
+        }
+
+        if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) return false;
+        sched->wiring.batch_count = 0;
+        sched->wiring.batch_index = 0;
+        sched->wiring.backoff_counter = 0;
+
+        return true;
+    }
+
+    void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena)
+    {
+        PTO2SchedulerState *sched = this;
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
+        ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) sched->ring_sched_states[r].dep_pool.base = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
+        sched->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
+    }
 
     // Forget per-region pointers; arena owns the backing memory.
-    void destroy();
-    void print_stats();
-    void print_queues();
+    void destroy()
+    {
+        PTO2SchedulerState *sched = this;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        {
+            sched->ring_sched_states[r].destroy();
+            sched->ring_sched_states[r].dep_pool.base = nullptr;
+        }
+        sched->wiring.queue.destroy();
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
+        ready_queue_destroy(&sched->dummy_ready_queue);
+    }
+    void print_stats()
+    {}
+    void print_queues()
+    {}
 };
 
 // Scheduler cold-path API is declared as PTO2SchedulerState member functions.

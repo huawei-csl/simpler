@@ -113,39 +113,181 @@ private:
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
 public:
-    Runtime();
+    Runtime()
+    {
+        // NOTE: host_api is initialized in InitRuntime() (host-only code)
+        // because the CApi functions don't exist when compiled for device.
 
-    void *get_gm_sm_ptr() const;
-    void *get_gm_heap_ptr() const;
-    const ChipStorageTaskArgs &get_orch_args() const;
-    void set_gm_sm_ptr(void *p);
-    void set_gm_heap(void *p);
-    void set_slot_states_ptr(void *p);
-    void set_orch_args(const ChipStorageTaskArgs &args);
+        // Initialize handshake buffers
+        memset(workers, 0, sizeof(workers));
+        worker_count = 0;
+        aicpu_thread_num = 1;
+        ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+        task_window_size = 0;
+        heap_size = 0;
+        dep_pool_size = 0;
+        orch_to_sched = false;
 
-    void set_prebuilt_arena(void *arena_base, size_t runtime_off);
-    void *get_prebuilt_arena_base() const;
-    size_t get_prebuilt_runtime_offset() const;
+        // Initialize device orchestration state
+        gm_sm_ptr_ = nullptr;
+        gm_heap_ptr_ = nullptr;
+        slot_states_ptr_ = nullptr;
+        orch_args_storage_.clear();
+        prebuilt_arena_base_ = nullptr;
+        prebuilt_runtime_offset_ = 0;
+
+        // Initialize device orchestration SO binary
+        dev_orch_so_addr_ = 0;
+        dev_orch_so_size_ = 0;
+        active_callable_id_ = -1;
+        register_new_callable_id_ = false;
+        device_orch_func_name_[0] = '\0';
+        device_orch_config_name_[0] = '\0';
+
+        // Initialize kernel binary tracking
+        registered_kernel_count_ = 0;
+
+        // Initialize function address mapping
+        for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) func_id_to_addr_[i] = 0;
+    }
+
+    void *get_gm_sm_ptr() const
+    {
+        return gm_sm_ptr_;
+    }
+    void *get_gm_heap_ptr() const
+    {
+        return gm_heap_ptr_;
+    }
+    const ChipStorageTaskArgs &get_orch_args() const
+    {
+        return orch_args_storage_;
+    }
+    void set_gm_sm_ptr(void *p)
+    {
+        gm_sm_ptr_ = p;
+    }
+    void set_gm_heap(void *p)
+    {
+        gm_heap_ptr_ = p;
+    }
+    void set_slot_states_ptr(void *p)
+    {
+        slot_states_ptr_ = p;
+    }
+    void set_orch_args(const ChipStorageTaskArgs &args)
+    {
+        orch_args_storage_ = args;
+    }
+
+    void set_prebuilt_arena(void *arena_base, size_t runtime_off)
+    {
+        prebuilt_arena_base_ = arena_base;
+        prebuilt_runtime_offset_ = runtime_off;
+    }
+    void *get_prebuilt_arena_base() const
+    {
+        return prebuilt_arena_base_;
+    }
+    size_t get_prebuilt_runtime_offset() const
+    {
+        return prebuilt_runtime_offset_;
+    }
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
-    uint64_t get_dev_orch_so_addr() const;
-    uint64_t get_dev_orch_so_size() const;
-    void set_active_callable_id(int32_t callable_id, bool is_new);
-    int32_t get_active_callable_id() const;
-    bool register_new_callable_id() const;
-    void set_device_orch_func_name(const char *name);
-    const char *get_device_orch_func_name() const;
-    void set_device_orch_config_name(const char *name);
-    const char *get_device_orch_config_name() const;
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size)
+    {
+        dev_orch_so_addr_ = dev_addr;
+        dev_orch_so_size_ = size;
+    }
+    uint64_t get_dev_orch_so_addr() const
+    {
+        return dev_orch_so_addr_;
+    }
+    uint64_t get_dev_orch_so_size() const
+    {
+        return dev_orch_so_size_;
+    }
+    void set_active_callable_id(int32_t callable_id, bool is_new)
+    {
+        active_callable_id_ = callable_id;
+        register_new_callable_id_ = is_new;
+    }
+    int32_t get_active_callable_id() const
+    {
+        return active_callable_id_;
+    }
+    bool register_new_callable_id() const
+    {
+        return register_new_callable_id_;
+    }
+    void set_device_orch_func_name(const char *name)
+    {
+        if (name == nullptr)
+        {
+            device_orch_func_name_[0] = '\0';
+            return;
+        }
+        std::strncpy(device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+        device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+    }
+    const char *get_device_orch_func_name() const
+    {
+        return device_orch_func_name_;
+    }
+    void set_device_orch_config_name(const char *name)
+    {
+        if (name == nullptr)
+        {
+            device_orch_config_name_[0] = '\0';
+            return;
+        }
+        std::strncpy(device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+        device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+    }
+    const char *get_device_orch_config_name() const
+    {
+        return device_orch_config_name_;
+    }
 
-    uint64_t get_function_bin_addr(int func_id) const;
-    void set_function_bin_addr(int func_id, uint64_t addr);
-    void replay_function_bin_addr(int func_id, uint64_t addr);
+    uint64_t get_function_bin_addr(int func_id) const
+    {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+        return func_id_to_addr_[func_id];
+    }
+    void set_function_bin_addr(int func_id, uint64_t addr)
+    {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        if (addr != 0 && func_id_to_addr_[func_id] == 0)
+        {
+            if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID)
+            {
+                registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+            }
+            else
+            {}
+        }
+        func_id_to_addr_[func_id] = addr;
+    }
+    void replay_function_bin_addr(int func_id, uint64_t addr)
+    {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        func_id_to_addr_[func_id] = addr;
+    }
 
-    int get_registered_kernel_count() const;
-    int get_registered_kernel_func_id(int index) const;
-    void clear_registered_kernels();
+    int get_registered_kernel_count() const
+    {
+        return registered_kernel_count_;
+    }
+    int get_registered_kernel_func_id(int index) const
+    {
+        if (index < 0 || index >= registered_kernel_count_) return -1;
+        return registered_kernel_func_ids_[index];
+    }
+    void clear_registered_kernels()
+    {
+        registered_kernel_count_ = 0;
+    }
 
     int get_task_count() const
     {
