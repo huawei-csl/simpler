@@ -479,9 +479,12 @@ using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
 template <typename Fn>
 using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
 
+// Spill machinery removed: fanin_count is hard-capped at PTO2_FANIN_INLINE_CAP
+// by append_fanin_or_fail (returns PTO2_ERROR_DEPENDENCY_OVERFLOW on attempt
+// to exceed). The iteration is now a straight inline loop.
 template <typename InlineSlots, typename Fn>
 inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
-    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
+    InlineSlots &&inline_slot_states, int32_t fanin_count, Fn &&fn
 ) {
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
     static_assert(
@@ -490,53 +493,13 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
     );
 
     if constexpr (std::is_void_v<FaninCallbackResult>) {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
+        for (int32_t i = 0; i < fanin_count; i++) {
             fn(inline_slot_states[i]);
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            fn(first[i].slot_state);
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            fn(spill_pool.base[i].slot_state);
         }
         return;
     } else {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
+        for (int32_t i = 0; i < fanin_count; i++) {
             if (!fn(inline_slot_states[i])) {
-                return false;
-            }
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return true;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            if (!fn(first[i].slot_state)) {
-                return false;
-            }
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            if (!fn(spill_pool.base[i].slot_state)) {
                 return false;
             }
         }
@@ -547,8 +510,7 @@ inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
 template <typename Fn>
 inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
     return for_each_fanin_storage(
-        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
+        payload.fanin_inline_slot_states, payload.fanin_actual_count, static_cast<Fn &&>(fn)
     );
 }
 
@@ -682,12 +644,13 @@ struct PTO2DepListPool {
 // =============================================================================
 
 /**
- * Groups a TaskAllocator and DepPool into one per-depth unit.
- * PTO2_MAX_RING_DEPTH instances provide independent reclamation per scope depth.
+ * Groups a TaskAllocator into one per-depth unit. PTO2_MAX_RING_DEPTH instances
+ * provide independent reclamation per scope depth. (The fanin spill pool that
+ * used to live here was removed when PTO2_FANIN_INLINE_CAP was lowered to 16;
+ * tasks with more than 16 fanin edges now fail at submit time.)
  */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
-    PTO2FaninPool fanin_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H

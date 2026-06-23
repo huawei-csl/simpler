@@ -32,76 +32,12 @@ static void latch_pool_error(std::atomic<int32_t> *error_code_ptr, int32_t error
 }
 
 // =============================================================================
-// Fanin Spill Pool Implementation
+// Fanin Spill Pool Implementation — removed.
+// PTO2_FANIN_INLINE_CAP was lowered to 16; spill is no longer used. Tasks with
+// more than 16 fanin edges fail at submit time via append_fanin_or_fail returning
+// PTO2_ERROR_DEPENDENCY_OVERFLOW. The PTO2FaninPool struct and its callers were
+// removed; this file no longer defines reclaim()/ensure_space().
 // =============================================================================
-void PTO2FaninPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive) {
-    if (sm_last_task_alive <= reclaim_task_cursor) return;
-
-    int32_t scan_end = sm_last_task_alive;
-    for (int32_t task_id = reclaim_task_cursor; task_id < scan_end; ++task_id) {
-        PTO2TaskPayload &payload = ring.get_payload_by_task_id(task_id);
-        if (payload.fanin_spill_pool != this) {
-            continue;
-        }
-
-        int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
-        int32_t spill_edge_count = payload.fanin_actual_count - inline_count;
-        if (spill_edge_count > 0) {
-            advance_tail(payload.fanin_spill_start + spill_edge_count);
-        }
-    }
-    reclaim_task_cursor = scan_end;
-}
-
-bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed) {
-    if (available() >= needed) return true;
-
-    int spin_count = 0;
-    int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
-    while (available() < needed) {
-        reclaim(ring, prev_last_alive);
-        if (available() >= needed) return true;
-
-        spin_count++;
-
-        int32_t cur_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (cur_last_alive > prev_last_alive) {
-            spin_count = 0;
-            prev_last_alive = cur_last_alive;
-        }
-
-        if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
-            int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Fanin Spill Pool Deadlock Detected!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("Fanin spill pool cannot reclaim space after %d spins (no progress).", spin_count);
-            LOG_ERROR(
-                "  - Pool used:     %d / %d (%.1f%%)", used(), capacity,
-                (capacity > 0) ? (100.0 * used() / capacity) : 0.0
-            );
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("  - Needed:        %d entries", needed);
-            LOG_ERROR("  - last_task_alive: %d (stuck here)", cur_last_alive);
-            LOG_ERROR("  - current_task:    %d", current);
-            LOG_ERROR("  - In-flight tasks: %d", current - cur_last_alive);
-            LOG_ERROR("Diagnosis:");
-            LOG_ERROR("  last_task_alive is not advancing, so fanin spill pool tail");
-            LOG_ERROR("  cannot reclaim. Check TaskRing diagnostics for root cause.");
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase fanin spill pool capacity (current: %d, recommended: %d)", capacity, high_water * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
-            LOG_ERROR("========================================");
-            latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
-            return false;
-        }
-        SPIN_WAIT_HINT();
-    }
-    return true;
-}
 
 // =============================================================================
 // Dependency List Pool Implementation

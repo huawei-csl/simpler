@@ -233,22 +233,16 @@ static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
 }
 
 struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2OrchestratorState *orch, PTO2FaninPool &spill_pool, uint32_t seen_epoch) :
-        count(0),
-        spill_start(0),
-        orch(orch),
-        seen_epoch(seen_epoch),
-        spill_pool(spill_pool) {}
+    PTO2FaninBuilder(PTO2OrchestratorState *orch, uint32_t seen_epoch) :
+        count(0), orch(orch), seen_epoch(seen_epoch) {}
     int32_t count{0};
-    int32_t spill_start{0};
     PTO2OrchestratorState *orch{nullptr};
     uint32_t seen_epoch{0};
-    PTO2FaninPool &spill_pool;
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
 
     template <typename Fn>
     PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+        return for_each_fanin_storage(inline_slots, count, static_cast<Fn &&>(fn));
     }
 
     bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
@@ -265,35 +259,21 @@ struct PTO2FaninBuilder {
     }
 };
 
+// Spill machinery removed: max fanin per task is hard-capped at
+// PTO2_FANIN_INLINE_CAP (= 16). Tasks attempting more fanin edges fail
+// at submit time with PTO2_ERROR_DEPENDENCY_OVERFLOW.
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
-    PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+    PTO2FaninBuilder *fanin_builder, uint8_t /*ring_id*/
 ) {
     if (fanin_builder->mark_seen(prod_ring, prod_slot)) {
         return true;
     }
-
-    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
-        return true;
-    }
-
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
-    if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1)) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+    if (fanin_builder->count >= PTO2_FANIN_INLINE_CAP) {
+        orch_mark_fatal(orch, PTO2_ERROR_DEPENDENCY_OVERFLOW);
         return false;
     }
-    int32_t spill_idx = fanin_pool.top;
-    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
-    if (entry == nullptr) {
-        orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
-        return false;
-    }
-    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->spill_start = spill_idx;
-    }
-    entry->slot_state = prod_state;
-    fanin_builder->count++;
+    fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
     return true;
 }
 
@@ -588,7 +568,7 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
+    PTO2FaninBuilder fanin_builder(orch, next_fanin_seen_epoch(orch));
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -672,7 +652,7 @@ static TaskOutputTensors submit_task_common(
     // outputs alive. Replaces the old fanout_count refcount.
     const int32_t my_local_id = static_cast<int32_t>(task_id.local());
     for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
+        fanin_builder.inline_slots, fanin_builder.count,
         [my_local_id](PTO2TaskSlotState *producer) {
             if (producer->last_consumer_local_id < my_local_id) {
                 producer->last_consumer_local_id = my_local_id;
@@ -680,12 +660,11 @@ static TaskOutputTensors submit_task_common(
         }
     );
 
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Store fanin metadata in payload for scheduler to iterate
+    // Store fanin metadata in payload for scheduler to iterate. The spill
+    // pool is gone, so fanin_builder.count is guaranteed by
+    // append_fanin_or_fail to be <= PTO2_FANIN_INLINE_CAP.
     payload.fanin_actual_count = fanin_builder.count;
-    payload.fanin_spill_start = fanin_builder.spill_start;
-    payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) {
+    for (int i = 0; i < fanin_builder.count; i++) {
         payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
 
@@ -892,8 +871,6 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
-    payload.fanin_spill_start = 0;
-    payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
@@ -933,13 +910,6 @@ void PTO2OrchestratorState::mark_done() {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
         if (total_tasks > 0) {
             LOG_INFO_V0("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
-        }
-        auto &fanin_pool = orch->rings[r].fanin_pool;
-        if (fanin_pool.top > 1) {
-            LOG_INFO_V0(
-                "=== [FaninPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, fanin_pool.top,
-                fanin_pool.tail, fanin_pool.top - fanin_pool.tail, fanin_pool.high_water, fanin_pool.capacity
-            );
         }
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);

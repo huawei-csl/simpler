@@ -93,8 +93,9 @@
 // Wiring queue
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
 
-// Fanin storage
-#define PTO2_FANIN_INLINE_CAP 64
+// Fanin storage. Inline-only cap; spill machinery removed for cache footprint.
+// Tasks exceeding this cap fail at submit with PTO2_ERROR_DEPENDENCY_OVERFLOW.
+#define PTO2_FANIN_INLINE_CAP 16
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
@@ -226,12 +227,12 @@ enum PTO2SpecState : uint8_t {
 inline constexpr int PTO2_SPEC_CORE_MASK_WORDS = 2;
 
 struct PTO2TaskPayload {
-    // === Cache lines 0-8 (576B) — metadata + inline fanin ===
+    // === Cache lines 0-2 (192B) — metadata + inline fanin (spill removed) ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
-    PTO2FaninPool *fanin_spill_pool{nullptr};
+    int32_t fanin_actual_count{0};  // Actual fanin count (must be <= PTO2_FANIN_INLINE_CAP)
+    int32_t _fanin_pad_{0};         // Was fanin_spill_start; kept as padding so the
+                                    // PTO2TaskSlotState* array stays 8B-aligned.
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // Speculative early-dispatch metadata (AICPU-side only). Ordered by descending
     // alignment (8B mask, 4B fanin, then 1B flags) so the block packs with no
@@ -351,18 +352,24 @@ struct PTO2TaskPayload {
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
+// Pre-tensor metadata block is now ~192B (3 cache lines): 16B header +
+// 128B inline fanin pointers + 40B speculative early-dispatch fields +
+// alignment. The old spill pool pointer and spill_start are gone (spill
+// machinery removed); PTO2_FANIN_INLINE_CAP lowered from 64 to 16 to
+// shrink the inline pointer array from 512B to 128B.
+static_assert(offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 16,
+              "inline fanin array must start at byte 16 (no spill metadata before it)");
+static_assert(offsetof(PTO2TaskPayload, tensors) % 64 == 0, "tensors must be 64B-aligned");
 static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
-);
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
-static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    offsetof(PTO2TaskPayload, scalars) ==
+        offsetof(PTO2TaskPayload, tensors) + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
 );
 static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
+    sizeof(PTO2TaskPayload) ==
+        offsetof(PTO2TaskPayload, tensors) + MAX_TENSOR_ARGS * sizeof(Tensor)
+        + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    "PTO2TaskPayload trailing-region size invariant"
 );
 
 /**

@@ -304,12 +304,11 @@ bool PTO2OrchestratorState::init_data_from_layout(
         );
         heap_offset += heap_sizes[r];
 
-        const size_t fanin_pool_bytes = PTO2_ALIGN_UP(
-            static_cast<size_t>(layout.dep_pool_capacities[r]) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE
-        );
-        auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-        memset(fanin_entries, 0, fanin_pool_bytes);
-        orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacities[r], orch_err);
+        // Fanin spill pool removed; PTO2_FANIN_INLINE_CAP=16 is the hard
+        // per-task cap. layout.off_fanin_pool[r] / dep_pool_capacities[r]
+        // are retained in the layout struct so the arena reserve stays
+        // consistent across host/device builds but are no longer consumed.
+        (void)orch_err;
 
         const size_t seen_epoch_bytes = PTO2_ALIGN_UP(
             static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint32_t), PTO2_ALIGN_SIZE
@@ -337,7 +336,7 @@ void PTO2OrchestratorState::wire_arena_pointers(
 ) {
     auto *orch = this;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->rings[r].fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
+        // Fanin spill pool removed; no per-ring fanin_pool to wire.
         orch->fanin_seen_epoch[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
     }
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
@@ -350,7 +349,7 @@ void PTO2OrchestratorState::destroy() {
     auto *orch = this;
     orch->tensor_map.destroy();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->rings[r].fanin_pool.base = nullptr;
+        // Fanin spill pool removed; nothing to nullify here.
         orch->fanin_seen_epoch[r] = nullptr;
     }
     orch->scope_tasks = nullptr;
