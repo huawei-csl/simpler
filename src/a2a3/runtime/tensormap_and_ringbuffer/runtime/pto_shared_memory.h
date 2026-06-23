@@ -84,6 +84,15 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
 
+    // Monotonic watermark: highest local_id W such that every task 0..W on
+    // this ring has reached PTO2_TASK_COMPLETED. Advanced via CAS in
+    // on_mixed_task_complete; read by advance_ring_pointers to determine
+    // which trailing slots can be reclaimed (gate: slot.last_consumer_local_id
+    // <= completed_watermark). Replaces the per-task fanout_refcount/CONSUMED
+    // notification chain. Initialized to -1 so the first task (local_id 0)
+    // must complete before any slot can retire.
+    std::atomic<int32_t> completed_watermark{-1};
+
     // Layout metadata (set once at init)
     uint64_t task_window_size;
     int32_t task_window_mask;

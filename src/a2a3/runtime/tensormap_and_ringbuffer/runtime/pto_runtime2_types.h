@@ -124,9 +124,10 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
  *   COMPLETED->CONSUMED:  fanout_refcount == fanout_count && state == COMPLETED
  */
 typedef enum {
-    PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
-    PTO2_TASK_COMPLETED = 1,  // Execution finished, output may still be in use
-    PTO2_TASK_CONSUMED = 2    // Output fully consumed, buffers can be released
+    PTO2_TASK_PENDING = 0,   // Submitted; awaiting fanin, queued, or dispatched
+    PTO2_TASK_COMPLETED = 1  // Execution finished; per-ring completed_watermark
+                             // advances past this slot's last_consumer_local_id
+                             // to make its heap chunk reclaimable.
 } PTO2TaskState;
 
 /**
@@ -379,19 +380,27 @@ static_assert(
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;              // 1 (owning scope) + number of consumers
+
+    // Watermark reclamation: highest local task id among this slot's
+    // consumers. Seeded to this slot's own local_id in prepare_task; bumped
+    // via max() in submit_task_common for each consumer that has this slot
+    // as a fanin. The slot's heap chunk is safe to reclaim when the per-ring
+    // completed_watermark reaches at least this id. Single-writer
+    // (orchestrator) at submit time — no atomicity needed.
+    int32_t last_consumer_local_id;
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
-    // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED/CONSUMED
+    // Task state (PENDING -> COMPLETED). Polling readiness reads task_state
+    // on producer slots; reclamation gates on the per-ring completed_watermark
+    // instead of a CONSUMED transition.
+    std::atomic<PTO2TaskState> task_state;
 
     // Fanin (accessed together in release_fanin_and_check_ready)
     std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
-    // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+    int32_t _reclaim_slack_;  // Was fanout_refcount; reserved (commit 2 reuses).
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -455,13 +464,14 @@ struct alignas(64) PTO2TaskSlotState {
      */
     void reset_for_reuse() {
         fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = 1;
         fanout_head = nullptr;
         fanin_refcount.store(0, std::memory_order_relaxed);
-        fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
+        // last_consumer_local_id is reset in prepare_task once the task_id
+        // is known (single-writer there; nothing else races us).
+        //
         // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin /
         // spec_chain_*) are NOT reset here — this method skips the payload by
         // contract. They are (re)initialized in PTO2TaskPayload::init on every

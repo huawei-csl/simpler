@@ -124,9 +124,14 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = slot.task->task_id.local();
+        // Watermark-based: a slot's consumers are all done iff the per-ring
+        // completed_watermark has reached last_consumer_local_id (the highest
+        // local_id among this slot's consumers, stamped at submit time).
+        const auto &ring = rt->orchestrator.sm_header->rings[ring_id];
+        const int32_t target = slot.last_consumer_local_id;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
+        while (ring.completed_watermark.load(std::memory_order_acquire) < target) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
                 orch.report_fatal(

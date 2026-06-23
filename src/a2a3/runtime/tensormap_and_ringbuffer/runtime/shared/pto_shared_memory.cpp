@@ -155,6 +155,8 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // Per-ring flow control (start at 0)
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         header->rings[r].fc.init();
+        // Reclamation watermark: -1 means "no task has completed yet".
+        header->rings[r].completed_watermark.store(-1, std::memory_order_relaxed);
     }
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);

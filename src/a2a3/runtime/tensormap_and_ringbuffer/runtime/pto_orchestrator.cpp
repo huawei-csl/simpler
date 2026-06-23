@@ -340,9 +340,10 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     LOG_ERROR("  scope_task_count:   %d", scope_task_count);
     LOG_ERROR("  active_tasks:       %d / %d", active_count, allocator.window_size());
     LOG_ERROR("Root Cause:");
-    LOG_ERROR("  Tasks within a scope hold a fanout_count reference that is only");
-    LOG_ERROR("  released at scope_end. When scope task count >= window_size,");
-    LOG_ERROR("  no slots can be reclaimed -> deadlock.");
+    LOG_ERROR("  Watermark reclamation requires the per-ring completed_watermark");
+    LOG_ERROR("  to reach each slot's last_consumer_local_id before the slot can");
+    LOG_ERROR("  be reclaimed. When scope task count >= window_size, in-scope");
+    LOG_ERROR("  consumers wrap and no slots can retire -> deadlock.");
     LOG_ERROR("Solution:");
     LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
     LOG_ERROR("  2. Increase task window (current: %d)", allocator.window_size());
@@ -392,14 +393,18 @@ static bool prepare_task(
     // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
     // single payload-init point, which runs before the scheduler wiring push.
 
-    // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
-    //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
-    //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
-    // Fields immutable after RingSchedState::init():
-    //   ring_id
-    // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
+    // Fields already reset by advance_ring_pointers (eager reset after slot
+    // retirement): fanout_lock=0, fanout_head=nullptr, fanin_refcount=0,
+    // completed_subtasks=0, next_block_idx=0
+    // Fields immutable after RingSchedState::init(): ring_id
+    // task_state left as COMPLETED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    // Seed last_consumer_local_id to self: with no consumers yet, the slot is
+    // safe to reclaim as soon as the per-ring watermark reaches this task.
+    // Consumers will bump this via max() in submit_task_common when they list
+    // this slot as a fanin.
+    out->slot_state->last_consumer_local_id = out->alloc_result.task_id;
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
@@ -660,12 +665,18 @@ static TaskOutputTensors submit_task_common(
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
+    // Bump each producer's last_consumer_local_id to max(prev, this consumer's
+    // id). Single-writer (orchestrator) — no lock or atomic needed. The per-ring
+    // completed_watermark must reach this id before the producer's slot can be
+    // reclaimed, so we record the highest consumer that needs the producer's
+    // outputs alive. Replaces the old fanout_count refcount.
+    const int32_t my_local_id = static_cast<int32_t>(task_id.local());
     for_each_fanin_storage(
         fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
+        [my_local_id](PTO2TaskSlotState *producer) {
+            if (producer->last_consumer_local_id < my_local_id) {
+                producer->last_consumer_local_id = my_local_id;
+            }
         }
     );
 
@@ -698,13 +709,14 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 #if PTO2_ORCH_PROFILING
-    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
+    g_orch_args_atomic_count += 1;  // last_consumer_local_id store (non-atomic; 1 logical op)
 #endif
 
     // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
+    // Deferred wiring: orchestrator only stores dependency metadata and bumps
+    // last_consumer_local_id. The actual fanout_head wiring (lock + dep_pool +
+    // early_finished) is handled asynchronously by scheduler thread 0 via the
+    // wiring queue.
     // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
     while (!sched->wiring.queue.push(&cur_slot_state)) {
         SPIN_WAIT_HINT();

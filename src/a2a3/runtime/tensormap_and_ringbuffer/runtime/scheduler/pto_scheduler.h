@@ -615,11 +615,17 @@ struct PTO2SchedulerState {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
             int32_t old_last_task_alive = last_task_alive;
 
+            // Watermark-gated reclamation. A slot is safe to retire when both:
+            //   (a) every task up to and including its last consumer has reached
+            //       COMPLETED (i.e. completed_watermark >= last_consumer_local_id), AND
+            //   (b) the slot itself is at or before the watermark.
+            // (a) implies (b) for any task with at least one consumer; the
+            // explicit (b) check protects the no-consumer self-seeded case.
+            int32_t watermark = ring->completed_watermark.load(std::memory_order_acquire);
             while (last_task_alive < current_task_index) {
                 PTO2TaskSlotState &slot_state = ring->get_slot_state_by_task_id(last_task_alive);
-                if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
-                    break;
-                }
+                if (last_task_alive > watermark) break;
+                if (watermark < slot_state.last_consumer_local_id) break;
                 last_task_alive++;
             }
 
@@ -804,81 +810,39 @@ struct PTO2SchedulerState {
 #endif
     }
 
-    void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
+    // Watermark advance: when slot_state has reached PTO2_TASK_COMPLETED, walk
+    // the ring's completion-state byte-test loop and CAS-advance the per-ring
+    // completed_watermark forward through every consecutive slot that has
+    // completed. Bounded by my_id (which we know is published since the caller
+    // just completed it). If a gap remains, we stop — the task filling the gap
+    // will resume the walk when it completes. Then try-lock advance_ring_pointers
+    // to retire any newly-reclaimable trailing slots.
+    void advance_watermark_for_completion(PTO2TaskSlotState &slot_state) {
+        int32_t ring_id = slot_state.ring_id;
+        auto &rss = ring_sched_states[ring_id];
+        auto &ring = *rss.ring;
+        const int32_t my_id = static_cast<int32_t>(slot_state.task->task_id.local());
 
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
-                expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return;
+        int32_t w = ring.completed_watermark.load(std::memory_order_acquire);
+        while (w < my_id) {
+            int32_t next = w + 1;
+            PTO2TaskSlotState &cand = ring.get_slot_state_by_task_id(next);
+            if (cand.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) break;
+            if (ring.completed_watermark.compare_exchange_weak(
+                    w, next, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                w = next;
+            }
         }
 
-#if PTO2_SCHED_PROFILING
-        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
-#endif
-
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
+        if (rss.advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+            rss.advance_ring_pointers();
+            rss.advance_lock.store(0, std::memory_order_release);
         }
     }
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void check_and_handle_consumed(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        int32_t fc = slot_state.fanout_count;
-        int32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
-
-        atomic_count += 2;  // fanout_count.load + fanout_refcount.load
-
-        if (rc != fc) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
-                expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            atomic_count += 1;  // failed CAS
-            return;
-        }
-
-        atomic_count += 1;  // successful CAS
-
-#if PTO2_SCHED_PROFILING
-        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
-#endif
-
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
-                expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
-            )) {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-            atomic_count += 2;  // try-lock CAS + unlock store
-        } else {
-            atomic_count += 1;  // failed try-lock CAS
-        }
-    }
-#endif
-
-    void release_producer(PTO2TaskSlotState &slot_state) {
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        check_and_handle_consumed(slot_state);
-    }
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void release_producer(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        atomic_count += 1;  // fanout_refcount.fetch_add
-        check_and_handle_consumed(slot_state, atomic_count);
-    }
-#endif
 
     // Speculative early-dispatch release. If the now-ready task was pre-staged
     // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
@@ -1117,22 +1081,12 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    void on_scope_end(PTO2TaskSlotState **task_slot_states, int32_t count) {
-#if PTO2_ORCH_PROFILING
-        extern uint64_t g_orch_scope_end_atomic_count;
-        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
-        for (int32_t i = 0; i < count; i++) {
-            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
-        }
-#else
-        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
-        for (int32_t i = 0; i < count; i++) {
-            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i]);
-        }
-#endif
-    }
+    // Watermark reclamation makes the scope-end "release scope reference" step
+    // a no-op: reclamation gates on (completed_watermark >= last_consumer_local_id),
+    // which is satisfied independent of any per-scope refcount. Kept as a
+    // declared-but-empty entry point so the orchestrator's scope_end call site
+    // can stay; remove the orchestrator hook in a follow-up cleanup commit.
+    void on_scope_end(PTO2TaskSlotState ** /*task_slot_states*/, int32_t /*count*/) {}
 
     /**
      * Subtask completion: atomic counter model.
@@ -1238,6 +1192,13 @@ struct PTO2SchedulerState {
             propagate_dispatch_fanin(*rel_sink.items[i]);
         }
 
+        // Watermark advance: now that this slot has reached COMPLETED, walk
+        // the ring's per-slot completion bytes forward through every
+        // consecutive completed slot. Try-lock advance_ring_pointers to retire
+        // any newly-reclaimable trailing slots. Replaces the old per-task
+        // CONSUMED transition + check_and_handle_consumed.
+        advance_watermark_for_completion(slot_state);
+
 #if PTO2_SCHED_PROFILING
         g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
         g_sched_push_wait_cycle[thread_idx] += push_wait;
@@ -1249,46 +1210,20 @@ struct PTO2SchedulerState {
     }
 
     /**
-     * Cold path: release producers (fanin traversal) + check self for CONSUMED.
-     * Returns fanin edge count for profiling.
+     * Cold path: previously walked the consumer's fanin producers to bump each
+     * one's fanout_refcount and trigger their CONSUMED transition. Under the
+     * watermark scheme, reclamation is driven by completed_watermark advance
+     * in advance_watermark_for_completion (called from on_mixed_task_complete),
+     * so this hook has nothing to do. Kept as a no-op so the existing
+     * deferred_release_slot_states[] plumbing in scheduler_completion.cpp and
+     * scheduler_dispatch.cpp still compiles unchanged; the dead buffer +
+     * threading can be removed in a follow-up cleanup.
      */
-
 #if PTO2_SCHED_PROFILING
-    int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
-        PTO2_SCHED_CYCLE_START();
-        extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
-        extern uint64_t g_sched_self_atomic_count[];
-        extern uint64_t g_sched_self_consumed_cycle[];
-        extern uint64_t g_sched_complete_count[];
-        uint64_t fanin_atomics = 0;
+    int32_t on_task_release(PTO2TaskSlotState & /*slot_state*/, int32_t /*thread_idx*/) { return 0; }
 #else
-    int32_t on_task_release(PTO2TaskSlotState &slot_state) {
+    int32_t on_task_release(PTO2TaskSlotState & /*slot_state*/) { return 0; }
 #endif
-        PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-#if PTO2_SCHED_PROFILING
-            release_producer(*producer_slot_state, fanin_atomics);
-#else
-            release_producer(*producer_slot_state);
-#endif
-        });
-#if PTO2_SCHED_PROFILING
-        g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
-#endif
-
-        // Self consumed check
-#if PTO2_SCHED_PROFILING
-        uint64_t self_atomics = 0;
-        check_and_handle_consumed(slot_state, self_atomics);
-        g_sched_self_atomic_count[thread_idx] += self_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
-        g_sched_complete_count[thread_idx]++;
-#else
-        check_and_handle_consumed(slot_state);
-#endif
-        return payload->fanin_actual_count;
-    }
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
 
