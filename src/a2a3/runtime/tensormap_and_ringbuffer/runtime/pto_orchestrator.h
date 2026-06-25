@@ -13,6 +13,18 @@
 #define PTO_ORCHESTRATOR_H
 
 #include "common/l2_swimlane_profiling.h"
+
+// Diagnostic logging: separate macro DIAG_V0 so we don't collide with the
+// dual definitions of LOG_INFO_V0 in pto_orchestration_api.h (ops table) vs.
+// unified_log.h (direct symbol). Both define LOG_INFO_V0, both happen to
+// route to compatible vlog primitives — but neither is reliably in scope
+// in every TU that includes pto_orchestrator.h. So we add a third macro
+// here that resolves to the right path per TU.
+#if defined(LOG_INFO_V0)
+#define DIAG_V0(...) LOG_INFO_V0(__VA_ARGS__)
+#else
+#define DIAG_V0(...) ((void)0)
+#endif
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
@@ -310,10 +322,11 @@ struct PTO2OrchestratorState
     }
     TaskOutputTensors alloc_tensors(const L0TaskArgs &args)
     {
+        DIAG_V0("DIAG alloc_tensors ENTER tensor_count=%d", args.tensor_count());
         auto *orch = this;
         // Orchestration API should short-circuit after fatal, but keep this entry
         // robust as a no-op in case a caller reaches it directly.
-        if (orch->fatal) return TaskOutputTensors{};
+        if (orch->fatal) { DIAG_V0("DIAG alloc fatal-short-circuit"); return TaskOutputTensors{}; }
 
         if (args.tensor_count() <= 0)
         {
@@ -340,9 +353,12 @@ struct PTO2OrchestratorState
             return TaskOutputTensors{};
         }
 
+        DIAG_V0("DIAG alloc pre-layout");
         PTO2OutputLayout layout = calculate_output_layout(args);
+        DIAG_V0("DIAG alloc pre-prepare total_out=%d", layout.total_output_size);
         PTO2PreparedTask prepared;
-        if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared)) return TaskOutputTensors{};
+        if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared)) { DIAG_V0("DIAG alloc prepare FAILED"); return TaskOutputTensors{}; }
+        DIAG_V0("DIAG alloc post-prepare task_id=%u", (unsigned)prepared.task_id.local());
 
         PTO2TaskDescriptor &task = *prepared.task;
         PTO2TaskPayload &payload = *prepared.payload;
@@ -527,10 +543,13 @@ inline void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *tas
 
 inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id)
 {
+    DIAG_V0("DIAG submit_task_common ENTER aic=%d aiv0=%d aiv1=%d", aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id);
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
+    DIAG_V0("DIAG submit post-layout total_out=%d", layout.total_output_size);
     PTO2PreparedTask prepared;
-    if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) return result;
+    if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) { DIAG_V0("DIAG submit prepare FAILED"); return result; }
+    DIAG_V0("DIAG submit post-prepare task_id_local=%u", (unsigned)prepared.task_id.local());
     uint8_t ring_id = prepared.task_id.ring();
     PTO2SchedulerState *sched = orch->scheduler;
     PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
