@@ -292,7 +292,7 @@ struct alignas(64) PTO2ReadyQueue {
         while (!element.compare_exchange_weak(
                 empty = nullptr, slot_state, std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
-            contended = true;
+            contended = true; // contended only if very unlikely loop happened, more likely waiting for reader
             atomic_ops++; // element CAS failed
             do {
                 pto2_cpu_relax();
@@ -358,7 +358,7 @@ struct alignas(64) PTO2ReadyQueue {
         PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acq_rel);
         atomic_ops++;  // exchange
         while (val == nullptr) {
-            contended = true;
+            contended = true; // contended only if very unlikely loop happened, more likely waiting for writer
             do {
                 pto2_cpu_relax();
                 atomic_ops++;  // load
