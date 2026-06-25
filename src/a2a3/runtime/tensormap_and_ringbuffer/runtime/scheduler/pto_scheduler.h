@@ -69,12 +69,19 @@ inline void pto2_cpu_relax() noexcept { _mm_pause(); }
 inline void pto2_cpu_relax() noexcept { std::atomic_signal_fence(std::memory_order_acquire); }
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#    ifndef unlikely
+#ifndef unlikely
+#    if defined(__GNUC__) || defined(__clang__)
 #        define unlikely(x) (__builtin_expect(!!(x), 0))
+#    else
+#        define unlikely(x) (x)
 #    endif
-#    ifndef likely
+#endif
+
+#ifndef likely
+#    if defined(__GNUC__) || defined(__clang__)
 #        define likely(x)   (__builtin_expect(!!(x), 1))
+#    else
+#        define likely(x) (x)
 #    endif
 #endif
 
@@ -174,9 +181,9 @@ struct alignas(64) PTO2ReadyQueue {
     bool do_push_(PTO2TaskSlotState *value, uint32_t index) noexcept {
         auto &element = slots[index];
         PTO2TaskSlotState *empty;
-        while (!element.compare_exchange_weak(
-                   empty = nullptr, value, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            do { pto2_cpu_relax(); } while (element.load(std::memory_order_relaxed) != nullptr);
+        while (unlikely(!element.compare_exchange_weak(
+                   empty = nullptr, value, std::memory_order_acq_rel, std::memory_order_relaxed))) {
+            do { pto2_cpu_relax(); } while (unlikely(element.load(std::memory_order_relaxed) != nullptr));
         }
         return true;
     }
@@ -184,8 +191,8 @@ struct alignas(64) PTO2ReadyQueue {
     PTO2TaskSlotState *do_pop_(uint32_t index) noexcept {
         auto &element = slots[index];
         PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acq_rel);
-        while (val == nullptr) {
-            do { pto2_cpu_relax(); } while (element.load(std::memory_order_relaxed) == nullptr);
+        while (unlikely(val == nullptr)) {
+            do { pto2_cpu_relax(); } while (unlikely(element.load(std::memory_order_relaxed) == nullptr));
             val = element.exchange(nullptr, std::memory_order_acq_rel);
         }
         return val;
@@ -194,7 +201,7 @@ struct alignas(64) PTO2ReadyQueue {
     uint64_t size() noexcept {
         uint32_t head = get_head(headCachedTail_.load(std::memory_order_relaxed));
         uint32_t tail = get_tail(tailCachedHead_.load(std::memory_order_relaxed));
-        return head >= tail? static_cast<int64_t>(head) - static_cast<int64_t>(tail) : 0u;
+        return likely(head >= tail) ? static_cast<int64_t>(head) - static_cast<int64_t>(tail) : 0u;
     }
 
     bool push(PTO2TaskSlotState *slot_state) noexcept {
@@ -203,14 +210,15 @@ struct alignas(64) PTO2ReadyQueue {
         uint32_t tail = get_cached_tail(headCachedTail);
         while (true) {
             uint32_t headTrail = head - capacity;
-            if (headTrail == tail) {
+            if (unlikely(headTrail == tail)) {
                 tail = get_tail(tailCachedHead_.load(std::memory_order_relaxed));
-                if (headTrail == tail) return false;  // full
+                if (unlikely(headTrail == tail)) return false;  // full
             }
-            if (headCachedTail_.compare_exchange_weak(
+            if (likely(headCachedTail_.compare_exchange_weak(
                     headCachedTail, pack(head + 1u, tail),
-                    std::memory_order_relaxed, std::memory_order_relaxed))
+                    std::memory_order_relaxed, std::memory_order_relaxed))) {
                 break;
+            }
             head = get_head(headCachedTail);
             tail = std::max(tail, get_cached_tail(headCachedTail));
         }
@@ -231,18 +239,18 @@ struct alignas(64) PTO2ReadyQueue {
         while (true) {
             uint32_t headTrail = head - capacity;
             toPush = tail - headTrail;
-            if (toPush < count) {
+            if (unlikely(toPush < count)) {
                 tail = get_tail(tailCachedHead_.load(std::memory_order_relaxed));
                 toPush = tail - headTrail;
+                if (unlikely(toPush == 0u)) {
+                    return toPush;
+                }
             }
             toPush = std::min(toPush, count);
-            if (toPush == 0u) {
-                return toPush;
-            }
 
-            if (headCachedTail_.compare_exchange_weak(
+            if (likely(headCachedTail_.compare_exchange_weak(
                     headCachedTail, pack(head + toPush, tail),
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    std::memory_order_relaxed, std::memory_order_relaxed))) {
                 break;
             }
             head = get_head(headCachedTail);
@@ -267,18 +275,18 @@ struct alignas(64) PTO2ReadyQueue {
         uint32_t atomic_ops = 1;  // headCachedTail_.load
         while (true) {
             uint32_t headTrail = head - capacity;
-            if (headTrail == tail) {
+            if (unlikely(headTrail == tail)) {
                 tail = get_tail(tailCachedHead_.load(std::memory_order_relaxed));
                 atomic_ops++;
-                if (headTrail == tail) {
+                if (unlikely(headTrail == tail)) {
                     atomic_count += atomic_ops;
                     if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
                     return false;
                 }
             }
-            if (headCachedTail_.compare_exchange_weak(
+            if (likely(headCachedTail_.compare_exchange_weak(
                     headCachedTail, pack(head + 1u, tail),
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    std::memory_order_relaxed, std::memory_order_relaxed))) {
                 atomic_ops++;  // successful CAS
                 break;
             }
@@ -290,15 +298,15 @@ struct alignas(64) PTO2ReadyQueue {
 
         auto &element = slots[get_index(head)];
         PTO2TaskSlotState *empty;
-        while (!element.compare_exchange_weak(
+        while (unlikely(!element.compare_exchange_weak(
                 empty = nullptr, slot_state, std::memory_order_acq_rel,
-                std::memory_order_relaxed)) {
+                std::memory_order_relaxed))) {
             contended = true; // contended only if very unlikely loop happened, more likely waiting for reader
             atomic_ops++; // element CAS failed
             do {
                 pto2_cpu_relax();
                 atomic_ops++; // element load
-            } while (element.load(std::memory_order_relaxed) != nullptr);
+            } while (unlikely(element.load(std::memory_order_relaxed) != nullptr));
         }
         atomic_ops++;  // element CAS success
         atomic_count += atomic_ops;
@@ -312,14 +320,15 @@ struct alignas(64) PTO2ReadyQueue {
         uint32_t tail = get_tail(tailCachedHead);
         uint32_t head = get_cached_head(tailCachedHead);
         while (true) {
-            if (tail == head) {
+            if (unlikely(tail == head)) {
                 head = get_head(headCachedTail_.load(std::memory_order_relaxed));
-                if (tail == head) return nullptr;  // empty
+                if (unlikely(tail == head)) return nullptr;  // empty
             }
-            if (tailCachedHead_.compare_exchange_weak(
+            if (likely(tailCachedHead_.compare_exchange_weak(
                     tailCachedHead, pack(tail + 1u, head),
-                    std::memory_order_relaxed, std::memory_order_relaxed))
+                    std::memory_order_relaxed, std::memory_order_relaxed))) {
                 break;
+            }
             tail = get_tail(tailCachedHead);
             head = std::max(head, get_cached_head(tailCachedHead));
         }
