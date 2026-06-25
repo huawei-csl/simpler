@@ -272,6 +272,7 @@ struct alignas(64) PTO2ReadyQueue {
                 atomic_ops++;
                 if (headTrail == tail) {
                     atomic_count += atomic_ops;
+                    if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
                     return false;
                 }
             }
@@ -287,7 +288,7 @@ struct alignas(64) PTO2ReadyQueue {
             tail = std::max(tail, get_cached_tail(headCachedTail));
         }
 
-        auto &element = slots_[get_index(head)];
+        auto &element = slots[get_index(head)];
         PTO2TaskSlotState *empty;
         while (!element.compare_exchange_weak(
                 empty = nullptr, slot_state, std::memory_order_acq_rel,
@@ -339,6 +340,7 @@ struct alignas(64) PTO2ReadyQueue {
                 atomic_ops++;
                 if (tail == head) {
                     atomic_count += atomic_ops;
+                    if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
                     return nullptr;  // empty
                 }
             }
@@ -354,7 +356,7 @@ struct alignas(64) PTO2ReadyQueue {
             head = std::max(head, get_cached_head(tailCachedHead));
         }
 
-        auto &element = slots_[get_index(tail)];
+        auto &element = slots[get_index(tail)];
         PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acq_rel);
         atomic_ops++;  // exchange
         while (val == nullptr) {
@@ -409,70 +411,61 @@ struct alignas(64) PTO2ReadyQueue {
     int pop_batch(
         PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle
     ) noexcept {
-        uint64_t tailCachedHead;
-        uint32_t tail, head;
-        int count;
+        uint32_t amount = static_cast<uint32_t>(max_count);
+        uint64_t tailCachedHead = tailCachedHead_.load(std::memory_order_relaxed);
+        uint32_t tail = get_tail(tailCachedHead);
+        uint32_t head = get_cached_head(tailCachedHead);
+        uint32_t toPop;
         uint64_t t0 = get_sys_cnt_aicpu();
         bool contended = false;
-        uint32_t atomic_ops = 0;
+        uint32_t atomic_ops = 1; // load
+
         while (true) {
-            tailCachedHead = tailCachedHead_.load(std::memory_order_relaxed);
-            tail = get_tail(tailCachedHead);
-            head = get_cached_head(tailCachedHead);
-            atomic_ops++;  // tailCachedHead_.load
-            if (tail == head) {
+            toPop = head - tail;
+            if (toPop < amount) {
                 head = get_head(headCachedTail_.load(std::memory_order_relaxed));
-                atomic_ops++;
-                if (tail == head) {
-                    atomic_count += atomic_ops;
-                    return 0;  // empty
-                }
+                toPop = head - tail;
+                atomic_ops++; // load
             }
-            uint32_t available = head - tail;
-            uint32_t limit = static_cast<uint32_t>(max_count) < available
-                                 ? static_cast<uint32_t>(max_count) : available;
-            count = 0;
-            while (static_cast<uint32_t>(count) < limit) {
-                if (slots_[get_index(tail + static_cast<uint32_t>(count))].load(
-                        std::memory_order_acquire) != nullptr) {
-                    ++count;
-                    atomic_ops++;  // element.load
-                } else {
-                    contended = true;
-                    atomic_ops++;  // element.load
-                    count = -1;
-                    break;
-                }
-            }
-            if (count == 0) {
+
+            toPop = std::min(toPop, amount);
+            if (toPop == 0u) {
                 atomic_count += atomic_ops;
+                if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
                 return 0;
             }
-            if (count < 0) continue;
+
             if (tailCachedHead_.compare_exchange_weak(
-                    tailCachedHead, pack(tail + static_cast<uint32_t>(count), head),
+                    tailCachedHead, pack(tail + toPop, head),
                     std::memory_order_relaxed, std::memory_order_relaxed)) {
-                atomic_ops++;  // successful CAS
+                atomic_ops++; // CAS success
                 break;
             }
-            contended = true;
-            atomic_ops++;  // failed CAS
+            atomic_ops++; // CAS fail
+            tail = get_tail(tailCachedHead);
+            head = std::max(head, get_cached_head(tailCachedHead));
         }
-        for (int i = 0; i < count; i++) {
-            auto &element = slots_[get_index(tail + static_cast<uint32_t>(i))];
-            PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acq_rel);
+
+        const uint32_t end = tail + toPop;
+        for (uint32_t i = tail; i < end; ++i) {
+            auto &element = slots[get_index(i)];
+            *out = element.exchange(nullptr, std::memory_order_acq_rel);
             atomic_ops++;  // exchange
-            while (val == nullptr) {
-                contended = true;
-                do { pto2_cpu_relax(); } while (element.load(std::memory_order_relaxed) == nullptr);
-                val = element.exchange(nullptr, std::memory_order_acq_rel);
-                atomic_ops++;
+            while (*out == nullptr) {
+                contended = true; // contended only if very unlikely loop happened, more likely waiting for writer
+                do {
+                    pto2_cpu_relax();
+                    atomic_ops++;  // load
+                } while (element.load(std::memory_order_relaxed) == nullptr);
+                *out = element.exchange(nullptr, std::memory_order_acq_rel);
+                atomic_ops++; // exchange
             }
-            out[i] = val;
+            out++;
         }
+
         atomic_count += atomic_ops;
         if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
-        return count;
+        return static_cast<int>(toPop);
     }
 #endif
 };
