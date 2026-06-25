@@ -266,7 +266,7 @@ struct alignas(64) PTO2ReadyQueue {
         bool contended = false;
         uint32_t atomic_ops = 1;  // headCachedTail_.load
         while (true) {
-            uint32_t headTrail = head - static_cast<uint32_t>(mask_ + 1u);
+            uint32_t headTrail = head - capacity;
             if (headTrail == tail) {
                 tail = get_tail(tailCachedHead_.load(std::memory_order_relaxed));
                 atomic_ops++;
@@ -286,19 +286,20 @@ struct alignas(64) PTO2ReadyQueue {
             head = get_head(headCachedTail);
             tail = std::max(tail, get_cached_tail(headCachedTail));
         }
+
         auto &element = slots_[get_index(head)];
         PTO2TaskSlotState *empty;
-        if (!element.compare_exchange_weak(
+        while (!element.compare_exchange_weak(
                 empty = nullptr, slot_state, std::memory_order_acq_rel,
                 std::memory_order_relaxed)) {
             contended = true;
+            atomic_ops++; // element CAS failed
             do {
-                do { pto2_cpu_relax(); } while (element.load(std::memory_order_relaxed) != nullptr);
-            } while (!element.compare_exchange_weak(
-                empty = nullptr, slot_state, std::memory_order_acq_rel,
-                std::memory_order_relaxed));
+                pto2_cpu_relax();
+                atomic_ops++; // element load
+            } while (element.load(std::memory_order_relaxed) != nullptr);
         }
-        atomic_ops++;  // element CAS
+        atomic_ops++;  // element CAS success
         atomic_count += atomic_ops;
         if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
         return true;
@@ -352,14 +353,18 @@ struct alignas(64) PTO2ReadyQueue {
             tail = get_tail(tailCachedHead);
             head = std::max(head, get_cached_head(tailCachedHead));
         }
+
         auto &element = slots_[get_index(tail)];
         PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acq_rel);
         atomic_ops++;  // exchange
         while (val == nullptr) {
             contended = true;
-            do { pto2_cpu_relax(); } while (element.load(std::memory_order_relaxed) == nullptr);
+            do {
+                pto2_cpu_relax();
+                atomic_ops++;  // load
+            } while (element.load(std::memory_order_relaxed) == nullptr);
             val = element.exchange(nullptr, std::memory_order_acq_rel);
-            atomic_ops++;
+            atomic_ops++; // exchange
         }
         atomic_count += atomic_ops;
         if (contended) wait_cycle += (get_sys_cnt_aicpu() - t0);
