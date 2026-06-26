@@ -256,7 +256,7 @@ struct alignas(64) PTO2ReadyQueue {
 
         const uint32_t end = head + toPush;
         for (uint32_t i = head; i < end; ++i) {
-            do_push_(*items++, get_index(head));
+            do_push_(*items++, get_index(i));
         }
 
         return toPush;
