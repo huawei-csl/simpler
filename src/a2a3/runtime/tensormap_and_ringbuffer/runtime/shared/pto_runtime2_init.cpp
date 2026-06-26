@@ -37,28 +37,27 @@ size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
     // Align the slots[] base to a full cache line so MPMC CAS traffic on the
     // first slot cannot false-share with whatever region sits in front of us
     // (e.g. orchestrator tensormap heads written by the orch thread).
-    return arena.reserve(capacity * sizeof(PTO2ReadyQueueSlot), PTO2_ALIGN_SIZE);
+    return arena.reserve(capacity * sizeof(std::atomic<PTO2TaskSlotState *>), PTO2_ALIGN_SIZE);
 }
 
 bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity) {
     // Address the slots region for data writes without storing the pointer in
     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
-    auto *slots_arena = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
+    auto *slots_arena = static_cast<std::atomic<PTO2TaskSlotState *> *>(arena.region_ptr(slots_off));
     queue->capacity = capacity;
     queue->mask = capacity - 1;
-    queue->enqueue_pos.store(0, std::memory_order_relaxed);
-    queue->dequeue_pos.store(0, std::memory_order_relaxed);
+    queue->tailCachedHead_.store(0u, std::memory_order_relaxed);
+    queue->headCachedTail_.store(0u, std::memory_order_relaxed);
 
     for (uint64_t i = 0; i < capacity; i++) {
-        slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        slots_arena[i].slot_state = nullptr;
+        slots_arena[i].store(nullptr, std::memory_order_relaxed);
     }
 
     return true;
 }
 
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off) {
-    queue->slots = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
+    queue->slots = static_cast<std::atomic<PTO2TaskSlotState *> *>(arena.region_ptr(slots_off));
 }
 
 void ready_queue_destroy(PTO2ReadyQueue *queue) {
