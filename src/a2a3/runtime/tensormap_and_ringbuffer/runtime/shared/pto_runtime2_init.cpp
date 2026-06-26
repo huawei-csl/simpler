@@ -34,7 +34,7 @@
 // =============================================================================
 
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
-    // Align the slots_ base to a full cache line so MPMC CAS traffic on the
+    // Align the slots[] base to a full cache line so MPMC CAS traffic on the
     // first slot cannot false-share with whatever region sits in front of us
     // (e.g. orchestrator tensormap heads written by the orch thread).
     return arena.reserve(capacity * sizeof(std::atomic<PTO2TaskSlotState *>), PTO2_ALIGN_SIZE);
@@ -42,7 +42,7 @@ size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
 
 bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity) {
     // Address the slots region for data writes without storing the pointer in
-    // queue->slots_ — that field is set by ready_queue_wire_arena_pointers.
+    // queue->slots — that field is set by ready_queue_wire_arena_pointers.
     auto *slots_arena = static_cast<std::atomic<PTO2TaskSlotState *> *>(arena.region_ptr(slots_off));
     queue->capacity = capacity;
     queue->mask = capacity - 1;
