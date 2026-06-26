@@ -298,7 +298,6 @@ struct alignas(64) PTO2ReadyQueue {
         while (unlikely(!element.compare_exchange_weak(
             empty = nullptr, slot_state, std::memory_order_release, std::memory_order_relaxed
         ))) {
-            contended = true;  // contended only if very unlikely loop happened, more likely waiting for reader
             atomic_ops++;      // element CAS failed
             do {
                 pto2_cpu_relax();
@@ -366,7 +365,6 @@ struct alignas(64) PTO2ReadyQueue {
         PTO2TaskSlotState *val = element.exchange(nullptr, std::memory_order_acquire);
         atomic_ops++;  // exchange
         while (unlikely(val == nullptr)) {
-            contended = true;  // contended only if very unlikely loop happened, more likely waiting for writer
             do {
                 pto2_cpu_relax();
                 atomic_ops++;  // load
@@ -443,6 +441,7 @@ struct alignas(64) PTO2ReadyQueue {
                 atomic_ops++;  // CAS success
                 break;
             }
+            contended = true;
             atomic_ops++;  // CAS fail
             tail = get_tail(tailCachedHead);
             head = std::max(head, get_cached_head(tailCachedHead));
@@ -454,7 +453,6 @@ struct alignas(64) PTO2ReadyQueue {
             *out = element.exchange(nullptr, std::memory_order_acq_rel);
             atomic_ops++;  // exchange
             while (unlikely(*out == nullptr)) {
-                contended = true;  // contended only if very unlikely loop happened, more likely waiting for writer
                 do {
                     pto2_cpu_relax();
                     atomic_ops++;  // load
