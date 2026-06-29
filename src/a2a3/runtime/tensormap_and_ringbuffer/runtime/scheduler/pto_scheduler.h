@@ -130,12 +130,19 @@ struct alignas(64) PTO2ReadyQueue {
         return (e >= d) ? (e - d) : 0;
     }
 
+    // Subsequent elements are now on different cache lines
+    inline constexpr uint64_t get_index(const uint64_t pos) {
+        static_assert(sizeof(PTO2ReadyQueueSlot) == 16);
+        constexpr uint64_t mul = 5u;
+        return (pos * mul) & mask;
+    }
+
     bool push(PTO2TaskSlotState *slot_state) {
         uint64_t pos;
         PTO2ReadyQueueSlot *slot;
         while (true) {
             pos = enqueue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
+            slot = &slots[get_index(pos)];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - static_cast<int64_t>(pos);
             if (diff == 0) {
@@ -160,13 +167,14 @@ struct alignas(64) PTO2ReadyQueue {
         if (count == 0) return;
 
         uint64_t pos;
+        uint64_t end = pos + static_cast<uint64_t>(count);
         while (true) {
             pos = enqueue_pos.load(std::memory_order_relaxed);
             bool ready = true;
-            for (int i = 0; i < count; i++) {
-                PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
+            for (uint64_t i = pos; i < end; i++) {
+                PTO2ReadyQueueSlot *slot = &slots[get_index(i)];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - static_cast<int64_t>(pos + i);
+                int64_t diff = seq - static_cast<int64_t>(i);
                 if (diff != 0) {
                     ready = false;
                     break;
@@ -176,16 +184,16 @@ struct alignas(64) PTO2ReadyQueue {
                 continue;
             }
             if (enqueue_pos.compare_exchange_weak(
-                    pos, pos + count, std::memory_order_relaxed, std::memory_order_relaxed
+                    pos, end, std::memory_order_relaxed, std::memory_order_relaxed
                 )) {
                 break;
             }
         }
 
-        for (int i = 0; i < count; i++) {
-            PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            slot->slot_state = items[i];
-            slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
+        for (uint64_t i = pos; i < end; i++) {
+            PTO2ReadyQueueSlot *slot = &slots[get_index(i)];
+            slot->slot_state = *items++;
+            slot->sequence.store(static_cast<int64_t>(i + 1), std::memory_order_release);
         }
     }
 
@@ -198,7 +206,7 @@ struct alignas(64) PTO2ReadyQueue {
         uint32_t atomic_ops = 0;
         while (true) {
             pos = enqueue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
+            slot = &slots[get_index(pos)];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - static_cast<int64_t>(pos);
             atomic_ops += 2;  // enqueue_pos.load + sequence.load
@@ -241,7 +249,7 @@ struct alignas(64) PTO2ReadyQueue {
         PTO2ReadyQueueSlot *slot;
         while (true) {
             pos = dequeue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
+            slot = &slots[get_index(pos)];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - static_cast<int64_t>(pos + 1);
             if (diff == 0) {
@@ -276,7 +284,7 @@ struct alignas(64) PTO2ReadyQueue {
         uint32_t atomic_ops = 0;
         while (true) {
             pos = dequeue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
+            slot = &slots[get_index(pos)];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - static_cast<int64_t>(pos + 1);
             atomic_ops += 2;  // dequeue_pos.load + sequence.load
@@ -317,9 +325,9 @@ struct alignas(64) PTO2ReadyQueue {
             pos = dequeue_pos.load(std::memory_order_relaxed);
             count = 0;
             while (count < max_count) {
-                PTO2ReadyQueueSlot *slot = &slots[(pos + count) & mask];
+                PTO2ReadyQueueSlot *slot = &slots[get_index(pos + count)];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - static_cast<int64_t>(pos + count + 1);
+                int64_t diff = seq - 1 - static_cast<int64_t>(pos + count);
                 if (diff == 0) {
                     count++;
                     continue;
@@ -340,7 +348,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         for (int i = 0; i < count; i++) {
-            PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
+            PTO2ReadyQueueSlot *slot = &slots[get_index(pos + i)];
             out[i] = slot->slot_state;
             slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
         }
@@ -359,9 +367,9 @@ struct alignas(64) PTO2ReadyQueue {
             atomic_ops++;  // dequeue_pos.load
             count = 0;
             while (count < max_count) {
-                PTO2ReadyQueueSlot *slot = &slots[(pos + count) & mask];
+                PTO2ReadyQueueSlot *slot = &slots[get_index(pos + count)];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - static_cast<int64_t>(pos + count + 1);
+                int64_t diff = seq - 1 - static_cast<int64_t>(pos + count);
                 atomic_ops++;  // sequence.load
                 if (diff == 0) {
                     count++;
@@ -392,7 +400,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         for (int i = 0; i < count; i++) {
-            PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
+            PTO2ReadyQueueSlot *slot = &slots[get_index(pos + i)];
             out[i] = slot->slot_state;
             slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
             atomic_ops++;  // sequence.store
