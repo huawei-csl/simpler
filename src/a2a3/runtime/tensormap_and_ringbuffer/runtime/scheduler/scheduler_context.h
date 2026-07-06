@@ -85,7 +85,16 @@ struct PTO2Runtime;
 class SchedulerContext
 {
 public:
-    int32_t init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base)
+    // Init is split into three parts so the per-core AICore handshake — a
+    // serial, MMIO-bound loop that dominates preamble (~217 µs of ~283 µs for
+    // 72 cores) — can run in parallel across all AICPU threads. The leader
+    // (exec_idx 0) runs pre_handshake_init, then every thread handshakes a
+    // disjoint slice of cores via handshake_partition, then the leader runs
+    // post_handshake_init after a barrier. See AicpuExecutor::init.
+    //
+    // Leader-only: per-core state + config + swimlane buffers + core count.
+    // Must be published before any thread enters handshake_partition.
+    int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base)
     {
         always_assert(runtime != nullptr);
 
@@ -97,14 +106,15 @@ public:
         sched_thread_num_ = sched_thread_num;
         regs_ = regs_base;
 
-        // Initialize l2-swimlane buffers BEFORE handshake_all_cores so the
-        // AICore-side rotation table slots are populated when AICore reads
-        // them post-handshake. AICore stashes &rotation_table[block_idx] at
-        // entry; the slot CONTENTS (the actual record buffer pointer it later
-        // dereferences) are written here. handshake_all_cores sets
-        // aicpu_ready=1 per core, which is AICore's signal to proceed past
-        // Phase 1 — once it has the green light, it expects the slot to be
-        // initialized. See the contract comment in
+        // Initialize l2-swimlane buffers BEFORE any thread writes aicpu_ready in
+        // handshake_partition so the AICore-side rotation table slots are
+        // populated when AICore reads them post-handshake. AICore stashes
+        // &rotation_table[block_idx] at entry; the slot CONTENTS (the actual
+        // record buffer pointer it later dereferences) are written here.
+        // aicpu_ready=1 is AICore's signal to proceed past Phase 1 — once it has
+        // the green light, it expects the slot to be initialized. This runs on
+        // the leader before it publishes hs_setup_done_, so it happens-before
+        // every thread's handshake. See the contract comment in
         // aicore/aicore_executor.cpp:105-110 and the parallel call in
         // host_build_graph/aicpu/aicpu_executor.cpp:341. Without this call,
         // --enable-l2-swimlane runs hit AICore-side memory corruption that
@@ -115,9 +125,95 @@ public:
             l2_swimlane_aicpu_init(runtime->dev.worker_count);
         }
 
-        // Discover cores and assign to scheduler threads.
-        int32_t rc = handshake_all_cores(runtime);
-        if (rc != 0) return rc;
+        cores_total_num_ = runtime->dev.worker_count;
+        if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) return -1;
+        aic_count_ = 0;
+        aiv_count_ = 0;
+        handshake_failed_.store(false, std::memory_order_release);
+        return 0;
+    }
+
+    // All threads: handshake this thread's contiguous slice [lo, hi) of cores.
+    // Each core is touched by exactly one thread (contiguous, gap-free
+    // partition), so core_exec_states_ writes are race-free. The AIC/AIV
+    // worker-id lists are built serially in post_handshake_init to preserve the
+    // core-index ordering that assign_cores_to_threads relies on.
+    void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads)
+    {
+        Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+        const int32_t total = cores_total_num_;
+        const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
+        const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
+
+        // Step 1: signal this slice's cores to proceed past Phase 1.
+        for (int32_t i = lo; i < hi; i++)
+        {
+            all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
+            OUT_OF_ORDER_STORE_BARRIER();
+            all_handshakes[i].aicpu_ready = 1;
+        }
+        OUT_OF_ORDER_STORE_BARRIER();
+
+        uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+
+        // Step 2: wait for this slice's cores, init their registers, collect state.
+        for (int32_t i = lo; i < hi; i++)
+        {
+            Handshake *hank = &all_handshakes[i];
+
+            while (hank->aicore_regs_ready == 0) SPIN_WAIT_HINT();
+
+            uint32_t physical_core_id = hank->physical_core_id;
+
+            if (physical_core_id >= max_physical_cores_count)
+            {
+                handshake_failed_.store(true, std::memory_order_release);
+                continue;
+            }
+
+            uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+            uint64_t reg_addr = regs[physical_core_id];
+
+            // Initialize AICore registers after discovery (first round)
+            platform_init_aicore_regs(reg_addr);
+            OUT_OF_ORDER_STORE_BARRIER();
+            hank->aicpu_regs_ready = 1;
+
+            OUT_OF_ORDER_STORE_BARRIER();
+
+            while (hank->aicore_done == 0) SPIN_WAIT_HINT();
+
+            CoreType type = hank->core_type;
+
+            core_exec_states_[i].reg_addr = reg_addr;
+            core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
+
+            core_exec_states_[i].worker_id = i;
+            core_exec_states_[i].physical_core_id = physical_core_id;
+            core_exec_states_[i].core_type = type;
+        }
+    }
+
+    // Leader-only, after the handshake barrier: build worker-id lists, assign
+    // cores to threads, read task counts, init dispatch payloads.
+    int32_t post_handshake_init(Runtime *runtime)
+    {
+        if (handshake_failed_.load(std::memory_order_acquire))
+        {
+            emergency_shutdown(runtime);
+            return -1;
+        }
+
+        // Build cluster-ordered AIC/AIV worker-id lists from the discovered
+        // cores. Serial and MMIO-free — the expensive per-core handshake already
+        // ran in parallel. Core-index order matches the original single-thread
+        // handshake so assign_cores_to_threads forms identical clusters.
+        for (int32_t i = 0; i < cores_total_num_; i++)
+        {
+            if (core_exec_states_[i].core_type == CoreType::AIC) aic_worker_ids_[aic_count_++] = i;
+            else aiv_worker_ids_[aiv_count_++] = i;
+        }
+
         if (!assign_cores_to_threads()) return -1;
 
         // Initialize task counters. Task count comes from PTO2 shared memory.
@@ -527,7 +623,7 @@ private:
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
-    // Cluster-ordered worker_id lists, populated by handshake_all_cores().
+    // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aic_count_{0};
@@ -540,78 +636,9 @@ private:
     std::atomic<bool> pto2_init_done_{false};
     std::atomic<bool> pto2_init_complete_{false};
 
-    // Handshake with all AICore workers; populates core_exec_states_, worker id lists.
-    int32_t handshake_all_cores(Runtime *runtime)
-    {
-        Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
-        cores_total_num_ = runtime->dev.worker_count;
-
-        // Validate cores_total_num_ before using as array index
-        if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) return -1;
-
-        aic_count_ = 0;
-        aiv_count_ = 0;
-
-        for (int32_t i = 0; i < cores_total_num_; i++)
-        {
-            all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
-            OUT_OF_ORDER_STORE_BARRIER();
-            all_handshakes[i].aicpu_ready = 1;
-        }
-        OUT_OF_ORDER_STORE_BARRIER();
-
-        // Get platform physical cores count for validation
-        uint32_t max_physical_cores_count = platform_get_physical_cores_count();
-
-        // Step 2: Wait for all cores to respond, collect core type and register addresses
-        bool handshake_failed = false;
-        for (int32_t i = 0; i < cores_total_num_; i++)
-        {
-            Handshake *hank = &all_handshakes[i];
-
-            while (hank->aicore_regs_ready == 0) SPIN_WAIT_HINT();
-
-            uint32_t physical_core_id = hank->physical_core_id;
-
-            if (physical_core_id >= max_physical_cores_count)
-            {
-                handshake_failed = true;
-                continue;
-            }
-
-            uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
-            uint64_t reg_addr = regs[physical_core_id];
-
-            // Initialize AICore registers after discovery (first round)
-            platform_init_aicore_regs(reg_addr);
-            OUT_OF_ORDER_STORE_BARRIER();
-            hank->aicpu_regs_ready = 1;
-
-            OUT_OF_ORDER_STORE_BARRIER();
-
-            while (hank->aicore_done == 0) SPIN_WAIT_HINT();
-
-            CoreType type = hank->core_type;
-
-            core_exec_states_[i].reg_addr = reg_addr;
-            core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
-
-            core_exec_states_[i].worker_id = i;
-            core_exec_states_[i].physical_core_id = physical_core_id;
-            core_exec_states_[i].core_type = type;
-
-            if (type == CoreType::AIC) aic_worker_ids_[aic_count_++] = i;
-            else aiv_worker_ids_[aiv_count_++] = i;
-        }
-
-        if (handshake_failed)
-        {
-            emergency_shutdown(runtime);
-            return -1;
-        }
-
-        return 0;
-    }
+    // Set by any thread whose slice hits an invalid physical_core_id in
+    // handshake_partition; checked by the leader in post_handshake_init.
+    std::atomic<bool> handshake_failed_{false};
 
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads()
