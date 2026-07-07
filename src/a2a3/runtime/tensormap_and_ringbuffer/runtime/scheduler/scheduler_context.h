@@ -27,6 +27,7 @@
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
 #include "aicpu/device_time.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
@@ -470,7 +471,20 @@ public:
 
         // Dump profile breakdown for this thread. Logged AFTER the hot loop
         // exits, so this adds no overhead to the measured phases.
-        profile.total_cycles = get_sys_cnt_aicpu() - profile_loop_start;
+        const uint64_t sched_end_ts = get_sys_cnt_aicpu();
+        profile.total_cycles = sched_end_ts - profile_loop_start;
+
+#if PTO2_PROFILING
+        // Ride this scheduler thread's dispatch window home to the per-thread
+        // phase buffer. The host reduces min(start)/max(end) across the sched
+        // threads into the `Sched` marker, so Effective =
+        //   max(orch_end, sched_end) - min(orch_start, sched_start)
+        // ends when the LAST scheduler finishes all tasks — not when the
+        // orchestrator finished submitting. Without this the sched span is
+        // absent and Effective collapses to the orch-submit window. sched_end_ts
+        // is the loop-exit time (completed_ observed = all tasks done).
+        aicpu_phase_set_window(AicpuPhase::SchedWindow, profile_loop_start, sched_end_ts);
+#endif
         LOG_INFO_V9(
             "CLAUDE_PROFILING thread=%d total_cyc=%lu iters=%lu compl_cyc=%lu compl_n=%lu ctask_cyc=%lu ctask_n=%lu cores_scan=%lu async_cyc=%lu async_n=%lu drain_cyc=%lu drain_n=%lu spsc_cyc=%lu spsc_n=%lu poll_cyc=%lu poll_n=%lu poll_skipped=%lu dummy_cyc=%lu dummy_n=%lu dispatch_cyc=%lu dispatch_n=%lu idle_cyc=%lu idle_n=%lu",
             (int)thread_idx,
