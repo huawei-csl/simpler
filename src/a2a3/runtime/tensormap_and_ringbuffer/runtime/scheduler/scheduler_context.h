@@ -34,8 +34,6 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "spin_hint.h"
-// SchedulerThreadProfile is defined in scheduler_types.h (above) so the
-// drain_wiring_queue method in pto_scheduler.h can take a pointer to it.
 
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -341,18 +339,15 @@ public:
 
         uint64_t last_progress_ts = get_sys_cnt_aicpu();
 
-        // Profile reset + total-cycle start. Reset here so each
-        // resolve_and_dispatch call (≈ one kernel launch) records its own
-        // breakdown. The dump happens at loop exit, well outside the hot path.
-        SchedulerThreadProfile &profile = thread_profiles_[thread_idx];
-        profile.reset();
-        const uint64_t profile_loop_start = get_sys_cnt_aicpu();
+        // Dispatch-loop start timestamp for the SchedWindow phase marker (the
+        // host reduces min(start)/max(end) across sched threads → the `Sched`
+        // span). This one call ≈ one kernel launch.
+        [[maybe_unused]] const uint64_t sched_loop_start_ts = get_sys_cnt_aicpu();
 
         while (true)
         {
             if (completed_.load(std::memory_order_acquire)) break;
             bool made_progress = false;
-            profile.total_iters++;
             if (!tracker.has_any_running_cores())
             {
                 LoopAction action = handle_orchestrator_exit(header, runtime);
@@ -364,20 +359,15 @@ public:
 
             if (tracker.has_any_running_cores())
             {
-                uint64_t t0 = get_sys_cnt_aicpu();
                 check_running_cores_for_completion(thread_idx, completed_this_turn, cur_thread_completed, made_progress);
-                profile.completion_cycles += get_sys_cnt_aicpu() - t0;
-                profile.completion_iters++;
             }
             if (completed_this_turn > 0)
             {
                 completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
             }
 
-            uint64_t t0_async = 0;
             if (rt_ != nullptr && rt_->aicore_mailbox != nullptr && (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending()))
             {
-                t0_async = get_sys_cnt_aicpu();
                 AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_);
                 if (poll_result.error_code != PTO2_ERROR_NONE)
                 {
@@ -391,8 +381,6 @@ public:
                     completed_tasks_.fetch_add(poll_result.completed, std::memory_order_relaxed);
                     made_progress = true;
                 }
-                profile.async_wait_cycles += get_sys_cnt_aicpu() - t0_async;
-                profile.async_wait_iters++;
             }
 
             // Phase 2 drain check
@@ -402,23 +390,15 @@ public:
                 continue;
             }
 
-            // Phase 3: Drain wiring queue (thread 0 only). Pass cumulative
-            // sub-phase counters (SPSC drain stage 1 / classify+route
-            // stage 2) so drain_wiring_queue accumulates into them.
+            // Phase 3: Drain wiring queue (thread 0 only).
             if (thread_idx == 0)
             {
-                uint64_t t0 = get_sys_cnt_aicpu();
-                int wired = sched_->drain_wiring_queue(orchestrator_done_,
-                    &profile.spsc_drain_cycles, &profile.spsc_drain_iters,
-                    &profile.pending_poll_cycles, &profile.pending_poll_iters);
+                int wired = sched_->drain_wiring_queue(orchestrator_done_);
                 if (wired > 0) made_progress = true;
-                profile.drain_wiring_cycles += get_sys_cnt_aicpu() - t0;
-                profile.drain_wiring_iters++;
             }
 
             if (thread_idx == 0)
             {
-                uint64_t t0 = get_sys_cnt_aicpu();
                 constexpr int DUMMY_DRAIN_BATCH = 16;
                 PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
                 int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
@@ -430,18 +410,11 @@ public:
                     cur_thread_completed++;
                 }
                 if (dummy_got > 0) made_progress = true;
-                profile.dummy_drain_cycles += get_sys_cnt_aicpu() - t0;
-                profile.dummy_drain_iters++;
             }
 
             // Phase 4: MIX-strict-priority dispatch with phase-split and
             // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-            {
-                uint64_t t0 = get_sys_cnt_aicpu();
-                dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress);
-                profile.dispatch_cycles += get_sys_cnt_aicpu() - t0;
-                profile.dispatch_iters++;
-            }
+            dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress);
 
             if (made_progress)
             {
@@ -450,7 +423,6 @@ public:
             }
             else
             {
-                uint64_t t0_idle = get_sys_cnt_aicpu();
                 idle_iterations++;
 
                 if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0)
@@ -468,15 +440,8 @@ public:
                     last_progress_ts = get_sys_cnt_aicpu();
                 }
                 SPIN_WAIT_HINT();
-                profile.idle_spin_cycles += get_sys_cnt_aicpu() - t0_idle;
-                profile.idle_iters++;
             }
         }
-
-        // Dump profile breakdown for this thread. Logged AFTER the hot loop
-        // exits, so this adds no overhead to the measured phases.
-        const uint64_t sched_end_ts = get_sys_cnt_aicpu();
-        profile.total_cycles = sched_end_ts - profile_loop_start;
 
 #if PTO2_PROFILING
         // Ride this scheduler thread's dispatch window home to the per-thread
@@ -487,23 +452,9 @@ public:
         // orchestrator finished submitting. Without this the sched span is
         // absent and Effective collapses to the orch-submit window. sched_end_ts
         // is the loop-exit time (completed_ observed = all tasks done).
-        aicpu_phase_set_window(AicpuPhase::SchedWindow, profile_loop_start, sched_end_ts);
+        const uint64_t sched_end_ts = get_sys_cnt_aicpu();
+        aicpu_phase_set_window(AicpuPhase::SchedWindow, sched_loop_start_ts, sched_end_ts);
 #endif
-        LOG_INFO_V9(
-            "CLAUDE_PROFILING thread=%d total_cyc=%lu iters=%lu compl_cyc=%lu compl_n=%lu ctask_cyc=%lu ctask_n=%lu cores_scan=%lu async_cyc=%lu async_n=%lu drain_cyc=%lu drain_n=%lu spsc_cyc=%lu spsc_n=%lu poll_cyc=%lu poll_n=%lu poll_skipped=%lu dummy_cyc=%lu dummy_n=%lu dispatch_cyc=%lu dispatch_n=%lu idle_cyc=%lu idle_n=%lu",
-            (int)thread_idx,
-            (unsigned long)profile.total_cycles, (unsigned long)profile.total_iters,
-            (unsigned long)profile.completion_cycles, (unsigned long)profile.completion_iters,
-            (unsigned long)profile.complete_task_cycles, (unsigned long)profile.complete_task_calls,
-            (unsigned long)profile.cores_scanned,
-            (unsigned long)profile.async_wait_cycles, (unsigned long)profile.async_wait_iters,
-            (unsigned long)profile.drain_wiring_cycles, (unsigned long)profile.drain_wiring_iters,
-            (unsigned long)profile.spsc_drain_cycles, (unsigned long)profile.spsc_drain_iters,
-            (unsigned long)profile.pending_poll_cycles, (unsigned long)profile.pending_poll_iters,
-            (unsigned long)profile.pending_poll_skipped,
-            (unsigned long)profile.dummy_drain_cycles, (unsigned long)profile.dummy_drain_iters,
-            (unsigned long)profile.dispatch_cycles, (unsigned long)profile.dispatch_iters,
-            (unsigned long)profile.idle_spin_cycles, (unsigned long)profile.idle_iters);
 
         return cur_thread_completed;
     }
@@ -615,7 +566,6 @@ private:
 
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
-    SchedulerThreadProfile thread_profiles_[MAX_AICPU_THREADS];
 
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
@@ -1196,7 +1146,6 @@ private:
 
     void check_running_cores_for_completion(int32_t thread_idx, int32_t &completed_this_turn, int32_t &cur_thread_completed, bool &made_progress)
     {
-        SchedulerThreadProfile &profile = thread_profiles_[thread_idx];
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto running_core_states = tracker.get_all_running_cores();
         while (running_core_states.has_value())
@@ -1204,7 +1153,6 @@ private:
             int32_t bit_pos = running_core_states.pop_first();
             int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
             CoreExecState &core = core_exec_states_[core_id];
-            profile.cores_scanned++;
 
             uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
             rmb();
@@ -1219,18 +1167,12 @@ private:
             // 1. Complete finished tasks (capture pointers before modifying core state)
             if (t.pending_done)
             {
-                uint64_t tc0 = get_sys_cnt_aicpu();
                 complete_slot_task(*core.pending_slot_state, core.pending_reg_task_id, core_id, completed_this_turn);
-                profile.complete_task_cycles += get_sys_cnt_aicpu() - tc0;
-                profile.complete_task_calls++;
                 cur_thread_completed++;
             }
             if (t.running_done)
             {
-                uint64_t tc0 = get_sys_cnt_aicpu();
                 complete_slot_task(*core.running_slot_state, core.running_reg_task_id, core_id, completed_this_turn);
-                profile.complete_task_cycles += get_sys_cnt_aicpu() - tc0;
-                profile.complete_task_calls++;
                 cur_thread_completed++;
             }
 

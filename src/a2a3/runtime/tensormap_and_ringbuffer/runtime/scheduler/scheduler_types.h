@@ -41,41 +41,6 @@ enum class LoopAction : int8_t
     BREAK_LOOP,  // equivalent to 'break' from the while(true) loop
 };
 
-// Per-thread phase profiling. Accumulates cumulative cycle counts and entry
-// counts for each phase of resolve_and_dispatch's main loop. Dumped once at
-// loop exit via LOG_INFO_V9 — the hot path only does cycle counter math.
-struct alignas(64) SchedulerThreadProfile
-{
-    uint64_t total_cycles{0};
-    uint64_t completion_cycles{0};
-    // Sub-phase of completion: time spent INSIDE complete_slot_task, and
-    // count of times it ran (one per subtask completion observed).
-    uint64_t complete_task_cycles{0};
-    uint64_t complete_task_calls{0};
-    // Sub-phase of completion: count of cores scanned per iter (proxy for
-    // cond_ptr read cost; aggregate / completion_iters = avg cores/iter).
-    uint64_t cores_scanned{0};
-    uint64_t async_wait_cycles{0};
-    uint64_t drain_wiring_cycles{0};
-    uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC pop_batch into drain_buf
-    uint64_t pending_poll_cycles{0};  // sub-phase of drain_wiring: classify+route each drained task
-    uint64_t dummy_drain_cycles{0};
-    uint64_t dispatch_cycles{0};
-    uint64_t idle_spin_cycles{0};
-    uint64_t completion_iters{0};
-    uint64_t async_wait_iters{0};
-    uint64_t drain_wiring_iters{0};
-    uint64_t spsc_drain_iters{0};
-    uint64_t pending_poll_iters{0};
-    uint64_t pending_poll_skipped{0};  // (a) gate hits: poll calls skipped due to no new completions
-    uint64_t dummy_drain_iters{0};
-    uint64_t dispatch_iters{0};
-    uint64_t idle_iters{0};
-    uint64_t total_iters{0};
-
-    void reset() { *this = SchedulerThreadProfile{}; }
-};
-
 struct alignas(64) CoreExecState
 {
     // --- Hot fields (completion + dispatch, every iteration) ---

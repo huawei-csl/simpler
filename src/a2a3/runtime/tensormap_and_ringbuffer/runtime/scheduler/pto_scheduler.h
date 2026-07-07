@@ -522,18 +522,10 @@ struct PTO2SchedulerState
     // Sub-phase timing pointers (optional). If non-null, cumulative cycle/
     // iteration counters for Stage 1 (SPSC drain) and Stage 2 (classify+route)
     // are accumulated into them.
-    int drain_wiring_queue(bool force_drain = false,
-                           uint64_t *spsc_cyc_out = nullptr, uint64_t *spsc_iters_out = nullptr,
-                           uint64_t *poll_cyc_out = nullptr, uint64_t *poll_iters_out = nullptr)
+    int drain_wiring_queue(bool force_drain = false)
     {
         // Stage 1: drain SPSC → drain_buf
-        uint64_t t0 = spsc_cyc_out ? get_sys_cnt_aicpu() : 0;
         int drained = wiring.queue.pop_batch(wiring.drain_buf, PendingState::DRAIN_BATCH);
-        if (spsc_cyc_out)
-        {
-            *spsc_cyc_out += get_sys_cnt_aicpu() - t0;
-            if (spsc_iters_out) (*spsc_iters_out)++;
-        }
 
         // Backoff when nothing to do and orchestrator isn't pressing
         if (drained == 0)
@@ -551,7 +543,6 @@ struct PTO2SchedulerState
         // producer's wake_list". Tasks are scanned exactly once here;
         // re-scans on producer completion happen via on_mixed_task_complete's
         // wake_list drain.
-        uint64_t t1 = poll_cyc_out ? get_sys_cnt_aicpu() : 0;
         for (int i = 0; i < drained; i++)
         {
             PTO2TaskSlotState *s = wiring.drain_buf[i];
@@ -573,11 +564,6 @@ struct PTO2SchedulerState
                 PTO2TaskSlotState *producer = &ring.get_slot_state_by_task_id(prod_local);
                 register_wake(producer, s);
             }
-        }
-        if (poll_cyc_out)
-        {
-            *poll_cyc_out += get_sys_cnt_aicpu() - t1;
-            if (poll_iters_out) (*poll_iters_out)++;
         }
 
         return drained;
