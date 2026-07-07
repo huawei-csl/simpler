@@ -276,8 +276,12 @@ public:
             core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
         }
 
-        // Clear per-core dispatch payloads
-        memset(payload_per_core_, 0, sizeof(payload_per_core_));
+        // payload_per_core_ is no longer zeroed here: build_payload() overwrites
+        // every field it dispatches (function addr, args, contexts) and now sets
+        // not_ready=0 explicitly, so no stale payload field can be read. Mirrors
+        // upstream, which dropped this ~72 KB memset for the same reason.
+        // deferred_slab_per_core_ still needs zeroing (its count/entries are read
+        // by the async-completion drain without a per-round reset on every slot).
         memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
 
         // Reset sync-start drain coordination — a previous run that aborted mid-drain
@@ -768,6 +772,12 @@ private:
         dispatch_payload.local_context.async_ctx = async_ctx;
         dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
         dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
+        // Speculative early-dispatch gate. Polling has no staging path, so every
+        // dispatch is execute-on-pickup. Writing this per dispatch (as upstream
+        // does) is what lets deinit skip the ~72 KB payload_per_core_ memset:
+        // AICore reads not_ready each pickup and a stale 1 would hang it on the
+        // doorbell wait.
+        dispatch_payload.not_ready = 0;
     }
 
     struct PublishHandle
