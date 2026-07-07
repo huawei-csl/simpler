@@ -276,13 +276,13 @@ public:
             core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
         }
 
-        // payload_per_core_ is no longer zeroed here: build_payload() overwrites
-        // every field it dispatches (function addr, args, contexts) and now sets
-        // not_ready=0 explicitly, so no stale payload field can be read. Mirrors
-        // upstream, which dropped this ~72 KB memset for the same reason.
-        // deferred_slab_per_core_ still needs zeroing (its count/entries are read
-        // by the async-completion drain without a per-round reset on every slot).
-        memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
+        // Neither per-core array is zeroed here (mirrors upstream, ~300 KB
+        // saved). payload_per_core_: build_payload() overwrites every dispatched
+        // field including not_ready=0. deferred_slab_per_core_: dispatch resets
+        // count=0/error_code=NONE before the slab can be read, the loop above
+        // reset every running/pending_reg_task_id to INVALID so no undispatched
+        // slot is ever drained, and the consumer is count-gated so it never
+        // reads entries[] past the fresh count.
 
         // Reset sync-start drain coordination — a previous run that aborted mid-drain
         // would otherwise leave dirty pending/elected/ack state for the next reuse.
