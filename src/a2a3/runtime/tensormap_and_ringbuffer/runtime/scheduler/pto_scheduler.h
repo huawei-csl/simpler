@@ -490,27 +490,44 @@ struct PTO2SchedulerState
         return -1;
     }
 
-    // (e) Register `consumer` on `producer`'s wake list. If producer has
-    // already completed (head == WAKE_LIST_SENTINEL), push consumer directly
-    // to ready_queues. Otherwise CAS push-onto the head.
+    // (e) Register `consumer` on `producer`'s wake list. If the producer has
+    // already completed (head == WAKE_LIST_SENTINEL) we must NOT assume the
+    // consumer is ready: classify_fanin_state() short-circuits at the FIRST
+    // unmet fanin, so the producer handed to us is only "an" unmet fanin, not
+    // necessarily the last one. A producer that completes in the window between
+    // that classify and this call would otherwise let us push a consumer whose
+    // *later* fanins are still pending — a premature dispatch that lets a
+    // dependent task run against a not-yet-produced input (e.g. the
+    // paged_attention online-softmax UP chain: UP_bn dispatched before UP_{bn-1}
+    // finishes writing the shared accumulator -> concurrent RMW -> wrong query).
+    // On the SENTINEL path we re-classify against ALL fanins and only route to
+    // ready when every fanin is satisfied; otherwise we re-target the next
+    // still-unmet producer and retry. Monotonic completion_flags guarantee
+    // termination.
     void register_wake(PTO2TaskSlotState *producer, PTO2TaskSlotState *consumer)
     {
-        PTO2TaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
         while (true)
         {
-            if (expected == WAKE_LIST_SENTINEL)
+            PTO2TaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
+            while (expected != WAKE_LIST_SENTINEL)
             {
-                // Producer already completed and drained its wake list. The
-                // last unmet fanin is now satisfied; push consumer to ready.
-                push_ready_routed(consumer);
+                consumer->next_in_wake_list = expected;
+                if (producer->wake_list_head.compare_exchange_weak(expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed))
+                {
+                    return;  // registered on a still-pending producer
+                }
+                // CAS failed: expected reloaded; retry (may now be SENTINEL).
+            }
+            // Producer completed. Re-check every fanin before committing.
+            int32_t state = classify_fanin_state(consumer);
+            if (state < 0)
+            {
+                push_ready_routed(consumer);  // all fanins now satisfied
                 return;
             }
-            consumer->next_in_wake_list = expected;
-            if (producer->wake_list_head.compare_exchange_weak(expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed))
-            {
-                return;  // registered
-            }
-            // CAS failed: expected was updated by load on retry. Loop.
+            // Re-target the next still-unmet producer and retry.
+            const PTO2TaskPayload &p = *consumer->payload;
+            producer = &ring_sched_states[p.fanin_ring_ids[state]].ring->get_slot_state_by_task_id(p.fanin_local_ids[state]);
         }
     }
 
