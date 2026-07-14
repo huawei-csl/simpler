@@ -65,32 +65,37 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[s_block_idx]);
 
-    // Phase 1: Wait for AICPU initialization signal
-    while (my_hank->aicpu_ready == 0) {
-        dcci(my_hank, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-
-    // Phase 2: Report physical core ID, signal ready
+    // Phase 1: report physical core ID + core type and signal done in one write,
+    // with no wait for the AICPU — both fields are self-known. The AICPU opens
+    // this core's register window only after it observes aicore_done, so a single
+    // report suffices. The host clears aicore_done before this kernel launches,
+    // so the value the AICPU reads is this run's report, never a stale prior one.
     my_hank->physical_core_id = get_physical_core_id();
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_regs_ready = 1;
-    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    while (my_hank->aicpu_regs_ready == 0) {
-        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-    // Report initial idle status via register
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
-
-    // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = s_block_idx + 1;  // Signal ready (use s_block_idx + 1 to avoid 0)
-
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
+    // Phase 2: Wait for the AICPU to open our register window. A kernel launch
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon; a5 shares this
+    // register protocol and relies on CI); the AICPU writes DATA_MAIN_BASE =
+    // AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a non-zero read
+    // means the window is open and reads/writes are valid. The AICPU runs
+    // assign_cores_to_threads (µs) between opening the window and the first
+    // dispatch, so this IDLE is observed long before any task_id lands — the
+    // poll cannot miss it and mistake a later task for the reset value.
+    // Window-open is the sync point for everything the AICPU publishes (task
+    // pointer, swimlane head): the AICPU writes those before opening the window.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    // Report initial idle status via register (FAST_PATH is now open).
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+
+    // The AICPU writes task after observing our report (so our CACHELINE_OUT flush
+    // above cannot clobber it) and before opening the window; dcci to read its
+    // fresh value here.
+    dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     // Cache profiling state once after Phase 3. The L2 / PMU rings and the
@@ -98,9 +103,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
     // they are safe to cache here.
     uint32_t profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
+    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    bool pmu_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_PMU);
     // Per-core L2SwimlaneActiveHead channel — lazy-resolved on first task; the
     // table slot AICPU populates inside `l2_swimlane_aicpu_init` runs
     // concurrently with kernel entry, so we cannot deref at startup. The
@@ -169,7 +174,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pmu_aicore_record_task(pmu_ring, pmu_reg_base, task_id);
             }
 
-            if (dump_tensor_enabled) {
+            if (dump_args_enabled) {
                 pipe_barrier(PIPE_ALL);
             }
 

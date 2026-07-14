@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId (arch header picked up via rt_objs include path)
 
 // =============================================================================
@@ -76,12 +77,25 @@ void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
 
 uint64_t get_sys_cnt_aicpu() {
     auto now = std::chrono::steady_clock::now();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    uint64_t elapsed_ns =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    constexpr uint64_t kNsPerSec = std::nano::den;
+    uint64_t seconds = elapsed_ns / kNsPerSec;
+    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
+    return seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
 }
 
-void cache_invalidate_range(const void * /* addr */, size_t /* size */) {}
+// =============================================================================
+// cache_maintenance.h stub
+// =============================================================================
 
-void cache_flush_range(const void * /* addr */, size_t /* size */) {}
+namespace aicpu_cache_maintenance {
+
+void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
+
+void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+}  // namespace aicpu_cache_maintenance
 
 // =============================================================================
 // platform_regs.h stub (get_reg_ptr)
@@ -91,11 +105,23 @@ void cache_flush_range(const void * /* addr */, size_t /* size */) {}
 // early-dispatch) is an inline that resolves a register id to its MMIO pointer
 // via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
 // host UT runner; hand back writable static storage (8 bytes — the doorbell is a
-// 64-bit store) so the inline links and any write is harmless.
-volatile uint32_t *get_reg_ptr(uint64_t /* reg_base_addr */, RegId /* reg */) {
-    static volatile uint64_t dummy_reg = 0;
-    return reinterpret_cast<volatile uint32_t *>(&dummy_reg);
+// 64-bit store) and retain the requested base address for ownership tests.
+static volatile uint64_t g_test_reg = 0;
+static uint64_t g_test_reg_base_addr = 0;
+
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId /* reg */) {
+    g_test_reg_base_addr = reg_base_addr;
+    return reinterpret_cast<volatile uint32_t *>(&g_test_reg);
 }
+
+void reset_test_reg_stub() {
+    g_test_reg = 0;
+    g_test_reg_base_addr = 0;
+}
+
+uint64_t get_test_reg_stub_value() { return g_test_reg; }
+
+uint64_t get_test_reg_stub_base_addr() { return g_test_reg_base_addr; }
 
 // =============================================================================
 // runtime_maker.cpp stub (bind_callable_to_runtime_impl)

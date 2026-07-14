@@ -143,6 +143,7 @@ class KernelCompiler:
         runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
+        src_common_dir = str(self.project_root / "src" / "common")
         tracr_dir1 = str(self.project_root / "tools")
         tracr_dir2 = str(self.project_root / "tools" / "tracr" / "include")
         tracr_dir3 = str(self.project_root / "tools" / "tracr" / "extern")
@@ -150,6 +151,7 @@ class KernelCompiler:
             runtime_dir,
             runtime_common_dir,
             common_dir,
+            src_common_dir,
             tracr_dir1,
             tracr_dir2,
             tracr_dir3,
@@ -218,6 +220,15 @@ class KernelCompiler:
                         source_files.append(str(f))
 
         return include_dirs, source_files
+
+    def _get_orchestration_platform_sources(self) -> list[str]:
+        """Sources needed when public AICPU helper headers are used by orchestration SOs."""
+        variant = "sim" if self.platform.endswith("sim") else "onboard"
+        source_dir = self.project_root / "src" / "common" / "platform" / variant / "aicpu"
+        return [
+            str(source_dir / "cache_ops.cpp"),
+            str(source_dir / "device_time.cpp"),
+        ]
 
     def _run_subprocess(
         self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
@@ -427,16 +438,25 @@ class KernelCompiler:
         orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
         if orch_includes:
             include_dirs = include_dirs + orch_includes
+        orch_sources = list(orch_sources) + self._get_orchestration_platform_sources()
 
-        # Resolve toolchain: HOST_GXX needs no runtime-specific extras
-        toolchain_type = self._get_toolchain(
-            {
-                "a2a3": ToolchainType.AARCH64_GXX,
-                "a2a3sim": ToolchainType.HOST_GXX,
-                "a5": ToolchainType.AARCH64_GXX,
-                "a5sim": ToolchainType.HOST_GXX,
-            },
-        )
+        # host_build_graph dlopens the orchestration .so on the host, so it
+        # compiles with the host g++ (x86_64) regardless of platform.
+        # tensormap_and_ringbuffer dlopens it on the aarch64 AICPU onboard, so
+        # it cross-compiles there and uses the host g++ only for sim.
+        if runtime_name == "host_build_graph":
+            toolchain_type = ToolchainType.HOST_GXX
+        elif runtime_name == "tensormap_and_ringbuffer":
+            toolchain_type = self._get_toolchain(
+                {
+                    "a2a3": ToolchainType.AARCH64_GXX,
+                    "a2a3sim": ToolchainType.HOST_GXX,
+                    "a5": ToolchainType.AARCH64_GXX,
+                    "a5sim": ToolchainType.HOST_GXX,
+                },
+            )
+        else:
+            raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
         toolchain: Union[GxxToolchain, Aarch64GxxToolchain]
         if toolchain_type == ToolchainType.AARCH64_GXX:
             assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
@@ -446,7 +466,8 @@ class KernelCompiler:
 
         # HOST_GXX: simulation build (host execution)
         # AARCH64_GXX: cross-compilation for supported runtimes
-        #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
+        # Runtime calls still go through pto_orchestration_api.h; platform helper sources
+        # are linked only for public AICPU utility headers used directly by orchestration code.
         return self._compile_orchestration_shared_lib(
             source_path,
             toolchain,

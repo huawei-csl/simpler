@@ -62,6 +62,7 @@ jobs:
   # build artifacts cannot mask a regression in the next mode. Slow but reliable.
   # See docs/python-packaging.md and tools/verify_packaging.sh.
   packaging-matrix:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -107,6 +108,7 @@ jobs:
 
   # ---------- Unit tests (no hardware, Python + C++) ----------
   ut:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -163,12 +165,12 @@ jobs:
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -249,12 +251,12 @@ jobs:
             --require-pto-isa --dump-args
 
   st-sim-a5:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -306,11 +308,39 @@ jobs:
           pytest examples tests/st --platform a5sim --device 0-15 -v \
             --pto-session-timeout 600 --require-pto-isa
 
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run. Mirrors st-sim-a2a3.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2
+
+      - name: args_dump smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args
+
   # ---------- Profiling sub-flags smoke (compile + run) ----------
-  # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
-  # PTO2_TENSORMAP_PROFILING are compile-time gates whose defaults and
+  # SIMPLER_DFX / SIMPLER_ORCH_PROFILING / SIMPLER_SCHED_PROFILING /
+  # SIMPLER_TENSORMAP_PROFILING are compile-time gates whose defaults and
   # dependency checks live in src/common/task_interface/profiling_config.h.
-  # The defaults (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job,
+  # The defaults (SIMPLER_DFX=1, sub-flags=0) are exercised by every CI job,
   # but non-default branches are otherwise dead coverage: a developer flipping
   # any of them for perf debugging or to minimize logging overhead had no gate
   # protecting the gated code from drift (renamed fields, changed signatures,
@@ -325,11 +355,11 @@ jobs:
   # Combos walk the macro hierarchy explicitly (not just "all on" or "all
   # off") so log scrubbing the failing leg pinpoints the specific gate:
   #
-  #   PTO2_PROFILING (default=1, covered by every other CI job)
-  #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
-  #   ├── orch:             -DPTO2_ORCH_PROFILING=1
-  #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
-  #   ├── sched:            -DPTO2_SCHED_PROFILING=1
+  #   SIMPLER_DFX (default=1, covered by every other CI job)
+  #   ├── dfx-off:         -DSIMPLER_DFX=0   (no profiling at all)
+  #   ├── orch:             -DSIMPLER_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DSIMPLER_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DSIMPLER_SCHED_PROFILING=1
   #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
   #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
   #
@@ -342,7 +372,7 @@ jobs:
   # the matching profiling log strings, and pytest output emits *only* the
   # corresponding profiling block — no cross-contamination from cmake cache.
   profiling-flags-smoke:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -397,14 +427,14 @@ jobs:
           # Combo names paired with their CXX defines. Parallel arrays (not
           # an associative array) so the loop iteration order is deterministic
           # and the log reads top-to-bottom in hierarchy order.
-          COMBO_NAMES=(pto2-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_NAMES=(dfx-off orch orch-tensormap sched orch-sched all-on)
           COMBO_DEFS=(
-            "-DPTO2_PROFILING=0"
-            "-DPTO2_ORCH_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
-            "-DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_DFX=0"
+            "-DSIMPLER_ORCH_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
           )
           ARCHES=(a2a3sim a5sim)
           FAIL=()
@@ -442,12 +472,13 @@ jobs:
 
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
+    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -522,14 +553,14 @@ jobs:
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -615,10 +646,10 @@ jobs:
         run: |
           FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
 
-          NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
+          NON_CODE='^(docs/|\.docs/|\.claude/|\.gitignore$|\.pre-commit-config\.yaml$)|\.md$'
 
           # a2a3: skip only when ALL changed files are a5-only or non-code
-          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
           A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
 
           if [ -n "$A2A3_REMAINING" ]; then
@@ -631,7 +662,7 @@ jobs:
           fi
 
           # a5: skip only when ALL changed files are a2a3-only or non-code
-          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
           A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
 
           if [ -n "$A5_REMAINING" ]; then
@@ -645,12 +676,13 @@ jobs:
 
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
+    needs: pre-commit
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -716,14 +748,14 @@ jobs:
           cmake --build build
 
   st-onboard-a5:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -746,3 +778,43 @@ jobs:
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
+
+      # DFX per-feature smokes — hardware mirror of the st-sim-a5 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: l2_swimlane smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: PMU smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: args_dump smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"

@@ -29,7 +29,7 @@
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
 #include "common/unified_log.h"
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
 
@@ -108,7 +108,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     constexpr int kSegmentCap = 64;
     const PTO2TaskSlotState *seg[kSegmentCap];
     int seg_count = 0;
-    bool signaled = false;
     bool failed = false;
 
     auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
@@ -119,8 +118,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
-                // A fatal latched elsewhere (e.g. the scheduler-side wiring
-                // deadlock detector) breaks this wait; cold path only.
+                // A fatal latched elsewhere breaks this wait; cold path only.
                 if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
                     failed = true;
                     return;
@@ -147,8 +145,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                (slot.fanout_count & ~PTO2_FANOUT_SCOPE_BIT)) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
-                // A fatal latched elsewhere (e.g. the scheduler-side wiring
-                // deadlock detector) breaks this wait; cold path only.
+                // A fatal latched elsewhere breaks this wait; cold path only.
                 if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
                     failed = true;
                     return;
@@ -186,10 +183,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
             if (failed) return;
         }
         seg[seg_count++] = &s;
-        if (!signaled) {
-            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
-            signaled = true;
-        }
     };
 
     auto do_wait = [&]() {
@@ -212,9 +205,6 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     };
 
     do_wait();
-    if (signaled) {
-        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
-    }
     return !failed;
 }
 MAYBE_UNINITIALIZED_END
@@ -262,9 +252,9 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
 
 // Ops-table entry that hands the call-site captured by PTO2ScopeGuard to the
 // [ScopeStats] collector. The slot is always present in the struct to keep
-// the layout stable; at PTO2_PROFILING=0 we fill nullptr so the orchestration
+// the layout stable; at SIMPLER_DFX=0 we fill nullptr so the orchestration
 // .so's null-check skips it.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
 #endif
 
@@ -283,7 +273,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else
     .scope_set_site = nullptr,

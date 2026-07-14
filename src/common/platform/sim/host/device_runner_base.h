@@ -48,7 +48,7 @@
 #include "host/memory_allocator.h"
 #include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
@@ -104,6 +104,15 @@ public:
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
 
+    // On sim, allocate_tensor returns a plain host pointer, so the "device"
+    // address is already host-readable — register is identity, unregister a
+    // no-op. Mirrors the onboard DeviceRunnerBase API (separate class trees).
+    void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
+        (void)bytes;
+        return dev_ptr;
+    }
+    void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
+
     int record_device_orch_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
@@ -150,9 +159,9 @@ public:
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(int level) {
-        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
-        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    void set_dump_args_enabled(int level) {
+        dump_args_level_ = static_cast<DumpArgsLevel>(level);
+        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
     }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -308,14 +317,14 @@ protected:
 
     // Performance / diagnostics collectors shared across arches.
     L2SwimlaneCollector l2_swimlane_collector_;
-    TensorDumpCollector dump_collector_;
+    ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
     // Enablement flags. Written via setters before run(); read inside run().
     bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
+    bool enable_dump_args_{false};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()

@@ -113,7 +113,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
         if (set_scheduler_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor PTO2_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
+            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
             // the scheduler keeps its compile-time default. Sim skips the
             // op/stream ordering check (validate_runtime_timeout_order is onboard).
             RuntimeTimeoutParseStatus sched_status;
@@ -127,6 +127,11 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_))) return -1;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
+            return -1;
+        if (!load_sym(
+                "set_platform_l2_swimlane_aicore_rotation_table",
+                reinterpret_cast<void **>(&set_platform_l2_swimlane_aicore_rotation_table_func_)
+            ))
             return -1;
         if (!load_sym("set_l2_swimlane_enabled", reinterpret_cast<void **>(&set_l2_swimlane_enabled_func_))) return -1;
         if (!load_sym("set_platform_pmu_base", reinterpret_cast<void **>(&set_platform_pmu_base_func_))) return -1;
@@ -253,21 +258,21 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     runtime.set_aicpu_thread_num(launch_aicpu_num);
 
     int num_aic = block_dim;
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_args_) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     }
     if (enable_l2_swimlane_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
     }
     if (enable_pmu_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     }
     if (enable_dep_gen_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
     if (enable_scope_stats_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     }
 
     Handshake *workers = runtime.get_workers();
@@ -313,10 +318,10 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
-    if (enable_dump_tensor_) {
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -350,7 +355,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // mgmt + poll threads exit cleanly. stop() is idempotent and a no-op on
     // collectors that never started.
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        stop_collectors();
+        finalize_collectors();
     });
 
     // Allocate simulated register blocks for all AICore cores. Uses sparse
@@ -396,7 +401,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
         set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
         set_platform_scope_stats_base_func_ == nullptr || set_platform_l2_swimlane_base_func_ == nullptr ||
-        set_l2_swimlane_enabled_func_ == nullptr) {
+        set_platform_l2_swimlane_aicore_rotation_table_func_ == nullptr || set_l2_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -406,8 +411,9 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         set_orch_device_id_func_(device_id_);
     }
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_dump_args_enabled_func_(enable_dump_tensor_);
+    set_dump_args_enabled_func_(enable_dump_args_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
+    set_platform_l2_swimlane_aicore_rotation_table_func_(kernel_args_.l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_pmu_enabled_func_(enable_pmu_);
@@ -423,7 +429,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     if (enable_l2_swimlane_) {
         l2_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.start(thread_factory);
     }
     if (enable_pmu_) {
@@ -546,7 +552,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.export_swimlane_json();
     }
 
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.stop();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
@@ -601,6 +607,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_l2_swimlane_base_func_ = nullptr;
+        set_platform_l2_swimlane_aicore_rotation_table_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
@@ -631,23 +638,9 @@ int DeviceRunner::finalize() {
         return 0;
     }
 
-    // a5 sim full collector finalize: release shm back to prof_free_cb.
-    if (l2_swimlane_collector_.is_initialized()) {
-        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (scope_stats_collector_.is_initialized()) {
-        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-        kernel_args_.scope_stats_data_base = 0;
-    }
+    // Cleanup performance profiling. Normally already done by run()'s
+    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    finalize_collectors();
 
     release_callable_state();
 
@@ -686,18 +679,22 @@ int DeviceRunner::finalize() {
 // Performance Profiling Implementation
 // =============================================================================
 
-void DeviceRunner::stop_collectors() {
+void DeviceRunner::finalize_collectors() {
     if (l2_swimlane_collector_.is_initialized()) {
-        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.stop();
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.stop();
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.stop();
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.scope_stats_data_base = 0;
     }
 }
 
@@ -715,12 +712,12 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return rc;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_,
-        dump_tensor_level_
+        dump_args_level_
     );
     if (rc != 0) {
         return rc;

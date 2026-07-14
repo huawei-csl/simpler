@@ -39,7 +39,7 @@ and what code lives on each side.
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
 | --------- | ---- | ------- | ----------------------------- |
 | `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call + a following `dsb` to commit ordering. |
-| `cache_invalidate_range(addr, size)` (`src/a2a3/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required on a2a3 before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
+| `cache_invalidate_range(addr, size)` (`src/common/platform/include/aicpu/cache_maintenance.h`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range on onboard builds; sim builds keep it a no-op. Required on a2a3 before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
 
 `cache_invalidate_range` is the protocol-correct primitive for the
 **host-DMA → AICPU** case on a2a3. It was introduced in PR #204
@@ -99,7 +99,7 @@ Two separate concerns, often conflated:
   `rmb()` between the COND check and the slot reads.
 
 Concretely, the L2 swimlane staging-slot read in
-`src/{a2a3,a5}/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp` does
+`src/common/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp` does
 **not** call `cache_invalidate_range` on the slot, but it **does** call
 `rmb()` before reading `slot->task_id` and the timing fields. All of
 those fields are AICore writes covered by the AICore-side `dcci` in
@@ -185,8 +185,9 @@ forever once they ship.
 
 ## Related code
 
-- `src/a2a3/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
-- `src/a2a3/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
+- `src/common/platform/include/aicpu/cache_maintenance.h` — public cache-maintenance wrappers.
+- `src/common/platform/onboard/aicpu/cache_ops.cpp` — onboard implementation (`dc civac` / `dsb sy` / `isb`).
+- `src/common/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
 - AICore-side `dcci` usage lives in the L2 swimlane / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
 
 ## Related docs

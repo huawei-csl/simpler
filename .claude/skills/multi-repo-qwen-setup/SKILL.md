@@ -54,8 +54,8 @@ styles**. They measure different things; don't confuse them:
   `examples/model/qwen3_14b/npu_generate.py`, flags `--model-dir --prompt
   --max-seq-len --max-new-tokens --num-layers-override --profile[-verbose]`.
   Measures **end-to-end prefill/decode TPOT** for the whole model; read via
-  the `--profile` report + `device_log_timing` (§2–§5). Use it to reproduce
-  a serving perf number or chase a serving `507018`.
+  the `--profile` report + `strace_timing --rounds-table` (§2–§5). Use it
+  to reproduce a serving perf number or chase a serving `507018`.
 - **Path B — `decode_layer` kernel (pypto-lib).** A single JIT case for one
   decode layer, not the engine. Entry
   `models/qwen3/14b/decode_layer.py`, flags `-p <platform> -d <device>`,
@@ -117,15 +117,26 @@ task-submit --timeout 2400 --max-time 2400 --device auto --device-num 1 --run "\
 
 - `--num-layers-override 40` = full model; `--profile[-verbose]` prints the
   timing report (`api.run_decode` per-step = end-to-end TPOT, `kernel.decode_layer`
-  host wall, per-step layer breakdown).
+  host wall, per-step layer breakdown) plus `strace_timing --rounds-table`
+  (§2–§5).
 - Decode dispatches through the **L3 `DistributedWorker`**, which forks a
   **chip-child (L2)** that runs `run_prepared`. The per-step timing lives at
   **L2**: `run_prepared` computes both host (`host_wall`) and device
-  (`device_wall` = the fused-decode orchestrator wall, ~33 ms — nonzero) plus
-  the device orch/sched markers. The L3 parent's `Worker.run` returns
-  `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3 is a
-  dispatcher with no device wall of its own) and is **not** the source you
+  (`device_wall` = the fused-decode orchestrator wall, ~40 ms at 3.5k context —
+  nonzero) plus the device orch/sched markers. The L3 parent's `Worker.run`
+  returns `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3
+  is a dispatcher with no device wall of its own) and is **not** the source you
   read. Read L2 instead (next section).
+
+  > **Warmup skews single-invocation reads.** The pypto-serving profile warmup
+  > dispatches a tiny-KV decode step (`[warmup] decode dispatch … seq_len≈257`,
+  > `device_wall` ~28 ms) *before* the real 3.5k-context steps (~40 ms). Any
+  > tool that reports one invocation shows the warmup value. Decode is
+  > memory-bound: ~28 ms reads the 28 GB bf16 weights every step, +~12 ms reads
+  > the 3.3k-token KV for attention — the KV read is why warmup (short KV) is
+  > ~12 ms cheaper, not cold start. Trust `kernel.decode_layer avg` from
+  > `--profile` (excludes warmup) or `strace_timing --tree` (medians all
+  > invocations); do not read a single decode step.
 
 ## 3. Run decode (batch-16)
 
@@ -159,8 +170,8 @@ log to tell them apart**:
 
    ```bash
    # add to the task-submit --run, before the python call:
-   export PTO2_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
-   export PTO2_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
+   export SIMPLER_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
+   export SIMPLER_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
    ```
 
    The runtime reads these and overrides the compiled defaults
@@ -186,19 +197,19 @@ Redirect the CANN device log out of the shared default, then parse it:
 export ASCEND_PROCESS_LOG_PATH="$PWD/build/pypto-serving/build_output/ascend"
 mkdir -p "$ASCEND_PROCESS_LOG_PATH"
 # after the run (local, no device):
-$PY -m simpler_setup.tools.device_log_timing \
-    --device-log "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log"
+$PY -m simpler_setup.tools.strace_timing \
+    "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log" --rounds-table
 ```
 
-`device_log_timing` reports per-round **Total / Orch / Sched** from the
-`PTO2_PROFILING` markers (on by default, no swimlane needed). Round 0 is the
-prefill; the rest are decode steps. **Total ≈ on-device kernel makespan** =
-the "kernel run time" layer.
+`strace_timing --rounds-table` reports per-round **Device / Orch / Sched**
+from the `[STRACE]` markers (on by default, no swimlane needed). Round 0 is
+the prefill; the rest are decode steps. **Device ≈ on-device kernel
+makespan** = the "kernel run time" layer.
 
 For layers ②③④ — the host↔device and bind/validate spans — parse the
 `[STRACE]` host-trace markers with `strace_timing.py` (landed in
 [simpler #1177](https://github.com/hw-native-sys/simpler/pull/1177)). The
-markers are emitted at `LOG_INFO_V9` under `PTO2_PROFILING` (no new flag),
+markers are emitted at `LOG_INFO_V9` under `SIMPLER_DFX` (no new flag),
 so the same log captured above carries them:
 
 ```bash
@@ -214,7 +225,7 @@ The full per-token decomposition (what each layer means / how to get it):
 
 | layer | = | source |
 | ----- | - | ------ |
-| ① kernel run time | makespan | `device_log_timing` Total |
+| ① kernel run time | makespan | `strace_timing --rounds-table` Device |
 | ② device init/finalize | `device_wall − makespan` | `strace_timing` (`[STRACE]` markers) |
 | ③ host↔device handshake | `runner_run − device_wall` | `strace_timing` (`runner_run` span) |
 | ④ attach+bind+validate | `host_wall − runner_run` | `strace_timing` (`bind`/`validate` spans) |
@@ -222,9 +233,9 @@ The full per-token decomposition (what each layer means / how to get it):
 
 ②③④ come from the **L2 chip-child** `run_prepared`'s `host_wall` /
 `runner_run` / `device_wall`. `host_wall` and `device_wall` are already
-computed there (and `device_wall` is nonzero, ~33 ms — it is the L2 orchestrator
-wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3 parent drops
-the child's `RunTiming`, so they never reach a return value.
+computed there (and `device_wall` is nonzero, ~40 ms at 3.5k context — it is the
+L2 orchestrator wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3
+parent drops the child's `RunTiming`, so they never reach a return value.
 
 Simpler surfaces them instead as **`[STRACE]` host-trace markers** — one
 line per `run_prepared` stage
@@ -306,8 +317,8 @@ instrumentation lives in the **host** lib; only that target needs rebuilding.
   prefill (50 s+ vs 16.7 s) and decode spikes. Hold the die exclusively.
 - ❌ Reading `507018` as "simpler bug" without the device log — it masks a
   heap deadlock, an op-timeout, and a forward-progress stall.
-- ❌ Editing `platform_config.h` to raise timeouts — use the `PTO2_OP_EXECUTE_TIMEOUT_US`
-  / `PTO2_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
+- ❌ Editing `platform_config.h` to raise timeouts — use the `SIMPLER_OP_EXECUTE_TIMEOUT_US`
+  / `SIMPLER_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
   doesn't change the default for everyone else.
 - ❌ Setting the timeout env but breaking the ordering (`stream_sync` ≤ `op_execute`,
   or `op_execute` ≤ scheduler 10 s, or `stream_sync` not clearing scheduler + 1.5 s

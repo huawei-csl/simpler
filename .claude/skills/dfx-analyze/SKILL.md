@@ -15,12 +15,12 @@ Per-DFX docs: `docs/dfx/` (`l2-timing.md`, `sched-overhead-model.md`,
 
 | You want… | Tool | Needs |
 | --------- | ---- | ----- |
-| Per-run **Host / Device / Effective / Orch / Sched** timing | `strace_timing --rounds-table` | nothing extra — `[STRACE]` markers are on stderr (`SIMPLER_PROFILING`, compile-time default on, **NOT** gated by swimlane) |
+| Per-run **Host / Device / Effective / Orch / Sched** timing | `strace_timing --rounds-table` | nothing extra — `[STRACE]` markers are on stderr (`SIMPLER_HOST_STRACE`, compile-time default on, **NOT** gated by swimlane) |
 | AICPU **scheduler overhead / Tail-OH / critical-path** breakdown | `sched_overhead_analysis` | a `--enable-l2-swimlane` (level≥3) run + `--enable-dep-gen` run |
 | Swimlane → **Perfetto** Chrome trace | `swimlane_converter` | `--enable-l2-swimlane` run (`--overhead` track needs deps.json too) |
 | Task **dependency graph** (text / HTML) | `deps_viewer` | `--enable-dep-gen` run → `deps.json` |
 | **Per-scope ring-fill peaks** (task_window / heap / tensormap) | `scope_stats_plot` | `--enable-scope-stats` run → `scope_stats.jsonl` |
-| Inspect / export **args dumps** | `dump_viewer` | `--enable-dump-tensor` run → `args_dump/` |
+| Inspect / export **args dumps** | `dump_viewer` | `--dump-args` run → `args_dump/` |
 
 ## First reflex: Host/Device/Orch/Sched needs nothing extra
 
@@ -34,11 +34,11 @@ python -m simpler_setup.tools.strace_timing run.log --rounds-table
 # Orch≈Sched≈Effective ⇒ AICPU-bound. (Effective = orch∪sched window.)
 # --tree instead shows the nested span tree (device_wall → preamble/so_load/
 #   graph_build → config_validate/arena_wire/sm_reset prep + orch/sched → post_orch).
-# SIMPLER_DEVICE_PROFILING=0 drops the device clk=dev markers (host spans stay).
+# SIMPLER_DEVICE_STRACE_ENABLE=0 drops the device clk=dev markers (host spans stay).
 ```
 
 For the per-thread `loops`/`tasks_scheduled` deep-dive (not in the markers),
-rebuild with `PTO2_SCHED_PROFILING=1` and read the device log directly.
+rebuild with `SIMPLER_SCHED_PROFILING=1` and read the device log directly.
 
 ## Where the inputs are written
 

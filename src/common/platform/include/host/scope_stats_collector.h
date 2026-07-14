@@ -14,8 +14,9 @@
  * @brief Host-side scope_stats streaming collector + NDJSON export.
  *
  * Architecture mirrors PmuCollector: BufferPoolManager<ScopeStatsModule> runs
- * split mgmt threads (poll per-thread ready queues, recycle buffers, refill the
- * single instance's free_queue); ScopeStatsCollector's collector thread shards
+ * split mgmt threads (drain polls per-thread ready queues and refills the
+ * single instance's free_queue from recycled lanes; replenish returns done
+ * buffers to recycled lanes). ScopeStatsCollector's collector thread shards
  * append each full buffer's ScopeStatsRecords to an in-memory vector. After
  * stop(), write_jsonl() renders them to
  * <output_dir>/scope_stats/scope_stats.jsonl.
@@ -87,10 +88,14 @@ struct ScopeStatsModule {
 
     static constexpr int kBufferKinds = 1;
     static constexpr uint32_t kReadyQueueSize = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
+    static constexpr uint32_t kHostPoolQueueSize =
+        PLATFORM_MAX_AICPU_THREADS * PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE;
     static constexpr uint32_t kSlotCount = PLATFORM_SCOPE_STATS_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "ScopeStatsModule";
-    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
-    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    // The orchestrator is the sole device-side producer (scope_stats_collector_aicpu
+    // enqueues into queues[s_orch_thread_idx]), so one drain thread scanning
+    // every AICPU ready queue covers it; further shards would only ever be empty.
+    static constexpr int kMaxCollectorThreads = 1;
 
     static constexpr int batch_size(int /*kind*/) {
         constexpr int kBatch = PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE - PLATFORM_SCOPE_STATS_SLOT_COUNT;

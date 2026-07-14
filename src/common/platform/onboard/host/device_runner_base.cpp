@@ -68,25 +68,25 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
     if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
-        const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+        const char *op_env = std::getenv(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %llu", PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
+            "%s=%s invalid, using default %llu", SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
             (unsigned long long)order_defaults.op_execute_timeout_us
         );
     }
 
     if (parse_status.stream_sync_env_set && !parse_status.stream_sync_valid) {
-        const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
+        const char *sync_env = std::getenv(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
+            "%s=%s invalid, using default %d", SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
             order_defaults.stream_sync_timeout_ms
         );
     }
 
     if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
-        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        const char *sched_env = std::getenv(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
+            "%s=%s invalid, using default %d", SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
             order_defaults.scheduler_timeout_ms
         );
     }
@@ -955,9 +955,22 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     );
 }
 
+// Eager prebuilt-arena warm-up. A runtime that has a prebuilt runtime arena
+// (tensormap_and_ringbuffer) provides a strong prewarm_config_impl in its
+// runtime_maker.cpp that overrides this weak no-op default. Runtimes without one
+// (host_build_graph, or an arch that has not implemented it yet) link this weak
+// default and treat prewarm as a no-op. simpler_init calls it directly for the
+// fork-constant ring sizing once the device is up.
+extern "C" __attribute__((weak)) int prewarm_config_impl(
+    const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
+    const uint64_t * /*ring_dep_pool*/
+) {
+    return 0;
+}
+
 void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_l2_swimlane_enabled(config.enable_l2_swimlane);
-    set_dump_tensor_enabled(config.enable_dump_tensor);
+    set_dump_args_enabled(config.enable_dump_args);
     set_pmu_enabled(config.enable_pmu);
     // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
     // without dep_gen falls through to the base no-op.
@@ -1364,7 +1377,7 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
     if (enable_l2_swimlane_) {
         l2_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.start(thread_factory);
     }
     if (enable_pmu_) {
@@ -1387,7 +1400,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run() {
         l2_swimlane_collector_.export_swimlane_json();
     }
 
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.stop();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();

@@ -24,7 +24,7 @@
 // Profiling macros (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/device_time.h"
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
@@ -108,7 +108,7 @@ struct alignas(64) CoreExecState {
     // hot completion poll does a single volatile load instead of recomputing
     // reg_base + reg_offset(COND) on every iteration.
     volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // --- Profiling fields (dispatch path, compile-time gated) ---
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
@@ -306,9 +306,14 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
+    // Placement for the cores named by active_mask, ignoring cores this task does
+    // not use. All used cores idle -> RUNNING placement (each to its running slot).
+    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
+    // own state -- an idle core takes its running slot (and is marked running, so
+    // the completion poller, which scans only running cores, tracks its FIN), an
+    // already-running core takes its pending slot and executes after its in-flight
+    // task. REJECT only when a used core's pending slot is already occupied (no free
+    // slot) or the mask is empty.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used(0ULL);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
@@ -328,10 +333,7 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
-        }
-        return MixPlacement::REJECT;
+        return MixPlacement::PENDING;
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
@@ -414,14 +416,13 @@ struct SlotTransition {
 // Profiling counters (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 struct alignas(64) SchedL2SwimlaneCounters {
     bool l2_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
     uint64_t sched_scan_cycle{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
@@ -432,8 +433,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
+#if SIMPLER_SCHED_PROFILING
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};

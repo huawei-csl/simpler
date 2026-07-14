@@ -104,7 +104,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
         if (set_scheduler_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor PTO2_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
+            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
             // the scheduler keeps its compile-time default. Sim skips the
             // op/stream ordering check (validate_runtime_timeout_order is onboard).
             RuntimeTimeoutParseStatus sched_status;
@@ -269,21 +269,21 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 #endif
 
     int num_aic = block_dim;
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_args_) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     }
     if (enable_l2_swimlane_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
     }
     if (enable_pmu_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     }
     if (enable_dep_gen_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
     if (enable_scope_stats_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
@@ -330,10 +330,10 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
-    if (enable_dump_tensor_) {
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -453,7 +453,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         set_orch_device_id_func_(device_id_);
     }
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_dump_args_enabled_func_(enable_dump_tensor_);
+    set_dump_args_enabled_func_(enable_dump_args_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table_func_(kernel_args_.l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
@@ -472,7 +472,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     if (enable_l2_swimlane_) {
         l2_swimlane_collector_.start(thread_factory);
     }
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.start(thread_factory);
     }
     if (enable_pmu_) {
@@ -604,7 +604,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.export_swimlane_json();
     }
 
-    if (enable_dump_tensor_) {
+    if (enable_dump_args_) {
         dump_collector_.stop();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
@@ -762,7 +762,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return 0;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
@@ -773,7 +773,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     };
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, nullptr, free_cb, output_prefix_, dump_tensor_level_
+        num_dump_threads, device_id, alloc_cb, nullptr, free_cb, output_prefix_, dump_args_level_
     );
     if (rc != 0) {
         return rc;

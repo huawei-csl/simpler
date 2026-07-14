@@ -43,7 +43,6 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Phase1)              \
     X(Phase2)              \
     X(Phase3)              \
-    X(Phase3b)             \
     X(Phase4)              \
     X(Drain)               \
     X(Initializing)        \

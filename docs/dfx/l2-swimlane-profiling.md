@@ -33,12 +33,13 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into six
+- **AICPU scheduler phases** — per-iteration breakdown into five
   mutually time-exclusive **outer** phases (`complete` / `dispatch`
-  / `release` / `wire` / `dummy` / `early_dispatch`), one **inner**
-  phase that nests inside its parent outer (`resolve`, parent =
-  Complete or Dummy), and one **separate-lane** phase
-  (`dummy_task`, rendered on Worker View AICPU_N rather than on the
+  / `release` / `dummy` / `early_dispatch`), one logical
+  **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
+  sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
+  and one **separate-lane**
+  phase (`dummy_task`, rendered on Worker View AICPU_N rather than on the
   sched lane). Idle iterations no longer emit a record on a2a3; the
   host tooling reconstructs idle spans from the gap between
   consecutive work records on the same thread. See §3.2 for the
@@ -228,19 +229,24 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
-| `wire` | outer | sched | tasks wired by `drain_wiring_queue` this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
-| `resolve` | inner | sched (nests in `complete` or `dummy`) | consumers visited in `on_task_complete` |
+| `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
+
+Fanin/fanout wiring is not a scheduler phase: it runs on the
+orchestrator submit path, so it has no swimlane lane. Read its cost
+from `g_orch_fanin_cycle` in the device-log orch breakdown (the
+`fanin` line) instead.
 
 Outer phases are mutually time-exclusive within an iter — each
 emit advances the per-thread phase anchor (`_t0_phase`). Inner
-phases (`resolve`) don't advance the anchor; Perfetto nests them
-under the parent outer bar via time containment. Separate-lane
-phases are routed to a different lane by the converter (Worker
-View AICPU_N), so they never overlap visually with the sched
-lane bars even when their timestamps fall inside an outer span.
+phases (`resolve`) don't advance the anchor; the converter renders
+them on a sibling `Sched_N` tid so flow arrows attach to the outer
+`complete`/`dummy` lane instead of being visually captured by the inner
+slice. Separate-lane phases are routed to a different lane by the converter
+(Worker View AICPU_N), so they never overlap visually with the sched lane
+bars even when their timestamps fall inside an outer span.
 
 Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
 are still parsed for old captures but current a2a3/a5 builds no
@@ -282,23 +288,32 @@ in. The trace contains:
 - **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
   blocks (level >= 4).
 - **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
-  blocks coloured by `phase` (level >= 3). The six outer phases
-  (`complete` / `dispatch` / `release` / `wire` / `dummy` /
+  blocks coloured by `phase` (level >= 3). The five outer phases
+  (`complete` / `dispatch` / `release` / `dummy` /
   `early_dispatch`) appear as sibling bars on each scheduler
-  thread's lane; the `resolve` inner phase nests inside its
-  parent (`complete` or `dummy`).
+  thread's first `Sched_N` lane; the `resolve` inner phase appears on an
+  adjacent `Sched_N` sub-lane.
 - **Scheduler View** (pid=3) — task-execution overlay using AICPU
   dispatch/finish timestamps (level >= 2), with the same labels
   as Worker View.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
-  - `AIC_N` — matrix cores (kernel exec from level >= 1)
-  - `AIV_N` — vector cores (kernel exec from level >= 1)
+  - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
+  - `AIV_N` — vector cores (receive → kernel end from level >= 1)
   - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
     zero-width markers (one per dummy drained by the sched
     thread on AICPU N) and `alloc` bars (from `alloc_tensors()`
     calls that the orchestrator on AICPU 0 inline-completed).
     Both are activities the AICPU performs as a worker, so they
     share the same lane tier as AIC/AIV.
+  AIC/AIV hover args keep both `kernel-duration-us` and
+  `local_setup_us`; the old standalone setup preview bar is folded
+  into the task bar.
+
+`merged_swimlane.json` no longer emits separate `setup` X events.
+For AIC/AIV tasks, the Worker View task bar starts at `receive_time_us`
+and ends at `end_time_us`; the kernel-only duration remains available as
+`kernel-duration-us`, and the receive→start setup interval remains
+available as `local_setup_us` in the task's hover args.
 
 **Task labeling (AICore View and AICPU View) depends entirely on
 whether a `deps.json` is present** (see
@@ -458,11 +473,32 @@ that something dropped on the way from dep_gen to converter.
 
 **SPMD dependency arrows.** For logical tasks with `block_num > 1`,
 dependency / `hb_violation` flows connect via **anchor pairing** on
-physical core lanes — there is no dedicated `SPMD (block-level)` track.
+the Worker View and Scheduler View task lanes — there is no dedicated
+`SPMD (block-level)` track.
 
-SPMD tasks use the minimum-`core_id` subtask row per `core_type` as the
-dependency anchor; MIX-type SPMD tasks pick the minimum separately for
-AIC and AIV.
+Each view independently selects one SPMD anchor for every
+`(func_id, task_id)` group. The Worker View chooses the earliest visible
+kernel slice: `receive_time_us` when present, including the valid value `0`,
+or `start_time_us` for archived records without a receive timestamp. The
+Scheduler View independently chooses the earliest visible AICPU slice by
+`dispatch_time_us`. Equal start times are resolved by the smaller `core_id`.
+The two views can therefore select different physical subtask records. Within
+each view, dependency and `complete` arrows use that view's selected anchor.
+
+The grouping includes both the function identity and the logical `task_id`
+(ring/local id), so MIX tasks that share a `task_id` across AIC/AIV functions
+keep separate anchors. The converter does not draw one arrow per subtask
+instance.
+
+**`complete` arrows.** Like the dependency mirror, the per-task
+`complete` flow (task → the pid=2 `complete` phase that observed its
+last subtask FIN) is drawn from **both** task views using their independently
+selected anchor rows. The Worker View source anchors on the kernel slice
+(`end_time_us`), and the Scheduler View source anchors on the AICPU
+`finish_time_us`. Both arrows land on the identical pid=2 endpoint (thread +
+timestamp), so clicking the task in either view surfaces the arrow without
+changing completion attribution. The Scheduler View arrow is skipped when
+there is no visible AICPU bar.
 
 Non-SPMD tasks (including MIX multi-slot kernels with `block_num == 1`)
 keep every subtask row as an endpoint (N×N pairing unchanged).
@@ -506,9 +542,8 @@ What the swimlane shows:
   so Perfetto draws arrows between predecessor and successor tasks
   — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
   `deps.json` the trace is correct but unarrowed. For SPMD tasks,
-  dependency arrows use the minimum-`core_id` subtask row per
-  `core_type` as the anchor; MIX-type SPMD tasks pick the
-  minimum-`core_id` subtask separately for AIC and AIV.
+  dependency arrows independently use each view's earliest visible slice per
+  `(func_id, task_id)` group as the anchor.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
   its two work phases (complete / dispatch); idle is recovered
@@ -621,10 +656,15 @@ cross-direction read on the hot path.
 
 **Sizing.** `PLATFORM_AICORE_BUFFER_SIZE = 1024` (power of two, modulo
 lowers to AND) and `PLATFORM_AICORE_BUFFERS_PER_CORE = 4` (1 active +
-3 recycled). Host-side `BufferPoolManager` refills the recycled pool
-from the ready queue while the session runs, so session length is
-bounded only by how fast the host drains — not by the per-core buffer
-sum.
+3 recycled). Host-side `BufferPoolManager` drains full buffers through
+the collector, returns them via done → replenish → recycled lanes, and
+the owning drain shard refills the device free queue from that lane. The
+replenish thread also keeps recycled lanes above their host-side watermarks
+by batched allocation, but it never writes device free queues. These
+watermarks are steady-state low-water marks: AICPU-task keeps half of the
+init-seeded surplus per shard, while AICore-task has no init surplus and only
+keeps a minimal reserve batch. Session length is bounded only by how fast the
+host closes that loop — not by the per-core buffer sum.
 
 **Measured impact.** Hardware bench on a2a3 paged_attention_unroll
 Case1 with swimlane=4: rotation design delivers sched -4 µs / orch -19 µs
@@ -637,11 +677,12 @@ sched overhead per session as price for unbounded session length).
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
 `L2SwimlaneCollector` runs split mgmt threads and collector shards on top of a
-[`BufferPoolManager<L2SwimlaneModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
-drain/refill shards poll SPSC ready queues and recycle full buffers
-**while kernels are still executing**, a replenish thread keeps free
-queues topped up, and collector shards drain the host hand-off queues into
-`on_buffer_collected`.
+[`BufferPoolManager<L2SwimlaneModule>`](../../src/common/platform/include/host/buffer_pool_manager.h):
+drain/refill shards poll SPSC ready queues and refill free queues from
+shard-local recycled lanes **while kernels are still executing**. Collector
+shards drain the host hand-off queues into `on_buffer_collected`, then the
+replenish thread routes done buffers to same-kind lanes below their recycled
+watermarks before allocating any remaining top-up.
 
 `L2SwimlaneModule` declares four buffer kinds going through one ready
 queue per AICPU thread:
@@ -653,7 +694,7 @@ queue per AICPU thread:
   AICPU enqueues on rotation).
 
 Each `ReadyQueueEntry::kind` carries the discriminator. This is the
-only multi-kind module in the current framework — PMU and TensorDump
+only multi-kind module in the current framework — PMU and ArgsDump
 are single-kind.
 
 ```text
@@ -671,7 +712,7 @@ are single-kind.
 │   │ drain/refill shard │ │ queues        │   record (kind 0); fill  │
 │   │ + replenish thread │ │<──4 kinds────<│   func_id / dispatch /   │
 │   │   poll ready queue │<┼──multiplexed──│   finish; rotate buffer  │
-│   │   recycle buffers  │─┼──free queue──>│   when full              │
+│   │   refill freeQ     │─┼──free queue──>│   when full              │
 │   └────────────────────┘ │               │ AICPU scheduler thread:  │
 │   ┌────────────────────┐ │               │   per work iter: write   │
 │   │ collector shard    │ │               │   SchedPhaseRecord       │
@@ -708,9 +749,9 @@ export_swimlane_json()             ← writes <output_prefix>/l2_swimlane_record
 finalize(unregister, free)
 ```
 
-[`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
+[`L2SwimlaneCollector`](../../src/common/platform/include/host/l2_swimlane_collector.h)
 on a2a3 inherits from
-[`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../src/common/platform/include/host/profiler_base.h):
+[`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../../src/common/platform/include/host/profiler_base.h):
 the base class owns split mgmt threads, collector shards, and the
 `BufferPoolManager<L2SwimlaneModule>` they share. `L2SwimlaneCollector`
 supplies the L2-specific pieces — the `L2SwimlaneModule` trait
@@ -722,7 +763,7 @@ to copy into the right per-core or per-thread vector, plus
 `read_phase_header_metadata` /
 `reconcile_counters` / `export_swimlane_json` / `finalize`. The
 mgmt/collector threading and `Module` trait pattern are shared with
-PMU and TensorDump — see
+PMU and ArgsDump — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 
@@ -731,8 +772,10 @@ framework reference.
 a5's `L2SwimlaneCollector` derives from
 `ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` and uses the same
 framework abstractions as a2a3, including the same split mgmt +
-collector shard shape (`kMgmtDrainThreadCount` = `kCollectorThreadCount`
-= `PLATFORM_MAX_AICPU_THREADS`, i.e. 7 on a5 vs 4 on a2a3). The
+collector shard shape (`kMaxCollectorThreads` =
+`PLATFORM_MAX_AICPU_THREADS`, i.e. 7 on a5 vs 4 on a2a3, capping the
+shard arrays; the live drain/collector count is
+`min(aicpu_thread_num, kMaxCollectorThreads)`). The
 behavioral deviation from §5.2 is the **transport channel**: a5 has no
 `halHostRegister`, so each device buffer is paired with a
 host-shadow `malloc()` and the mgmt loop synchronizes the two via
@@ -768,8 +811,10 @@ whatever the host shadow held at the start of the tick. Per-buffer
 payloads (`L2SwimlaneAicpuTaskBuffer` / `L2SwimlaneAicpuPhaseBuffer`)
 are pulled on demand inside `ProfilerAlgorithms::process_entry` after
 a popped ready-entry resolves to its host shadow. `BufferPoolManager`'s
-`release_owned_buffers` frees the device pointer via the
-collector's `release_fn` and the paired shadow via `std::free()`.
+`release_owned_buffers` canonicalizes carved sub-buffers back to the
+registered allocation block before calling the collector's `release_fn`;
+paired host shadows are released later by `clear_mappings()` or on init
+rollback by `release_all_owned()`.
 
 ```text
         HOST                                         DEVICE
@@ -795,7 +840,7 @@ collector's `release_fn` and the paired shadow via `std::free()`.
 │   for each ready entry:  │               │                          │
 │     copy buf from device │<──memcpy─────<│                          │
 │     resolve host ptr     │               │                          │
-│     push to L2 ready_q   │               │                          │
+│     push to host ready_q │               │                          │
 │   advance queue_heads,   │               │                          │
 │     refill free_queues   │               │                          │
 │   write_range_to_device  │──memcpy──────>│                          │
@@ -838,11 +883,11 @@ l2_swimlane_collector_.export_swimlane_json()
 l2_swimlane_collector_.finalize()
 ```
 
-[`L2SwimlaneCollector`](../src/a5/platform/include/host/l2_swimlane_collector.h)
+[`L2SwimlaneCollector`](../../src/common/platform/include/host/l2_swimlane_collector.h)
 on a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
+([`profiling_common::ProfilerBase`](../../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
+[`BufferPoolManager`](../../src/common/platform/include/host/buffer_pool_manager.h)
 with `L2SwimlaneModule` (`kBufferKinds = 2`). The only a5-specific
 glue is the 5-callback `MemoryOps` and the per-tick shm mirror.
 
@@ -928,7 +973,7 @@ benchmark is not perturbed.
   phases past `PLATFORM_PHASE_RECORDS_PER_THREAD` per thread) are
   silently dropped via AICPU early return; the host surfaces the
   count in the finalize log line. Raise the constants in
-  [platform_config.h](../src/a5/platform/include/common/platform_config.h)
+  [platform_config.h](../../src/a5/platform/include/common/platform_config.h)
   for workloads that exceed them.
 - `a5sim` exercises the export pipeline; the simulated device
   clock is not realistic for absolute-timing analysis.
@@ -1007,7 +1052,7 @@ rules.
 
 - [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `[STRACE]`
   host_wall / device_wall, plus Total / Orch / Sched straight from the
-  `PTO2_PROFILING` device-log markers (no swimlane capture, works with
+  `SIMPLER_DFX` device-log markers (no swimlane capture, works with
   `--rounds > 1`); the lighter alternative when you don't need the
   per-task / phase deep dive.
 - [profiling-framework.md](../profiling-framework.md) — shared

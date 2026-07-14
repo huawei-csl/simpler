@@ -19,7 +19,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/memory_barrier.h"
@@ -66,7 +66,7 @@ struct AicpuExecutor {
     // Fast lookup: core_id -> reg_addr
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Physical core ids keyed by logical worker id. Populated by discover_cores()
     // and handed to pmu_aicpu_init() so the platform can resolve per-core PMU
     // MMIO bases from `get_platform_regs()`.
@@ -111,8 +111,8 @@ struct AicpuExecutor {
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
-    // ===== Dump tensor state =====
-    Runtime *runtime_{nullptr};  // Cached for dump_tensor access in try_dispatch_task
+    // ===== Args dump state =====
+    Runtime *runtime_{nullptr};  // Cached for args dump access in try_dispatch_task
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -130,8 +130,8 @@ struct AicpuExecutor {
     // Helper functions (inline to avoid linker issues, not always_inline to preserve barriers)
     //
     // resolve_task_dependencies also handles post-completion profiling hooks
-    // (AFTER_COMPLETION tensor dump + per-task PMU record) so that callers
-    // walk one boundary instead of sprinkling three #if PTO2_PROFILING blocks
+    // (AFTER_COMPLETION args dump + per-task PMU record) so that callers
+    // walk one boundary instead of sprinkling three #if SIMPLER_DFX blocks
     // after every resolve site. core_id / core_type are only read when the
     // relevant profiling flag is enabled.
     inline void resolve_task_dependencies(
@@ -148,7 +148,7 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 static int
 collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint64_t *buffer_addrs, int max_count) {
     int found = 0;
@@ -169,7 +169,7 @@ collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint6
 // ===== Helper Function Implementations =====
 
 // Resolve dependencies: decrement fanin and enqueue newly ready tasks.
-// Also handles post-completion profiling hooks (AFTER_COMPLETION tensor dump
+// Also handles post-completion profiling hooks (AFTER_COMPLETION args dump
 // + per-task PMU record) so callers don't need to re-check profiling flags.
 inline void AicpuExecutor::resolve_task_dependencies(
     Task *task, Runtime &runtime, int thread_idx, int core_id, CoreType core_type, int *cur_ready_queue_aic,
@@ -179,7 +179,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
         return;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
@@ -191,7 +191,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
             dump_args_for_task(
                 thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
-                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
+                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::AFTER_COMPLETION
             );
         }
     }
@@ -260,7 +260,7 @@ inline bool AicpuExecutor::try_dispatch_task(
         running_task_ids_[core_id]
     );
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         Task *task = runtime_->get_task(task_id);
         if (task != nullptr) {
@@ -274,7 +274,7 @@ inline bool AicpuExecutor::try_dispatch_task(
                     collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
                 dump_args_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
-                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
+                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::BEFORE_DISPATCH
                 );
             }
         }
@@ -285,9 +285,11 @@ inline bool AicpuExecutor::try_dispatch_task(
     pending_task_ids_[core_id] = task_id;
 
     // AICore buffer rotation: count this dispatch and rotate before write_reg
-    // when crossing a BUFFER_SIZE boundary.
+    // when crossing a BUFFER_SIZE boundary. The just-filled buffer is stashed
+    // for ACK-gated release and drained via the next-rotation / run-end backstop
+    // (no ACK hook wired). `task_id` is passed as the gate token.
     if (l2_swimlane_enabled) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, static_cast<uint32_t>(task_id));
     }
 
     // Publish task data before AICore can observe the dispatched task_id.
@@ -368,7 +370,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->worker_count);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(aicpu_thread_num_);
     }
@@ -478,7 +480,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         physical_core_ids_[i] = physical_core_id;
 #endif
 
@@ -1102,7 +1104,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_flush(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
@@ -1111,7 +1113,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     }
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
     if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cur_thread_cores, thread_cores_num_[thread_idx]);

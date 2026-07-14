@@ -42,7 +42,7 @@
  *          maps 1:1 onto a Chrome-trace "X" event; same-host cross-process
  *          comparable. STRACE_A appends caller-supplied "k=v" attrs verbatim.
  *
- * Gated on SIMPLER_PROFILING (default on, see profiling_config.h — no env var)
+ * Gated on SIMPLER_HOST_STRACE (default on, see profiling_config.h — no env var)
  * and emitted at LOG_INFO_V9 (the must-see tier, default-visible). In a
  * non-profiling build the macros compile to nothing.
  */
@@ -50,7 +50,9 @@
 #ifndef PLATFORM_STRACE_H_
 #define PLATFORM_STRACE_H_
 
-#if SIMPLER_PROFILING
+#include "profiling_config.h"
+
+#if SIMPLER_HOST_STRACE
 
 #include <pthread.h>
 
@@ -204,7 +206,7 @@ emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, con
 #define STRACE_DEV_SPAN_AT(name, ts_ns, dur_ns, depth) \
     ::simpler::strace::emit_span_at((name), (ts_ns), (dur_ns), (depth))
 
-#else  // !SIMPLER_PROFILING
+#else  // !SIMPLER_HOST_STRACE
 
 #define STRACE(name) ((void)0)
 #define STRACE_A(name, attrs) ((void)0)
@@ -212,6 +214,6 @@ emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, con
 #define STRACE_SET_HID(h) ((void)0)
 #define STRACE_DEV_SPAN_AT(name, ts_ns, dur_ns, depth) ((void)0)
 
-#endif  // SIMPLER_PROFILING
+#endif  // SIMPLER_HOST_STRACE
 
 #endif  // PLATFORM_STRACE_H_

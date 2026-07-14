@@ -61,7 +61,7 @@
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "prepare_callable_common.h"
 
 struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
@@ -98,6 +98,23 @@ public:
     void clear_temporary_buffer();
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
+
+    /**
+     * Map a device buffer into the host address space and return a
+     * host-readable VA (or nullptr on failure); the paired unregister releases
+     * it. The returned VA may differ from dev_ptr, so callers must use it, not
+     * dev_ptr, for host access. Register/unregister must be paired (unregister
+     * before free_tensor). On a2a3 onboard this wraps
+     * halHostRegister(DEV_SVM_MAP_HOST); a5 onboard has no host-map path and
+     * uses the base default. Base default: unsupported (returns nullptr /
+     * no-op); a2a3 overrides.
+     */
+    virtual void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+        (void)dev_ptr;
+        (void)bytes;
+        return nullptr;
+    }
+    virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
@@ -479,9 +496,9 @@ public:
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(int level) {
-        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
-        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    void set_dump_args_enabled(int level) {
+        dump_args_level_ = static_cast<DumpArgsLevel>(level);
+        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
     }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -886,7 +903,7 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     L2SwimlaneCollector l2_swimlane_collector_;
-    TensorDumpCollector dump_collector_;
+    ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
@@ -894,8 +911,8 @@ protected:
     // Written by the c_api entry point via `set_*_enabled()` before
     // `run()`, read inside `run()` and its helpers.
     bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
+    bool enable_dump_args_{false};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()

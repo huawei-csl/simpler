@@ -86,15 +86,15 @@ struct PTO2OrchestratorState {
     uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     int32_t manual_begin_depth{PTO2_MAX_SCOPE_DEPTH};
 
-    // === SCHEDULER REFERENCE ===
-    // Note: In simulated mode, orchestrator and scheduler share address space
-    // In real mode, they communicate via shared memory only
-    PTO2SchedulerState *scheduler;  // For simulated mode only
+    // === SCHEDULER STATE ACCESS ===
+    // Same runtime-arena scheduler object; Orch-side wiring mutates dep_pool
+    // and publishes ready tasks through it before scheduler workers dispatch.
+    PTO2SchedulerState *scheduler;
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // L2 swimlane_level copied from get_l2_swimlane_level().
     L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};
 #endif
@@ -115,7 +115,7 @@ struct PTO2OrchestratorState {
     int64_t inline_completed_tasks{0};
 
     // === STATISTICS ===
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
@@ -174,6 +174,8 @@ struct PTO2OrchestratorState {
     // Forget pointers; arena owns the backing buffers.
     void destroy();
     void set_scheduler(PTO2SchedulerState *scheduler);
+    void mark_dep_pool_position(PTO2TaskSlotState &slot_state);
+    void wire_fanin_task(PTO2TaskSlotState &slot_state, int32_t wfanin);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
@@ -187,7 +189,7 @@ struct PTO2OrchestratorState {
 // Orchestrator Profiling Data
 // =============================================================================
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;  // Combined task slot + heap allocation

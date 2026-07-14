@@ -61,7 +61,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 // =============================================================================
-// Lazy-loaded HAL (ascend_hal) for profiling host-register only
+// Lazy-loaded HAL (ascend_hal) for halHostRegister / halHostUnregister
 // =============================================================================
 
 namespace {
@@ -263,12 +263,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
 
     // Build the profiling-flag bitfield (a2a3 carries an extra dep_gen bit).
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    if (enable_l2_swimlane_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    if (enable_pmu_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
-    if (enable_dep_gen_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
-    if (enable_scope_stats_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_args_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    if (enable_l2_swimlane_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    if (enable_pmu_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    if (enable_dep_gen_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    if (enable_scope_stats_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
@@ -343,11 +343,11 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }
     }
 
-    if (enable_dump_tensor_) {
-        // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        // Initialize args dump (independent from profiling)
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -444,6 +444,19 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
     // a2a3 silicon (the dev box is a5-only), relying on CI. See
     // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    // The AICore publishes aicore_done on launch (gated by nothing), and the
+    // workers region persists across runs in the pooled arena. Clearing each
+    // worker's aicore_done before the AICore kernel launches keeps the AICPU's
+    // handshake sweep from reading a prior run's report — which would open a
+    // window on that run's physical_core_id. Only aicore_done needs clearing; the
+    // AICore overwrites physical_core_id/core_type in the same report.
+    {
+        Handshake *workers = runtime.get_workers();
+        for (int i = 0; i < num_aicore; i++) {
+            workers[i].aicore_done = 0;
+        }
+    }
+
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
@@ -707,6 +720,57 @@ int DeviceRunner::force_reset_device() {
     return 0;
 }
 
+void *DeviceRunner::register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("register_device_memory_to_host: invalid device_id %d", device_id_);
+        return nullptr;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("register_device_memory_to_host: failed to load ascend_hal: %s", dlerror());
+        return nullptr;
+    }
+    HalHostRegisterFn fn = get_halHostRegister();
+    if (fn == nullptr) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister symbol not found: %s", dlerror());
+        return nullptr;
+    }
+    void *host_va = nullptr;
+    int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, &host_va);
+    if (rc != 0) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+        return nullptr;
+    }
+    return host_va;
+}
+
+void DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
+    if (dev_ptr == nullptr) {
+        return;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("unregister_device_memory_from_host: invalid device_id %d", device_id_);
+        return;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: failed to load ascend_hal: %s", dlerror());
+        return;
+    }
+    // halHostUnregister is keyed by the device pointer; the HAL maps it back to
+    // the host VA internally.
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    if (fn == nullptr) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister symbol not found: %s", dlerror());
+        return;
+    }
+    int rc = fn(dev_ptr, device_id_);
+    if (rc != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+    }
+}
+
 int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
@@ -857,7 +921,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return 0;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
@@ -866,7 +930,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
-            LOG_ERROR("Failed to load ascend_hal for tensor dump: %s", dlerror());
+            LOG_ERROR("Failed to load ascend_hal for args dump: %s", dlerror());
             return -1;
         }
         HalHostRegisterFn fn = get_halHostRegister();
@@ -882,7 +946,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     };
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_tensor_level_
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_args_level_
     );
     if (rc != 0) {
         return rc;

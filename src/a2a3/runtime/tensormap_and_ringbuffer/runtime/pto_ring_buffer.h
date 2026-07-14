@@ -44,7 +44,7 @@
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (deadlock wall-clock)
 #include "common/unified_log.h"
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 // Heap-ring wrap reporting — the allocator is the only place each individual
 // wrap is observable, so it notifies the scope_stats collector here. Gated:
 // pays nothing (no include, no call) when profiling is compiled out.
@@ -59,9 +59,6 @@
 // backstop for the residual case the structural test can't prove locally; it is
 // an ABSOLUTE TIME (not a spin count), so it is stable across chips/contention.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
-
-// Dep pool spin limit - if exceeded, dep pool capacity too small for workload
-#define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
@@ -135,7 +132,7 @@ public:
         bool blocked_on_heap = false;
         uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
         bool block_timing = false;  // false until the first no-reclaim-progress spin
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
         uint64_t wait_start = 0;
         bool waiting = false;
 #endif
@@ -146,7 +143,7 @@ public:
                 void *heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
                     record_wait(spin_count, wait_start, waiting);
 #endif
                     return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
@@ -158,7 +155,7 @@ public:
 
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
             if (!waiting) {
                 wait_start = get_sys_cnt_aicpu();
                 waiting = true;
@@ -172,8 +169,7 @@ public:
                 prev_last_alive = last_alive;
                 block_timing = false;
             } else if ((spin_count & 1023) == 0) {
-                // A fatal latched elsewhere (e.g. the scheduler-side wiring
-                // deadlock detector) breaks this otherwise-unbounded spin; the
+                // A fatal latched elsewhere breaks this otherwise-unbounded spin; the
                 // caller maps the failed alloc to orch_mark_fatal. Polled on the
                 // cold path only -- error_code_ptr_ is orch_error_code.
                 if (error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
@@ -307,7 +303,7 @@ private:
         uint64_t old_tail = heap_tail_;
         heap_tail_ =
             static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Reclaim pointer moves forward monotonically in ring order; a decrease
         // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
         // most one wrap per call). Report it so scope_stats can unroll.
@@ -344,7 +340,7 @@ private:
                 );
                 result = heap_base_;
                 heap_top_ = alloc_size;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 // Allocation pointer just wrapped past heap_size_; report it so
                 // scope_stats can unroll the wrapping offset into a monotonic value.
                 // The collector attributes the wrap to the current scope's ring.
@@ -375,7 +371,7 @@ private:
         return result;
     }
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
         if (waiting) {
             extern uint64_t g_orch_alloc_wait_cycle;
@@ -709,7 +705,7 @@ struct PTO2DepListPool {
     }
 
     /**
-     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
+     * Reclaim dead entries based on the slot state dep_pool_mark.
      * Safe to call multiple times — only advances tail forward.
      *
      * @param ring             Ring header (for reading slot dep_pool_mark)
@@ -719,9 +715,19 @@ struct PTO2DepListPool {
 
     /**
      * Ensure dep pool for a specific ring has at least `needed` entries available.
-     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
+     * Spin-waits for reclamation under pressure. The dep pool shares
+     * last_task_alive with the heap and task rings, so it detects a wedged
+     * reclaim watermark the same way PTO2TaskAllocator::alloc does: a structural
+     * head-of-line check plus a wall-clock backstop, each emitting report_deadlock.
      */
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
+
+    /**
+     * Structured dep-pool deadlock report, mirroring PTO2TaskAllocator::report_deadlock.
+     * scope_gated marks the provable head-of-line case (head COMPLETED, all
+     * consumers released, scope still open) as opposed to the wall-clock backstop.
+     */
+    void report_deadlock(PTO2SharedMemoryRingHeader &ring, int32_t needed, int32_t last_alive, bool scope_gated);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)

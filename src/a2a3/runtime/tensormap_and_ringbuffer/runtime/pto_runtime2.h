@@ -91,7 +91,7 @@ struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
-    // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
 };
 
@@ -223,8 +223,8 @@ PTO2Runtime *runtime_init_data_from_layout(
 /**
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
  * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
+ * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool})
+ * so each holds arena.base() + offset. Idempotent — runs on
  * both host (writing host-mirror addresses) and AICPU (writing device
  * addresses) sides.
  */

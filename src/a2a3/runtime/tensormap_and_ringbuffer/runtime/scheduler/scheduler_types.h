@@ -23,7 +23,7 @@
 // Profiling macros (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/device_time.h"
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
@@ -107,7 +107,7 @@ struct alignas(64) CoreExecState {
     // hot completion poll does a single volatile load instead of recomputing
     // reg_base + reg_offset(COND) on every iteration.
     volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // --- Profiling fields (dispatch path, compile-time gated) ---
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
@@ -208,6 +208,25 @@ public:
 
     bool has_any_running_cores() const { return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value(); }
 
+    // True if any core on this thread still has a free slot to stage onto — an
+    // idle core (running slot) or a running core with a free pending slot. A
+    // core is unavailable only when running AND its pending slot is occupied;
+    // idle cores keep pending_occupied_ clear by invariant, so
+    // ~pending_occupied_ over all cores is exactly "has a free slot". Purely
+    // local (no shared/atomic access) — used to skip early dispatch, and its
+    // shared-queue pop, when this thread has no capacity at all.
+    // BitStates of every core on this thread with a free slot to stage onto: a
+    // core is unavailable only when running AND its pending slot is occupied.
+    // Idle cores keep pending_occupied_ clear by invariant, so ~pending_occupied_
+    // over aic|aiv is exactly "has a free slot". Spans AIC+AIV, so its .count() is
+    // an upper bound on the early-dispatch drain's per-shape pop (never exceeds the
+    // thread's total free cores), and .has_value() is the has_any_free_slot()
+    // predicate that gates the Phase-4b early-dispatch pass. Purely local (no
+    // shared/atomic access).
+    BitStates get_free_slot_states() const { return (~pending_occupied_) & (aic_mask_ | aiv_mask_); }
+
+    bool has_any_free_slot() const { return get_free_slot_states().has_value(); }
+
     template <CoreType CT>
     int32_t get_running_count() const {
         if constexpr (CT == CoreType::AIC) {
@@ -305,9 +324,14 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
+    // Placement for the cores named by active_mask, ignoring cores this task does
+    // not use. All used cores idle -> RUNNING placement (each to its running slot).
+    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
+    // own state -- an idle core takes its running slot (and is marked running, so
+    // the completion poller, which scans only running cores, tracks its FIN), an
+    // already-running core takes its pending slot and executes after its in-flight
+    // task. REJECT only when a used core's pending slot is already occupied (no free
+    // slot) or the mask is empty.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used(0ULL);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
@@ -327,10 +351,54 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
+        return MixPlacement::PENDING;
+    }
+
+    // --- Gated MIX split placement ---
+    // A gated MIX block can place each of its cores INDEPENDENTLY (idle core -> gated
+    // running slot; busy core with a free pending slot -> gated pending slot), because
+    // every core waits on the doorbell and nothing executes until the rendezvous rings.
+    // This is unsafe for immediate (non-gated) dispatch — hence separate from
+    // classify_mix_cluster, which forces a single placement for the whole cluster.
+
+    // Cores of `cluster_offset` named by core_mask.
+    BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
+        BitStates used(0ULL);
+        if (core_mask & PTO2_SUBTASK_MASK_AIC) used |= BitStates(1ULL << cluster_offset);
+        if (core_mask & PTO2_SUBTASK_MASK_AIV0) used |= BitStates(1ULL << (cluster_offset + 1));
+        if (core_mask & PTO2_SUBTASK_MASK_AIV1) used |= BitStates(1ULL << (cluster_offset + 2));
+        return used;
+    }
+
+    // Every used core has SOME free slot: a core lacks one only when it is running AND
+    // its pending slot is occupied (both slots taken).
+    bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
+        BitStates used = mix_used_cores(cluster_offset, core_mask);
+        if (!used.has_value()) return false;
+        BitStates no_slot = (~core_states_) & pending_occupied_;  // running AND pending taken
+        return !(used & no_slot).has_value();
+    }
+
+    // Used cores that are idle -> will take a running slot (rendezvous seed count).
+    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
+        return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
+    }
+
+    // Clusters where every used core has a free slot (gated MIX split gate/iteration).
+    BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
+        BitStates result(0ULL);
+        BitStates candidates = get_cluster_offset_states();
+        while (candidates.has_value()) {
+            int32_t off = candidates.pop_first();
+            if (mix_cluster_all_slots(off, core_mask)) {
+                result |= BitStates(1ULL << off);
+            }
         }
-        return MixPlacement::REJECT;
+        return result;
+    }
+
+    int32_t count_mix_split_clusters(uint8_t core_mask) const {
+        return get_mix_split_cluster_offset_states(core_mask).count();
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
@@ -413,13 +481,12 @@ struct SlotTransition {
 // Profiling counters (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 struct alignas(64) SchedL2SwimlaneCounters {
     bool l2_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
@@ -436,8 +503,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
+#if SIMPLER_SCHED_PROFILING
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};
@@ -459,7 +525,15 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
     std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
     std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
-    int32_t _pad[10];
+    // Parallel staging: after the elected thread confirms global availability it sets
+    // stage_go, releasing every thread to stage its OWN cores concurrently (vs the old
+    // single-thread serial fill). Each thread ORs its bit into stage_done_mask when it
+    // finishes and accumulates its running-slot cores into running_staged; the elected
+    // thread waits for all bits, seeds the rendezvous, and reopens the gate.
+    std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=elected released parallel staging
+    std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per thread; all-set = all threads done staging
+    std::atomic<int32_t> drain_running_staged{0};    // sum of running-slot cores staged (rendezvous seed)
+    int32_t _pad[7];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 
