@@ -471,6 +471,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, DLL_loading, 0);
             // graph_build front-matter phases (orch thread only); the scheduler
             // threads spin-wait on runtime_init_ready_ across this whole region.
             // Each sub-phase gets its own `{}` scope so the boundaries are
