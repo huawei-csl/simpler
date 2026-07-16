@@ -21,10 +21,10 @@
 #define PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <dlfcn.h>
 
+#include "aicpu/device_time.h"
 #include "common/platform_config.h"
 
 // AICore function attribute - no-op in simulation
@@ -140,19 +140,7 @@ inline int64_t ld_dev(int32_t *src, int16_t offset) {
  *
  * @return Simulated counter value (ticks)
  */
-inline uint64_t get_sys_cnt_aicore() {
-    auto now = std::chrono::high_resolution_clock::now();
-    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-
-    // Convert nanoseconds to counter ticks
-    constexpr uint64_t kNsPerSec = std::nano::den;
-    uint64_t seconds = elapsed_ns / kNsPerSec;
-    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
-
-    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
-
-    return ticks;
-}
+inline uint64_t get_sys_cnt_aicore() { return sys_cnt_now_ticks(); }
 
 // =============================================================================
 // Register Access Simulation
@@ -179,9 +167,13 @@ inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
-    uint64_t val = static_cast<uint64_t>(*ptr);
-    OUT_OF_ORDER_LOAD_BARRIER();
-    return val;
+    // The register cell is the AICPU<->AICore handshake gate (dispatch / COND).
+    // In sim it is plain host memory shared across the AICore and AICPU host
+    // threads, so the load itself must be an atomic acquire for happens-before
+    // to hold against the writer's release (and for TSAN to see it). A bare
+    // fence beside a non-atomic load does neither, so __atomic_load_n subsumes
+    // the old OUT_OF_ORDER_LOAD_BARRIER().
+    return static_cast<uint64_t>(__atomic_load_n(ptr, __ATOMIC_ACQUIRE));
 }
 
 /**
@@ -196,8 +188,10 @@ inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
-    *ptr = static_cast<uint32_t>(value);
-    OUT_OF_ORDER_STORE_BARRIER();
+    // Atomic release store: publishes any prior stores (e.g. kernel outputs,
+    // the COND task_id payload) before the gate becomes visible to the AICPU's
+    // acquire load. Subsumes the old OUT_OF_ORDER_STORE_BARRIER().
+    __atomic_store_n(ptr, static_cast<uint32_t>(value), __ATOMIC_RELEASE);
 }
 
 /**

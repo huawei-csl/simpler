@@ -9,13 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllToAll kernel — symmetric, 3-phase, HCCL-window scratch pattern.
+ * AllToAll kernel — push-based (TPUT → barrier → local copy-out).
  *
- * Phase 1 (stage-in):   for dest in 0..nranks-1: input[dest*C..) → scratch[dest*C..)
- * Phase 2 (barrier):    signal matrix + TWAIT cross-rank sync
- * Phase 3 (exchange):   for src in 0..nranks-1: TLOAD(peer src scratch[my_rank*C]) → output[src*C..)
+ *   push:      TPUT input[dest*C..) → peer dest scratch[my_rank*C..)
+ *              (CommRemotePtr to self returns localPtr → local write)
+ *   barrier:   signal matrix TNOTIFY / TWAIT
+ *   copy-out:  TLOAD(local scratch[src*C..)) → TSTORE(output[src*C..))
  *
- * Scratch is indexed by destination rank: scratch[dest*C] holds the chunk sent to dest.
+ * Scratch invariant: slot src*C holds the chunk rank src pushed here.
+ * Input is read-only and peer writes land in distinct scratch slots, so no
+ * post-exchange barrier is required before copy-out.
  *
  * args layout:
  *   tensor(0) = input    nranks*COUNT_PER_RANK floats  (INPUT)
@@ -74,37 +77,29 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         return;
     }
 
-    // signal_base follows the nranks * COUNT_PER_RANK float staging region.
+    // signal_base follows the nranks * COUNT_PER_RANK float data region.
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + nranks * COUNT_PER_RANK);
 
     ShapeDyn shape(1, 1, 1, 1, COUNT_PER_RANK);
     StrideDyn stride(COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, 1);
 
-    TileData stageTile(1, COUNT_PER_RANK);
-    TileData recvTile(1, COUNT_PER_RANK);
-    TASSIGN(stageTile, 0x0);
-    TASSIGN(recvTile, 0x10000);
+    // Reused for push staging and local copy-out.
+    TileData pushTile(1, COUNT_PER_RANK);
+    TASSIGN(pushTile, 0x0);
 
-    // ------------------------------------------------------------------
-    // Phase 1: stage-in — copy each destination chunk into scratch so
-    // every peer can read the slice destined for them in Phase 3.
-    // ------------------------------------------------------------------
+    // Push each destination chunk into peer dest's scratch[my_rank*C].
+    __gm__ float *scratch_dst_local = scratch + my_rank * COUNT_PER_RANK;
     for (int dest = 0; dest < nranks; ++dest) {
+        __gm__ float *scratch_dst_remote = CommRemotePtr(commCtx, scratch_dst_local, dest);
+
         Global inputChunkG(input + dest * COUNT_PER_RANK, shape, stride);
-        Global scratchChunkG(scratch + dest * COUNT_PER_RANK, shape, stride);
-        TLOAD(stageTile, inputChunkG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(scratchChunkG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        Global scratchChunkG(scratch_dst_remote, shape, stride);
+
+        pto::comm::TPUT(scratchChunkG, inputChunkG, pushTile);
     }
     pipe_barrier(PIPE_ALL);
 
-    // ------------------------------------------------------------------
-    // Phase 2: device barrier — notify every peer that stage-in is done,
-    // then wait until every peer has notified us.
-    // ------------------------------------------------------------------
+    // Device barrier: notify peers that our pushes are done, then wait.
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
@@ -118,20 +113,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
-    // ------------------------------------------------------------------
-    // Phase 3: exchange — read chunk my_rank from every rank's scratch and
-    // write it into the corresponding slice of the output tensor.
-    // CommRemotePtr with pe==my_rank returns localPtr unchanged, so the
-    // self-read goes through the same code path as the remote reads.
-    // ------------------------------------------------------------------
+    // Local copy-out from scratch slots into output.
     for (int src = 0; src < nranks; ++src) {
-        __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + my_rank * COUNT_PER_RANK, src);
-        Global remoteG(remote_chunk, shape, stride);
+        Global scratchSlotG(scratch + src * COUNT_PER_RANK, shape, stride);
         Global outputSlotG(output + src * COUNT_PER_RANK, shape, stride);
-        TLOAD(recvTile, remoteG);
+        TLOAD(pushTile, scratchSlotG);
         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(outputSlotG, recvTile);
+        TSTORE(outputSlotG, pushTile);
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     }

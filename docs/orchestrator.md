@@ -502,7 +502,10 @@ private:
   writes `X` (new producer P2 in TensorMap), there's no P1 → P2 edge. This is
   correct: the reader only needs P1 to have completed, the new writer only
   needs its own prior producer. Simultaneous read and write races are a user
-  bug, not a scheduler concern.
+  bug, not a scheduler concern. When a workload genuinely needs the reader
+  ordered ahead of the overwrite, express it explicitly — see
+  [WAR anti-dependencies](war-anti-dependency.md) (issue #1306) for the
+  `add_dep` vs `INOUT` trade-off.
 
 ### Thread safety
 
