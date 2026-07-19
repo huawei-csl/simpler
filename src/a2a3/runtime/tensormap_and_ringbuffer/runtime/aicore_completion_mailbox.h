@@ -22,7 +22,10 @@
 #define AICORE_COMPLETION_MAILBOX_CAPACITY 4096u
 #define AICORE_COMPLETION_MAILBOX_MASK (AICORE_COMPLETION_MAILBOX_CAPACITY - 1u)
 
-static_assert((AICORE_COMPLETION_MAILBOX_CAPACITY & (AICORE_COMPLETION_MAILBOX_CAPACITY - 1u)) == 0, "AICORE_COMPLETION_MAILBOX_CAPACITY must be a power of two");
+static_assert(
+    (AICORE_COMPLETION_MAILBOX_CAPACITY & (AICORE_COMPLETION_MAILBOX_CAPACITY - 1u)) == 0,
+    "AICORE_COMPLETION_MAILBOX_CAPACITY must be a power of two"
+);
 
 // Mailbox message discriminator. CONDITION carries one deferred-completion
 // observation flattened from a DeferredCompletionEntry. TASK_NORMAL_DONE
@@ -34,8 +37,7 @@ static_assert((AICORE_COMPLETION_MAILBOX_CAPACITY & (AICORE_COMPLETION_MAILBOX_C
 #define MSG_KIND_CONDITION 0u
 #define MSG_KIND_TASK_NORMAL_DONE 1u
 
-struct AICoreCompletionMailboxMessage
-{
+struct AICoreCompletionMailboxMessage {
     std::atomic<uint64_t> seq;
     PTO2TaskId task_token;
     uint64_t addr;
@@ -47,11 +49,16 @@ struct AICoreCompletionMailboxMessage
 };
 
 static_assert(sizeof(AICoreCompletionMailboxMessage) == PTO2_ALIGN_SIZE, "AICoreCompletionMailboxMessage layout drift");
-static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t), "std::atomic<uint64_t> must be layout-compatible with uint64_t for the message slot layout to hold");
-static_assert(std::atomic<uint64_t>::is_always_lock_free, "AICoreCompletionMailbox requires lock-free uint64_t atomics on every supported target");
+static_assert(
+    sizeof(std::atomic<uint64_t>) == sizeof(uint64_t),
+    "std::atomic<uint64_t> must be layout-compatible with uint64_t for the message slot layout to hold"
+);
+static_assert(
+    std::atomic<uint64_t>::is_always_lock_free,
+    "AICoreCompletionMailbox requires lock-free uint64_t atomics on every supported target"
+);
 
-struct AICoreCompletionMsgView
-{
+struct AICoreCompletionMsgView {
     PTO2TaskId task_token{PTO2TaskId::invalid()};
     uint64_t addr{0};
     uint32_t expected_value{0};
@@ -60,8 +67,7 @@ struct AICoreCompletionMsgView
     uint32_t kind{0};
 };
 
-struct AICoreCompletionMailbox
-{
+struct AICoreCompletionMailbox {
     // head and tail live on their own cache lines so producer CAS contention
     // on head can't false-share with the consumer's tail updates.
     alignas(PTO2_ALIGN_SIZE) std::atomic<uint64_t> head;
@@ -72,21 +78,17 @@ struct AICoreCompletionMailbox
 
     // Cheap, lock-free pending hint. Callers may invoke this outside the
     // consumer lock; a stale answer only over/under-triggers a drain attempt.
-    bool has_pending()
-    {
-        return tail.load(std::memory_order_acquire) < head.load(std::memory_order_acquire);
-    }
+    bool has_pending() { return tail.load(std::memory_order_acquire) < head.load(std::memory_order_acquire); }
 
-    bool try_push_condition(PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type)
-    {
-        while (true)
-        {
+    bool try_push_condition(
+        PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
+    ) {
+        while (true) {
             uint64_t h = head.load(std::memory_order_relaxed);
             uint64_t t = tail.load(std::memory_order_acquire);
             if (h - t >= AICORE_COMPLETION_MAILBOX_CAPACITY) return false;
             uint64_t new_head = h + 1;
-            if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed))
-            {
+            if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
                 slot->task_token.raw = task_token.raw;
                 slot->addr = addr;
@@ -101,16 +103,13 @@ struct AICoreCompletionMailbox
         }
     }
 
-    bool try_push_normal_done(PTO2TaskId task_token, uint64_t slot_state_addr)
-    {
-        while (true)
-        {
+    bool try_push_normal_done(PTO2TaskId task_token, uint64_t slot_state_addr) {
+        while (true) {
             uint64_t h = head.load(std::memory_order_relaxed);
             uint64_t t = tail.load(std::memory_order_acquire);
             if (h - t >= AICORE_COMPLETION_MAILBOX_CAPACITY) return false;
             uint64_t new_head = h + 1;
-            if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed))
-            {
+            if (head.compare_exchange_weak(h, new_head, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 AICoreCompletionMailboxMessage *slot = &entries[h & AICORE_COMPLETION_MAILBOX_MASK];
                 slot->task_token.raw = task_token.raw;
                 slot->addr = slot_state_addr;
@@ -124,8 +123,7 @@ struct AICoreCompletionMailbox
         }
     }
 
-    bool try_pop(AICoreCompletionMsgView &out)
-    {
+    bool try_pop(AICoreCompletionMsgView &out) {
         uint64_t t = tail.load(std::memory_order_relaxed);
         uint64_t h = head.load(std::memory_order_relaxed);
         if (t >= h) return false;
@@ -142,6 +140,8 @@ struct AICoreCompletionMailbox
     }
 };
 
-static_assert(sizeof(AICoreCompletionMailbox) % PTO2_ALIGN_SIZE == 0, "AICoreCompletionMailbox size must be cache-line aligned");
+static_assert(
+    sizeof(AICoreCompletionMailbox) % PTO2_ALIGN_SIZE == 0, "AICoreCompletionMailbox size must be cache-line aligned"
+);
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_H_

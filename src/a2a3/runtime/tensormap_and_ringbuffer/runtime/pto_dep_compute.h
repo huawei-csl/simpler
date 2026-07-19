@@ -19,8 +19,7 @@
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
 
-struct DepInputs
-{
+struct DepInputs {
     int32_t tensor_count;
     const TensorRef *tensors;        // length = tensor_count (union; OUTPUT slots' .ptr is unused)
     const TensorArgType *arg_types;  // length = tensor_count
@@ -29,15 +28,13 @@ struct DepInputs
 };
 
 template <typename Emit>
-[[nodiscard]] inline bool compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit)
-{
+[[nodiscard]] inline bool
+compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit) {
     if (in_manual_scope) return true;
 
-    for (int32_t i = 0; i < inputs.tensor_count; i++)
-    {
+    for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::OUTPUT)
-        {
+        if (ptype == TensorArgType::OUTPUT) {
             // Runtime-created OUTPUT tensors are not looked up in the TensorMap since
             // they have no dependencies.
             continue;
@@ -47,8 +44,7 @@ template <typename Emit>
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
-        if (owner.is_valid())
-        {
+        if (owner.is_valid()) {
             if (!emit(owner)) return false;
         }
 
@@ -58,12 +54,12 @@ template <typename Emit>
 
         bool fatal = false;
         tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
-            if (!emit(entry.producer_task_id))
-            {
+            if (!emit(entry.producer_task_id)) {
                 fatal = true;
                 return false;  // stop iteration
             }
-            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) tensor_map.remove_entry(entry);
+            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED)
+                tensor_map.remove_entry(entry);
             return true;
         });
         if (fatal) return false;
@@ -71,14 +67,12 @@ template <typename Emit>
     return true;
 }
 
-inline void register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap &tensor_map, bool in_manual_scope)
-{
+inline void
+register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap &tensor_map, bool in_manual_scope) {
     if (in_manual_scope) return;
-    for (int32_t i = 0; i < inputs.tensor_count; i++)
-    {
+    for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING)
-        {
+        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
             const Tensor *tensor = &inputs.tensors[i].ref();
             if (!tensor->manual_dep) tensor_map.insert(*tensor, task_id);
         }

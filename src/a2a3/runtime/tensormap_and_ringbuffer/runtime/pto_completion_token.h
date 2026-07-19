@@ -17,8 +17,7 @@
 #include "aicore_completion_mailbox_types.h"
 #include "pto_runtime_status.h"
 
-struct CompletionToken
-{
+struct CompletionToken {
     uint64_t addr;
     uint32_t expected_value;
     uint32_t engine;
@@ -26,15 +25,13 @@ struct CompletionToken
     uint64_t backend_cookie;
 };
 
-enum class CompletionPollState : uint8_t
-{
+enum class CompletionPollState : uint8_t {
     PENDING = 0,
     READY = 1,
     FAILED = 2,
 };
 
-struct CompletionPollResult
-{
+struct CompletionPollResult {
     CompletionPollState state{CompletionPollState::PENDING};
     int32_t error_code{PTO2_ERROR_NONE};
 };

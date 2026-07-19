@@ -89,29 +89,23 @@
 // a redefinition conflict. See issue #1189.
 constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
 
-typedef enum
-{
+typedef enum {
     PTO2_TASK_PENDING = 0,   // Submitted; awaiting fanin, queued, or dispatched
     PTO2_TASK_COMPLETED = 1  // Execution finished; per-ring completed_watermark
                              // advances past this slot's last_consumer_local_id
                              // to make its heap chunk reclaimable.
 } PTO2TaskState;
 
-struct PTO2TaskAllocResult
-{
+struct PTO2TaskAllocResult {
     int32_t task_id;    // Absolute task ID (not wrapped)
     int32_t slot;       // task_id & (window_size - 1)
     void *packed_base;  // Heap allocation result (nullptr if failure)
     void *packed_end;   // packed_base + aligned output_size
 
-    bool failed() const
-    {
-        return task_id < 0;
-    }
+    bool failed() const { return task_id < 0; }
 };
 
-struct PTO2OutputLayout
-{
+struct PTO2OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
     int32_t total_output_size = 0;
@@ -119,8 +113,7 @@ struct PTO2OutputLayout
 
 struct PTO2TaskSlotState;  // Forward declaration
 
-struct PTO2TaskDescriptor
-{
+struct PTO2TaskDescriptor {
     // Mixed-task identification (encodes ring_id in upper 32 bits)
     PTO2TaskId task_id;  // raw: (ring_id << 32) | local_id
 
@@ -255,7 +248,9 @@ struct PTO2TaskPayload {
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
-    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == MAX_SCALAR_ARGS * 8, "scalar region size matches MAX_SCALAR_ARGS");
+    static_assert(
+        MAX_SCALAR_ARGS * sizeof(uint64_t) == MAX_SCALAR_ARGS * 8, "scalar region size matches MAX_SCALAR_ARGS"
+    );
 
     /**
      * Prefetch (for write) the regions init() is about to fill so the stores land
@@ -287,15 +282,15 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    void init(
+        const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
+    ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
         // int32_t out_idx = 0;
-        for (int32_t i = 0; i < args.tensor_count(); i++)
-        {
-            if (args.tag(i) != TensorArgType::OUTPUT)
-            {
+        for (int32_t i = 0; i < args.tensor_count(); i++) {
+            if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(args.tensor(i).ref());
             } else {
                 init_tensor_from_create_info(
@@ -336,7 +331,9 @@ struct PTO2TaskPayload {
 // PTO2_MAX_FANIN=128 the fanin arrays alone exceed 576B, so upstream's fixed
 // AICore arg-materialization contract is re-established only when early dispatch
 // is wired. tensors/scalars are naturally cache-line aligned and packed.
-static_assert(offsetof(PTO2TaskPayload, fanin_local_ids) == 16, "fanin array must follow the metadata + fanin count words");
+static_assert(
+    offsetof(PTO2TaskPayload, fanin_local_ids) == 16, "fanin array must follow the metadata + fanin count words"
+);
 static_assert(
     offsetof(PTO2TaskPayload, scalars) == offsetof(PTO2TaskPayload, tensors) + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
@@ -346,8 +343,7 @@ static_assert(
     "no trailing padding after scalars"
 );
 
-struct alignas(64) PTO2TaskSlotState
-{
+struct alignas(64) PTO2TaskSlotState {
     // Highest local task id among this slot's consumers. Set to this slot's
     // own local_id in prepare_task; bumped via max() in submit_task_common for
     // each consumer that has this slot as a fanin. The slot's heap chunk is
@@ -406,14 +402,12 @@ struct alignas(64) PTO2TaskSlotState
      */
     void bind_ring(uint8_t rid) { ring_id = rid; }
 
-    void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t)
-    {
+    void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
         payload = p;
         task = t;
     }
 
-    void reset_for_reuse()
-    {
+    void reset_for_reuse() {
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);

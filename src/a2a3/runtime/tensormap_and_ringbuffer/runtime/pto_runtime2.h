@@ -37,8 +37,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu();
 static constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES =
     (PTO2_TENSOR_DATA_TIMEOUT_MS * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
 
-enum PTO2RuntimeMode
-{
+enum PTO2RuntimeMode {
     PTO2_MODE_EXECUTE = 0,    // Execute tasks on workers
     PTO2_MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
     PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
@@ -46,8 +45,7 @@ enum PTO2RuntimeMode
 
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
-struct PTO2RuntimeOps
-{
+struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
@@ -69,7 +67,9 @@ struct PTO2RuntimeOps
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+    void (*set_tensor_data)(
+        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
@@ -83,8 +83,7 @@ struct PTO2RuntimeOps
  * layout (the input to runtime_reserve_layout). Stable per (callable_id, ring
  * config); re-read at AICPU boot to reconstruct ring/heap/dep-pool capacities.
  */
-struct ArenaSizingKey
-{
+struct ArenaSizingKey {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
@@ -98,8 +97,7 @@ struct ArenaSizingKey
  * runtime_wire_arena_pointers (the AICPU re-wires arena-internal pointers
  * from these after rtMemcpy).
  */
-struct ArenaOffsets
-{
+struct ArenaOffsets {
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
@@ -118,14 +116,12 @@ struct ArenaOffsets
  * Produced once on the host by runtime_reserve_layout(); consumed by
  * runtime_init_data_from_layout and runtime_wire_arena_pointers.
  */
-struct PTO2RuntimeArenaLayout
-{
+struct PTO2RuntimeArenaLayout {
     ArenaSizingKey sizing;
     ArenaOffsets offsets;
 };
 
-struct PTO2Runtime
-{
+struct PTO2Runtime {
     // Ops table (first field — used by orchestration .so via function pointers)
     const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
@@ -154,8 +150,7 @@ struct PTO2Runtime
 inline PTO2RuntimeArenaLayout runtime_reserve_layout(
     DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
     const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
-)
-{
+) {
     PTO2RuntimeArenaLayout layout{};
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         layout.sizing.task_window_sizes[r] = task_window_sizes[r];
@@ -164,7 +159,8 @@ inline PTO2RuntimeArenaLayout runtime_reserve_layout(
     }
 
     int32_t task_window_sizes_i32[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) task_window_sizes_i32[r] = static_cast<int32_t>(task_window_sizes[r]);
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        task_window_sizes_i32[r] = static_cast<int32_t>(task_window_sizes[r]);
 
     layout.offsets.off_sm_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
     layout.offsets.orch = PTO2OrchestratorState::reserve_layout(arena, task_window_sizes_i32, dep_pool_capacities[0]);
@@ -178,8 +174,8 @@ inline PTO2RuntimeArenaLayout runtime_reserve_layout(
 
 // Single-size adapter: broadcasts the scalar to every ring. Defined after the
 // per-ring overload so name lookup sees both at the call site.
-inline PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity)
-{
+inline PTO2RuntimeArenaLayout
+runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity) {
     uint64_t per_ring_task_window[PTO2_MAX_RING_DEPTH];
     uint64_t per_ring_heap[PTO2_MAX_RING_DEPTH];
     int32_t per_ring_dep_pool[PTO2_MAX_RING_DEPTH];
@@ -191,8 +187,10 @@ inline PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_
     return runtime_reserve_layout(arena, per_ring_task_window, per_ring_heap, per_ring_dep_pool);
 }
 
-inline PTO2Runtime *runtime_init_data_from_layout(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t, void *gm_heap_dev_base, uint64_t heap_size)
-{
+inline PTO2Runtime *runtime_init_data_from_layout(
+    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t,
+    void *gm_heap_dev_base, uint64_t heap_size
+) {
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.offsets.off_runtime));
     memset(rt, 0, sizeof(*rt));
 
@@ -206,7 +204,10 @@ inline PTO2Runtime *runtime_init_data_from_layout(DeviceArena &arena, const PTO2
     rt->gm_heap_owned = false;
     rt->total_cycles = 0;
 
-    if (!rt->orchestrator.init_data_from_layout(layout.offsets.orch, arena, sm_dev_base, gm_heap_dev_base, heap_size, layout.sizing.task_window_sizes[0])) return nullptr;
+    if (!rt->orchestrator.init_data_from_layout(
+            layout.offsets.orch, arena, sm_dev_base, gm_heap_dev_base, heap_size, layout.sizing.task_window_sizes[0]
+        ))
+        return nullptr;
     if (!rt->scheduler.init_data_from_layout(layout.offsets.sched, arena, sm_dev_base)) return nullptr;
 
     auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
@@ -217,23 +218,20 @@ inline PTO2Runtime *runtime_init_data_from_layout(DeviceArena &arena, const PTO2
 
 // Per-ring overload (matches upstream a5 signature with sm_size + heap_sizes[]).
 inline PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode,
-    void *sm_dev_base, uint64_t sm_size, void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
-)
-{
+    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
+    void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+) {
     return runtime_init_data_from_layout(arena, layout, mode, sm_dev_base, sm_size, gm_heap_dev_base, heap_sizes[0]);
 }
 
-inline void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt)
-{
+inline void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt) {
     rt->sm_handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
     rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
     rt->orchestrator.wire_arena_pointers(layout.offsets.orch, arena, &rt->scheduler);
     rt->scheduler.wire_arena_pointers(layout.offsets.sched, arena);
 }
 
-inline void runtime_destroy(PTO2Runtime *rt)
-{
+inline void runtime_destroy(PTO2Runtime *rt) {
     // Arena buffer is pooled across runs by DeviceRunner — never freed here.
     if (!rt) return;
     rt->scheduler.destroy();
@@ -244,10 +242,7 @@ inline void runtime_destroy(PTO2Runtime *rt)
 
 // Upstream-compatible overload: arena is ignored (arena lifetime is owned by
 // the caller in the polling design too).
-inline void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/)
-{
-    runtime_destroy(rt);
-}
+inline void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/) { runtime_destroy(rt); }
 
 // Upstream arena-reuse path (#1234). On cache hits the host skips the
 // arena re-upload, so the AICPU-side reset here is the only thing that
@@ -264,8 +259,8 @@ inline void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/)
 // state that trips a scheduler stall on the second run).
 inline void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
-inline bool runtime_reset_for_reuse(DeviceArena & /*arena*/, const PTO2RuntimeArenaLayout & /*layout*/, PTO2Runtime *rt)
-{
+inline bool
+runtime_reset_for_reuse(DeviceArena & /*arena*/, const PTO2RuntimeArenaLayout & /*layout*/, PTO2Runtime *rt) {
     if (rt == nullptr) return false;
 
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
@@ -281,38 +276,26 @@ inline bool runtime_reset_for_reuse(DeviceArena & /*arena*/, const PTO2RuntimeAr
     return true;
 }
 
-inline void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode)
-{
+inline void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) rt->mode = mode;
 }
 
-inline void rt_scope_begin(PTO2Runtime *rt)
-{
+inline void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
     rt->orchestrator.begin_scope(mode);
 }
 
-inline void rt_scope_end(PTO2Runtime *rt)
-{
-    rt->orchestrator.end_scope();
-}
+inline void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-inline void rt_orchestration_done(PTO2Runtime *rt)
-{
-    rt->orchestrator.mark_done();
-}
+inline void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
-inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...)
-{
+inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    if (fmt == nullptr || fmt[0] == '\0')
-    {
+    if (fmt == nullptr || fmt[0] == '\0') {
         rt->orchestrator.report_fatal(error_code, func, nullptr);
-    }
-    else
-    {
+    } else {
         char message[1024];
         vsnprintf(message, sizeof(message), fmt, args);
         rt->orchestrator.report_fatal(error_code, func, "%s", message);
@@ -323,8 +306,7 @@ inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *fun
 // Orchestration-side logging dispatchers: orchestration .so calls
 // LOG_*(fmt, ...) which routes through these ops into the unified log.
 // Verbosity gates live inside the unified_log_* primitives.
-inline void rt_log_error(const char *func, const char *fmt, ...)
-{
+inline void rt_log_error(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char message[1024];
@@ -332,8 +314,7 @@ inline void rt_log_error(const char *func, const char *fmt, ...)
     va_end(args);
     unified_log_error(func, "%s", message);
 }
-inline void rt_log_warn(const char *func, const char *fmt, ...)
-{
+inline void rt_log_warn(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char message[1024];
@@ -341,8 +322,7 @@ inline void rt_log_warn(const char *func, const char *fmt, ...)
     va_end(args);
     unified_log_warn(func, "%s", message);
 }
-inline void rt_log_debug(const char *func, const char *fmt, ...)
-{
+inline void rt_log_debug(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char message[1024];
@@ -350,8 +330,7 @@ inline void rt_log_debug(const char *func, const char *fmt, ...)
     va_end(args);
     unified_log_debug(func, "%s", message);
 }
-inline void rt_log_info_v(const char *func, int v, const char *fmt, ...)
-{
+inline void rt_log_info_v(const char *func, int v, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char message[1024];
@@ -361,8 +340,7 @@ inline void rt_log_info_v(const char *func, int v, const char *fmt, ...)
 }
 
 MAYBE_UNINITIALIZED_BEGIN
-inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller)
-{
+inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
     PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
 
@@ -380,12 +358,14 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
         // (m) Use completion_flags as the single completion signal.
-        while (ring_hdr.completion_flags[local_id & mask].load(std::memory_order_acquire) == 0)
-        {
+        while (ring_hdr.completion_flags[local_id & mask].load(std::memory_order_acquire) == 0) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)
-            {
-                orch.report_fatal(PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller, "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed", (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id);
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                );
                 failed = true;
                 return;
             }
@@ -402,12 +382,14 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         int32_t target = slot.last_consumer_local_id;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (ring_hdr.completed_watermark.load(std::memory_order_acquire) < target)
-        {
+        while (ring_hdr.completed_watermark.load(std::memory_order_acquire) < target) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)
-            {
-                orch.report_fatal(PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller, "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done", (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id);
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                );
                 failed = true;
                 return;
             }
@@ -415,8 +397,7 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     };
 
     auto flush_segment = [&]() {
-        for (int i = 0; i < seg_count; i++)
-        {
+        for (int i = 0; i < seg_count; i++) {
             wait_one_producer(*seg[i]);
             if (failed) return;
             if (!wait_for_consumers) continue;
@@ -429,22 +410,19 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto try_push = [&](const PTO2TaskSlotState &s) {
         for (int j = 0; j < seg_count; j++)
             if (seg[j] == &s) return;
-        if (seg_count == kSegmentCap)
-        {
+        if (seg_count == kSegmentCap) {
             flush_segment();
             if (failed) return;
         }
         seg[seg_count++] = &s;
-        if (!signaled)
-        {
+        if (!signaled) {
             orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
             signaled = true;
         }
     };
 
     auto do_wait = [&]() {
-        if (owner.is_valid())
-        {
+        if (owner.is_valid()) {
             auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
             try_push(s);
             if (failed) return;
@@ -466,8 +444,7 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 }
 MAYBE_UNINITIALIZED_END
 
-inline uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[])
-{
+inline uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) return 0;
 
     if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) return 0;
@@ -480,8 +457,8 @@ inline uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t 
     return result;
 }
 
-inline void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value)
-{
+inline void
+set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
     if (tensor.buffer.addr == 0) return;
 
     // Wait for producer + all consumers before writing (WAW + WAR safety)
@@ -496,25 +473,19 @@ inline void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndim
 // Function-pointer ops table backing — moved from pto_runtime2.cpp so that
 // the inline runtime_finalize_after_wire above can refer to it.
 
-inline TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args)
-{
+inline TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     return rt->orchestrator.submit_task(mixed_kernels, args);
 }
 
-inline TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const L0TaskArgs &args)
-{
+inline TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
     return rt->orchestrator.alloc_tensors(args);
 }
 
-inline TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArgs &args)
-{
+inline TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
     return rt->orchestrator.submit_dummy_task(args);
 }
 
-inline bool is_fatal_impl(PTO2Runtime *rt)
-{
-    return rt->orchestrator.fatal;
-}
+inline bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
 inline const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
@@ -534,8 +505,7 @@ inline const PTO2RuntimeOps s_runtime_ops = {
     .scope_set_site = nullptr,
 };
 
-inline void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count)
-{
+inline void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;
     rt->orchestrator.total_cluster_count = aic_count;
     rt->orchestrator.total_aiv_count = aiv_count;
@@ -543,8 +513,7 @@ inline void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int3
 
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
-struct PTO2OrchestrationConfig
-{
+struct PTO2OrchestrationConfig {
     int expected_arg_count;
 };
 #endif

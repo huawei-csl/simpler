@@ -41,8 +41,7 @@ struct Segment {
  *
  * All offsets are relative to the arena's base.
  */
-struct PTO2TensorMapLayout
-{
+struct PTO2TensorMapLayout {
     size_t off_buckets;
     size_t off_bucket_epochs;
     size_t off_entry_pool;
@@ -94,83 +93,76 @@ extern uint64_t g_insert_count;
  *
  * Entry size: 128B (2 cache lines), matches Tensor.
  */
-struct alignas(64) PTO2TensorMapEntry
-{
+struct alignas(64) PTO2TensorMapEntry {
     // === Cache line 1 (64B) — lookup hot path; mirrors Tensor line 1 from byte 16 ===
-    uint64_t buffer_addr;                      // 8B [0, 8):   tensor base address (hash key, mirrors Tensor::buffer.addr)
-    PTO2TensorMapEntry *next_in_bucket;        // 8B [8, 16):  next entry in hash bucket chain (overlays Tensor::buffer.size)
-    PTO2TaskId producer_task_id;               // 8B [16, 24):  mirrors Tensor::owner_task_id slot
-    uint64_t start_offset;                     // 8B [24, 32):  mirrors Tensor::start_offset (element offset)
-    int32_t version;                           // 4B [32, 36):  mirrors Tensor::version
-    uint32_t ndims;                            // 4B [36, 40):  mirrors Tensor::ndims
-    DataType dtype;                            // 1B [40, 41):  mirrors Tensor::dtype
-    bool manual_dep;                           // 1B [41, 42):  mirrors Tensor::manual_dep
-    bool is_contiguous;                        // 1B [42, 43):  mirrors Tensor::is_contiguous
-    uint8_t __padding1__;                      // 1B [43, 44):  mirrors Tensor padding
-    uint32_t shapes[MAX_TENSOR_DIMS];          // 20B [44, 64): mirrors Tensor::shapes
+    uint64_t buffer_addr;                // 8B [0, 8):   tensor base address (hash key, mirrors Tensor::buffer.addr)
+    PTO2TensorMapEntry *next_in_bucket;  // 8B [8, 16):  next entry in hash bucket chain (overlays Tensor::buffer.size)
+    PTO2TaskId producer_task_id;         // 8B [16, 24):  mirrors Tensor::owner_task_id slot
+    uint64_t start_offset;               // 8B [24, 32):  mirrors Tensor::start_offset (element offset)
+    int32_t version;                     // 4B [32, 36):  mirrors Tensor::version
+    uint32_t ndims;                      // 4B [36, 40):  mirrors Tensor::ndims
+    DataType dtype;                      // 1B [40, 41):  mirrors Tensor::dtype
+    bool manual_dep;                     // 1B [41, 42):  mirrors Tensor::manual_dep
+    bool is_contiguous;                  // 1B [42, 43):  mirrors Tensor::is_contiguous
+    uint8_t __padding1__;                // 1B [43, 44):  mirrors Tensor padding
+    uint32_t shapes[MAX_TENSOR_DIMS];    // 20B [44, 64): mirrors Tensor::shapes
 
     // === Cache line 2 (64B) — chain manipulation + non-contiguous overlap data ===
-    PTO2TensorMapEntry *prev_in_bucket;         // 8B [64, 72)
-    PTO2TensorMapEntry *next_in_task;           // 8B [72, 80)
-    PTO2TensorMapEntry *prev_in_task;           // 8B [80, 88)
-    int32_t bucket_index;                       // 4B [88, 92): -1 when unlinked
-    uint32_t __padding2__;                      // 4B [92, 96)
-    uint64_t extent_elem_cache;                 // 8B [96, 104): non-contiguous extent (mirrors Tensor)
-    uint32_t strides[MAX_TENSOR_DIMS];          // 20B [104, 124): element strides, mirrors Tensor::strides
-    uint8_t __padding3__[4];                    // 4B [124, 128)
+    PTO2TensorMapEntry *prev_in_bucket;  // 8B [64, 72)
+    PTO2TensorMapEntry *next_in_task;    // 8B [72, 80)
+    PTO2TensorMapEntry *prev_in_task;    // 8B [80, 88)
+    int32_t bucket_index;                // 4B [88, 92): -1 when unlinked
+    uint32_t __padding2__;               // 4B [92, 96)
+    uint64_t extent_elem_cache;          // 8B [96, 104): non-contiguous extent (mirrors Tensor)
+    uint32_t strides[MAX_TENSOR_DIMS];   // 20B [104, 124): element strides, mirrors Tensor::strides
+    uint8_t __padding3__[4];             // 4B [124, 128)
 
-    void copy_from_tensor(const Tensor &tensor)
-    {
+    void copy_from_tensor(const Tensor &tensor) {
         memcpy(this, &tensor, 64);
-        if (tensor.is_contiguous && tensor.start_offset == 0)
-        {
+        if (tensor.is_contiguous && tensor.start_offset == 0) {
             uint64_t numel = 1;
-            for (uint32_t i = 0; i < tensor.ndims; i++) numel *= tensor.shapes[i];
+            for (uint32_t i = 0; i < tensor.ndims; i++)
+                numel *= tensor.shapes[i];
             extent_elem_cache = numel;
             uint32_t s = 1;
-            for (int32_t i = static_cast<int32_t>(tensor.ndims) - 1; i >= 0; i--)
-            {
+            for (int32_t i = static_cast<int32_t>(tensor.ndims) - 1; i >= 0; i--) {
                 strides[i] = s;
                 s *= tensor.shapes[i];
             }
-        }
-        else
-        {
+        } else {
             extent_elem_cache = tensor.extent_elem_cache;
-            for (uint32_t i = 0; i < tensor.ndims; i++) strides[i] = tensor.strides[i];
+            for (uint32_t i = 0; i < tensor.ndims; i++)
+                strides[i] = tensor.strides[i];
         }
     }
 
-    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr)
-    {
+    void copy_tensor_create_info(const TensorCreateInfo &tensor_create_info, uint64_t addr) {
         memcpy(this, &tensor_create_info, 64);
         buffer_addr = addr;
         // Create-info outputs are always contiguous with start_offset = 0;
         // extent_elem = prod(shapes); stride is row-major.
         uint64_t numel = 1;
-        for (uint32_t i = 0; i < tensor_create_info.ndims; i++) numel *= tensor_create_info.shapes[i];
+        for (uint32_t i = 0; i < tensor_create_info.ndims; i++)
+            numel *= tensor_create_info.shapes[i];
         extent_elem_cache = numel;
         uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--)
-        {
+        for (int32_t i = static_cast<int32_t>(tensor_create_info.ndims) - 1; i >= 0; i--) {
             strides[i] = s;
             s *= tensor_create_info.shapes[i];
         }
     }
 
-    uint64_t effective_extent_elem() const
-    {
-        if (is_contiguous)
-        {
+    uint64_t effective_extent_elem() const {
+        if (is_contiguous) {
             uint64_t n = 1;
-            for (uint32_t i = 0; i < ndims; i++) n *= shapes[i];
+            for (uint32_t i = 0; i < ndims; i++)
+                n *= shapes[i];
             return n;
         }
         return extent_elem_cache;
     }
 
-    OverlapStatus check_overlap(const Tensor &input) const
-    {
+    OverlapStatus check_overlap(const Tensor &input) const {
         debug_assert(input.buffer.addr == buffer_addr);
         debug_assert(input.version >= version);
         if (input.version > version) return OverlapStatus::OTHER;
@@ -228,8 +220,7 @@ struct alignas(64) PTO2TensorMapEntry
         uint32_t ent_offsets[MAX_TENSOR_DIMS] = {};
         uint64_t in_remain = input.start_offset;
         uint64_t ent_remain = start_offset;
-        for (uint32_t i = 0; i < ndims; i++)
-        {
+        for (uint32_t i = 0; i < ndims; i++) {
             const uint32_t s = strides[i];
             in_offsets[i] = static_cast<uint32_t>(in_remain / s);
             ent_offsets[i] = static_cast<uint32_t>(ent_remain / s);
@@ -240,16 +231,14 @@ struct alignas(64) PTO2TensorMapEntry
 
         // Validate that each side fits within ref_shapes (defense in depth —
         // a well-formed view always satisfies this).
-        for (uint32_t i = 0; i < ndims; i++)
-        {
+        for (uint32_t i = 0; i < ndims; i++) {
             if (static_cast<uint64_t>(in_offsets[i]) + input.shapes[i] > ref_shapes[i]) return OverlapStatus::OTHER;
             if (static_cast<uint64_t>(ent_offsets[i]) + shapes[i] > ref_shapes[i]) return OverlapStatus::OTHER;
         }
 
         // -------- L2 core: per-dim line-segment intersection --------
         bool input_contains_entry = true;
-        for (uint32_t i = 0; i < ndims; i++)
-        {
+        for (uint32_t i = 0; i < ndims; i++) {
             Segment in_seg{in_offsets[i], static_cast<uint64_t>(in_offsets[i]) + input.shapes[i]};
             Segment ent_seg{ent_offsets[i], static_cast<uint64_t>(ent_offsets[i]) + shapes[i]};
             if (!in_seg.line_segment_intersection(ent_seg)) return OverlapStatus::NO_OVERLAP;
@@ -269,10 +258,11 @@ static_assert(offsetof(PTO2TensorMapEntry, dtype) == offsetof(Tensor, dtype));
 static_assert(offsetof(PTO2TensorMapEntry, manual_dep) == offsetof(Tensor, manual_dep));
 static_assert(offsetof(PTO2TensorMapEntry, is_contiguous) == offsetof(Tensor, is_contiguous));
 static_assert(offsetof(PTO2TensorMapEntry, shapes) == offsetof(Tensor, shapes));
-static_assert(offsetof(PTO2TensorMapEntry, prev_in_bucket) == 64, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
+static_assert(
+    offsetof(PTO2TensorMapEntry, prev_in_bucket) == 64, "TensorMapEntry must be exactly 2 cache lines (128 bytes)"
+);
 
-struct PTO2TensorMap
-{
+struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
     PTO2TensorMapEntry **buckets;  // Array of offsets into entry_pool (-1 = empty)
     uint32_t *bucket_epochs;
@@ -298,25 +288,16 @@ struct PTO2TensorMap
     // Per-ring cleanup progress (for periodic cleanup_retired)
     int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
 
-    uint32_t get_task_local_id_slot(uint8_t ring_id, uint32_t task_local_id) const
-    {
+    uint32_t get_task_local_id_slot(uint8_t ring_id, uint32_t task_local_id) const {
         return task_local_id & (task_window_sizes[ring_id] - 1);
     }
 
-    int32_t current_used() const
-    {
-        return next_entry_idx - free_num;
-    }
-    int32_t pool_capacity() const
-    {
-        return pool_size;
-    }
+    int32_t current_used() const { return next_entry_idx - free_num; }
+    int32_t pool_capacity() const { return pool_size; }
 
     // new_entry only allocates memory, does not assign attributes
-    PTO2TensorMapEntry *new_entry()
-    {
-        if (free_num > 0)
-        {
+    PTO2TensorMapEntry *new_entry() {
+        if (free_num > 0) {
             PTO2TensorMapEntry *res = free_entry_list[--free_num];
             debug_assert(res->bucket_index == -1);
             return res;
@@ -326,19 +307,15 @@ struct PTO2TensorMap
         return res;
     }
 
-    void free_entry(PTO2TensorMapEntry &entry)
-    {
+    void free_entry(PTO2TensorMapEntry &entry) {
         always_assert(entry.bucket_index != -1);  // must still be in a bucket
 
         // Update predecessor's next pointer (O(1) via prev_in_bucket)
-        if (entry.prev_in_bucket == nullptr)
-        {
+        if (entry.prev_in_bucket == nullptr) {
             // Entry is the head of its bucket chain, update bucket head
             // Must compute hash BEFORE clearing tensor
             buckets[entry.bucket_index] = entry.next_in_bucket;
-        }
-        else
-        {
+        } else {
             entry.prev_in_bucket->next_in_bucket = entry.next_in_bucket;
         }
 
@@ -353,35 +330,47 @@ struct PTO2TensorMap
         entry.prev_in_task = nullptr;
     }
 
-    static PTO2TensorMapLayout reserve_layout(DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH])
-    {
-        // num_buckets must be a power of two for the hash truncation to work.
-        always_assert((new_num_buckets & (new_num_buckets - 1)) == 0);
+    static PTO2TensorMapLayout reserve_layout(
+        DeviceArena &arena, int32_t new_num_buckets, int32_t new_pool_size,
+        const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]
+    ) {
+        // num_buckets must be a positive power of two for the hash truncation to
+        // work (0 passes the power-of-two test but makes __builtin_ctz UB).
+        always_assert(new_num_buckets > 0 && (new_num_buckets & (new_num_buckets - 1)) == 0);
 
         PTO2TensorMapLayout layout{};
         layout.num_buckets = new_num_buckets;
         layout.pool_size = new_pool_size;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) layout.task_window_sizes[r] = new_task_window_sizes[r];
-
-        layout.off_buckets = arena.reserve(static_cast<size_t>(new_num_buckets) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *));
-        layout.off_bucket_epochs = arena.reserve(static_cast<size_t>(new_num_buckets) * sizeof(uint32_t), alignof(uint32_t));
-        layout.off_entry_pool = arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry), alignof(PTO2TensorMapEntry));
-        layout.off_free_entry_list = arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *));
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            layout.off_task_entry_heads[r] = arena.reserve(static_cast<size_t>(new_task_window_sizes[r]) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *));
-            layout.off_task_entry_head_epochs[r] = arena.reserve(static_cast<size_t>(new_task_window_sizes[r]) * sizeof(uint32_t), alignof(uint32_t));
+            layout.task_window_sizes[r] = new_task_window_sizes[r];
+
+        layout.off_buckets = arena.reserve(
+            static_cast<size_t>(new_num_buckets) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
+        );
+        layout.off_bucket_epochs =
+            arena.reserve(static_cast<size_t>(new_num_buckets) * sizeof(uint32_t), alignof(uint32_t));
+        layout.off_entry_pool =
+            arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry), alignof(PTO2TensorMapEntry));
+        layout.off_free_entry_list = arena.reserve(
+            static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
+        );
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            layout.off_task_entry_heads[r] = arena.reserve(
+                static_cast<size_t>(new_task_window_sizes[r]) * sizeof(PTO2TensorMapEntry *),
+                alignof(PTO2TensorMapEntry *)
+            );
+            layout.off_task_entry_head_epochs[r] =
+                arena.reserve(static_cast<size_t>(new_task_window_sizes[r]) * sizeof(uint32_t), alignof(uint32_t));
         }
         return layout;
     }
 
-    static PTO2TensorMapLayout reserve_layout_default(DeviceArena &arena, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH])
-    {
+    static PTO2TensorMapLayout
+    reserve_layout_default(DeviceArena &arena, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
         return reserve_layout(arena, PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_sizes);
     }
 
-    bool init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena)
-    {
+    bool init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
         num_buckets = layout.num_buckets;
         pool_size = layout.pool_size;
 
@@ -393,15 +382,13 @@ struct PTO2TensorMap
         auto *free_list_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
 
         // buckets[]: empty == nullptr.
-        for (int32_t i = 0; i < num_buckets; i++)
-        {
+        for (int32_t i = 0; i < num_buckets; i++) {
             buckets_arena[i] = nullptr;
             bucket_epochs_arena[i] = 0;
         }
 
         memset(entry_pool_arena, 0, static_cast<size_t>(pool_size) * sizeof(PTO2TensorMapEntry));
-        for (int32_t i = 0; i < pool_size; i++)
-        {
+        for (int32_t i = 0; i < pool_size; i++) {
             entry_pool_arena[i].bucket_index = -1;
             entry_pool_arena[i].next_in_bucket = nullptr;
             entry_pool_arena[i].prev_in_bucket = nullptr;
@@ -417,12 +404,10 @@ struct PTO2TensorMap
         next_entry_idx = 0;
         free_num = 0;
 
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             auto *heads_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
             auto *head_epochs_arena = static_cast<uint32_t *>(arena.region_ptr(layout.off_task_entry_head_epochs[r]));
-            for (int32_t i = 0; i < layout.task_window_sizes[r]; i++)
-            {
+            for (int32_t i = 0; i < layout.task_window_sizes[r]; i++) {
                 heads_arena[i] = nullptr;
                 head_epochs_arena[i] = 0;
             }
@@ -434,14 +419,12 @@ struct PTO2TensorMap
         return true;
     }
 
-    void wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena)
-    {
+    void wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
         buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
         bucket_epochs = static_cast<uint32_t *>(arena.region_ptr(layout.off_bucket_epochs));
         entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
         free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
             task_entry_head_epochs[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_task_entry_head_epochs[r]));
         }
@@ -453,64 +436,54 @@ struct PTO2TensorMap
     // are compared against current_epoch on every lookup/insert; bumping
     // current_epoch invalidates all previous entries logically. Only on the
     // rare wrap to 0 do we pay the O(num_buckets + Σ window) reset.
-    void reset_for_reuse()
-    {
+    void reset_for_reuse() {
         next_entry_idx = 0;
         free_num = 0;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             last_task_alives[r] = 0;
             last_cleanup[r] = 0;
         }
         current_epoch++;
-        if (current_epoch == 0)
-        {
+        if (current_epoch == 0) {
             current_epoch = 1;
-            for (int32_t i = 0; i < num_buckets; i++) bucket_epochs[i] = 0;
-            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-            {
-                for (int32_t i = 0; i < task_window_sizes[r]; i++) task_entry_head_epochs[r][i] = 0;
+            for (int32_t i = 0; i < num_buckets; i++)
+                bucket_epochs[i] = 0;
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                for (int32_t i = 0; i < task_window_sizes[r]; i++)
+                    task_entry_head_epochs[r][i] = 0;
             }
         }
     }
 
-    void destroy()
-    {
+    void destroy() {
         buckets = nullptr;
         entry_pool = nullptr;
         free_entry_list = nullptr;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) task_entry_heads[r] = nullptr;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+            task_entry_heads[r] = nullptr;
     }
 
-    void sync_validity(int32_t ring_id, int32_t last_task_alive)
-    {
-        this->last_task_alives[ring_id] = last_task_alive;
-    }
+    void sync_validity(int32_t ring_id, int32_t last_task_alive) { this->last_task_alives[ring_id] = last_task_alive; }
 
     template <typename Fn>
-    void lookup(const Tensor &tensor, Fn &&on_match)
-    {
+    void lookup(const Tensor &tensor, Fn &&on_match) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
         if (bucket_epochs[bucket_index] != current_epoch) {
             return;
         }
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
-        while (cur_entry != nullptr)
-        {
+        while (cur_entry != nullptr) {
             PTO2TensorMapEntry *next_entry = cur_entry->next_in_bucket;
 
-            if (!entry_valid(*cur_entry))
-            {
+            if (!entry_valid(*cur_entry)) {
                 cur_entry = next_entry;
                 continue;
             }
 
-            if (tensor.buffer.addr == cur_entry->buffer_addr)
-            {
+            if (tensor.buffer.addr == cur_entry->buffer_addr) {
                 auto overlap_status = cur_entry->check_overlap(tensor);
-                if (overlap_status != OverlapStatus::NO_OVERLAP)
-                {
+                if (overlap_status != OverlapStatus::NO_OVERLAP) {
                     if (!on_match(*cur_entry, overlap_status)) return;
                 }
             }
@@ -520,30 +493,29 @@ struct PTO2TensorMap
         }
     }
 
-    void insert(const Tensor &tensor, PTO2TaskId producer_task_id)
-    {
+    void insert(const Tensor &tensor, PTO2TaskId producer_task_id) {
         PTO2TensorMapEntry *entry = new_entry();
         entry->copy_from_tensor(tensor);
         link_entry(entry, tensor.buffer.addr, producer_task_id);
     }
 
-    void cleanup_retired(int32_t ring_id, int32_t old_last_task_alive, int32_t new_last_task_alive)
-    {
+    void cleanup_retired(int32_t ring_id, int32_t old_last_task_alive, int32_t new_last_task_alive) {
         // Iterate through retired tasks on this ring and remove their entries
-        for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++)
-        {
+        for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
             if (task_entry_head_epochs[ring_id][task_slot] != current_epoch) {
                 continue;
             }
             PTO2TensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
 
-            while (cur_entry != nullptr)
-            {
+            while (cur_entry != nullptr) {
                 PTO2TensorMapEntry *next_entry = cur_entry->next_in_task;  // Save before clearing
                 // Only remove if this entry belongs to the retiring task
                 // (slot may have been reused by a newer task)
-                debug_assert(cur_entry->producer_task_id == PTO2TaskId::make(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id)));
+                debug_assert(
+                    cur_entry->producer_task_id ==
+                    PTO2TaskId::make(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id))
+                );
                 free_entry(*cur_entry);
                 cur_entry = next_entry;
             }
@@ -553,14 +525,12 @@ struct PTO2TensorMap
         }
     }
 
-    uint32_t hash(uint64_t key)
-    {
+    uint32_t hash(uint64_t key) {
         key *= 0x9E3779B97F4A7C15ULL;
         return static_cast<uint32_t>(key >> (64 - __builtin_ctz(num_buckets)));
     }
 
-    void link_entry(PTO2TensorMapEntry *entry, uint64_t addr, PTO2TaskId producer_task_id)
-    {
+    void link_entry(PTO2TensorMapEntry *entry, uint64_t addr, PTO2TaskId producer_task_id) {
         uint32_t bucket_index = hash(addr);
         auto ring_id = producer_task_id.ring();
         auto local_id = producer_task_id.local();
@@ -590,31 +560,25 @@ struct PTO2TensorMap
         task_entry_heads[ring_id][task_slot] = entry;
     }
 
-    bool entry_valid(const PTO2TensorMapEntry &entry) const
-    {
+    bool entry_valid(const PTO2TensorMapEntry &entry) const {
         return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
     }
 
-    void remove_entry(PTO2TensorMapEntry &entry)
-    {
+    void remove_entry(PTO2TensorMapEntry &entry) {
         remove_from_task(entry);
         free_entry(entry);
     }
 
-    void remove_from_task(PTO2TensorMapEntry &entry)
-    {
+    void remove_from_task(PTO2TensorMapEntry &entry) {
         always_assert(entry.bucket_index != -1);  // must still be in a bucket
         // Update predecessor's next pointer (O(1) via prev_in_task)
-        if (entry.prev_in_task == nullptr)
-        {
+        if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
             int32_t ring_id = entry.producer_task_id.ring();
             int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
             task_entry_heads[ring_id][task_slot] = entry.next_in_task;
-        }
-        else
-        {
+        } else {
             entry.prev_in_task->next_in_task = entry.next_in_task;
         }
 
@@ -625,8 +589,7 @@ struct PTO2TensorMap
         entry.prev_in_task = nullptr;
     }
 
-    int32_t valid_count()
-    {
+    int32_t valid_count() {
         int32_t count = 0;
 
         for (int32_t i = 0; i < pool_size; i++)
@@ -635,17 +598,16 @@ struct PTO2TensorMap
         return count;
     }
 
-    void sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive)
-    {
+    void sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive) {
         auto ring_id = task_id.ring();
         auto local_id = task_id.local();
         sync_validity(ring_id, sm_last_task_alive);
 
         // Only attempt cleanup when last_task_alive has actually advanced;
         // otherwise cleanup_retired would empty-loop and we'd spin forever.
-        auto overlap = get_task_local_id_slot(ring_id, local_id) == get_task_local_id_slot(ring_id, last_cleanup[ring_id]);
-        if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL || overlap)
-        {
+        auto overlap =
+            get_task_local_id_slot(ring_id, local_id) == get_task_local_id_slot(ring_id, last_cleanup[ring_id]);
+        if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL || overlap) {
             cleanup_retired(ring_id, last_cleanup[ring_id], sm_last_task_alive);
             last_cleanup[ring_id] = sm_last_task_alive;
         }

@@ -19,8 +19,7 @@
 #include "pto_completion_token.h"
 #include "pto_runtime_status.h"
 
-struct SdmaEventRecord
-{
+struct SdmaEventRecord {
     uint32_t flag;
     uint32_t sq_tail;
     uint64_t channel_info;
@@ -29,24 +28,23 @@ struct SdmaEventRecord
 static_assert(sizeof(SdmaEventRecord) == 16, "SDMA event record ABI drift");
 static_assert(offsetof(SdmaEventRecord, sq_tail) == 4, "SDMA event record ABI drift");
 
-inline uintptr_t sdma_completion_cache_line(const volatile void *addr)
-{
+inline uintptr_t sdma_completion_cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
 
-inline CompletionPollResult poll_sdma_event_record(uint64_t record_addr)
-{
+inline CompletionPollResult poll_sdma_event_record(uint64_t record_addr) {
     if (record_addr == 0) return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
-    volatile SdmaEventRecord *record = reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
+    volatile SdmaEventRecord *record =
+        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
     cache_invalidate_range(reinterpret_cast<const void *>(sdma_completion_cache_line(record)), PTO2_ALIGN_SIZE);
     uint32_t flag = __atomic_load_n(&record->flag, __ATOMIC_ACQUIRE);
     return {flag != 0 ? CompletionPollState::READY : CompletionPollState::PENDING, PTO2_ERROR_NONE};
 }
 
-inline void retire_sdma_event_record(uint64_t record_addr)
-{
+inline void retire_sdma_event_record(uint64_t record_addr) {
     if (record_addr == 0) return;
-    volatile SdmaEventRecord *record = reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
+    volatile SdmaEventRecord *record =
+        reinterpret_cast<volatile SdmaEventRecord *>(static_cast<uintptr_t>(record_addr));
     cache_invalidate_range(reinterpret_cast<const void *>(sdma_completion_cache_line(record)), PTO2_ALIGN_SIZE);
     uint32_t completed_tail = __atomic_load_n(&record->sq_tail, __ATOMIC_ACQUIRE);
     uint64_t channel_info_addr = __atomic_load_n(&record->channel_info, __ATOMIC_ACQUIRE);
