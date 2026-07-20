@@ -268,10 +268,6 @@ private:
             offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
             offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
             offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-            // completion_flags block follows slot_states for every ring (mirrors
-            // setup_pointers_per_ring / ring_task_descriptors_addr). Omitting it left
-            // rings >= 1 task_descriptors_offset pointing into the prior ring's flags.
-            offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
         }
 
         header->total_size = sm_size;
