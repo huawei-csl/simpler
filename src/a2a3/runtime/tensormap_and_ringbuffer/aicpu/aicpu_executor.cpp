@@ -257,6 +257,37 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         if (init_failed_.load(std::memory_order_acquire)) return -1;
     }
 
+    // Multi-thread runs take the barrier-free init path: the orchestrator (last
+    // thread) skips the handshake and returns to build the graph immediately, and
+    // each scheduler thread handshakes + self-assigns only the clusters it will
+    // dispatch to (ci % sched_thread_num_ == tidx) — no all-thread barrier and no
+    // leader-serialized post_handshake_init. DFX-safe: polling inits PMU / dep-gen
+    // per-thread inside the dispatch loop (no global pmu_aicpu_init over all cores),
+    // so unlike #1345 upstream there is no leader-only profiling init needing a
+    // barrier. Single-thread runs keep the original path (no orch/scheduler split).
+    const bool barrier_free = (nthreads >= 2);
+    if (barrier_free) {
+        const bool is_orchestrator = (tidx == sched_thread_num_);
+        if (!is_orchestrator) {
+            sched_ctx_.handshake_owned_clusters(runtime, tidx, sched_thread_num_);
+            sched_ctx_.assign_own_clusters(tidx);
+            if (sched_ctx_.handshake_failed()) {
+                sched_ctx_.abort_and_shutdown(runtime);
+                init_failed_.store(true, std::memory_order_release);
+                init_done_.store(true, std::memory_order_release);
+                return -1;
+            }
+        }
+        // No thread blocks: schedulers dispatch their own cores as soon as those
+        // cores are up; the orchestrator overlaps graph-build with peer handshakes.
+        if (is_leader) {
+            finished_count_.store(0, std::memory_order_release);
+            init_done_.store(true, std::memory_order_release);
+            LOG_INFO_V0("AicpuExecutor: Init complete (barrier-free)");
+        }
+        return 0;
+    }
+
     // All threads: handshake this thread's slice of cores in parallel.
     sched_ctx_.handshake_partition(runtime, tidx, nthreads);
 

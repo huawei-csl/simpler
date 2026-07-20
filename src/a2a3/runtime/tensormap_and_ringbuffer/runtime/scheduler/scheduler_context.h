@@ -136,6 +136,24 @@ public:
         aic_count_ = 0;
         aiv_count_ = 0;
         handshake_failed_.store(false, std::memory_order_release);
+
+        // State the barrier-free init path (handshake_owned_clusters /
+        // assign_own_clusters) reads without a leader post_handshake_init:
+        // scheduler-thread count and func table. The leader sets these before
+        // publishing hs_setup_done_, so they happen-before any thread's
+        // self-assignment. The barrier path re-derives them in post_handshake_init,
+        // so this is redundant (not harmful) there.
+        //
+        // payload_per_core_ / deferred_slab_per_core_ are deliberately NOT memset:
+        // build_payload() overwrites every dispatched payload field and dispatch
+        // resets slab count/error_code before the slab can be read (the same
+        // invariant deinit() relies on to skip the ~300 KB zeroing). The global
+        // memset here was ~37 us of preamble on the critical path — upstream skips
+        // it and that was the bulk of polling's small-kernel preamble gap.
+        // sub_block_id is set per owned core in assign_own_clusters and persists
+        // across runs, so it survives without the memset.
+        active_sched_threads_ = (sched_thread_num > 0) ? sched_thread_num : aicpu_thread_num;
+        func_id_to_addr_ = runtime->dev.func_id_to_addr_;
         return 0;
     }
 
@@ -195,6 +213,143 @@ public:
             core_exec_states_[i].core_type = type;
         }
     }
+
+    // Barrier-free init (multi-thread): a scheduler thread handshakes only
+    // the cores it will later dispatch to — clusters ci with ci % active_threads ==
+    // tidx, cluster ci = {ci, aic_n+2ci, aic_n+2ci+1} in the blocked layout
+    // ([0,aic_n) AIC, [aic_n,3*aic_n) AIV). Same per-core handshake as
+    // handshake_partition, over the owned set instead of a contiguous slice, so
+    // core_exec_states_ writes stay race-free (each core owned by one thread).
+    void handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
+        Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+        const int32_t aic_n = cores_total_num_ / 3;
+
+        int32_t owned[RUNTIME_MAX_WORKER];
+        int32_t own_n = 0;
+        for (int32_t ci = tidx; ci < aic_n; ci += active_threads) {
+            owned[own_n++] = ci;                  // AIC
+            owned[own_n++] = aic_n + 2 * ci;      // AIV0
+            owned[own_n++] = aic_n + 2 * ci + 1;  // AIV1
+        }
+
+        // Batched 4-phase handshake (adopts #1345's batching, keeping polling's
+        // aicpu_ready release since the AICore waits on it before reporting): tasks
+        // / windows / states are each published in one pass so posted MMIO STRs and
+        // GM stores don't serialize, and only ~4 barriers fire for the whole owned
+        // set instead of ~2 per core.
+
+        // Phase 1: publish every task pointer (one barrier so all are visible before
+        // any release), then release every owned core (aicpu_ready=1). The AICore
+        // reads its task only after observing aicpu_ready.
+        for (int32_t k = 0; k < own_n; k++)
+            all_handshakes[owned[k]].task = reinterpret_cast<uint64_t>(&payload_per_core_[owned[k]][0]);
+        OUT_OF_ORDER_STORE_BARRIER();
+        for (int32_t k = 0; k < own_n; k++)
+            all_handshakes[owned[k]].aicpu_ready = 1;
+        OUT_OF_ORDER_STORE_BARRIER();
+
+        uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+        uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+
+        struct ReadyCore {
+            int32_t i;
+            uint32_t pcid;
+            uint64_t reg_addr;
+            CoreType core_type;
+        };
+        ReadyCore ready[RUNTIME_MAX_WORKER];
+        int32_t n_ready = 0;
+        bool core_serviced[RUNTIME_MAX_WORKER] = {false};
+
+        // Phase 2: collect every owned core's report (spin until all done),
+        // prefetching each CoreExecState line for the write pass.
+        for (int32_t remaining = own_n; remaining > 0;) {
+            for (int32_t k = 0; k < own_n; k++) {
+                int32_t i = owned[k];
+                if (core_serviced[i]) continue;
+                Handshake *hank = &all_handshakes[i];
+                if (hank->aicore_done == 0) {
+                    SPIN_WAIT_HINT();
+                    continue;
+                }
+                uint32_t physical_core_id = hank->physical_core_id;
+                if (physical_core_id >= max_physical_cores_count) {
+                    handshake_failed_.store(true, std::memory_order_release);
+                    core_serviced[i] = true;
+                    remaining--;
+                    continue;
+                }
+                __builtin_prefetch(&core_exec_states_[i], 1, 3);
+                ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+                core_serviced[i] = true;
+                remaining--;
+            }
+        }
+
+        // Phase 3: open every core's register window, then ONE barrier.
+        for (int32_t r = 0; r < n_ready; r++)
+            platform_init_aicore_regs(ready[r].reg_addr);
+        OUT_OF_ORDER_STORE_BARRIER();
+
+        // Phase 4: publish each CoreExecState (AICPU-private, may follow the
+        // windows). running/pending_reg_task_id start INVALID: pre_handshake_init
+        // memset them to 0, which is a valid task id (AICPU_TASK_INVALID, the idle
+        // sentinel, is not 0), so without this reset the scheduler reads every core
+        // as "running task 0", never dispatches, and trips SCHEDULER_TIMEOUT.
+        for (int32_t r = 0; r < n_ready; r++) {
+            int32_t i = ready[r].i;
+            core_exec_states_[i].reg_addr = ready[r].reg_addr;
+            core_exec_states_[i].cond_ptr = get_reg_ptr(ready[r].reg_addr, RegId::COND);
+            core_exec_states_[i].worker_id = i;
+            core_exec_states_[i].physical_core_id = ready[r].pcid;
+            core_exec_states_[i].core_type = ready[r].core_type;
+            core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
+            core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
+        }
+        OUT_OF_ORDER_STORE_BARRIER();
+    }
+
+    // Barrier-free counterpart of post_handshake_init's assignment: thread tidx
+    // populates its own CoreTracker + per-owned-core sub_block_id right after
+    // handshaking its clusters — no all-thread barrier, no leader serialization.
+    // The blocked layout gives the owned clusters' worker ids directly, so no
+    // aic_worker_ids_ discovery is needed. AsyncCtx/slab pointers are set per
+    // dispatch by build_payload (as on the barrier path), so only the tracker and
+    // the one-time sub_block_id are set here.
+    void assign_own_clusters(int32_t tidx) {
+        const int32_t aic_n = cores_total_num_ / 3;
+        const int32_t active = active_sched_threads_;
+
+        CoreTracker &tracker = core_trackers_[tidx];
+        int32_t own_n = 0;
+        for (int32_t ci = tidx; ci < aic_n; ci += active)
+            own_n++;
+        tracker.init(own_n);
+
+        int32_t local = 0;
+        for (int32_t ci = tidx; ci < aic_n; ci += active)
+            tracker.set_cluster(local++, ci, aic_n + 2 * ci, aic_n + 2 * ci + 1);
+
+        for (int32_t c = 0; c < tracker.get_cluster_count(); c++) {
+            int32_t cluster_offset = c * 3;
+            int32_t aiv0_id = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(cluster_offset));
+            int32_t aiv1_id = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(cluster_offset));
+            payload_per_core_[aiv0_id][0].global_context.sub_block_id = 0;
+            payload_per_core_[aiv0_id][1].global_context.sub_block_id = 0;
+            payload_per_core_[aiv1_id][0].global_context.sub_block_id = 1;
+            payload_per_core_[aiv1_id][1].global_context.sub_block_id = 1;
+        }
+    }
+
+    // Latch completion + broadcast exit on a handshake failure seen without the
+    // all-thread barrier (barrier-free path). Idempotent.
+    void abort_and_shutdown(Runtime *runtime) {
+        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+            emergency_shutdown(runtime);
+        }
+    }
+
+    bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
 
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores to threads, read task counts, init dispatch payloads.
