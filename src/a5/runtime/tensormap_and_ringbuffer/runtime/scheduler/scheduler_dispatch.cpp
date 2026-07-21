@@ -14,6 +14,9 @@
 #include <cinttypes>
 #include <limits>
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "aicpu/device_phase_aicpu.h"
 #include "common.h"  // debug_assert
 #include "common/unified_log.h"
@@ -151,11 +154,18 @@ void SchedulerContext::dispatch_subtask_to_core(
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
     build_payload(payload, slot_state, subslot, async_ctx, block_idx);
 
+    // Carry the dispatched kernel's func_id in the marker extraId so TraCR
+    // traces record task identity (which kernel ran). subslot selects this
+    // core's kernel_id (AIC vs AIV for a paired task); post-processing maps
+    // func_id -> kernel name via the run's kernel_config.py.
+    const uint32_t tracr_func_id = static_cast<uint32_t>(slot_state.task->kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, tracr_func_id);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, tracr_func_id);
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -508,6 +518,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     constexpr bool pmu_active = false;
 #endif
 
+#ifdef INDEP_ORCH
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
+    LOG_INFO_V9(
+        "[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx,
+        g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed)
+    );
+    while (!orchestrator_done_.load(std::memory_order_acquire)) {
+        SPIN_WAIT_HINT();
+    }
+#endif
+
 #if SIMPLER_DFX
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
@@ -611,6 +632,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -730,6 +752,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
             handle_drain_mode(runtime, thread_idx);
             continue;
         }
@@ -743,6 +766,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             constexpr int DUMMY_DRAIN_BATCH = 16;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+
+            if (dummy_got > 0) {
+                (void)(dummy_got);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
+            }
 #if SIMPLER_DFX
             // Dummy outer phase: covers handling of all dummies popped this
             // iter. tasks_processed = dummy_got.
@@ -810,6 +838,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         // pmu_active is cached at function scope above (loop-invariant).
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
+
         dispatch_ready_tasks(runtime, thread_idx, tracker, pmu_active, made_progress, try_pushed);
 
 #if SIMPLER_DFX
@@ -855,6 +885,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
             while (deferred_release_count > 0) {
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
+
 #if SIMPLER_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
