@@ -25,9 +25,12 @@
 // or a weak stub in pto_runtime2.h (host). Used only for sub-phase profiling.
 uint64_t get_sys_cnt_aicpu();
 
+// A ready-queue slot is a single atomic cell (Egorushkin atomic_queue design):
+// the element pointer itself is the synchronization variable. An empty cell
+// holds nullptr; a producer CAS-writes the pointer, a consumer exchange-reads
+// it back to nullptr. No separate sequence field is needed.
 struct PTO2ReadyQueueSlot {
-    std::atomic<int64_t> sequence;
-    PTO2TaskSlotState *slot_state;
+    std::atomic<PTO2TaskSlotState *> cell;
 };
 
 // Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
@@ -55,147 +58,174 @@ struct PTO2LocalReadyBuffer {
     PTO2TaskSlotState *pop() { return (count > 0) ? slot_states[--count] : nullptr; }
 };
 
+// Lock-free MPMC ready queue using Maxim Egorushkin's atomic_queue design
+// (as packaged in huawei-csl/queues MPMC_AtomicRingBuffer): each slot's element
+// pointer is itself the sync variable, and consecutive logical positions are
+// reindexed onto physically distant slots (stride reindex_mul, coprime to
+// capacity) so concurrent producers/consumers rarely touch the same cache line.
+// The push/pop cursors are packed two-per-atomic with a cached view of the
+// opposite cursor: head_cached_tail = {head:hi32, cachedTail:lo32},
+// tail_cached_head = {tail:hi32, cachedHead:lo32}. capacity/mask/reindex_mul
+// are runtime values (arena-backed storage), not template constants.
 struct alignas(64) PTO2ReadyQueue {
     PTO2ReadyQueueSlot *slots;
     uint64_t capacity;
-    uint64_t mask;        // capacity - 1
-    char _pad0[64 - 24];  // Pad to own cache line
+    uint64_t mask;         // capacity - 1
+    uint32_t reindex_mul;  // stride mapping logical position -> physical slot
+    char _pad0[64 - 28];   // Pad to own cache line
 
-    std::atomic<uint64_t> enqueue_pos;
-    char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+    alignas(64) std::atomic<uint64_t> tail_cached_head;  // {tail:hi32, cachedHead:lo32}
+    char _pad1[64 - sizeof(std::atomic<uint64_t>)];
 
-    std::atomic<uint64_t> dequeue_pos;
-    char _pad2[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+    alignas(64) std::atomic<uint64_t> head_cached_tail;  // {head:hi32, cachedTail:lo32}
+    char _pad2[64 - sizeof(std::atomic<uint64_t>)];
 
-    uint64_t size() {
-        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
-        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
-        return (e >= d) ? (e - d) : 0;
+    static constexpr uint32_t hi32(uint64_t v) { return static_cast<uint32_t>(v >> 32u); }
+    static constexpr uint32_t lo32(uint64_t v) { return static_cast<uint32_t>(v); }
+    static constexpr uint64_t pack(uint32_t hi, uint32_t lo) {
+        return (static_cast<uint64_t>(hi) << 32u) | static_cast<uint64_t>(lo);
+    }
+    // Stride coprime to a power-of-two capacity: smallest odd >= slots-per-line.
+    static uint32_t calc_reindex_mul(uint64_t cap) {
+        constexpr uint32_t line_bytes = 64u;
+        uint32_t smallest =
+            static_cast<uint32_t>((line_bytes + sizeof(PTO2TaskSlotState *) - 1) / sizeof(PTO2TaskSlotState *));
+        if ((smallest & 1u) == 0u) ++smallest;
+        if (smallest >= cap) smallest = 1u;
+        return smallest;
+    }
+    // Overflow-safe because capacity divides 2^32: (pos*mul) mod capacity is
+    // preserved through the 32-bit wrap.
+    uint32_t phys_index(uint32_t position) const {
+        return (position * reindex_mul) & static_cast<uint32_t>(mask);
     }
 
-    // No-op: the sequence-based Vyukov MPMC queue is self-consistent across
-    // runs — every slot's sequence at end of run 1 equals the enqueue_pos
-    // where run 2's first push at that slot will land, so pushes/pops resume
-    // seamlessly without any reset.
+    uint64_t size() {
+        const uint32_t head = hi32(head_cached_tail.load(std::memory_order_relaxed));
+        const uint32_t tail = hi32(tail_cached_head.load(std::memory_order_relaxed));
+        return static_cast<uint32_t>(head - tail);  // unsigned modular occupancy
+    }
+
+    // No-op: positions increase monotonically and every slot is exchanged back
+    // to nullptr by its last pop, so run N+1 resumes from run N's cursors with
+    // every slot already empty — no per-slot reset needed across arena reuse.
     void reset_for_reuse() {}
 
-    bool push(PTO2TaskSlotState *slot_state) {
-        uint64_t pos;
-        PTO2ReadyQueueSlot *slot;
-        while (true) {
-            pos = enqueue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
-            int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - static_cast<int64_t>(pos);
-            if (diff == 0) {
-                if (enqueue_pos.compare_exchange_weak(
-                        pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed
-                    ))
-                    break;
-            } else if (diff < 0) {
-                return false;  // Queue full
-            }
+    // A reserved-but-not-yet-written slot (producer advanced the cursor, its
+    // store not landed) is a transient the consumer briefly spins on; on the
+    // AICPU each thread owns a core and completes its store without preemption,
+    // so the spin is short and bounded.
+    PTO2TaskSlotState *do_pop(uint32_t position) {
+        std::atomic<PTO2TaskSlotState *> &e = slots[position].cell;
+        PTO2TaskSlotState *val = e.exchange(nullptr, std::memory_order_acquire);
+        while (val == nullptr) {
+            do {
+                SPIN_WAIT_HINT();
+            } while (e.load(std::memory_order_relaxed) == nullptr);
+            val = e.exchange(nullptr, std::memory_order_acquire);
         }
+        return val;
+    }
 
-        slot->slot_state = slot_state;
-        slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
+    void do_push(PTO2TaskSlotState *value, uint32_t position) {
+        std::atomic<PTO2TaskSlotState *> &e = slots[position].cell;
+        PTO2TaskSlotState *empty = nullptr;
+        while (!e.compare_exchange_weak(empty, value, std::memory_order_release, std::memory_order_relaxed)) {
+            empty = nullptr;
+            do {
+                SPIN_WAIT_HINT();
+            } while (e.load(std::memory_order_relaxed) != nullptr);
+        }
+    }
+
+    bool push(PTO2TaskSlotState *value) {
+        uint64_t hct = head_cached_tail.load(std::memory_order_relaxed);
+        uint32_t head;
+        uint32_t tail;
+        do {
+            head = hi32(hct);
+            tail = lo32(hct);
+            const uint32_t head_trail = head - static_cast<uint32_t>(capacity);
+            if (head_trail == tail && head_trail == (tail = hi32(tail_cached_head.load(std::memory_order_relaxed))))
+                return false;  // Queue full
+        } while (!head_cached_tail.compare_exchange_weak(
+            hct, pack(head + 1u, tail), std::memory_order_relaxed, std::memory_order_relaxed
+        ));
+        do_push(value, phys_index(head));
         return true;
     }
 
-    // Batch push: reserve count slots with a single CAS after confirming
-    // every target slot is available under the usual Vyukov sequence check.
+    // Push all `count` items; blocks (spins) only if the queue lacks room, which
+    // for the ready queue's large capacity vs. per-donation batch never occurs.
     void push_batch(PTO2TaskSlotState **items, int count) {
-        if (count == 0) return;
+        if (count <= 0) return;
+        const uint32_t amount = static_cast<uint32_t>(count);
 
-        uint64_t pos;
-        while (true) {
-            pos = enqueue_pos.load(std::memory_order_relaxed);
-            bool ready = true;
-            for (int i = 0; i < count; i++) {
-                PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
-                int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - static_cast<int64_t>(pos + i);
-                if (diff != 0) {
-                    ready = false;
-                    break;
+        uint64_t hct = head_cached_tail.load(std::memory_order_relaxed);
+        uint32_t head;
+        uint32_t tail;
+        do {
+            head = hi32(hct);
+            tail = lo32(hct);
+            const uint32_t head_trail = head - static_cast<uint32_t>(capacity);
+            uint32_t avail = tail - head_trail;
+            if (avail < amount) {
+                tail = hi32(tail_cached_head.load(std::memory_order_relaxed));
+                avail = tail - head_trail;
+                while (avail < amount) {
+                    SPIN_WAIT_HINT();
+                    tail = hi32(tail_cached_head.load(std::memory_order_relaxed));
+                    avail = tail - head_trail;
                 }
             }
-            if (!ready) continue;
-            if (enqueue_pos.compare_exchange_weak(
-                    pos, pos + count, std::memory_order_relaxed, std::memory_order_relaxed
-                ))
-                break;
-        }
+        } while (!head_cached_tail.compare_exchange_weak(
+            hct, pack(head + amount, tail), std::memory_order_relaxed, std::memory_order_relaxed
+        ));
 
-        for (int i = 0; i < count; i++) {
-            PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            slot->slot_state = items[i];
-            slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
-        }
+        for (uint32_t i = 0; i < amount; i++)
+            do_push(items[i], phys_index(head + i));
     }
 
     PTO2TaskSlotState *pop() {
-        // Fast-path: skip slot load when queue is clearly empty
-        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
-        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
-        if (d >= e) return nullptr;
-
-        uint64_t pos;
-        PTO2ReadyQueueSlot *slot;
-        while (true) {
-            pos = dequeue_pos.load(std::memory_order_relaxed);
-            slot = &slots[pos & mask];
-            int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - static_cast<int64_t>(pos + 1);
-            if (diff == 0) {
-                if (dequeue_pos.compare_exchange_weak(
-                        pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed
-                    ))
-                    break;
-            } else if (diff < 0) {
+        uint64_t tch = tail_cached_head.load(std::memory_order_relaxed);
+        uint32_t tail;
+        uint32_t head;
+        do {
+            tail = hi32(tch);
+            head = lo32(tch);
+            if (tail == head && tail == (head = hi32(head_cached_tail.load(std::memory_order_relaxed))))
                 return nullptr;  // Queue empty
-            }
-        }
-
-        PTO2TaskSlotState *result = slot->slot_state;
-        slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
-        return result;
+        } while (!tail_cached_head.compare_exchange_weak(
+            tch, pack(tail + 1u, head), std::memory_order_relaxed, std::memory_order_relaxed
+        ));
+        return do_pop(phys_index(tail));
     }
 
-    // Batch pop: reserve a contiguous run of ready slots with a single CAS.
-    // Returns actual number of items popped (may be less than max_count).
+    // Reserve up to max_count contiguous positions with one CAS, then drain
+    // them. Returns actual number popped (may be less than max_count).
     int pop_batch(PTO2TaskSlotState **out, int max_count) {
-        uint64_t pos;
-        int count;
-        while (true) {
-            pos = dequeue_pos.load(std::memory_order_relaxed);
-            count = 0;
-            while (count < max_count) {
-                PTO2ReadyQueueSlot *slot = &slots[(pos + count) & mask];
-                int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - static_cast<int64_t>(pos + count + 1);
-                if (diff == 0) {
-                    count++;
-                    continue;
-                }
-                if (diff < 0) break;
-                count = -1;
-                break;
+        const uint32_t want = static_cast<uint32_t>(max_count);
+        uint64_t tch = tail_cached_head.load(std::memory_order_relaxed);
+        uint32_t tail;
+        uint32_t head;
+        uint32_t to_pop;
+        do {
+            tail = hi32(tch);
+            head = lo32(tch);
+            to_pop = head - tail;
+            if (to_pop < want) {
+                head = hi32(head_cached_tail.load(std::memory_order_relaxed));
+                to_pop = head - tail;
+                if (to_pop == 0u) return 0;
             }
-            if (count == 0) return 0;
-            if (count < 0) continue;
-            if (dequeue_pos.compare_exchange_weak(
-                    pos, pos + count, std::memory_order_relaxed, std::memory_order_relaxed
-                ))
-                break;
-        }
+            to_pop = std::min(to_pop, want);
+        } while (!tail_cached_head.compare_exchange_weak(
+            tch, pack(tail + to_pop, head), std::memory_order_relaxed, std::memory_order_relaxed
+        ));
 
-        for (int i = 0; i < count; i++) {
-            PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            out[i] = slot->slot_state;
-            slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
-        }
-        return count;
+        for (uint32_t i = 0; i < to_pop; i++)
+            out[i] = do_pop(phys_index(tail + i));
+        return static_cast<int>(to_pop);
     }
 };
 
@@ -209,13 +239,12 @@ ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, siz
     auto *slots_arena = static_cast<PTO2ReadyQueueSlot *>(arena.region_ptr(slots_off));
     queue->capacity = capacity;
     queue->mask = capacity - 1;
-    queue->enqueue_pos.store(0, std::memory_order_relaxed);
-    queue->dequeue_pos.store(0, std::memory_order_relaxed);
+    queue->reindex_mul = PTO2ReadyQueue::calc_reindex_mul(capacity);
+    queue->tail_cached_head.store(0, std::memory_order_relaxed);
+    queue->head_cached_tail.store(0, std::memory_order_relaxed);
 
-    for (uint64_t i = 0; i < capacity; i++) {
-        slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        slots_arena[i].slot_state = nullptr;
-    }
+    for (uint64_t i = 0; i < capacity; i++)
+        slots_arena[i].cell.store(nullptr, std::memory_order_relaxed);
 
     return true;
 }
