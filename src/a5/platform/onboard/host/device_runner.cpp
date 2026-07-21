@@ -18,6 +18,7 @@
 #include "device_runner.h"
 
 #include "acl/acl.h"
+#include "host/acl_error_log.h"
 #include "host_log.h"
 
 #include <dlfcn.h>
@@ -95,6 +96,7 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     aclError aRet = aclInit(nullptr);
     if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
         LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return static_cast<int>(aRet);
     }
 
@@ -102,6 +104,7 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     aRet = aclrtSetDevice(device_id);
     if (aRet != ACL_SUCCESS) {
         LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return static_cast<int>(aRet);
     }
 
@@ -116,6 +119,7 @@ void *DeviceRunner::create_comm_stream() {
     aclError aRet = aclrtCreateStream(&stream);
     if (aRet != ACL_SUCCESS) {
         LOG_ERROR("aclrtCreateStream failed: %d", static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return nullptr;
     }
     return stream;
@@ -770,8 +774,8 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id) {
     int rc = l2_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr,
-        prof_free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb,
+        /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.args.l2_swimlane_data_base =

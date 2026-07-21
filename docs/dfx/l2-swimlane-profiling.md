@@ -1,5 +1,17 @@
 # L2 Swimlane Profiling — Per-task Timing & Scheduler Phases
 
+> **Lighter alternative for a single interval.** If you only need the
+> dispatch→finish window of one or two specific tasks (not a full per-task
+> timeline), prefer the selective **task-timing slots**: tag the task with
+> `L0TaskArgs::set_task_timing_slot(0..15)` and read the
+> `…device_wall.task_slot_<N>` `[STRACE]` span. It reuses the fixed device-phase
+> buffer — no collector threads, no per-task AICore records, works in
+> `SIMPLER_DFX=0`, and avoids the ~0.8 µs/switch observer effect below. See
+> [device-phases.md](device-phases.md#selective-task-timing-slots-implemented)
+> and [l2-timing.md](l2-timing.md#4b-measuring-one-tasks-dispatchfinish-without-the-swimlane).
+> Use the full swimlane (this doc) when you need **every** task's start/end and
+> the dependency/scheduler-phase picture.
+
 ## 1. Background & Motivation
 
 Why a kernel takes the time it takes is rarely visible from
@@ -33,9 +45,9 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into five
-  mutually time-exclusive **outer** phases (`complete` / `dispatch`
-  / `release` / `dummy` / `early_dispatch`), one logical
+- **AICPU scheduler phases** — per-iteration breakdown into six
+  mutually time-exclusive **outer** phases (`complete` / `async_poll`
+  / `dispatch` / `release` / `dummy` / `early_dispatch`), one logical
   **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
   and one **separate-lane**
@@ -236,6 +248,7 @@ field but render differently in Perfetto:
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
+| `async_poll` | outer | sched | async-wait (SDMA/RoCE/URMA/CCU) subtasks completed this iter; split from `complete` |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
@@ -499,6 +512,11 @@ Scheduler View independently chooses the earliest visible AICPU slice by
 `dispatch_time_us`. Equal start times are resolved by the smaller `core_id`.
 The two views can therefore select different physical subtask records. Within
 each view, dependency and `complete` arrows use that view's selected anchor.
+Dependency flows connect the visual starts of the selected source and
+destination bars. The source completion timestamp still determines whether
+the flow is named `dependency` or `hb_violation`; it does not become the flow
+start because a completion later than the destination bar start would create
+a reverse-time flow that Perfetto cannot display.
 
 The grouping includes both the function identity and the logical `task_id`
 (ring/local id), so MIX tasks that share a `task_id` across AIC/AIV functions

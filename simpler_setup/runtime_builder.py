@@ -19,11 +19,34 @@ from typing import Optional
 
 from .environment import PROJECT_ROOT
 from .platform_info import TARGETS, load_build_config, parse_platform
-from .runtime_compiler import RuntimeCompiler
+from .runtime_compiler import (
+    RuntimeCompiler,
+    _sdma_workspace_enabled,
+    _urma_workspace_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
+
+
+def platform_embeds_pto_isa(platform: str) -> bool:
+    """Return True when this platform's onboard host embeds PTO-ISA headers.
+
+    a2a3 onboard always embeds (workspace forced ON in CMake). a5 onboard
+    embeds only when the SDMA or URMA async workspace overlay is opted in
+    (``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE`` / ``SIMPLER_ENABLE_PTO_URMA_WORKSPACE``
+    truthy) — the overlays are opt-in, so default-OFF a5 builds must not pull
+    in pin/metadata machinery. See issues #1351 (SDMA) and #1392 (URMA).
+    """
+    arch, variant = parse_platform(platform)
+    if variant != "onboard":
+        return False
+    if arch == "a2a3":
+        return True
+    if arch == "a5":
+        return _sdma_workspace_enabled() or _urma_workspace_enabled()
+    return False
 
 
 def _get_git_head(repo_root: Path) -> str:
@@ -181,30 +204,28 @@ class RuntimeBuilder:
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
-        Scoped on arch/variant, not on ``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE``
-        (the actual flag that pulls pto-isa headers into the host .so). This is
-        deliberately coarser: should a2a3 onboard ever turn that workspace off,
-        a pto-isa bump would still invalidate this target's cache even though it
-        no longer embeds pto-isa. That over-invalidation only costs an extra
-        recompile — it can never serve a stale object — so erring wide is the
-        safe direction, and keeping the scope arch/variant-based matches the
-        cmake-side define gating in src/a2a3/platform/onboard/host/CMakeLists.txt.
+        Driven by :func:`platform_embeds_pto_isa`: a2a3 onboard always (CMake
+        forces the SDMA workspace ON), a5 onboard only when the SDMA or URMA
+        async workspace overlay is truthy. a5 must key on the overlay env/CMake
+        option — not bare ``arch == "a5"`` — so default-OFF a5 builds never
+        clone pto-isa or write metadata for nothing (#1351).
         """
-        return self._arch == "a2a3" and self._variant == "onboard"
+        return platform_embeds_pto_isa(self.platform)
 
     def _resolve_build_pto_isa_commit(self) -> str:
         """Return the pinned pto-isa commit baked into this build.
 
-        Only a2a3 onboard host code embeds pto-isa headers, so a pto-isa bump
-        must invalidate that build's cmake cache even when the runtime repo
-        HEAD is unchanged (issue #1139: a stale host_runtime.so compiled
-        against the old headers otherwise survives a reinstall). For every
-        other arch/variant the pto-isa revision does not affect the compiled
-        objects, so return "" and leave the stamp keyed on the runtime HEAD.
+        When host code embeds pto-isa headers (a2a3 onboard, or a5 onboard
+        with the SDMA or URMA overlay ON), a pto-isa bump must invalidate that build's
+        cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
+        a stale host_runtime.so compiled against the old headers otherwise
+        survives a reinstall). For every other arch/variant the pto-isa
+        revision does not affect the compiled objects, so return "" and leave
+        the stamp keyed on the runtime HEAD.
 
         ``pto_isa.pin`` is the single source of truth. If the pin is missing or
-        invalid, let ``read_pto_isa_pin`` raise so an a2a3 onboard build cannot
-        silently proceed with unknown PTO-ISA headers.
+        invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
+        cannot silently proceed with unknown PTO-ISA headers.
         """
         if not self._requires_pto_isa_metadata_validation():
             return ""
@@ -346,16 +367,12 @@ class RuntimeBuilder:
                 defines: dict[str, str] = {}
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
-                # Mirror the SIMPLER_ENABLE_PTO_SDMA_WORKSPACE env var into the
-                # CMake option (src/{arch}/platform/onboard/host/CMakeLists.txt)
-                # so the a5 SDMA workspace overlay is built only when opted in.
-                if os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in {
-                    "1",
-                    "ON",
-                    "TRUE",
-                    "YES",
-                }:
-                    defines["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] = "ON"
+                for opt_in_define in (
+                    "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+                    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+                ):
+                    if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
+                        defines[opt_in_define] = "ON"
                 cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name

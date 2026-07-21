@@ -37,7 +37,7 @@ sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
 from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
-from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
+from simpler_setup.runtime_builder import RuntimeBuilder, platform_embeds_pto_isa  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -112,12 +112,12 @@ def build_all(
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
-    # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
-    # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
-    # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve PTO_ISA_ROOT now so
-    # the runtime compiler consumes the same pinned managed checkout as kernel
-    # compilation. Skipped when only sim platforms are being built.
-    if "a2a3" in platforms:
+    # Onboard hosts that embed pto-isa headers (a2a3 always; a5 when the SDMA
+    # overlay is opted in) hard-depend on the pinned managed checkout + CANN
+    # aclnn syms. Resolve PTO_ISA_ROOT now so the runtime compiler consumes the
+    # same pin as kernel compilation. Skipped when no embedding platform is
+    # being built (sim-only, or a5 with overlay OFF). See issue #1351.
+    if any(platform_embeds_pto_isa(p) for p in platforms):
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
         pto_isa_root = ensure_pto_isa_root(verbose=True)
@@ -156,7 +156,7 @@ def build_all(
 
         for runtime_name in runtimes:
             tasks.append((platform, runtime_name))
-            if arch == "a2a3" and variant == "onboard":
+            if platform_embeds_pto_isa(platform):
                 from simpler_setup.pto_isa import pto_isa_runtime_artifact_key  # noqa: PLC0415
 
                 pto_isa_runtime_keys.append(pto_isa_runtime_artifact_key(arch, variant, runtime_name))

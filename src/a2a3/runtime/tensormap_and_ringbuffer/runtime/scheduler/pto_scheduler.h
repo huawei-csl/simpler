@@ -544,12 +544,12 @@ struct PTO2SchedulerState {
     }
 
     bool try_claim_ready_once(PTO2TaskSlotState &slot_state) {
-        uint8_t state = slot_state.ready_state.load(std::memory_order_acquire);
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
         for (;;) {
-            if ((state & PTO2_READY_CLAIMED) != 0) return false;
-            uint8_t desired = state | PTO2_READY_CLAIMED;
-            if (slot_state.ready_state.compare_exchange_weak(
-                    state, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 return true;
             }
@@ -864,6 +864,34 @@ struct PTO2SchedulerState {
         return true;
     }
 
+    // Attempt to claim and enqueue a consumer after every direct producer becomes
+    // launch-visible. Both propagation and wiring can complete dispatch_fanin.
+    inline void try_enqueue_early_dispatch_candidate(PTO2TaskSlotState &consumer) {
+        // Predicated tasks resolve at the ready point, never early-dispatch. The
+        // wiring caller has no separate predicate filter, so the gate lives here.
+        if (consumer.active_mask.has_predicate()) return;
+        PTO2ResourceShape shape = consumer.active_mask.to_shape();
+        if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX) {
+            return;
+        }
+
+        uint8_t expected = PTO2_EARLY_DISPATCH_NONE;
+        if (!consumer.payload->early_dispatch_state.compare_exchange_strong(
+                expected, PTO2_EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return;
+        }
+
+        uint64_t task_id = static_cast<uint64_t>(consumer.task->task_id.raw);
+        // A sync-start cohort uses one shape-agnostic queue so only the
+        // all-or-nothing drain path can claim and stage it.
+        if (consumer.active_mask.requires_sync_start()) {
+            early_sync_start_queue.push_tagged(&consumer, task_id);
+        } else {
+            early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
+        }
+    }
+
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Called after a
     // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or the
     // sync_start drain), but no-ops until every logical block is launch-visible. Only then
@@ -892,10 +920,18 @@ struct PTO2SchedulerState {
             }
             if (was_pre_staged && launch_state != PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE) return;
         }
-        if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
-            return;  // already propagated once
+        // The once-claim and fanout snapshot share fanout_lock with wiring, so a
+        // set marker tells wiring that its new edge is outside this snapshot.
+        // The unlocked precheck avoids fanout-lock traffic after propagation.
+        if (p.has_dispatch_propagated()) return;
         p.lock_fanout();
-        PTO2DepListEntry *edge = p.fanout_head;  // snapshot head, walk lock-free (fanout stable by dispatch)
+        if (!p.try_mark_dispatch_propagated()) {
+            p.unlock_fanout();
+            return;
+        }
+        // Nodes reachable from the captured head are immutable; wiring serializes
+        // later prepends under fanout_lock and seeds them separately.
+        PTO2DepListEntry *edge = p.fanout_head;
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
@@ -909,27 +945,7 @@ struct PTO2SchedulerState {
             // seed short and never bumps, so this stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->payload->fanin_actual_count) continue;
-            PTO2ResourceShape shape = c->active_mask.to_shape();
-            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
-                continue;
-            // sync_start blocks launch as an atomic cohort. They ride the early-dispatch path
-            // too, but through a dedicated shape-agnostic queue (early_sync_start_queue),
-            // drained as the highest tier in try_early_dispatch via the gated drain +
-            // running-slot rendezvous (enter_drain_mode pre-stages every block gated — MIX
-            // with per-core split placement — and the rendezvous rings them together once
-            // every gated core occupies a running slot and the producer released). They must
-            // NOT enter early_dispatch_queues[shape]: that path's partial range-claim would
-            // strand gated cohort blocks nobody rings, so the rendezvous never reaches
-            // block_num. The rendezvous counts CORES (a MIX block spans a cluster), so one
-            // shape-agnostic queue suffices.
-            uint8_t expect = PTO2_EARLY_DISPATCH_NONE;  // exactly-once: only the CAS winner enqueues
-            if (!c->payload->early_dispatch_state.compare_exchange_strong(
-                    expect, PTO2_EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
-                ))
-                continue;
-            uint64_t task_id = static_cast<uint64_t>(c->task->task_id.raw);
-            if (c->active_mask.requires_sync_start()) early_sync_start_queue.push_tagged(c, task_id);
-            else early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(c, task_id);
+            try_enqueue_early_dispatch_candidate(*c);
         }
     }
 
@@ -1037,18 +1053,18 @@ struct PTO2SchedulerState {
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr
     ) {
-        uint8_t state = slot_state.ready_state.load(std::memory_order_acquire);
-        atomic_count += 1;  // ready_state load
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
+        atomic_count += 1;  // lifecycle_flags load
         for (;;) {
-            if ((state & PTO2_READY_CLAIMED) != 0) return false;
-            uint8_t desired = state | PTO2_READY_CLAIMED;
-            if (slot_state.ready_state.compare_exchange_weak(
-                    state, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
-                atomic_count += 1;  // ready_state CAS
+                atomic_count += 1;  // lifecycle_flags CAS
                 break;
             }
-            atomic_count += 1;  // failed ready_state CAS
+            atomic_count += 1;  // failed lifecycle_flags CAS
         }
 
         // Early-dispatch: pre-staged tasks are released by doorbell
@@ -1191,7 +1207,7 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
 
 #if SIMPLER_SCHED_PROFILING
-        lock_atomics += 3;  // task_state.store + ready_state.fetch_or + unlock.store
+        lock_atomics += 3;  // task_state.store + lifecycle_flags.fetch_or + unlock.store
         g_sched_lock_atomic_count[thread_idx] += lock_atomics;
         g_sched_lock_wait_cycle[thread_idx] += lock_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);

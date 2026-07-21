@@ -185,7 +185,7 @@ This builds the nanobind `_task_interface` extension **and** pre-builds all runt
 | Nanobind bindings (`python/bindings/`) | Re-run `pip install --no-build-isolation -e .` (no rebuild-on-import; `editable.rebuild = false`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
-| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard, so a pin bump invalidates stale runtime objects automatically. |
+| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard (and a5 onboard when the SDMA overlay is enabled), so a pin bump invalidates stale runtime objects automatically. |
 
 A `pto_isa.pin` bump changes the SDMA headers embedded by
 `host_runtime.so`. Install-time runtime builds and run-time kernel compilation

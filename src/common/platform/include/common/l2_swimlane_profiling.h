@@ -60,6 +60,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
 // =============================================================================
@@ -434,6 +435,9 @@ struct L2SwimlaneDataHeader {
     uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
+
+    // DFX backpressure coordination (unified across all DFX subsystems).
+    DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
 
 // ABI lock for the merged header. The phase metadata fields and the
@@ -526,6 +530,10 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // (cluster scan + build_payload). tasks_processed = subtasks.
     DrainPublish = 10,  // inner: this thread's drain_stage_cores publish pass
                         // (MMIO write_reg per subtask). tasks_processed = subtasks.
+    // Outer (sched lane): async-wait completion polling, split out of Complete
+    // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
+    // bar. tasks_processed = async subtasks completed this iter.
+    AsyncPoll = 11,
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.

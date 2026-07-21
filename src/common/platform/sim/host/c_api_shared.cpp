@@ -283,34 +283,12 @@ int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
         SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
-        int rc = runner->l3_l2_orch_comm_shutdown();
-        int finalize_rc = runner->finalize();
-        if (rc == 0) {
-            rc = finalize_rc;
-        }
+        int rc = runner->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
             pto_cpu_sim_release_device(dev);
         }
         return rc;
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
-    if (ctx == NULL || control_block == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_init(control_block, control_block_size);
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
-    if (ctx == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_shutdown();
     } catch (...) {
         return -1;
     }
@@ -331,6 +309,14 @@ int simpler_init(
     if (ctx == NULL) return -1;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+    // HostApi callbacks, including the prewarm path below, recover their
+    // DeviceRunner from this thread-local binding.
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    auto tsd_guard = RAIIScopeGuard([]() {
+        pthread_setspecific(g_runner_key, nullptr);
+    });
+
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
@@ -490,6 +476,31 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
         if (ns != 0) {
             STRACE_DEV_SPAN_AT(
                 p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
+                3
+            );
+        }
+    }
+
+    // Selective task-timing slots: one span per complete slot, start = dispatch
+    // and duration = finish - dispatch, both on the phase timeline so cross-slot
+    // intervals (e.g. finish(slot_1) - dispatch(slot_0)) stay recoverable.
+    // Untagged / incomplete slots read back 0/0 and are skipped.
+    static const char *const kTaskSlotNames[NUM_TASK_TIMING_SLOTS] = {
+        "simpler_run.runner_run.device_wall.task_slot_0",  "simpler_run.runner_run.device_wall.task_slot_1",
+        "simpler_run.runner_run.device_wall.task_slot_2",  "simpler_run.runner_run.device_wall.task_slot_3",
+        "simpler_run.runner_run.device_wall.task_slot_4",  "simpler_run.runner_run.device_wall.task_slot_5",
+        "simpler_run.runner_run.device_wall.task_slot_6",  "simpler_run.runner_run.device_wall.task_slot_7",
+        "simpler_run.runner_run.device_wall.task_slot_8",  "simpler_run.runner_run.device_wall.task_slot_9",
+        "simpler_run.runner_run.device_wall.task_slot_10", "simpler_run.runner_run.device_wall.task_slot_11",
+        "simpler_run.runner_run.device_wall.task_slot_12", "simpler_run.runner_run.device_wall.task_slot_13",
+        "simpler_run.runner_run.device_wall.task_slot_14", "simpler_run.runner_run.device_wall.task_slot_15",
+    };
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        const uint64_t dispatch_ns = runner->last_task_slot_dispatch_ns(s);
+        const uint64_t finish_ns = runner->last_task_slot_finish_ns(s);
+        if (finish_ns > dispatch_ns) {
+            STRACE_DEV_SPAN_AT(
+                kTaskSlotNames[s], static_cast<long long>(dispatch_ns), static_cast<long long>(finish_ns - dispatch_ns),
                 3
             );
         }

@@ -25,7 +25,9 @@ with ``kind=``, ``func_id=``, and SPMD block num when applicable. Text-mode
 tasks render as ``func_id=none``. ``SPMD block num = N`` is the logical block
 num captured from ``block_num``. In HTML mode SPMD nodes use a red border plus a
 transparent right-side ``xN`` block num label; nodes are colored by
-``core_type`` when a perf sidecar is colocated (AIC blue, AIV orange).
+``core_type`` when a perf sidecar is colocated (AIC blue, AIV orange). Each
+HTML node label also shows ``↓fanin ↑fanout`` peer counts; clicking a node opens
+a detail panel that buckets those peers by ``name_hint`` (``func_name``).
 
 Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON
@@ -47,7 +49,7 @@ skipped with a warning if the graph contains a cycle):
 ``reduced`` and ``omitted`` print the redundant edges to stdout. Text output
 emits only the selected edge set. HTML output keeps every edge in the Graphviz
 layout and colors the unselected edges like the page background, preserving the
-full-graph layout while making the selected edge set visible.
+full-graph layout while drawing the selected edge set above unselected edges.
 
 HTML output requires Graphviz installed (``brew install graphviz`` /
 ``apt install graphviz``). Text output does not.
@@ -58,6 +60,7 @@ import json
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
@@ -449,19 +452,70 @@ def _load_task_meta(deps_path, func_names=None):
     return meta
 
 
-def _label(task_id, meta, task_table, fmt_task, marker=""):
+def _task_name_hint(task_id, meta, task_table):
+    """Classification key for a task — the profiling ``name_hint`` / ``func_name``.
+
+    Falls back to alloc / dummy / f<id> / unknown when no human-readable name
+    is available. Used to bucket predecessor / successor peers in the HTML
+    detail panel.
+    """
+    kind = _task_kind(task_id, meta, task_table)
+    if kind == "alloc":
+        return "alloc"
+    if kind == "dummy":
+        return "dummy"
+    entry = meta.get(task_id) or {}
+    func_name = entry.get("func_name")
+    if func_name:
+        return str(func_name)
+    func_id = entry.get("func_id")
+    if func_id is not None:
+        return f"f{func_id}"
+    return "unknown"
+
+
+def _fan_maps(edges, nodes):
+    """Unique predecessor / successor peer sets per task (same semantics as text FANIN/FANOUT)."""
+    pred_map = {tid: set() for tid in nodes}
+    succ_map = {tid: set() for tid in nodes}
+    for pred, succ in edges:
+        pred_map[succ].add(pred)
+        succ_map[pred].add(succ)
+    return pred_map, succ_map
+
+
+def _count_by_name_hint(peer_ids, meta, task_table):
+    """Count peers grouped by ``_task_name_hint``, largest-count-first then name.
+
+    Returns a list of ``[hint, count]`` pairs (not a dict) so ordering survives
+    ``json.dumps(..., sort_keys=True)``.
+    """
+    counts: dict[str, int] = {}
+    for peer in peer_ids:
+        hint = _task_name_hint(peer, meta, task_table)
+        counts[hint] = counts.get(hint, 0) + 1
+    return [[hint, count] for hint, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _fan_suffix(fanin, fanout):
+    if fanin is None or fanout is None:
+        return ""
+    return f" ↓{fanin} ↑{fanout}"
+
+
+def _label(task_id, meta, task_table, fmt_task, marker="", fanin=None, fanout=None):
     base = fmt_task(task_id)
     pfx = f"{marker} " if marker else ""
     normalized_task_id = _normalize_task_id(task_id)
     kind = _task_kind(normalized_task_id, meta, task_table)
     if kind == "alloc":
-        return f"{pfx}{base} · alloc"
-    if kind == "dummy":
-        return f"{pfx}{base} · dummy"
-    func_name = (meta.get(normalized_task_id) or {}).get("func_name")
-    if func_name:
-        return f"{pfx}{base} · {func_name}"
-    return f"{pfx}{base}"
+        text = f"{pfx}{base} · alloc"
+    elif kind == "dummy":
+        text = f"{pfx}{base} · dummy"
+    else:
+        func_name = (meta.get(normalized_task_id) or {}).get("func_name")
+        text = f"{pfx}{base} · {func_name}" if func_name else f"{pfx}{base}"
+    return text + _fan_suffix(fanin, fanout)
 
 
 _CORE_STYLE = {
@@ -570,10 +624,10 @@ def _arg_row_html(arg, tensor_table, side):
     return f'<TR><TD ALIGN="LEFT" PORT="{port}" BGCOLOR="{bg}">{body}</TD></TR>'
 
 
-def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task, marker=""):
+def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task, marker="", fanin=None, fanout=None):
     """Build a Graphviz HTML-like label for a task node showing:
         - input rows (top)     INPUT + INOUT slots
-        - identity header      "<marker> (ring, local) · <func_name>"
+        - identity header      "<marker> (ring, local) · <func_name> ↓fanin ↑fanout"
         - output rows (bottom) INOUT + OUTPUT_EXISTING + OUTPUT slots
     INOUT slots appear in BOTH compartments (read-then-write semantics).
     ``marker`` is the 🔥 / ⭐ early-dispatch badge (empty for most tasks).
@@ -593,6 +647,7 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task, mar
         ident = f"{ident} · {func_name}"
     if marker:
         ident = f"{marker} {ident}"
+    ident = ident + _fan_suffix(fanin, fanout)
 
     rows = []
     for a in inputs:
@@ -663,7 +718,7 @@ def _task_blocks_text(task_entry):
     return f"SPMD block num = {block_num}"
 
 
-def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker=""):
+def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker="", fanin=None, fanout=None):
     meta_entry = meta.get(task_id)
     kind = _task_kind(task_id, meta, task_table)
     if kind == "submit" and meta_entry:
@@ -674,7 +729,7 @@ def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker=""):
         style = _DEFAULT_STYLE
 
     task_entry = task_table.get(task_id)
-    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task, marker=marker))
+    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task, marker=marker, fanin=fanin, fanout=fanout))
     label_attr = f'label="{label}"'
     style_attr = style["style"]
     if _task_block_num(task_entry) > 1:
@@ -757,9 +812,9 @@ def _task_markers(nodes, edges, meta, task_table):
         (deps.json ``early_dispatch`` — the submit had allow_early_resolve)
         or an alloc task. Alloc tasks are immediate graph sources, so they
         are treated as fire-marked producers by default.
-    ⭐ (star): every one of the task's predecessors is 🔥 (and it has at
-        least one), so the task is fully fed by flagged producers or alloc
-        sources.
+    ⭐ (star): every one of the task's predecessors is 🔥, and at least
+        one predecessor is not an alloc task. An alloc-only fanin does not
+        qualify.
     A task can carry both.
     """
     pred_map: dict[int, set] = {}
@@ -773,7 +828,13 @@ def _task_markers(nodes, edges, meta, task_table):
     for tid in nodes:
         fire = "🔥" if _fire_marked(tid) else ""
         preds = pred_map.get(tid, set())
-        star = "⭐" if preds and all(_fire_marked(p) for p in preds) else ""
+        star = (
+            "⭐"
+            if preds
+            and all(_fire_marked(p) for p in preds)
+            and any(_task_kind(p, meta, task_table) != "alloc" for p in preds)
+            else ""
+        )
         if fire or star:
             markers[tid] = fire + star
     return markers
@@ -811,27 +872,34 @@ def emit_dot(
     hidden_edges = set(hidden_edges or ())
     show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
     markers = _task_markers(nodes, edges, meta, task_table)
+    pred_map, succ_map = _fan_maps(edges, nodes)
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
-        "  concentrate=true;",
+        # Per-edge visibility requires each logical edge to retain its complete spline.
+        "  concentrate=false;",
         '  node [fontname="Helvetica", fontsize=10];',
         '  edge [color="#888"];',
     ]
     for n in nodes:
         m = meta.get(n)
         marker = markers.get(n, "")
+        fanin = len(pred_map.get(n, set()))
+        fanout = len(succ_map.get(n, set()))
         if show_tensor and n in task_table:
-            html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task, marker=marker)
+            html = _task_node_html(
+                n, task_table.get(n), m, tensor_table, fmt_task, marker=marker, fanin=fanin, fanout=fanout
+            )
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
-        lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task, marker=marker)}];")
+        attrs = _plain_node_attrs(n, meta, task_table, fmt_task, marker=marker, fanin=fanin, fanout=fanout)
+        lines.append(f"  {_node_id(n)} [{attrs}];")
 
     def edge_attr_str(edge_attrs):
         return (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
 
     def hidden_edge_attrs():
-        return ['color="#eef2f7"', 'fontcolor="#eef2f7"']
+        return ['class="hidden-edge"', 'color="#eef2f7"', 'fontcolor="#eef2f7"']
 
     for pred, succ in edges:
         hidden = (pred, succ) in hidden_edges
@@ -898,6 +966,27 @@ def _spmd_badges_json(nodes, task_table):
     return json.dumps(badges, sort_keys=True, separators=(",", ":"))
 
 
+def _dep_stats_json(nodes, edges, meta, task_table):
+    """Per-node fanin/fanout totals plus name_hint histograms for the HTML panel."""
+    task_table = task_table or {}
+    meta = meta or {}
+    fmt_task = _make_task_formatter(nodes)
+    pred_map, succ_map = _fan_maps(edges, nodes)
+    stats = {}
+    for tid in nodes:
+        preds = pred_map[tid]
+        succs = succ_map[tid]
+        stats[_node_id(tid)] = {
+            "label": fmt_task(tid),
+            "name_hint": _task_name_hint(tid, meta, task_table),
+            "fanin": len(preds),
+            "fanout": len(succs),
+            "pred_by_hint": _count_by_name_hint(preds, meta, task_table),
+            "succ_by_hint": _count_by_name_hint(succs, meta, task_table),
+        }
+    return json.dumps(stats, sort_keys=True, separators=(",", ":"))
+
+
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -911,7 +1000,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     color: #0f172a; overflow: hidden; -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }}
-  #hud, #legend {{
+  #hud, #legend, #detail {{
     position: fixed; z-index: 10; display: flex; align-items: center;
     background: rgba(255,255,255,0.94); border: 1px solid rgba(203,213,225,0.9);
     border-radius: 10px; color: #0f172a; font-size: 12px;
@@ -931,6 +1020,38 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }}
   #legend .swatch {{ display: inline-flex; align-items: center; gap: 6px; color: #334155; white-space: nowrap; }}
   #legend svg {{ display: block; }}
+  #detail {{
+    display: none; top: 64px; left: 12px; width: min(360px, calc(100vw - 24px));
+    max-height: calc(100vh - 88px); flex-direction: column; align-items: stretch;
+    padding: 0; overflow: hidden;
+  }}
+  #detail.open {{ display: flex; }}
+  #detail header {{
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+    padding: 10px 12px; border-bottom: 1px solid #e2e8f0;
+  }}
+  #detail header .title {{ font-weight: 600; color: #020617; line-height: 1.35; }}
+  #detail header .sub {{ color: #64748b; font-size: 11px; margin-top: 2px; }}
+  #detail header button {{
+    border: 0; background: #f1f5f9; color: #334155; width: 24px; height: 24px;
+    border-radius: 6px; cursor: pointer; font-size: 14px; line-height: 1; flex: 0 0 auto;
+  }}
+  #detail header button:hover {{ background: #e2e8f0; }}
+  #detail .body {{ padding: 10px 12px 12px; overflow: auto; }}
+  #detail .section {{ margin-top: 10px; }}
+  #detail .section:first-child {{ margin-top: 0; }}
+  #detail .section h3 {{
+    margin: 0 0 6px; font-size: 11px; font-weight: 600; color: #475569;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }}
+  #detail table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+  #detail td {{ padding: 3px 0; vertical-align: baseline; }}
+  #detail td.hint {{
+    color: #0f172a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    word-break: break-word;
+  }}
+  #detail td.count {{ text-align: right; font-weight: 600; color: #020617; width: 3em; padding-left: 8px; }}
+  #detail .empty {{ color: #94a3b8; font-size: 12px; }}
   #stage {{ width: 100vw; height: 100vh; overflow: hidden; cursor: grab; background:
     radial-gradient(circle at 20px 20px, rgba(100,116,139,0.18) 1px, transparent 1px), #eef2f7;
     background-size: 24px 24px; }}
@@ -939,8 +1060,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     transform-origin: 0 0; transition: none; max-width: none; overflow: visible;
     filter: drop-shadow(0 16px 28px rgba(15,23,42,0.10));
   }}
+  #stage .node {{ cursor: pointer; }}
   #stage .node path, #stage .node ellipse, #stage .node polygon {{
     filter: drop-shadow(0 3px 4px rgba(15,23,42,0.18));
+  }}
+  #stage .node.selected path, #stage .node.selected ellipse, #stage .node.selected polygon,
+  #stage .node.selected rect {{
+    stroke: #2563eb !important; stroke-width: 2.5px !important;
   }}
   #stage .edge path, #stage .edge polygon {{ opacity: 0.78; }}
 </style>
@@ -952,9 +1078,12 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <span class="stat">{n_edges} edges</span>
   <span class="divider"></span>
   <kbd>drag</kbd><span>pan</span>
-  <kbd>wheel</kbd><span>zoom</span>
+  <kbd>scroll</kbd><span>pan</span>
+  <kbd>ctrl+scroll</kbd><span>zoom</span>
+  <kbd>click</kbd><span>task</span>
   <kbd>f</kbd><span>fit</span>
   <kbd>r</kbd><span>reset</span>
+  <kbd>esc</kbd><span>close</span>
 </div>
 <div id="legend">
   <span class="swatch">
@@ -990,6 +1119,17 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     </svg>
     SPMD block num
   </span>
+  <span class="swatch">↓N ↑M = pred / succ</span>
+</div>
+<div id="detail">
+  <header>
+    <div>
+      <div class="title" id="detail-title"></div>
+      <div class="sub" id="detail-sub"></div>
+    </div>
+    <button type="button" id="detail-close" aria-label="Close">×</button>
+  </header>
+  <div class="body" id="detail-body"></div>
 </div>
 <div id="stage">
 {svg_body}
@@ -1002,7 +1142,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   svg.removeAttribute('width');
   svg.removeAttribute('height');
   const spmdBlocks = {spmd_badges_json};
+  const depStats = {dep_stats_json};
+  const detail = document.getElementById('detail');
+  const detailTitle = document.getElementById('detail-title');
+  const detailSub = document.getElementById('detail-sub');
+  const detailBody = document.getElementById('detail-body');
   const svgNS = 'http://www.w3.org/2000/svg';
+  let selectedNode = null;
 
   function svgEl(name, attrs) {{
     const el = document.createElementNS(svgNS, name);
@@ -1038,33 +1184,109 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }}
   addSpmdBadges();
 
+  function escapeHtml(text) {{
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }}
+
+  function hintTable(counts) {{
+    const entries = counts || [];
+    if (!entries.length) return '<div class="empty">none</div>';
+    return '<table>' + entries.map(([hint, count]) =>
+      `<tr><td class="hint">${{escapeHtml(hint)}}</td><td class="count">${{count}}</td></tr>`
+    ).join('') + '</table>';
+  }}
+
+  function closeDetail() {{
+    detail.classList.remove('open');
+    if (selectedNode) {{
+      selectedNode.classList.remove('selected');
+      selectedNode = null;
+    }}
+  }}
+
+  function openDetail(nodeGroup) {{
+    const titleEl = nodeGroup.querySelector(':scope > title');
+    const nodeId = titleEl ? titleEl.textContent : '';
+    const stats = depStats[nodeId];
+    if (!stats) return;
+    if (selectedNode) selectedNode.classList.remove('selected');
+    selectedNode = nodeGroup;
+    selectedNode.classList.add('selected');
+    detailTitle.textContent = `${{stats.label}} · ${{stats.name_hint}}`;
+    detailSub.textContent = `↓${{stats.fanin}} predecessors · ↑${{stats.fanout}} successors`;
+    detailBody.innerHTML =
+      `<div class="section"><h3>Predecessors by name_hint (${{stats.fanin}})</h3>` +
+      `${{hintTable(stats.pred_by_hint)}}</div>` +
+      `<div class="section"><h3>Successors by name_hint (${{stats.fanout}})</h3>` +
+      `${{hintTable(stats.succ_by_hint)}}</div>`;
+    detail.classList.add('open');
+  }}
+
+  document.getElementById('detail-close').addEventListener('click', (e) => {{
+    e.stopPropagation();
+    closeDetail();
+  }});
+
   let scale = 1, tx = 0, ty = 0;
   const apply = () => {{ svg.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`; }};
 
   stage.addEventListener('wheel', (e) => {{
     e.preventDefault();
-    const rect = stage.getBoundingClientRect();
-    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
-    const factor = Math.exp(-e.deltaY * 0.001);
-    const newScale = Math.min(20, Math.max(0.02, scale * factor));
-    tx = cx - (cx - tx) * (newScale / scale);
-    ty = cy - (cy - ty) * (newScale / scale);
-    scale = newScale;
+    let dx = e.deltaX, dy = e.deltaY;
+    if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {{
+      dx *= 16;
+      dy *= 16;
+    }} else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {{
+      dx *= stage.clientWidth;
+      dy *= stage.clientHeight;
+    }}
+
+    // ctrlKey is set by a real Ctrl+wheel and by trackpad pinch-to-zoom;
+    // a bare wheel / two-finger swipe pans.
+    if (e.ctrlKey) {{
+      const rect = stage.getBoundingClientRect();
+      const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+      const factor = Math.min(1.25, Math.max(0.8, Math.exp(-dy * 0.003)));
+      const newScale = Math.min(20, Math.max(0.02, scale * factor));
+      tx = cx - (cx - tx) * (newScale / scale);
+      ty = cy - (cy - ty) * (newScale / scale);
+      scale = newScale;
+    }} else {{
+      tx -= dx;
+      ty -= dy;
+    }}
     apply();
   }}, {{ passive: false }});
 
-  let dragging = false, lastX = 0, lastY = 0;
+  let dragging = false, panMoved = false, lastX = 0, lastY = 0;
   stage.addEventListener('mousedown', (e) => {{
-    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    if (e.button !== 0) return;
+    dragging = true; panMoved = false; lastX = e.clientX; lastY = e.clientY;
     stage.classList.add('panning');
   }});
   window.addEventListener('mousemove', (e) => {{
     if (!dragging) return;
-    tx += e.clientX - lastX; ty += e.clientY - lastY;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) panMoved = true;
+    tx += dx; ty += dy;
     lastX = e.clientX; lastY = e.clientY;
     apply();
   }});
   window.addEventListener('mouseup', () => {{ dragging = false; stage.classList.remove('panning'); }});
+
+  stage.addEventListener('click', (e) => {{
+    if (panMoved) return;
+    const node = e.target.closest('g.node');
+    if (node && svg.contains(node)) {{
+      openDetail(node);
+      return;
+    }}
+    closeDetail();
+  }});
 
   const fit = () => {{
     const bb = svg.getBoundingClientRect();
@@ -1078,6 +1300,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   document.addEventListener('keydown', (e) => {{
     if (e.key === 'f') fit();
     else if (e.key === 'r') {{ scale = 1; tx = 0; ty = 0; apply(); }}
+    else if (e.key === 'Escape') closeDetail();
   }});
   requestAnimationFrame(fit);
 }})();
@@ -1085,6 +1308,66 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+def _layer_svg_edges(svg_text):
+    try:
+        root = ET.fromstring(svg_text)
+    except ET.ParseError:
+        return svg_text
+
+    def local_name(element):
+        return element.tag.rsplit("}", 1)[-1]
+
+    def classes(element):
+        return set(element.get("class", "").split())
+
+    graph = next(
+        (element for element in root.iter() if local_name(element) == "g" and "graph" in classes(element)),
+        None,
+    )
+    if graph is None:
+        return svg_text
+
+    edge_groups = []
+    non_edge_children = []
+    has_hidden_edges = False
+    for child in graph:
+        child_classes = classes(child)
+        if local_name(child) == "g" and "edge" in child_classes:
+            hidden = "hidden-edge" in child_classes
+            edge_groups.append((child, hidden))
+            has_hidden_edges |= hidden
+        else:
+            non_edge_children.append(child)
+    if not has_hidden_edges:
+        return svg_text
+
+    graph[:] = non_edge_children
+
+    namespace = root.tag[1:].partition("}")[0] if root.tag.startswith("{") else ""
+    group_tag = f"{{{namespace}}}g" if namespace else "g"
+    hidden_layer = ET.Element(group_tag, {"class": "edge-layer hidden-edge-layer"})
+    visible_layer = ET.Element(group_tag, {"class": "edge-layer visible-edge-layer"})
+
+    for edge, hidden in edge_groups:
+        layer = hidden_layer if hidden else visible_layer
+        layer.append(edge)
+
+    insert_at = next(
+        (
+            index
+            for index, child in enumerate(non_edge_children)
+            if local_name(child) == "g" and "node" in classes(child)
+        ),
+        len(non_edge_children),
+    )
+    graph.insert(insert_at, hidden_layer)
+    graph.insert(insert_at + 1, visible_layer)
+
+    if namespace:
+        ET.register_namespace("", namespace)
+    return ET.tostring(root, encoding="unicode")
 
 
 def emit_html(
@@ -1120,11 +1403,13 @@ def emit_html(
     svg_text = svg_bytes.decode("utf-8", errors="replace")
     if "<svg" in svg_text:
         svg_text = svg_text[svg_text.index("<svg") :]
+    svg_text = _layer_svg_edges(svg_text)
     return _HTML_TEMPLATE.format(
         n_nodes=len(nodes),
         n_edges=visible_edge_count,
         svg_body=svg_text,
         spmd_badges_json=_spmd_badges_json(nodes, task_table),
+        dep_stats_json=_dep_stats_json(nodes, edges, meta, task_table),
     )
 
 
@@ -1192,7 +1477,7 @@ Examples:
             "minimal edge set; omitted selects only the redundant edges reduced would drop (the complement of "
             "reduced). reduced/omitted print the redundant edges to stdout, are structural (pred,succ) level, "
             "apply to both text and html, and are skipped with a warning on a cyclic graph. In html, all edges "
-            "still participate in layout; unselected edges are colored as background."
+            "still participate in layout; unselected edges are colored as background and drawn below selected edges."
         ),
     )
     p.add_argument(

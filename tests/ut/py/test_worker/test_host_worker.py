@@ -133,7 +133,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         def finalize(self) -> None:
             events.append(("finalize",))
 
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime):
+    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None):
         events.append(("main_loop", cw, chip_platform, chip_runtime))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
@@ -225,32 +225,33 @@ class TestLifecycle:
         assert hw._identity_registry == {}
         assert hw._live_handles == {}
 
-    def test_prepare_python_fn_after_init_before_start_succeeds(self):
-        # init() allocates mailboxes but does not fork children. Python
-        # callables prepared in this window still land in the startup
-        # snapshot consumed by the first run().
-        hw = Worker(level=3, num_sub_workers=0)
+    def test_register_python_fn_before_init_lands_in_snapshot(self):
+        # init() is eager, so there is no init-before-start window. A Python
+        # callable registered before init() is frozen into the startup snapshot
+        # and COW-inherited by the sub child during init — no run() needed.
+        hw = Worker(level=3, num_sub_workers=1)
+        handle = hw.register(lambda args: None)
         hw.init()
         try:
-            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw.close()
 
-    def test_prepare_python_fn_after_init_before_start_does_not_broadcast(self):
-        class BroadcastTrap:
-            def broadcast_control_all(self, *args, **kwargs):
-                raise AssertionError("pre-start Python prepare must not broadcast")
-
+    def test_pre_init_register_does_not_broadcast(self):
+        # A registration issued before init() takes the pre-start snapshot path
+        # and must not attempt a control broadcast — there is no started
+        # hierarchy to broadcast to yet.
         hw = Worker(level=3, num_sub_workers=1)
+
+        def _trap(*_a, **_k):
+            raise AssertionError("pre-init Python register must not broadcast")
+
+        hw._broadcast_py_control = _trap
+        handle = hw.register(lambda args: None)
         hw.init()
-        real_worker = hw._worker
         try:
-            hw._worker = BroadcastTrap()
-            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
-            hw._worker = real_worker
             hw.close()
 
     def test_prepare_python_fn_after_start_no_python_children_raises(self):
@@ -373,73 +374,51 @@ class TestLifecycle:
                 hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
-    def test_prepare_blocks_startup_snapshot_from_not_started_window(self):
-        hw = Worker(level=3, num_sub_workers=0)
+    def test_register_during_initializing_waits_then_takes_post_start_path(self):
+        # A register that races an in-progress startup epoch (INITIALIZING) must
+        # block on the lifecycle condition rather than mutate the registry, then
+        # resolve via the post-start broadcast path once the epoch commits READY.
+        hw = Worker(level=3, num_sub_workers=1)
         hw.init()
-
-        real_registry_lock = hw._registry_lock
-        register_waiting = threading.Event()
-        release_register = threading.Event()
-        startup_snapshot_attempted = threading.Event()
-        result: list[CallableHandle] = []
-        errors: list[BaseException] = []
-
-        class BlockingRegistryLock:
-            def __enter__(self):
-                thread_name = threading.current_thread().name
-                if thread_name == "register-thread":
-                    register_waiting.set()
-                    if not release_register.wait(timeout=2.0):
-                        raise TimeoutError("test timed out waiting to release register")
-                elif thread_name == "startup-thread":
-                    startup_snapshot_attempted.set()
-                return real_registry_lock.__enter__()
-
-            def __exit__(self, exc_type, exc, tb):
-                return real_registry_lock.__exit__(exc_type, exc, tb)
-
-            def locked(self):
-                return real_registry_lock.locked()
-
-        hw._registry_lock = BlockingRegistryLock()
-
-        def do_register():
-            try:
-                result.append(hw.register(lambda args: None))
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        def do_startup():
-            try:
-                hw._start_hierarchical()
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        register_thread = threading.Thread(target=do_register, name="register-thread")
-        startup_thread = threading.Thread(target=do_startup, name="startup-thread")
         try:
-            register_thread.start()
-            assert register_waiting.wait(timeout=2.0)
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_start_state = "starting"
 
-            startup_thread.start()
-            assert not startup_snapshot_attempted.wait(timeout=0.2)
+            errors: list[BaseException] = []
+            result: list[object] = []
+            wait_entered = threading.Event()
+            original_wait = hw._hierarchical_start_cv.wait
 
-            release_register.set()
-            register_thread.join(timeout=2.0)
-            startup_thread.join(timeout=2.0)
+            def wait_with_signal(timeout=None):
+                wait_entered.set()
+                return original_wait(timeout)
 
-            assert not register_thread.is_alive()
-            assert not startup_thread.is_alive()
+            hw._hierarchical_start_cv.wait = wait_with_signal
+
+            def do_register():
+                try:
+                    result.append(hw.register(lambda args: None))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t = threading.Thread(target=do_register)
+            t.start()
+            assert wait_entered.wait(timeout=2.0)
+            # Still INITIALIZING: the register must be parked, not installed.
+            assert len(hw._identity_registry) == 0
+
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_started = True
+                hw._hierarchical_start_state = "started"
+                hw._hierarchical_start_cv.notify_all()
+            t.join(timeout=2.0)
+
+            assert not t.is_alive()
             assert errors == []
             assert len(result) == 1
-            assert _slot_for(hw, result[0]) == 0
-            assert startup_snapshot_attempted.is_set()
-            assert hw._hierarchical_start_state == "started"
         finally:
-            release_register.set()
-            register_thread.join(timeout=2.0)
-            startup_thread.join(timeout=2.0)
-            hw._registry_lock = real_registry_lock
+            if "original_wait" in locals():
+                hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
     def test_prepare_chip_callable_after_init_no_chips_succeeds(self):
@@ -1843,26 +1822,6 @@ class TestChipMainLoopDigestRegister:
         _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
 
     @staticmethod
-    def _send_ctrl_l3_l2_orch_comm_init(buf, state_addr, shm_name: str):
-        from simpler.worker import (  # noqa: PLC0415
-            _CONTROL_REQUEST,
-            _CTRL_L3_L2_ORCH_COMM_INIT,
-            _CTRL_SHM_NAME_BYTES,
-            _OFF_ARGS,
-            _OFF_CALLABLE,
-            _mailbox_store_i32,
-        )
-
-        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_L3_L2_ORCH_COMM_INIT)
-        encoded = shm_name.encode("utf-8")
-        assert len(encoded) + 1 <= _CTRL_SHM_NAME_BYTES
-        buf[_OFF_ARGS : _OFF_ARGS + len(encoded)] = encoded
-        buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
-            _CTRL_SHM_NAME_BYTES - len(encoded)
-        )
-        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
-
-    @staticmethod
     def _wait_for_done_and_reset(buf, state_addr, timeout: float = 5.0):
         """Block until the loop publishes _CONTROL_DONE, then read the error
         code and reset the mailbox to _IDLE so the next round can start."""
@@ -1909,6 +1868,7 @@ class TestChipMainLoopDigestRegister:
         t = threading.Thread(
             target=_run_chip_main_loop,
             args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs),
+            kwargs={"chip_platform": ""},
             daemon=True,
         )
         t.start()
@@ -1949,34 +1909,6 @@ class TestChipMainLoopDigestRegister:
             shm.unlink()
             payload_shm.close()
             payload_shm.unlink()
-
-    def test_l3_l2_orch_comm_init_passes_control_shm_mapping_to_chip_worker(self):
-        from unittest.mock import MagicMock  # noqa: PLC0415
-
-        cw = MagicMock()
-        cw.l3_l2_orch_comm_init_from_addr = MagicMock()
-
-        control_shm = SharedMemory(create=True, size=4096)
-        shm, buf, state_addr = self._build_mailbox()
-        try:
-            t = self._spawn_loop(cw, buf, state_addr)
-            try:
-                self._send_ctrl_l3_l2_orch_comm_init(buf, state_addr, control_shm.name)
-                assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw.l3_l2_orch_comm_init_from_addr.assert_called_once()
-                addr, size = cw.l3_l2_orch_comm_init_from_addr.call_args.args
-                assert isinstance(addr, int)
-                assert addr != 0
-                assert size == control_shm.size
-            finally:
-                self._shutdown(state_addr)
-                t.join(timeout=2.0)
-                assert not t.is_alive()
-        finally:
-            shm.close()
-            shm.unlink()
-            control_shm.close()
-            control_shm.unlink()
 
     def test_register_reads_only_declared_payload_size(self):
         from unittest.mock import MagicMock  # noqa: PLC0415

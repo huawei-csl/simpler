@@ -11,6 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
@@ -70,6 +71,23 @@ public:
     // All threads: handshake this thread's contiguous slice [lo, hi) of cores
     // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Handshake exactly the cores this scheduler thread will later manage:
+    // clusters {tidx, tidx+active, ...}, cluster ci =
+    // {ci, N/3+2ci, N/3+2ci+1} (blocked layout: [0,N/3) AIC, [N/3,N) AIV). Matches
+    // assign_cores_to_threads' round-robin so handshake warms the same
+    // core_exec_states_ the thread later dispatches from.
+    void handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads);
+    // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
+    // its own CoreTracker + per-core payload state for the clusters it owns, right
+    // after handshaking them — no all-thread barrier or leader post_handshake_init.
+    void assign_own_clusters(int32_t tidx);
+    // Latch completion + shutdown cores on a handshake failure seen without the
+    // barrier (non-DFX path). Idempotent.
+    void abort_and_shutdown(Runtime *runtime);
+    // Leader-only profiling-subsystem init (DFX builds); called behind a barrier
+    // in the barrier-free path since pmu_aicpu_init needs all physical_core_ids_.
+    void post_handshake_profiling_init();
+    bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores, init profiling subsystems, read task counts, init payloads.
     int32_t post_handshake_init(Runtime *runtime);
@@ -114,6 +132,7 @@ public:
 
     int32_t aic_count() const { return aic_count_; }
     int32_t aiv_count() const { return aiv_count_; }
+    int32_t cores_total_num() const { return cores_total_num_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
@@ -248,6 +267,7 @@ private:
         uint32_t reg_task_id;
         int32_t core_offset;
         uint64_t *dispatch_timestamp_slot;
+        int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
     };
 
     PublishHandle prepare_subtask_to_core(
@@ -255,9 +275,17 @@ private:
         bool to_pending, int32_t block_idx, bool force_gate
     );
 
-    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
+    // `thread_idx` is the publishing Scheduler thread's index, used to select the
+    // per-thread task-timing record; every call site already has it in scope.
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
         if (h.dispatch_timestamp_slot != nullptr) {
             *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+        // task, folded as min. Untagged tasks pay only this cache-hot compare and
+        // never read the sys counter. Independent of L2 swimlane level.
+        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
         }
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
     }

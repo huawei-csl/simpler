@@ -206,7 +206,7 @@ def test_emit_dot_marks_spmd_nodes_without_expanding_labels():
         show_tensor_info=False,
     )
 
-    assert 'label="1"' in plain
+    assert 'label="1 ↓0 ↑0"' in plain
     assert 'color="#C62828"' in plain
     assert "penwidth=1.5" in plain
     assert 'style="filled"' in plain
@@ -222,6 +222,7 @@ def test_emit_dot_marks_spmd_nodes_without_expanding_labels():
     )
 
     assert '<TABLE BORDER="1" COLOR="#C62828"' in rich
+    assert "↓0 ↑0" in rich
     assert "SPMD" not in rich
     assert "4 blocks" not in rich
 
@@ -237,23 +238,118 @@ def test_spmd_badges_json_includes_only_multiblock_tasks():
     assert badges == '{"T0_2":8}'
 
 
+def test_dep_stats_json_groups_peers_by_name_hint():
+    task_table = {
+        2: {"task_id": 2, "kernel_ids": [-1, 7, -1]},
+        3: {"task_id": 3, "kernel_ids": [-1, 8, -1]},
+        4: {"task_id": 4, "kernel_ids": [-1, 7, -1]},
+        5: {"task_id": 5, "kernel_ids": [-1, 9, -1]},
+    }
+    meta = _merge_task_meta_with_kernel_ids(
+        {
+            2: {"func_name": "q_proj", "func_id": 7},
+            3: {"func_name": "k_proj", "func_id": 8},
+            4: {"func_name": "q_proj", "func_id": 7},
+        },
+        task_table,
+        func_names={9: "v_proj"},
+    )
+    stats = json.loads(
+        deps_viewer._dep_stats_json(
+            nodes=[1, 2, 3, 4, 5],
+            edges=[(1, 5), (2, 5), (3, 5), (4, 5), (5, 1)],
+            meta=meta,
+            task_table=task_table,
+        )
+    )
+
+    assert stats["T0_5"]["fanin"] == 4
+    assert stats["T0_5"]["fanout"] == 1
+    assert stats["T0_5"]["pred_by_hint"] == [["q_proj", 2], ["alloc", 1], ["k_proj", 1]]
+    assert stats["T0_5"]["succ_by_hint"] == [["alloc", 1]]
+    assert stats["T0_5"]["name_hint"] == "v_proj"
+
+
 def test_emit_dot_handles_missing_task_table():
     dot = deps_viewer.emit_dot(edges=[], nodes=[1], meta={}, task_table=None)
 
-    assert 'label="🔥 1 · alloc"' in dot
+    assert 'label="🔥 1 · alloc ↓0 ↑0"' in dot
 
 
-def test_emit_dot_treats_alloc_as_a_fire_marked_source():
+def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
     dot = deps_viewer.emit_dot(
-        edges=[(1, 2)],
-        nodes=[1, 2],
+        edges=[(1, 3), (2, 3)],
+        nodes=[1, 2, 3],
         meta={},
-        task_table={2: {"task_id": 2, "kernel_ids": [-1, 7, -1]}},
+        task_table={3: {"task_id": 3, "kernel_ids": [-1, 7, -1]}},
         show_tensor_info=False,
     )
 
-    assert 'label="🔥 1 · alloc"' in dot
-    assert 'label="⭐ 2"' in dot
+    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 2 · alloc ↓0 ↑1"' in dot
+    assert 'label="3 ↓2 ↑0"' in dot
+
+
+def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 3), (2, 3)],
+        nodes=[1, 2, 3],
+        meta={},
+        task_table={
+            2: {"task_id": 2, "kernel_ids": [-1, 6, -1], "early_dispatch": True},
+            3: {"task_id": 3, "kernel_ids": [-1, 7, -1]},
+        },
+        show_tensor_info=False,
+    )
+
+    assert 'label="🔥 1 · alloc ↓0 ↑1"' in dot
+    assert 'label="🔥 2 ↓0 ↑1"' in dot
+    assert 'label="⭐ 3 ↓2 ↑0"' in dot
+
+
+def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 4), (2, 4), (3, 4)],
+        nodes=[1, 2, 3, 4],
+        meta={},
+        task_table={
+            2: {"task_id": 2, "kernel_ids": [-1, 6, -1], "early_dispatch": True},
+            3: {"task_id": 3, "kernel_ids": [-1, 7, -1]},
+            4: {"task_id": 4, "kernel_ids": [-1, 8, -1]},
+        },
+        show_tensor_info=False,
+    )
+
+    assert 'label="4 ↓3 ↑0"' in dot
+
+
+def test_emit_html_includes_dep_stats_and_detail_panel(monkeypatch):
+    monkeypatch.setattr(
+        deps_viewer,
+        "emit_dot",
+        lambda *args, **kwargs: "digraph deps { T0_1 [label=<1>]; }",
+    )
+    monkeypatch.setattr(
+        deps_viewer,
+        "render_svg",
+        lambda dot, engine="dot": b"<svg><g class='node'><title>T0_1</title></g></svg>",
+    )
+
+    html = deps_viewer.emit_html(
+        edges=[(1, 2)],
+        nodes=[1, 2],
+        meta={2: {"func_name": "q_proj", "func_id": 7}},
+        task_table={
+            2: {"task_id": 2, "kernel_ids": [-1, 7, -1], "args": []},
+        },
+    )
+
+    assert 'id="detail"' in html
+    assert "const depStats =" in html
+    assert '"T0_2"' in html
+    assert '"pred_by_hint"' in html
+    assert "openDetail" in html
+    assert "↓N ↑M = pred / succ" in html
 
 
 def test_emit_dot_hides_selected_edges_with_background_color():
@@ -265,7 +361,7 @@ def test_emit_dot_hides_selected_edges_with_background_color():
         hidden_edges={(1, 2)},
     )
 
-    assert 'T0_1 -> T0_2 [color="#eef2f7", fontcolor="#eef2f7"];' in dot
+    assert 'T0_1 -> T0_2 [class="hidden-edge", color="#eef2f7", fontcolor="#eef2f7"];' in dot
     assert "T0_2 -> T0_3;" in dot
 
 

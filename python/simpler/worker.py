@@ -14,7 +14,7 @@ Callable identity is exposed as an opaque ``CallableHandle`` returned by
 ``ChipCallable`` objects. L3+ ``Worker.run`` keeps the existing raw Python
 orchestration-function entry point; that function captures handles and submits
 them through the Orchestrator. L≥3 targets resolve the handle's stable SHA-256
-digest to a private child-local slot; later Python registrations are serialized
+digest to a private L2-side slot; later Python registrations are serialized
 and sent through the mailbox control plane.
 
 Usage::
@@ -60,9 +60,11 @@ Usage::
 from __future__ import annotations
 
 import bisect
+import contextlib
 import ctypes
 import importlib
 import json
+import math
 import os
 import re
 import signal
@@ -70,16 +72,22 @@ import socket
 import struct
 import sys
 import threading
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
+    TENSOR_CHILD_MEMORY_OFFSET,
     WorkerType,
+    _l3_child_onboard_region_close,
+    _l3_child_onboard_region_create,
+    _l3_host_mapped_region_import_onboard,
+    _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -98,6 +106,24 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
+from .l3_l2_orch_comm import (
+    _CTRL_SHM_TOKEN_BYTES,
+    _REGION_CREATE_REPLY,
+    _REGION_CREATE_REPLY_BYTES,
+    _REGION_CREATE_REQUEST,
+    _REGION_CREATE_REQUEST_BYTES,
+    _REGION_LAYOUT_ALIGNMENT,
+    _REGION_MAGIC_VERSION,
+    L3HostRegionMapping,
+    L3L2OrchRegion,
+    L3L2RegionAccessProfile,
+    L3L2RegionCreateRequest,
+    _align_up,
+    _checked_add_u64,
+    decode_region_create_reply,
+    peek_region_create_reply_region_id,
+    validate_region_create_reply,
+)
 from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
@@ -113,6 +139,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    Tensor,
     _Worker,
 )
 
@@ -169,11 +196,31 @@ _TASK_DONE = 2
 _SHUTDOWN = 3
 _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
-# Child writes this after its expensive init (ChipWorker.init) completes.
-# Parent's _start_hierarchical spin-waits for every chip child to reach
-# INIT_DONE before allowing any dispatch — keeps cross-rank init skew out
-# of the per-rank host-side stream sync budget (issue #897).
-_INIT_DONE = 6
+# Startup readiness handshake. A child writes INIT_READY after its own init
+# (ChipWorker.init / inner Worker.init) succeeds, or INIT_FAILED after it fails,
+# leaving the cause in the mailbox error region. The parent's readiness barrier
+# (_await_children_ready) blocks on every child reaching INIT_READY before any
+# dispatch, which also keeps cross-rank init skew out of the per-rank host-side
+# stream sync budget (issue #897); INIT_FAILED, a dead child, or a blown
+# deadline aborts startup with a bounded error instead of an unbounded spin.
+_INIT_READY = 6
+_INIT_FAILED = 7
+
+# Startup readiness bound. A child that neither reports INIT_READY/INIT_FAILED
+# nor exits within this window is treated as hung and startup is aborted.
+# Generous by default so a legitimately slow device/runtime init (large
+# PTO2_RING_HEAP, cold arena build) is never falsely reaped; override per Worker
+# via the `startup_timeout_s` config kwarg. The point is to bound *hangs*, not
+# to police slow-but-progressing init.
+_STARTUP_TIMEOUT_S = 300.0
+# Parent poll granularity while waiting for children to become ready. Cheap
+# shared-memory reads dominate; the sleep only caps waitpid/deadline syscall
+# frequency and is far below any real init-skew alignment concern.
+_STARTUP_POLL_INTERVAL_S = 0.001
+# On startup rollback, a next-level child that reached its serve loop is asked
+# to close gracefully (so it unlinks the nested mailbox shms only it knows the
+# names of) before being SIGKILLed. This bounds that graceful wait.
+_ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
 _CTRL_MALLOC = 0
@@ -208,9 +255,8 @@ _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
-_CTRL_L3_L2_ORCH_COMM_INIT = 13
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
-# into every chip child *post-fork* and keeps it mapped so later runs can copy
+# into every local L3 child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
 # the shm stands in for, so the per-task blob's host pointers (raw parent VAs)
 # can be rewritten to the child's own mapping before the runtime dereferences
@@ -233,6 +279,8 @@ _HOST_BUF_UNMAP = struct.Struct("<Q")
 # mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
 _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
+_CTRL_L3_L2_REGION_CREATE = 16
+_CTRL_L3_L2_REGION_RELEASE = 17
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -363,7 +411,7 @@ _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
 class _HostBufEntry:
     """Parent-side record for a born-shared post-fork host buffer.
 
-    The worker owns ``shm`` — a named buffer the chip children attach and
+    The worker owns ``shm`` — a named buffer the local L3 children attach and
     read/write through. The user builds a tensor over it (via the buffer
     protocol on :class:`HostBuffer`), so the buffer *is* the shm: ``data_ptr ==
     shm_base`` and no per-run copy is needed (the child reads and writes the same
@@ -383,7 +431,7 @@ class HostBuffer:
     """Handle for a worker-allocated, born-shared host buffer (zero-copy).
 
     Returned by ``Worker.create_host_buffer``. ``buffer`` is a ``memoryview``
-    over shared memory already attached into every chip child; wrap it with
+    over shared memory already attached into every local L3 child; wrap it with
     ``torch.frombuffer`` / ``np.frombuffer`` to get a real tensor whose writes
     land directly in the child-visible pages — no per-run copy. ``token`` /
     ``data_ptr`` / ``nbytes`` identify the mapping; pass this handle back to
@@ -404,11 +452,14 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     """Redirect registered host pointers in a task-args blob to child mappings.
 
     ``ranges`` is ``(parent_lo, parent_hi, child_base)`` for each host buffer the
-    child has mapped via _CTRL_MAP_HOST. For every tensor whose ``buffer.addr``
-    (a parent VA) lands in a registered range, rewrite it in place to
-    ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
-    own mapping. Tensors outside every range (fork-inherited or child-allocated)
-    are left untouched. See _BLOB_TENSOR_STRIDE for the wire layout.
+    child has mapped via _CTRL_MAP_HOST. For every host tensor whose
+    ``buffer.addr`` (a parent VA) lands in a registered range, rewrite it in
+    place to ``child_base + (addr - parent_lo)`` so the runtime dereferences the
+    child's own mapping. Tensors outside every range (fork-inherited or
+    child-allocated) are left untouched. A ``child_memory`` tensor carries a
+    child-owned device pointer, never a host VA, so it is skipped even when its
+    address numerically falls inside a registered host range — rewriting it would
+    corrupt the device pointer. See _BLOB_TENSOR_STRIDE for the wire layout.
     """
     tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
     if tensor_count <= 0:
@@ -416,6 +467,8 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     base = blob_off + _BLOB_HEADER_BYTES
     for i in range(tensor_count):
         addr_off = base + i * _BLOB_TENSOR_STRIDE
+        if buf[addr_off + TENSOR_CHILD_MEMORY_OFFSET]:
+            continue
         addr = struct.unpack_from("<Q", buf, addr_off)[0]
         for parent_lo, parent_hi, child_base in ranges:
             if parent_lo <= addr < parent_hi:
@@ -910,46 +963,62 @@ def _sub_worker_loop(
     rethrows it as ``std::runtime_error``.
     """
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
-    while True:
-        state = _mailbox_load_i32(state_addr)
-        if state == _TASK_READY:
-            digest = _read_task_digest(buf)
-            cid = identity_table.get(digest)
-            fn = registry.get(int(cid)) if cid is not None else None
-            code = 0
-            msg = ""
-            if fn is None:
-                code = 1
-                msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
-            else:
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}
+    host_buf_ranges: list[tuple[int, int, int]] = []
+    try:
+        while True:
+            state = _mailbox_load_i32(state_addr)
+            if state == _TASK_READY:
+                digest = _read_task_digest(buf)
+                cid = identity_table.get(digest)
+                fn = registry.get(int(cid)) if cid is not None else None
+                code = 0
+                msg = ""
+                if fn is None:
+                    code = 1
+                    msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
+                else:
+                    try:
+                        if host_buf_ranges:
+                            _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
+                        args = _read_args_from_mailbox(buf)
+                        fn(args)
+                    except Exception as e:  # noqa: BLE001
+                        code = 1
+                        msg = _format_exc("sub_worker", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+            elif state == _CONTROL_REQUEST:
+                sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                code = 0
+                msg = ""
                 try:
-                    args = _read_args_from_mailbox(buf)
-                    fn(args)
+                    if sub_cmd == _CTRL_MAP_HOST:
+                        _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_UNMAP_HOST:
+                        _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    else:
+                        _handle_py_callable_control(
+                            buf,
+                            registry,
+                            identity_table,
+                            identity_refs,
+                            int(sub_cmd),
+                            context="sub_worker",
+                        )
                 except Exception as e:  # noqa: BLE001
                     code = 1
-                    msg = _format_exc("sub_worker", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _TASK_DONE)
-        elif state == _CONTROL_REQUEST:
-            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            code = 0
-            msg = ""
+                    msg = _format_exc("sub_worker control", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _SHUTDOWN:
+                break
+    finally:
+        for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
-                _handle_py_callable_control(
-                    buf,
-                    registry,
-                    identity_table,
-                    identity_refs,
-                    int(sub_cmd),
-                    context="sub_worker",
-                )
-            except Exception as e:  # noqa: BLE001
-                code = 1
-                msg = _format_exc("sub_worker control", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _CONTROL_DONE)
-        elif state == _SHUTDOWN:
-            break
+                host_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _read_shm_name(buf, offset: int) -> str:
@@ -1053,23 +1122,185 @@ def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
-def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
-    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
-    control_shm = SharedMemory(name=control_shm_name)
-    control_buf = control_shm.buf
-    assert control_buf is not None
-    exported = ctypes.c_char.from_buffer(control_buf)
-    success = False
+@dataclass
+class _L2HostL3L2Region:
+    region_id: int
+    payload_bytes: int
+    counter_offset: int
+    counter_bytes: int
+    total_bytes: int
+    shm: SharedMemory | None = None
+    dev_ptr: int = 0
+    onboard_handle: int = 0
+
+
+@dataclass
+class _L2HostL3L2RegionStore:
+    """Per-chip-child registry of live L3-L2 direct regions (loop-local state)."""
+
+    regions: dict[int, _L2HostL3L2Region] = field(default_factory=dict)
+    next_region_id: int = 1
+
+
+@dataclass(frozen=True)
+class _L2HostL3L2RegionReplyMeta:
+    payload_base: int
+    backing_name: bytes
+    access_profile: L3L2RegionAccessProfile
+    mapping_bytes: int
+    shareable_handle: int
+
+
+def _release_l2_host_l3_l2_region(region: _L2HostL3L2Region) -> None:
+    if region.shm is not None:
+        region.shm.close()
+        region.shm.unlink()
+        return
+    if region.onboard_handle:
+        _l3_child_onboard_region_close(region.onboard_handle)
+
+
+def _create_sim_l3_l2_region(
+    request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
+) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
+    shm = SharedMemory(create=True, size=total_bytes)
+    region = _L2HostL3L2Region(
+        region_id=region_id,
+        payload_bytes=request.payload_bytes,
+        counter_offset=counter_offset,
+        counter_bytes=request.counter_bytes,
+        total_bytes=total_bytes,
+        shm=shm,
+    )
+    region_buf = cast(memoryview, shm.buf)
+    region_buf[counter_offset : counter_offset + request.counter_bytes] = b"\x00" * request.counter_bytes
+    exported = ctypes.c_char.from_buffer(region_buf)
     try:
-        control_block_addr = ctypes.addressof(exported)
-        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
-        success = True
+        payload_base = ctypes.addressof(exported)
     finally:
         del exported
-        del control_buf
-        if not success:
-            control_shm.close()
-    return control_shm
+        del region_buf
+    backing_name = shm.name.encode("utf-8")
+    if len(backing_name) >= _CTRL_SHM_TOKEN_BYTES:
+        raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
+    meta = _L2HostL3L2RegionReplyMeta(
+        payload_base=payload_base,
+        backing_name=backing_name,
+        access_profile=L3L2RegionAccessProfile.SIM_POSIX_SHM,
+        mapping_bytes=total_bytes,
+        shareable_handle=0,
+    )
+    return region, meta
+
+
+def _create_onboard_l3_l2_region(
+    cw: ChipWorker, request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
+) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
+    export = _l3_child_onboard_region_create(total_bytes)
+    dev_ptr = int(export.device_addr)
+    region = _L2HostL3L2Region(
+        region_id=region_id,
+        payload_bytes=request.payload_bytes,
+        counter_offset=counter_offset,
+        counter_bytes=request.counter_bytes,
+        total_bytes=total_bytes,
+        dev_ptr=dev_ptr,
+        onboard_handle=int(export.registry_handle),
+    )
+    zeros = ctypes.create_string_buffer(request.counter_bytes)
+    cw.copy_to(dev_ptr + counter_offset, ctypes.addressof(zeros), request.counter_bytes)
+    meta = _L2HostL3L2RegionReplyMeta(
+        payload_base=dev_ptr,
+        backing_name=b"",
+        access_profile=L3L2RegionAccessProfile.ONBOARD_VMM,
+        mapping_bytes=int(export.mapping_bytes),
+        shareable_handle=int(export.shareable_handle),
+    )
+    return region, meta
+
+
+def _handle_ctrl_l3_l2_region_create(
+    cw: ChipWorker, buf: memoryview, chip_platform: str, store: _L2HostL3L2RegionStore
+) -> None:
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
+    req_shm = SharedMemory(name=request_shm_name)
+    reply_shm = SharedMemory(name=reply_shm_name)
+    req_buf = cast(memoryview, req_shm.buf)
+    reply_buf = cast(memoryview, reply_shm.buf)
+    region: _L2HostL3L2Region | None = None
+    try:
+        fields = _REGION_CREATE_REQUEST.unpack_from(req_buf, 0)
+        request = L3L2RegionCreateRequest(
+            magic_version=int(fields[0]),
+            request_bytes=int(fields[1]),
+            payload_bytes=int(fields[2]),
+            counter_bytes=int(fields[3]),
+        )
+        # Reject ABI mismatches loudly. The reply carries this child's own
+        # magic (not the request echo) so the L3 side can detect version skew.
+        if request.magic_version != _REGION_MAGIC_VERSION:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE magic_version mismatch")
+        if request.request_bytes != _REGION_CREATE_REQUEST_BYTES:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE request_bytes mismatch")
+        if request.payload_bytes <= 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE payload_bytes must be positive")
+        if request.counter_bytes <= 0 or request.counter_bytes % 4 != 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE counter_bytes must be positive and a multiple of 4")
+        counter_offset = _align_up(request.payload_bytes, _REGION_LAYOUT_ALIGNMENT)
+        total_bytes = _checked_add_u64(counter_offset, request.counter_bytes)
+
+        region_id = store.next_region_id
+        store.next_region_id += 1
+        if str(chip_platform).endswith("sim"):
+            region, meta = _create_sim_l3_l2_region(request, region_id, counter_offset, total_bytes)
+        else:
+            region, meta = _create_onboard_l3_l2_region(cw, request, region_id, counter_offset, total_bytes)
+        _REGION_CREATE_REPLY.pack_into(
+            reply_buf,
+            0,
+            _REGION_MAGIC_VERSION,
+            region_id,
+            meta.payload_base,
+            request.payload_bytes,
+            meta.payload_base + counter_offset,
+            request.counter_bytes,
+            int(meta.access_profile),
+            0,
+            int(getattr(cw, "device_id", -1)),
+            meta.backing_name + b"\x00" * (_CTRL_SHM_TOKEN_BYTES - len(meta.backing_name)),
+            meta.mapping_bytes,
+            meta.shareable_handle,
+        )
+        store.regions[region_id] = region
+        region = None
+    finally:
+        if region is not None:
+            try:
+                _release_l2_host_l3_l2_region(region)
+            except (BufferError, FileNotFoundError, OSError, RuntimeError):
+                pass
+        del req_buf
+        del reply_buf
+        req_shm.close()
+        reply_shm.close()
+
+
+def _handle_ctrl_l3_l2_region_release(buf: memoryview, store: _L2HostL3L2RegionStore) -> None:
+    region_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    region = store.regions.pop(int(region_id), None)
+    if region is None:
+        return
+    _release_l2_host_l3_l2_region(region)
+
+
+def _sweep_l2_host_l3_l2_regions(store: _L2HostL3L2RegionStore) -> None:
+    for region_id in list(store.regions):
+        region = store.regions.pop(region_id)
+        try:
+            _release_l2_host_l3_l2_region(region)
+        except (BufferError, FileNotFoundError, OSError, RuntimeError):
+            pass
 
 
 def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
@@ -1121,9 +1352,10 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     *,
-    chip_platform: str = "",
+    chip_platform: str,
     chip_runtime: str = "",
     on_task_done_success=None,
+    prepared: set[int] | None = None,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
@@ -1134,14 +1366,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot and runs it. The slot must already be prepared via
-    ``_CTRL_PREPARE`` (the explicit registration path the parent pushes after
-    init() to stage the H2D upload + device-orch load); a TASK_READY for an
-    unprepared slot is a control-flow error and fails the task rather than
-    lazily preparing it.
+    target-local slot and runs it. The slot must already be prepared: initial
+    startup-snapshot ChipCallables are prepared before INIT_READY (carried in via
+    ``prepared``), and callables registered dynamically after startup arrive via
+    ``_CTRL_PREPARE``. A TASK_READY for an unprepared slot is a control-flow
+    error and fails the task rather than lazily preparing it.
     """
-    prepared: set[int] = set()
-    l3_l2_control_shms: list[SharedMemory] = []
+    prepared = prepared if prepared is not None else set()
+    l3_l2_region_store = _L2HostL3L2RegionStore()
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
@@ -1286,12 +1518,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
                         _handle_ctrl_comm_init(cw, buf)
-                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
-                        l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_CREATE:
+                        _handle_ctrl_l3_l2_region_create(cw, buf, chip_platform, l3_l2_region_store)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
+                        _handle_ctrl_l3_l2_region_release(buf, l3_l2_region_store)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -1306,20 +1540,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             elif state == _SHUTDOWN:
                 break
     finally:
-        if l3_l2_control_shms:
-            try:
-                cw.l3_l2_orch_comm_shutdown()
-            except Exception as e:  # noqa: BLE001
-                sys.stderr.write(
-                    f"[chip_process pid={os.getpid()} dev={device_id}] "
-                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
-                )
-                sys.stderr.flush()
-        for control_shm in reversed(l3_l2_control_shms):
-            try:
-                control_shm.close()
-            except Exception:  # noqa: BLE001
-                pass
+        _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1356,20 +1577,38 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v, prewarm_config=prewarm_config)
     except Exception as e:
         _tb.print_exc()
-        # Write the message so any parent reader that *does* inspect this
-        # path sees the real cause. State handshake for this init-time
-        # failure is broken — see KNOWN_ISSUES.md — and that is not part
-        # of the L4 scope.
+        # Publish the cause into the mailbox and flag INIT_FAILED so the
+        # parent's readiness barrier returns a bounded error instead of
+        # spinning forever on a child that will never reach INIT_READY.
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        return
+
+    # Prepare every ChipCallable in the startup snapshot before publishing
+    # INIT_READY, so the H2D upload + device-orch load is charged inside the
+    # readiness barrier and the first task dispatch pays no upload. The set of
+    # prepared cids carries into the main loop, which requires a cid be prepared
+    # before it dispatches. The parent therefore issues no post-READY
+    # control_prepare for the initial snapshot.
+    prepared: set[int] = set()
+    try:
+        for cid, target in registry.items():
+            if isinstance(target, ChipCallable):
+                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+    except Exception as e:
+        _tb.print_exc()
+        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        cw.finalize()
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
-    # Signal init complete. Parent's _start_hierarchical spin-waits for
-    # every chip child to reach _INIT_DONE before dispatching the first
-    # task, so the per-rank host-side stream sync budget only covers
-    # actual op execution rather than absorbing peer-rank init skew.
-    _mailbox_store_i32(state_addr, _INIT_DONE)
+    # Signal init success. The parent's readiness barrier waits for every chip
+    # child to reach _INIT_READY before dispatching the first task, so the
+    # per-rank host-side stream sync budget only covers actual op execution
+    # rather than absorbing peer-rank init skew.
+    _mailbox_store_i32(state_addr, _INIT_READY)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
@@ -1385,6 +1624,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             identity_refs,
             chip_platform=platform,
             chip_runtime=runtime,
+            prepared=prepared,
         )
     finally:
         cw.finalize()
@@ -1432,7 +1672,7 @@ def _child_worker_loop(
     """Runs in forked child process. Any-level Worker as child of its parent.
 
     Polls the unified mailbox for (callable digest, config, args_blob). Looks
-    up the orchestration function in the child-local registry, then delegates to
+    up the orchestration function in the L2-side registry, then delegates to
     ``inner_worker.run(orch_fn, args, cfg)`` which opens its own scope,
     runs the orch function, and drains. Also services CONTROL_REQUEST
     so the L4 parent's dynamic register/unregister broadcasts cascade
@@ -1523,6 +1763,70 @@ def _child_worker_loop(
             break
 
 
+class _StartupCancelled(BaseException):
+    """Raised inside a forked child when the parent cooperatively cancels its
+    startup (SIGTERM). Unwinds the child's own ``setup`` — recursively rolling
+    back any grandchildren it already forked — before it exits."""
+
+
+def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
+    """Run a forked child to completion, always terminating via ``os._exit``.
+
+    ``setup()`` runs the child's fallible init and returns an opaque context;
+    any failure there publishes INIT_FAILED with the cause and exits. On
+    success the child publishes INIT_READY (the parent's readiness barrier
+    unblocks) and ``serve(ctx)`` runs the mailbox loop.
+
+    ``make_group_leader`` puts the child in its own process group so the startup
+    root can reap the whole subtree (this child plus every descendant it forks)
+    with one ``killpg``; deeper descendants inherit the group and do not set
+    their own. During ``setup`` a SIGTERM is a cooperative cancel: it raises
+    ``_StartupCancelled``, which unwinds ``setup`` (recursively tearing down any
+    grandchildren and their nested shms) before the child exits.
+
+    Load-bearing invariant: a forked child must NEVER let an exception unwind
+    back into the forked copy of the parent's ``_start_hierarchical`` frames.
+    Those frames carry the parent's inherited child-PID lists, so an unwind
+    into the startup rollback path would SIGKILL this child's *siblings* (real
+    processes at those PIDs). Catch everything and exit instead.
+    """
+    import traceback as _tb  # noqa: PLC0415
+
+    if make_group_leader:
+        with contextlib.suppress(OSError):
+            os.setpgid(0, 0)
+
+    state_addr = _buffer_field_addr(buf, _OFF_STATE)
+
+    def _on_cancel(_signum, _frame):
+        raise _StartupCancelled()
+
+    prev_term = signal.signal(signal.SIGTERM, _on_cancel)
+    try:
+        ctx = setup()
+    except _StartupCancelled:
+        # Parent cancelled us mid-init; setup() already unwound its own subtree.
+        _tb.print_exc()
+        os._exit(1)
+    except BaseException as e:  # noqa: BLE001
+        _tb.print_exc()
+        _write_error(buf, 1, _format_exc(f"{label} init", e))
+        _mailbox_store_i32(state_addr, _INIT_FAILED)
+        os._exit(1)
+    # Serving is torn down via the SHUTDOWN mailbox state, not the cancel signal.
+    # signal.signal returns None when the prior handler was not installed from
+    # Python (e.g. a C library / host default); restore SIG_DFL in that case so
+    # the round-trip does not raise TypeError.
+    signal.signal(signal.SIGTERM, prev_term if prev_term is not None else signal.SIG_DFL)
+    _mailbox_store_i32(state_addr, _INIT_READY)
+    try:
+        serve(ctx)
+    except BaseException:  # noqa: BLE001
+        _tb.print_exc()
+        os._exit(1)
+    os._exit(0)
+
+
 # ---------------------------------------------------------------------------
 # Worker factory
 # ---------------------------------------------------------------------------
@@ -1563,9 +1867,34 @@ class Worker:
         self._pending_unregister_cids: set[int] = set()
         self._pending_remote_unregister_hashids: set[bytes] = set()
         self._py_control_timeout_s = float(config.get("py_control_timeout_s", _PY_CONTROL_TIMEOUT_S))
+        # Upper bound on how long the readiness barrier waits for a forked child
+        # to report INIT_READY/INIT_FAILED before treating it as hung. Must be
+        # finite, else the deadline can never trip and the "bounded startup"
+        # guarantee is void (NaN compares false against every deadline).
+        self._startup_timeout_s = float(config.get("startup_timeout_s", _STARTUP_TIMEOUT_S))
+        if not (self._startup_timeout_s > 0 and math.isfinite(self._startup_timeout_s)):
+            raise ValueError("Worker startup_timeout_s must be a positive finite number of seconds")
+        # Per-startup bookkeeping consumed by the rollback path: PIDs the barrier
+        # already reaped (must not be re-SIGKILLed — the PID may be reused) and
+        # PIDs that reached their serve loop (READY → asked to close gracefully
+        # so they unlink their own nested shms). Reset at each _start_hierarchical.
+        self._startup_reaped_pids: set[int] = set()
+        self._startup_ready_pids: set[int] = set()
+        # Disposition of the last rollback (graceful vs. killed PIDs); diagnostics
+        # and tests read it to confirm READY children were closed, not killed.
+        self._last_rollback: dict[str, list[int]] | None = None
         self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
+        # Absolute time.monotonic() deadline for the current startup epoch, set
+        # once at init() and shared by every child group and recursive descendant
+        # so the whole tree comes up within a single startup_timeout_s budget.
+        self._startup_deadline: float = 0.0
+        # True on the worker whose init() the user called (the startup root).
+        # The root's direct children are process-group leaders, so the root can
+        # killpg a whole subtree; nested (recursive) workers inherit their
+        # parent's group and rely on the root's killpg as the hard backstop.
+        self._is_startup_root: bool = True
 
         # Optional CallConfig whose ring sizing is pre-warmed at init() so the
         # first run() with the same sizing skips the (~800ms) cold prebuilt
@@ -1616,15 +1945,12 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
-        self._l3_l2_orch_comm_ready: set[int] = set()
-        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
-        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
         # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
-        # a named shm into every chip child so memory created after the children
+        # a named shm into every local L3 child so memory created after the children
         # were forked is still reachable by a later run — with no per-run copy.
         self._host_buf_registry: dict[int, _HostBufEntry] = {}
         # Immutable read snapshot for the lock-free per-submit lookup
@@ -1653,16 +1979,20 @@ class Worker:
         return worker_id
 
     def add_remote_worker(self, spec: RemoteWorkerSpec) -> int:
-        if self._initialized:
-            raise RuntimeError("Worker.add_remote_worker after init")
-        if self.level < 4:
-            raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
-        if not isinstance(spec, RemoteWorkerSpec):
-            raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
-        worker_id = self._allocate_next_level_worker_id()
-        self._remote_worker_specs.append(spec)
-        self._remote_worker_ids.append(worker_id)
-        return worker_id
+        # Hold the lifecycle lock across the state check and the topology
+        # mutation so a concurrent init() cannot freeze the topology snapshot
+        # between them.
+        with self._hierarchical_start_cv:
+            if self._initialized or self._hierarchical_start_state != "not_started":
+                raise RuntimeError("Worker.add_remote_worker after init")
+            if self.level < 4:
+                raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
+            if not isinstance(spec, RemoteWorkerSpec):
+                raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
+            worker_id = self._allocate_next_level_worker_id()
+            self._remote_worker_specs.append(spec)
+            self._remote_worker_ids.append(worker_id)
+            return worker_id
 
     @staticmethod
     def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
@@ -1799,7 +2129,6 @@ class Worker:
             raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
         if int(worker_id) not in set(self._remote_worker_ids):
             raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
 
@@ -2264,6 +2593,28 @@ class Worker:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
+    def _register_into_snapshot_or_wait(self, reg: _CallableRegistration) -> CallableHandle | None:
+        """Linearize a level>=3 register against the startup epoch.
+
+        Waits out an in-progress init() (INITIALIZING); a FAILED epoch raises. A
+        pre-start registration is installed into the startup snapshot and its
+        handle returned; once the hierarchy is READY, returns None so the caller
+        takes its post-start control-broadcast path.
+        """
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            pre_start = self._hierarchical_start_state != "started" and not getattr(
+                self, "_hierarchical_started", False
+            )
+            if pre_start:
+                with self._registry_lock:
+                    handle, _is_new = self._install_registration_locked(reg)
+                return handle
+        return None
+
     def register(self, target, *, workers: list[int] | None = None) -> CallableHandle:
         """Register a callable for dispatch and return an opaque handle.
 
@@ -2286,24 +2637,18 @@ class Worker:
                         "Worker.register(RemoteCallable): workers must name remote worker ids returned by "
                         "add_remote_worker"
                     )
-            if not self._initialized:
-                with self._registry_lock:
-                    handle, _is_new = self._install_registration_locked(reg)
+            # Linearize against the startup epoch exactly like the local path: a
+            # register that races an in-progress init() waits for it, then a
+            # pre-start registration lands in the snapshot while a post-READY one
+            # goes through the remote prepare/commit control path.
+            handle = self._register_into_snapshot_or_wait(reg)
+            if handle is not None:
                 return handle
             return self._post_start_register_remote(reg)
         if self.level >= 3:
-            with self._hierarchical_start_cv:
-                while self._hierarchical_start_state == "starting":
-                    self._hierarchical_start_cv.wait()
-                if self._hierarchical_start_state == "failed":
-                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                pre_start = self._hierarchical_start_state != "started" and not getattr(
-                    self, "_hierarchical_started", False
-                )
-                if pre_start:
-                    with self._registry_lock:
-                        handle, _is_new = self._install_registration_locked(reg)
-                    return handle
+            handle = self._register_into_snapshot_or_wait(reg)
+            if handle is not None:
+                return handle
             if not isinstance(target, ChipCallable):
                 return self._post_start_register_python(reg)
 
@@ -2311,7 +2656,7 @@ class Worker:
             handle, is_new = self._install_registration_locked(reg)
 
         # L3+ post-init ChipCallable: broadcast to chip / next-level children
-        # via C++ after parent-side slot allocation is complete. The slot is
+        # via C++ after L3 Host-side slot allocation is complete. The slot is
         # target-private; task dispatches carry only handle.digest.
         if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
             try:
@@ -2381,7 +2726,6 @@ class Worker:
                 handle, _is_new = self._install_registration_locked(reg)
                 return handle
 
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("Worker.register(RemoteCallable): hierarchical worker is not started")
 
@@ -2711,10 +3055,10 @@ class Worker:
         ``mailbox_mu_`` so the broadcast serializes against any in-flight
         dispatch on each child mailbox. No Python lock required.
         """
-        # Chip children are forked lazily on the first Worker.run() via
-        # _start_hierarchical; before that point the chip mailboxes have no
-        # reader and a CTRL_REGISTER broadcast would deadlock. In that pre-fork
-        # window, the startup snapshot carries the digest and target bytes.
+        # Until init() has started the hierarchy the chip mailboxes have no
+        # reader, so a CTRL_REGISTER broadcast would deadlock; a registration in
+        # that window is instead carried by the startup snapshot and
+        # COW-inherited by the children forked in init().
         if not getattr(self, "_hierarchical_started", False):
             return
         assert self._worker is not None
@@ -2910,7 +3254,6 @@ class Worker:
         errors: list[str] = []
         try:
             if self._initialized:
-                self._start_hierarchical()
                 assert self._worker is not None
                 for worker_id in worker_ids:
                     try:
@@ -3039,54 +3382,104 @@ class Worker:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
         if self._config.get("device_ids", []):
             raise RuntimeError("Worker.add_worker() cannot be combined with device_ids on the same Worker")
-        if self._initialized:
-            raise RuntimeError("Worker.add_worker() must be called before init()")
         if worker._initialized:
             raise RuntimeError("Child worker must not be initialized before add_worker()")
-        worker_id = self._allocate_next_level_worker_id()
-        self._next_level_workers.append(worker)
-        self._next_level_worker_ids.append(worker_id)
-        return worker_id
+        # Hold the lifecycle lock across the state check and the topology
+        # mutation so a concurrent init() cannot freeze the topology snapshot
+        # between them.
+        with self._hierarchical_start_cv:
+            if self._initialized or self._hierarchical_start_state != "not_started":
+                raise RuntimeError("Worker.add_worker() must be called before init()")
+            worker_id = self._allocate_next_level_worker_id()
+            self._next_level_workers.append(worker)
+            self._next_level_worker_ids.append(worker_id)
+            return worker_id
 
     # ------------------------------------------------------------------
     # init — auto-discovery
     # ------------------------------------------------------------------
 
-    def init(self, prewarm_config=None) -> None:
-        """Initialize the worker.
+    def init(self, prewarm_config=None, *, _startup_deadline: float | None = None) -> None:
+        """Initialize the worker and bring its whole subtree to READY.
+
+        For an L3+ worker ``init`` is the single startup submission point: it
+        forks every local child (sub / chip / next-level), waits for the whole
+        subtree — recursively, for L4+ — to publish INIT_READY, activates any
+        remote L3 sessions, starts the C++ scheduler, and only then publishes
+        READY in one atomic commit. It returns with the tree ready to run, or
+        raises after a bounded rollback that leaves no child, mailbox, or session
+        behind. ``run`` / ``create_host_buffer`` / the remote register/memory
+        APIs never trigger startup.
 
         Args:
             prewarm_config: Optional CallConfig. When given, its ring sizing
                 (``runtime_env.ring_task_window`` / ``ring_heap`` /
                 ``ring_dep_pool``) is built + cached so the first ``run`` with the
                 same sizing skips the (~800ms) cold prebuilt runtime-arena build.
-                Timing is level-dependent: an L2 worker prewarms here in
-                ``init``; an L3+ worker has no chip children until the hierarchy
-                starts on the first ``run``, so it prewarms there — during
-                hierarchy startup, alongside the callable SO upload and before the
-                first task dispatches. A no-op for runtimes without a prebuilt
-                arena (host_build_graph). ``None`` (default) disables prewarm.
+                An L2 worker prewarms here; an L3+ worker prewarms each chip child
+                during hierarchy startup, before it publishes INIT_READY. A no-op
+                for runtimes without a prebuilt arena (host_build_graph). ``None``
+                (default) disables prewarm.
+            _startup_deadline: Internal. Absolute ``time.monotonic()`` deadline
+                inherited from a parent's startup epoch so a recursive descendant
+                consumes the parent's remaining budget instead of restarting the
+                timeout. ``None`` starts a fresh epoch.
         """
-        if self._initialized:
-            raise RuntimeError("Worker already initialized")
-        # Validate up front so a bad config fails here regardless of level, even
-        # though an L3+ worker does not build the arena until the first run.
         if prewarm_config is not None:
             prewarm_config.validate()
-        self._prewarm_config = prewarm_config
+        # Claim the startup epoch atomically: NEW -> INITIALIZING under the
+        # lifecycle lock so a concurrent init / register / close observes one
+        # linear transition and never a half-built Worker. The INITIALIZING /
+        # READY / FAILED state machine is a hierarchical (level >= 3) concept; an
+        # L2 worker inits synchronously in-process and never enters "starting".
+        with self._hierarchical_start_cv:
+            if self._initialized:
+                raise RuntimeError("Worker already initialized")
+            if self._hierarchical_start_state == "starting":
+                raise RuntimeError("Worker.init() is already in progress")
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker startup failed; close this Worker and create a new one")
+            self._prewarm_config = prewarm_config
+            if self.level >= 3:
+                self._hierarchical_start_state = "starting"
+                self._is_startup_root = _startup_deadline is None
+                own_deadline = time.monotonic() + self._startup_timeout_s
+                # A recursive descendant caps its own timeout at the parent's
+                # remaining budget so the whole tree fits one startup_timeout_s.
+                self._startup_deadline = (
+                    own_deadline if _startup_deadline is None else min(_startup_deadline, own_deadline)
+                )
+            self._hierarchical_start_cv.notify_all()
 
         try:
             if self.level == 2:
                 self._init_level2()
             elif self.level >= 3:
                 self._init_hierarchical()
+                self._start_hierarchical()
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
         except BaseException:
-            self._cleanup_partial_init()
+            # Commit FAILED even if rollback itself raises, so a waiter blocked on
+            # the lifecycle condition (register / close) is always released.
+            try:
+                self._cleanup_partial_init()
+            finally:
+                if self.level >= 3:
+                    with self._hierarchical_start_cv:
+                        self._hierarchical_start_state = "failed"
+                        self._hierarchical_start_cv.notify_all()
             raise
 
-        self._initialized = True
+        # Atomic READY commit: publish _initialized together with the started
+        # state so no thread ever observes a started hierarchy while
+        # _initialized is still False.
+        with self._hierarchical_start_cv:
+            self._initialized = True
+            if self.level >= 3:
+                self._hierarchical_started = True
+                self._hierarchical_start_state = "started"
+            self._hierarchical_start_cv.notify_all()
 
     def _init_level2(self) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -3164,6 +3557,12 @@ class Worker:
         else:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
+        # Open remote L3 sessions (the remote runner brings up its own L3->L2
+        # tree and answers the daemon handshake). Opening only exchanges a
+        # transient socket message — it starts no local thread. Registering the
+        # socket into the C++ Worker (which spawns the RemoteL3Endpoint health
+        # thread) is deferred to _start_hierarchical, after the last local fork,
+        # to preserve the fork-before-thread invariant.
         opened_remote_sessions: list[_RemoteSession] = []
         try:
             for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
@@ -3175,17 +3574,6 @@ class Worker:
                     spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
                 )
                 opened_remote_sessions.append(session)
-                assert self._worker is not None
-                self._worker.add_remote_l3_socket(
-                    worker_id,
-                    session_id,
-                    spec.transport,
-                    session.command_host,
-                    session.command_port,
-                    session.health_host,
-                    session.health_port,
-                    timeout_s,
-                )
                 self._remote_sessions.append(session)
                 opened_remote_sessions.pop()
         except BaseException:
@@ -3195,55 +3583,79 @@ class Worker:
         self._hierarchical_started = False
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
-        """Fork child processes and start C++ scheduler. Called on first run()."""
+        """Fork every local child, await the subtree, register endpoints, start the scheduler.
+
+        Called only by init(), which owns the lifecycle state. Any failure here
+        propagates to init(), whose single rollback entry (_cleanup_partial_init)
+        closes the C++ Worker (if the scheduler started) and tears the whole
+        epoch down. The readiness barriers raise on any child failure/exit/hang.
+        """
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
+        deadline = self._startup_deadline
 
-        try:
-            # Fork children from an immutable snapshot. The state transition
-            # and snapshot are one gate, so dynamic register/unregister callers
-            # cannot return through the pre-start path after this point.
-            with self._hierarchical_start_cv:
-                while self._hierarchical_start_state == "starting":
-                    self._hierarchical_start_cv.wait()
-                if self._hierarchical_start_state == "started":
-                    return
-                if self._hierarchical_start_state == "failed":
-                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                self._hierarchical_start_state = "starting"
-                with self._registry_lock:
-                    identity_snapshot = [
-                        (digest, state.target, state.ref_count, state.kind, state.target_namespace)
-                        for digest, state in self._identity_registry.items()
-                    ]
-                self._hierarchical_start_cv.notify_all()
+        # Freeze the startup registry snapshot. init() already holds the epoch in
+        # the "starting" state, so a concurrent register/unregister is blocked on
+        # the lifecycle condition and cannot slip a mutation in after this point.
+        with self._registry_lock:
+            identity_snapshot = [
+                (digest, state.target, state.ref_count, state.kind, state.target_namespace)
+                for digest, state in self._identity_registry.items()
+            ]
 
-            # Fork SubWorker processes (MUST be before any C++ threads)
-            for i in range(n_sub):
-                pid = os.fork()
-                if pid == 0:
-                    buf = self._sub_shms[i].buf
-                    assert buf is not None
-                    registry, identity_table, identity_refs = _make_local_identity_tables(
+        self._startup_reaped_pids = set()
+        self._startup_ready_pids = set()
+
+        # Fork SubWorker processes (MUST be before any C++ threads)
+        for i in range(n_sub):
+            pid = os.fork()
+            if pid == 0:
+                buf = self._sub_shms[i].buf
+                assert buf is not None
+
+                def _setup():
+                    return _make_local_identity_tables(
                         identity_snapshot,
                         callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
                         target_namespace="LOCAL_PYTHON",
                     )
-                    _sub_worker_loop(buf, registry, identity_table, identity_refs)
-                    os._exit(0)
-                else:
-                    self._sub_pids.append(pid)
 
-            # Fork ChipWorker processes (L3 with device_ids).  Always use the
-            # plain task-loop variant; the base communicator is established
-            # lazily on first ``orch.allocate_domain`` via CTRL_COMM_INIT.
-            chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
-            if device_ids:
-                for idx, dev_id in enumerate(device_ids):
-                    pid = os.fork()
-                    if pid == 0:
-                        buf = self._chip_shms[idx].buf
-                        assert buf is not None
+                _forked_child_main(
+                    buf,
+                    f"sub worker {i}",
+                    _setup,
+                    lambda t, b=buf: _sub_worker_loop(b, *t),
+                    make_group_leader=self._is_startup_root,
+                )
+            else:
+                self._sub_pids.append(pid)
+
+        # SUB children have no fallible device/runtime init, but they join the
+        # same readiness contract so a child that dies before entering its loop
+        # aborts startup rather than surfacing later as a hung submit_sub.
+        self._await_children_ready(self._sub_shms, self._sub_pids, "sub", deadline)
+
+        # Fork ChipWorker processes (L3 with device_ids).  Always use the plain
+        # task-loop variant; the base communicator is established lazily on first
+        # ``orch.allocate_domain`` via CTRL_COMM_INIT.
+        chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
+        if device_ids:
+            for idx, dev_id in enumerate(device_ids):
+                pid = os.fork()
+                if pid == 0:
+                    buf = self._chip_shms[idx].buf
+                    assert buf is not None
+                    if self._is_startup_root:
+                        with contextlib.suppress(OSError):
+                            os.setpgid(0, 0)
+                    # _chip_process_loop publishes INIT_READY/INIT_FAILED itself
+                    # (around cw.init + ChipCallable prepare). This guard only
+                    # ensures the child exits rather than unwinding into the
+                    # parent's startup frames (see _forked_child_main). A throw
+                    # before cw.init (e.g. identity-table build) leaves the
+                    # mailbox IDLE, so publish INIT_FAILED for a bounded parent
+                    # error.
+                    try:
                         _chip_process_loop(
                             buf,
                             self._l3_bins,
@@ -3259,129 +3671,288 @@ class Worker:
                             runtime=str(self._config["runtime"]),
                             prewarm_config=self._prewarm_config,
                         )
-                        os._exit(0)
-                    else:
-                        self._chip_pids.append(pid)
+                    except BaseException as e:  # noqa: BLE001
+                        import traceback as _tb  # noqa: PLC0415
 
-                # Cross-chip init barrier.  ChipWorker.init can have a long
-                # right tail (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank
-                # device_malloc beyond the host stream sync budget); without
-                # this barrier a fast-init chip starts its aclrtSyncStream
-                # window N seconds before a slow peer reaches the same
-                # point, and any cross-rank wait inside the op (HCCL notify,
-                # etc.) charges the slow peer's remaining init time against
-                # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget —
-                # the cascade documented in issue #897.  Reset each child to
-                # _IDLE once observed so the standard dispatch state machine
-                # resumes from the canonical "ready for work" state.
-                for shm in self._chip_shms:
-                    assert shm.buf is not None
-                    addr = _buffer_field_addr(shm.buf, _OFF_STATE)
-                    while _mailbox_load_i32(addr) != _INIT_DONE:
-                        pass
-                    _mailbox_store_i32(addr, _IDLE)
-
-            # Fork next-level Worker children (L4+ with Worker children).
-            # Each child process: init the inner Worker (which mmaps its own
-            # HeapRing and allocates its own child mailboxes), then enter
-            # _child_worker_loop. The inner Worker's own children are forked
-            # lazily on first run() inside _child_worker_loop, so the process
-            # tree nests correctly: L4 → L3 child → L3's chip/sub children.
-            for idx, inner_worker in enumerate(self._next_level_workers):
-                pid = os.fork()
-                if pid == 0:
-                    buf = self._next_level_shms[idx].buf
-                    assert buf is not None
-                    # Propagate the fork-constant prewarm sizing down so L4+ trees
-                    # prewarm their L3 chips too (each inner Worker prewarms on its
-                    # own first run). Closes the prior L4+ silent no-op.
-                    inner_worker.init(prewarm_config=self._prewarm_config)
-                    registry, identity_table, identity_refs = _make_local_identity_tables(
-                        identity_snapshot,
-                        callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
-                        target_namespace="LOCAL_PYTHON",
-                    )
-                    _child_worker_loop(buf, registry, identity_table, identity_refs, inner_worker)
+                        _tb.print_exc()
+                        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
+                            _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
+                            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+                        os._exit(1)
                     os._exit(0)
                 else:
-                    self._next_level_pids.append(pid)
+                    self._chip_pids.append(pid)
 
-            # _Worker was constructed in _init_hierarchical (pre-fork) so
-            # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
-            # workers via the unified mailbox.
-            dw = self._worker
-            assert dw is not None
+            # Cross-chip init barrier.  ChipWorker.init can have a long right tail
+            # (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank device_malloc beyond the
+            # host stream sync budget); without this barrier a fast-init chip
+            # starts its aclrtSyncStream window N seconds before a slow peer
+            # reaches the same point, and any cross-rank wait inside the op (HCCL
+            # notify, etc.) charges the slow peer's remaining init time against
+            # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget — the cascade
+            # documented in issue #897.  A chip that fails or dies during init
+            # raises here rather than spinning forever.
+            self._await_children_ready(self._chip_shms, self._chip_pids, "chip", deadline)
 
-            # Register chip workers as NEXT_LEVEL (L3)
-            if device_ids:
-                for shm in self._chip_shms:
-                    dw.add_next_level_worker(_mailbox_addr(shm))
+        # Fork next-level Worker children (L4+ with Worker children).
+        # Each child process eagerly inits the inner Worker, which forks its own
+        # chip/sub (and, for L5+, deeper next-level) children and blocks on their
+        # readiness before returning — so the process tree nests correctly (L4 →
+        # L3 child → L3's chip/sub grandchildren) and INIT_READY propagates up
+        # only after the whole subtree is ready.
+        for idx, inner_worker in enumerate(self._next_level_workers):
+            pid = os.fork()
+            if pid == 0:
+                buf = self._next_level_shms[idx].buf
+                assert buf is not None
 
-            # Register Worker children as NEXT_LEVEL (L4+)
-            if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
-                raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
-            for idx, shm in enumerate(self._next_level_shms):
-                worker_id = self._next_level_worker_ids[idx]
-                dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
+                def _setup(inner=inner_worker):
+                    # Propagate the fork-constant prewarm sizing and the shared
+                    # startup deadline so the inner subtree comes up within the
+                    # parent's remaining budget. INIT_READY is published only
+                    # after BOTH the inner init (its whole subtree) and the
+                    # identity-table build succeed, so the parent never observes
+                    # READY for a child that then dies in fallible post-init
+                    # setup. A failure after inner.init() succeeded tears the
+                    # inner subtree back down before propagating, so a fallible
+                    # post-init step leaves no orphaned grandchildren / shms.
+                    inner.init(prewarm_config=self._prewarm_config, _startup_deadline=deadline)
+                    try:
+                        return _make_local_identity_tables(
+                            identity_snapshot,
+                            callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
+                            target_namespace="LOCAL_PYTHON",
+                        )
+                    except BaseException:
+                        with contextlib.suppress(BaseException):
+                            inner.close()
+                        raise
 
-            for shm in self._sub_shms:
-                dw.add_sub_worker(_mailbox_addr(shm))
+                _forked_child_main(
+                    buf,
+                    f"next_level worker {idx}",
+                    _setup,
+                    lambda tables, b=buf, inner=inner_worker: _child_worker_loop(b, *tables, inner),
+                    make_group_leader=self._is_startup_root,
+                )
+            else:
+                self._next_level_pids.append(pid)
 
-            # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
-            dw.init()
+        # The recursive readiness edge: a next-level child's own init blocks on
+        # its descendants, so its INIT_READY means the whole subtree is ready. A
+        # failure, exit, or hang aborts startup here.
+        self._await_children_ready(self._next_level_shms, self._next_level_pids, "next_level", deadline)
 
-            self._orch = Orchestrator(dw.get_orchestrator(), self)
+        # Last local fork is done. Now — and only now — register remote L3
+        # endpoints, which spawns the RemoteL3Endpoint health thread; doing it
+        # here keeps every local fork ahead of every C++/Python thread. Each
+        # remote attach consumes the shared startup budget.
+        for session, spec in zip(self._remote_sessions, self._remote_worker_specs, strict=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("remote L3 endpoint attach: startup deadline exceeded")
+            assert self._worker is not None
+            self._worker.add_remote_l3_socket(
+                session.worker_id,
+                session.session_id,
+                spec.transport,
+                session.command_host,
+                session.command_port,
+                session.health_host,
+                session.health_port,
+                min(self._remote_session_timeout_s(), remaining),
+            )
 
-            # Pre-warm every chip child: for each registered ChipCallable digest,
-            # send `_CTRL_PREPARE` to all chip children so the first
-            # `submit_next_level` does not pay the H2D upload cost.  Sub fns /
-            # orch fns do not need pre-warming — the registry is already
-            # COW-inherited.
-            if device_ids:
-                for digest, target, _ref_count, kind, namespace in identity_snapshot:
-                    if kind == "CHIP_CALLABLE" and namespace == "LOCAL_CHIP" and isinstance(target, ChipCallable):
-                        for worker_id in range(len(self._chip_shms)):
-                            dw.control_prepare(worker_id, digest)
+        # _Worker was constructed in _init_hierarchical (pre-fork) so children
+        # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers via
+        # the unified mailbox.
+        dw = self._worker
+        assert dw is not None
 
-            # The prebuilt runtime-arena is prewarmed inside each chip child's
-            # cw.init (the fork-constant sizing is COW-inherited via
-            # _chip_process_loop's prewarm_config arg) — no control command here.
+        # Register chip workers as NEXT_LEVEL (L3)
+        if device_ids:
+            for shm in self._chip_shms:
+                dw.add_next_level_worker(_mailbox_addr(shm))
 
-            self._hierarchical_started = True
-            with self._hierarchical_start_cv:
-                self._hierarchical_start_state = "started"
-                self._hierarchical_start_cv.notify_all()
-        except Exception:
-            with self._hierarchical_start_cv:
-                self._hierarchical_start_state = "failed"
-                self._hierarchical_start_cv.notify_all()
-            raise
+        # Register Worker children as NEXT_LEVEL (L4+)
+        if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
+            raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
+        for idx, shm in enumerate(self._next_level_shms):
+            worker_id = self._next_level_worker_ids[idx]
+            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
+
+        for shm in self._sub_shms:
+            dw.add_sub_worker(_mailbox_addr(shm))
+
+        # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
+        dw.init()
+
+        self._orch = Orchestrator(dw.get_orchestrator(), self)
+
+        # Every ChipCallable in the startup snapshot was already uploaded by its
+        # chip child before that child published INIT_READY (see
+        # _chip_process_loop), and the runtime arena was prewarmed there too — so
+        # there is no post-scheduler control_prepare on the startup path.
+
+    def _await_children_ready(self, shms, pids, kind: str, deadline: float) -> None:
+        """Block until every forked child reports INIT_READY, or abort.
+
+        Polls each child's mailbox: INIT_READY resets the slot to _IDLE (so the
+        C++ dispatch state machine resumes from the canonical "ready for work"
+        state), records the pid as having reached its serve loop, and retires
+        it; INIT_FAILED surfaces the child's own error; ``waitpid(WNOHANG)``
+        catches a child that died before signalling (recording the reaped pid so
+        rollback never re-SIGKILLs a possibly-reused PID). ``deadline`` is the
+        single startup-epoch deadline shared by every child group and every
+        recursive descendant, so a deep tree cannot multiply the timeout; a
+        child that hangs past it aborts the epoch. A failure raises
+        ``RuntimeError`` — the caller rolls back the whole startup epoch.
+        """
+        pending = list(range(len(shms)))
+        while pending:
+            still_pending = []
+            for i in pending:
+                buf = shms[i].buf
+                assert buf is not None
+                addr = _buffer_field_addr(buf, _OFF_STATE)
+                state = _mailbox_load_i32(addr)
+                if state == _INIT_READY:
+                    _mailbox_store_i32(addr, _IDLE)
+                    self._startup_ready_pids.add(pids[i])
+                    continue
+                if state == _INIT_FAILED:
+                    raise RuntimeError(f"{kind} worker {i} (pid {pids[i]}) failed during init: {_read_error_msg(buf)}")
+                try:
+                    wpid, status = os.waitpid(pids[i], os.WNOHANG)
+                except ChildProcessError:
+                    self._startup_reaped_pids.add(pids[i])
+                    raise RuntimeError(
+                        f"{kind} worker {i} (pid {pids[i]}) exited during init before signalling ready"
+                    ) from None
+                if wpid != 0:
+                    self._startup_reaped_pids.add(pids[i])
+                    raise RuntimeError(
+                        f"{kind} worker {i} (pid {pids[i]}) exited during init "
+                        f"before signalling ready (wait status {status})"
+                    )
+                still_pending.append(i)
+            pending = still_pending
+            if pending:
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"{kind} worker(s) {pending} did not become ready within "
+                        f"{self._startup_timeout_s}s (startup deadline exceeded)"
+                    )
+                time.sleep(_STARTUP_POLL_INTERVAL_S)
 
     # ------------------------------------------------------------------
     # Hierarchical abort
     # ------------------------------------------------------------------
 
-    def _abort_hierarchical(self) -> None:
-        """Tear down all forked children + shms after a bootstrap failure.
+    def _abort_hierarchical(self) -> None:  # noqa: PLR0912 -- graceful/cooperative-cancel-then-killpg rollback across sub/chip/next-level, bounded-wait, reap, free shms
+        """Tear down the whole forked subtree + shms after a bootstrap failure.
 
-        Best-effort: SIGKILL every child we spawned, reap them, then close
-        and unlink every mailbox.  Called only from the init() failure path,
-        so `dw.init()` has not run and the C++ scheduler is not holding any
-        mailbox references.
+        Called from the init() failure path — the single rollback entry
+        (_cleanup_partial_init) — so `dw.init()` may or may not have run.
+
+        Teardown proceeds in two bounded phases within one cleanup budget:
+
+        1. Cooperative. A child that reached its serve loop (READY) is asked to
+           close gracefully via SHUTDOWN so it finalizes its device / unlinks its
+           own nested shms. A next-level child still inside ``inner.init()``
+           (mid-init, and possibly already the parent of grandchildren) is sent
+           SIGTERM, which unwinds its ``inner.init()`` and recursively reclaims
+           its grandchildren and their nested shms.
+        2. Hard backstop. Any child still alive past the cleanup deadline is
+           reaped. As the startup root, ``killpg`` takes the whole subtree — the
+           child and every descendant that inherited its process group — so a
+           mid-init grandchild is reaped here rather than left to the
+           multiprocessing resource_tracker; a nested (non-root) worker SIGKILLs
+           the direct pid and relies on the root's killpg. PIDs the barrier
+           already reaped are excluded so a reused PID is never signalled.
         """
+        reaped = set(self._startup_reaped_pids)
+        graceful: list[int] = []
+        cancelled: list[int] = []
+        killed: list[int] = []
+
+        # A next-level child may have published INIT_READY in the window between
+        # the barrier last polling it and aborting on a failing sibling — its
+        # mailbox still reads INIT_READY (only the barrier resets it to IDLE).
+        # Promote it to READY so it is torn down gracefully (SHUTDOWN unlinks its
+        # own nested shms) rather than cooperatively cancelled after it has
+        # already restored the default SIGTERM disposition.
+        for idx, pid in enumerate(self._next_level_pids):
+            if pid in reaped or pid in self._startup_ready_pids:
+                continue
+            buf = self._next_level_shms[idx].buf if idx < len(self._next_level_shms) else None
+            if buf is not None and _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _INIT_READY:
+                self._startup_ready_pids.add(pid)
+
+        # Phase 1a: READY children (sub / chip / next-level) close gracefully.
+        for pids_list, shms_list in (
+            (self._next_level_pids, self._next_level_shms),
+            (self._chip_pids, self._chip_shms),
+            (self._sub_pids, self._sub_shms),
+        ):
+            for idx, pid in enumerate(pids_list):
+                if pid in reaped or pid not in self._startup_ready_pids:
+                    continue
+                buf = shms_list[idx].buf if idx < len(shms_list) else None
+                if buf is None:
+                    continue
+                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+                graceful.append(pid)
+
+        # Phase 1b: mid-init next-level children get a cooperative cancel so they
+        # unwind inner.init() and recursively reclaim their own subtree.
+        for pid in self._next_level_pids:
+            if pid in reaped or pid in self._startup_ready_pids:
+                continue
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGTERM)
+            cancelled.append(pid)
+
+        waiting = set(graceful) | set(cancelled)
+        if waiting:
+            gdeadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            while waiting and time.monotonic() <= gdeadline:
+                for pid in list(waiting):
+                    try:
+                        wpid, _status = os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        waiting.discard(pid)
+                        reaped.add(pid)
+                        continue
+                    if wpid != 0:
+                        waiting.discard(pid)
+                        reaped.add(pid)
+                if waiting:
+                    time.sleep(_STARTUP_POLL_INTERVAL_S)
+
+        # Phase 2: hard backstop for any survivor. A not-yet-reaped pid still
+        # holds its slot (no reuse), so killpg on the root reaps the survivor's
+        # whole group (it + inherited-group descendants) safely.
         pids = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
         for pid in pids:
-            try:
+            if pid in reaped:
+                continue
+            if self._is_startup_root:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, OSError):
                 os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                pass
+            killed.append(pid)
         for pid in pids:
-            try:
+            if pid in reaped and pid not in killed:
+                continue
+            with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
+
+        self._last_rollback = {
+            "graceful": [p for p in graceful if p not in killed],
+            "killed": list(killed),
+        }
 
         for shm in self._sub_shms + self._chip_shms + self._next_level_shms:
             try:
@@ -3434,10 +4005,6 @@ class Worker:
         self._hierarchical_started = False
         self._comm_base_ready = False
         self._initialized = False
-        with self._hierarchical_start_cv:
-            if self._hierarchical_start_state != "started":
-                self._hierarchical_start_state = "not_started"
-            self._hierarchical_start_cv.notify_all()
 
     @property
     def live_domains(self) -> dict[str, CommDomainHandle]:
@@ -3448,14 +4015,7 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
-        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
-
-        return L3L2OrchCommClient(shm)
-
-    def _ensure_l3_l2_orch_comm(self, worker_id: int):
-        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
-
+    def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
         if self._worker is None:
@@ -3463,38 +4023,6 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
-        if worker_id in self._l3_l2_orch_comm_ready:
-            return self._l3_l2_orch_comm_clients[worker_id]
-
-        chip_shm = self._chip_shms[worker_id]
-        assert chip_shm.buf is not None
-        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
-        if state != _IDLE:
-            raise RuntimeError(
-                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
-                "the L3-L2 service is not ready"
-            )
-
-        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
-        try:
-            client = self._make_l3_l2_orch_comm_client(control_shm)
-            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
-        except Exception:
-            try:
-                control_shm.close()
-                control_shm.unlink()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-
-        self._l3_l2_orch_comm_shms[worker_id] = control_shm
-        self._l3_l2_orch_comm_clients[worker_id] = client
-        self._l3_l2_orch_comm_ready.add(worker_id)
-        return client
-
-    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
-        client = self._ensure_l3_l2_orch_comm(int(worker_id))
-        return client.submit(request, timeout_s)
 
     def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
         match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
@@ -3511,8 +4039,6 @@ class Worker:
         return poisoned
 
     def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise TypeError("L3-L2 host buffer registration expects a Tensor")
         if tensor.child_memory:
@@ -3529,8 +4055,6 @@ class Worker:
         )
 
     def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         if tensor.child_memory:
@@ -3549,57 +4073,105 @@ class Worker:
                 f"L3-L2 payload Tensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
-    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
-
+    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):  # noqa: PLR0912
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
             raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
-        response = self._l3_l2_orch_comm_submit(
-            int(worker_id),
-            L3L2OrchCommRequest(
-                cmd=L3L2OrchCommCmd.ALLOC_REGION,
+        self._validate_l3_l2_worker_id(int(worker_id))
+        req_shm = SharedMemory(create=True, size=_REGION_CREATE_REQUEST_BYTES)
+        reply_shm = SharedMemory(create=True, size=_REGION_CREATE_REPLY_BYTES)
+        req_buf = cast(memoryview, req_shm.buf)
+        reply_buf = cast(memoryview, reply_shm.buf)
+        region_id = 0
+        l3_host_mapping = None
+        try:
+            L3L2RegionCreateRequest(
+                magic_version=_REGION_MAGIC_VERSION,
+                request_bytes=_REGION_CREATE_REQUEST_BYTES,
                 payload_bytes=int(payload_bytes),
                 counter_bytes=int(counter_bytes),
-            ),
-            timeout_s=5.0,
-        )
-        if response.status != 0 or response.desc is None:
-            raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
-        region = L3L2OrchRegion(self, int(worker_id), response.desc)
-        self._live_l3_l2_regions.append(region)
-        return region
+            ).encode_into(req_buf)
+            worker = self._worker
+            assert worker is not None
+            worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+            # Peek before decode: decode rejects malformed replies, but the
+            # child has already created the region and the rollback below
+            # still needs the id.
+            region_id = peek_region_create_reply_region_id(reply_buf)
+            reply = decode_region_create_reply(reply_buf)
+            platform = str(self._config.get("platform", ""))
+            expected_access_profile = (
+                L3L2RegionAccessProfile.SIM_POSIX_SHM
+                if platform.endswith("sim")
+                else L3L2RegionAccessProfile.ONBOARD_VMM
+            )
+            counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
+            if platform.endswith("sim"):
+                handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+            else:
+                handle = _l3_host_mapped_region_import_onboard(
+                    int(reply.device_id),
+                    int(reply.shareable_handle),
+                    int(reply.mapping_bytes),
+                )
+            l3_host_mapping = L3HostRegionMapping(
+                worker_id=int(worker_id),
+                region_id=region_id,
+                access_profile=reply.access_profile,
+                total_bytes=total_bytes,
+                payload_offset=0,
+                payload_bytes=int(reply.desc.payload_bytes),
+                counter_offset=counter_offset,
+                counter_bytes=int(reply.desc.counter_bytes),
+                handle=int(handle),
+            )
+            region = L3L2OrchRegion(self, int(worker_id), reply.desc, l3_host_mapping)
+            self._live_l3_l2_regions.append(region)
+            return region
+        except Exception:
+            if l3_host_mapping is not None:
+                try:
+                    l3_host_mapping.close()
+                except RuntimeError:
+                    pass
+            if region_id:
+                try:
+                    assert self._worker is not None
+                    self._worker.control_l3_l2_region_release(int(worker_id), int(region_id))
+                except RuntimeError:
+                    pass
+            raise
+        finally:
+            del req_buf
+            del reply_buf
+            for shm in (req_shm, reply_shm):
+                try:
+                    shm.close()
+                    shm.unlink()
+                except (BufferError, FileNotFoundError, OSError):
+                    pass
 
     def _cleanup_l3_l2_regions(self) -> None:
         if not self._live_l3_l2_regions:
             return
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest  # noqa: PLC0415
-
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
         for region in regions:
             try:
-                if region._worker_id in self._l3_l2_orch_comm_ready:
-                    self._l3_l2_orch_comm_submit(
-                        region._worker_id,
-                        L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
-                        timeout_s=5.0,
-                    )
+                region._close_l3_host_mapping()
+                if self._worker is not None:
+                    self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
             finally:
                 region._expire()
 
     def _close_l3_l2_orch_comm(self) -> None:
-        self._live_l3_l2_regions.clear()
-        self._l3_l2_orch_comm_clients.clear()
-        self._l3_l2_orch_comm_ready.clear()
-        self._l3_l2_orch_comm_host_buffers.clear()
-        for shm in self._l3_l2_orch_comm_shms.values():
+        for region in self._live_l3_l2_regions:
             try:
-                shm.close()
-                shm.unlink()
-            except Exception:  # noqa: BLE001
+                region._close_l3_host_mapping()
+            except RuntimeError:
                 pass
-        self._l3_l2_orch_comm_shms.clear()
+        self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_host_buffers.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
@@ -3905,7 +4477,7 @@ class Worker:
         """Fan out CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to all participating chips.
 
         Each chip's `_Worker.control_*` is a blocking per-mailbox call; we issue
-        them on separate threads so the child-side file barrier can converge.
+        them on separate threads so the L2-side file barrier can converge.
         Joins all threads; raises on first error after all join.
         """
         dw = self._worker
@@ -4027,10 +4599,10 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
-        """Allocate a born-shared host buffer, attached into every chip child,
+        """Allocate a born-shared host buffer, attached into every local L3 child,
         that a later ``run()`` reads/writes with **no per-run copy**.
 
-        L3 chip children are forked lazily on the first ``run()``; memory created
+        Local L3 children are forked during ``init()``; host memory allocated
         afterwards is not in their address space. This hands you memory that is
         *born* in a shm already attached into every child, so there is nothing to
         copy: the child reads and writes the same physical pages the parent sees.
@@ -4046,7 +4618,7 @@ class Worker:
             worker.free_host_buffer(buf)           # drop the tensor first
 
         simpler stays framework-free: torch/numpy appear only on the user's side
-        (``frombuffer``). Blocks until every chip child has attached the buffer;
+        (``frombuffer``). Blocks until every local L3 child has attached the buffer;
         not thread-safe against a concurrent ``run`` / ``create`` / ``free`` on
         the same Worker — drive them from one thread, as the L3 worker is
         otherwise.
@@ -4055,9 +4627,13 @@ class Worker:
             raise TypeError("create_host_buffer requires a level >= 3 Worker")
         if not self._initialized:
             raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
-        self._start_hierarchical()
-        if not self._chip_shms:
-            raise RuntimeError("create_host_buffer requires forked chip children (none are configured)")
+        # A born-shared buffer is mapped into every direct process child (chip
+        # and sub alike, via _broadcast_host_control). Only a truly childless L3
+        # has nowhere to attach it.
+        if not self._chip_shms and not self._sub_shms:
+            raise RuntimeError(
+                "create_host_buffer requires at least one forked chip or sub child (this Worker has none)"
+            )
         assert self._worker is not None
 
         nbytes = int(nbytes)
@@ -4093,17 +4669,10 @@ class Worker:
                 self._rebuild_host_buf_snapshot()
 
             payload = _HOST_BUF_MAP_HEADER.pack(token, data_ptr, nbytes) + shm.name.encode("utf-8")
-            results = self._worker.broadcast_control_all(
-                WorkerType.NEXT_LEVEL,
-                int(_CTRL_MAP_HOST),
-                payload,
-                None,
-                timeout_s=self._py_control_timeout_s,
-            )
-            errors = self._control_errors(list(results))
+            errors = self._broadcast_host_control(_CTRL_MAP_HOST, payload)
             if errors:
                 raise RuntimeError(
-                    f"create_host_buffer: MAP_HOST failed on {len(errors)} chip children; first error: {errors[0]}"
+                    f"create_host_buffer: MAP_HOST failed on {len(errors)} local L3 children; first error: {errors[0]}"
                 )
         except BaseException:
             # Roll back on any failure — a staging error before the map, a partial
@@ -4138,7 +4707,7 @@ class Worker:
     def free_host_buffer(self, handle: HostBuffer) -> None:
         """Release a born-shared buffer created by ``create_host_buffer``.
 
-        Unmaps it from every chip child and frees the parent shm. Drop every
+        Unmaps it from every local L3 child and frees the parent shm. Drop every
         tensor / ``memoryview`` you built over ``handle.buffer`` *first*: a live
         view keeps the shm's pages exported, so ``close()`` cannot release them
         and the buffer only warns (and is reclaimed once the last view is gone).
@@ -4167,7 +4736,7 @@ class Worker:
         if errors:
             sys.stderr.write(
                 f"[worker pid={os.getpid()}] WARN: free_host_buffer token={entry.token} "
-                f"failed on {len(errors)} chip children; first error: {errors[0]}\n"
+                f"failed on {len(errors)} local L3 children; first error: {errors[0]}\n"
             )
             sys.stderr.flush()
 
@@ -4219,17 +4788,24 @@ class Worker:
                 self._close_host_shm(entry)
 
     def _broadcast_host_unmap(self, token: int) -> list[str]:
-        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every chip child."""
+        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every local L3 child."""
+        return self._broadcast_host_control(_CTRL_UNMAP_HOST, _HOST_BUF_UNMAP.pack(token))
+
+    def _broadcast_host_control(self, sub_cmd: int, payload: bytes) -> list[str]:
         if self._worker is None:
             return []
-        results = self._worker.broadcast_control_all(
-            WorkerType.NEXT_LEVEL,
-            int(_CTRL_UNMAP_HOST),
-            _HOST_BUF_UNMAP.pack(token),
-            None,
-            timeout_s=self._py_control_timeout_s,
-        )
-        return self._control_errors(list(results))
+        results = []
+        for worker_type in (WorkerType.NEXT_LEVEL, WorkerType.SUB):
+            results.extend(
+                self._worker.broadcast_control_all(
+                    worker_type,
+                    int(sub_cmd),
+                    payload,
+                    None,
+                    timeout_s=self._py_control_timeout_s,
+                )
+            )
+        return self._control_errors(results)
 
     def _stage_host_buffers_for_chip_submit(self, args: Any) -> None:
         """Validate the host tensors of one chip submit before dispatch.
@@ -4339,7 +4915,6 @@ class Worker:
             self._chip_worker._run_slot(state.slot_id, args, cfg)
             return None
 
-        self._start_hierarchical()
         assert self._orch is not None
         assert self._worker is not None
         # Drop any error stashed by a previous run() so this call starts
@@ -4416,6 +4991,13 @@ class Worker:
     # ------------------------------------------------------------------
 
     def close(self) -> None:  # noqa: PLR0912 -- parallel teardown for _worker + sub/chip/next/bootstrap shms with ordering constraints documented inline
+        # A close() that races an in-progress init() must not no-op on the still
+        # -false _initialized flag and leave the epoch's tree running: wait for
+        # the epoch to reach READY (then tear it down) or FAILED (already rolled
+        # back by init()).
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
         if not self._initialized:
             return
 
@@ -4433,7 +5015,7 @@ class Worker:
             sys.stderr.flush()
 
         # Release any host buffers the user never unregistered. Must run while
-        # the chip mailboxes are still usable (before _worker.close()).
+        # the local L3 child mailboxes are still usable (before _worker.close()).
         self._release_all_host_buffers()
 
         if self.level == 2:

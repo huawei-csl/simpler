@@ -242,7 +242,9 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     }
 #endif
 
-    return PublishHandle{core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot};
+    return PublishHandle{
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task->task_timing_slot
+    };
 }
 
 int SchedulerContext::prepare_block_for_dispatch(
@@ -392,7 +394,7 @@ void SchedulerContext::dispatch_shape(
             }
 #endif
             for (int i = 0; i < handle_count; i++) {
-                publish_subtask_to_core(handles[i], dispatch_ts);
+                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
             }
             handle_count = 0;
             made_progress = true;
@@ -661,7 +663,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     if (n > 0) {
         wmb();
         for (int i = 0; i < n; i++) {
-            publish_subtask_to_core(handles[i], early_dispatch_ts);
+            publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
             sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
             sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
@@ -708,9 +710,9 @@ int32_t SchedulerContext::stage_consumer_blocks(
 // Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
 // pre-stage claimed block ranges onto this thread's `shape` cores for `phase`. IDLE
 // stages onto idle cores (RUNNING slot, gated); PENDING stages onto a running core's
-// gated pending slot. Candidates are pushed to the shape's queue EVENT-DRIVEN by
-// propagate_dispatch_fanin, so the shape is the queue index (no per-consumer
-// to_shape()). Returns the number of blocks staged.
+// gated pending slot. Producer propagation and late wiring push candidates to the
+// shape's queue when dispatch_fanin becomes complete, so the shape is the queue
+// index (no per-consumer to_shape()). Returns the number of blocks staged.
 int32_t
 SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -1069,6 +1071,40 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
+#if SIMPLER_DFX
+        // Close the Complete phase BEFORE the async-wait poll so async-engine
+        // (SDMA/RoCE/URMA/CCU) wait time lands in its own AsyncPoll bar instead
+        // of folding into the Complete span. A finished slot OR a sub-block
+        // retire that finished no slot both count as completion work (the latter
+        // surfaces the SPMD harvest tail; on a pure-retire iteration
+        // phase_complete_count is 0).
+        if (!try_completed) {
+            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+        } else {
+            CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES &&
+                (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
+                // Complete's release_fanin pushes newly-ready consumers into the
+                // shared ready_queues[], so the end depth differs from the start.
+                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end_fresh(phase_end_shared);
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                    l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count, /*pop_hit=*/0,
+                    /*pop_miss=*/0, phase_start_shared, phase_end_shared
+                );
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                    phase_start_shared[s] = phase_end_shared[s];
+                l2_swimlane.phase_complete_count = 0;
+                l2_swimlane.phase_subretire_count = 0;
+            }
+            // Advance past the completion check even when no Complete bar was
+            // emitted (both counts 0). Otherwise its wall time folds into the
+            // next bar (AsyncPoll, or Dispatch when the poll is skipped).
+            _t0_phase = _t1;
+        }
+#endif
+
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
@@ -1096,36 +1132,37 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 last_progress_count = new_total;
                 made_progress = true;
             }
-        }
-
 #if SIMPLER_DFX
-        if (!try_completed) {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
-        } else {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
-            // Emit on any completion work this iteration — a finished slot OR
-            // sub-block retires that did not finish a slot. The latter makes the
-            // SPMD harvest tail visible (count field = blocks processed this
-            // iteration; on a pure-retire iteration phase_complete_count is 0).
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES &&
-                (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
-                // Complete's release_fanin pushes newly-ready consumers into the
-                // shared ready_queues[], so the end depth differs from the start.
+            // AsyncPoll phase: the async-wait completion poll, split out of
+            // Complete. Recorded here inside the poll branch, so "did the poll
+            // run" needs no separate flag. sched_async_cycle accrues only on
+            // iterations that actually poll. The bar is emitted even on a
+            // zero-completion poll so its polling cost stays visible rather than
+            // folding into the next bar. tasks_processed = async subtasks
+            // completed this iter.
+            CYCLE_COUNT_LAP(l2_swimlane.sched_async_cycle);
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+                // A completing poll runs on_task_complete, which pushes
+                // newly-ready consumers into the shared ready_queues[] — so the
+                // end depth then differs from the start; a zero-completion poll
+                // leaves the queues untouched and the cached start sample holds.
                 int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-                capture_phase_end_fresh(phase_end_shared);
+                if (poll_result.completed > 0) {
+                    capture_phase_end_fresh(phase_end_shared);
+                } else {
+                    capture_phase_end(phase_end_shared);
+                }
                 l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                    l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count, /*pop_hit=*/0,
-                    /*pop_miss=*/0, phase_start_shared, phase_end_shared
+                    thread_idx, L2SwimlaneSchedPhaseKind::AsyncPoll, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                    static_cast<uint32_t>(poll_result.completed), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared,
+                    phase_end_shared
                 );
                 for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
                     phase_start_shared[s] = phase_end_shared[s];
                 _t0_phase = _t1;
-                l2_swimlane.phase_complete_count = 0;
-                l2_swimlane.phase_subretire_count = 0;
             }
-        }
 #endif
+        }
 
         bool try_pushed = false;
 
@@ -1356,6 +1393,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
                                   get_sys_cnt_aicpu() :
                                   0;
+            // Snapshot the slot count before the drain loop decrements it to 0,
+            // so the Release bar can report how many slots it drained.
+            uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
             while (deferred_release_count > 0) {
                 INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
@@ -1374,7 +1414,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (rel_t0 != 0) {
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, /*tasks_processed=*/0
+                    l2_swimlane.sched_loop_count, released_count
                 );
             }
 #endif

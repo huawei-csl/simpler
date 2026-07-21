@@ -376,19 +376,19 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
     PTO2TaskPayload *payload = slot_state.payload;
     slot_state.fanin_count = wfanin + 1;
 
-    int32_t early_finished = 0;
+    int32_t completed_fanin = 0;
     for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
         producer->lock_fanout();
         int32_t pstate = producer->task_state.load(std::memory_order_acquire);
         if (pstate >= PTO2_TASK_COMPLETED) {
-            early_finished++;
+            completed_fanin++;
         } else {
             producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
         }
         producer->unlock_fanout();
     });
 
-    int32_t init_rc = early_finished + 1;
+    int32_t init_rc = completed_fanin + 1;
     int32_t new_rc = slot_state.fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
     mark_dep_pool_position(slot_state);
     if (new_rc >= slot_state.fanin_count) {
@@ -907,6 +907,7 @@ static TaskOutputTensors submit_task_common(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    task.task_timing_slot = args.task_timing_slot();
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -1161,6 +1162,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;
+    // alloc_tensors builds a kernel-less descriptor that never dispatches; keep
+    // the slot untagged so a recycled ring slot cannot leak a stale tag.
+    task.task_timing_slot = TASK_TIMING_SLOT_NONE;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 

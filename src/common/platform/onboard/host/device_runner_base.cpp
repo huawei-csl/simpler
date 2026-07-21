@@ -43,6 +43,7 @@
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/acl_error_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "pto_runtime_c_api.h"
@@ -159,64 +160,6 @@ void DeviceRunnerBase::clear_temporary_buffer() {
         retained_temp_addr_ = nullptr;
         retained_temp_size_ = 0;
     }
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
-    if (!l3_l2_orch_comm_supported()) {
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    }
-    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
-}
-
-int DeviceRunnerBase::l3_l2_orch_comm_shutdown() {
-    if (!l3_l2_orch_comm_supported()) {
-        return 0;
-    }
-    return l3_l2_orch_comm_service_.stop();
-}
-
-void *DeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
-        return nullptr;
-    }
-    void *ptr = allocate_tensor(static_cast<size_t>(bytes));
-    if (ptr == nullptr) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    l3_l2_allocations_.insert(ptr);
-    return ptr;
-}
-
-void DeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
-    if (ptr == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
-    auto it = l3_l2_allocations_.find(ptr);
-    if (it == l3_l2_allocations_.end()) {
-        return;
-    }
-    free_tensor(ptr);
-    l3_l2_allocations_.erase(it);
-}
-
-int DeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
-}
-
-int DeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
-    if (bytes > std::numeric_limits<size_t>::max()) {
-        return -1;
-    }
-    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
-}
-
-std::thread DeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
-    return create_thread(std::move(fn));
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
@@ -379,6 +322,7 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
         LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -423,6 +367,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicpu_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             return rc;
         }
         aicpu_created_here = true;
@@ -431,6 +376,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicore_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             // Roll back only the AICPU stream we just created, not a
             // pre-existing persistent one.
             if (aicpu_created_here) {
@@ -666,6 +612,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
@@ -791,6 +738,7 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     }
     if (rc != 0) {
         LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1015,8 +963,6 @@ int DeviceRunnerBase::finalize_common() {
     // raw_base_ flag) so the eventual destructor no-ops. Any new member owning
     // an RTS/device resource must be released here, with an idempotent
     // destructor as the backstop. See issue #1197.
-    capture(l3_l2_orch_comm_shutdown());
-
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
     // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
@@ -1128,6 +1074,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
         int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
         if (rc != RT_ERROR_NONE) {
             LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             aicore_bin_handle_ = nullptr;
             return rc;
         }
@@ -1148,6 +1095,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1176,8 +1124,12 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     // buffer is allocated once (lazy) but RESET every run so a stale prior run
     // cannot leak into the reduction.
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
-    constexpr size_t kBytes = static_cast<size_t>(kRecords) * sizeof(AicpuPhaseRecord);
+    // Phase region followed by the task-timing tail. Both records are 16 bytes and
+    // share the {kPhaseUnset, 0} reset, so one AicpuPhaseRecord init array covers
+    // both; the AICPU SO resolves the tail at base + task_timing_tail_offset().
+    static_assert(sizeof(AicpuPhaseRecord) == sizeof(TaskTimingRecord), "phase/tail records must share size");
+    constexpr int kRecords = kThreads * NUM_AICPU_PHASES + task_timing_buffer_slots(kThreads);
+    constexpr size_t kBytes = device_phase_buffer_bytes(kThreads);
     if (device_wall_dev_ptr_ == nullptr) {
         device_wall_dev_ptr_ = allocate_tensor(kBytes);
         if (device_wall_dev_ptr_ != nullptr) {
@@ -1187,8 +1139,8 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     if (device_wall_dev_ptr_ != nullptr) {
         AicpuPhaseRecord init[kRecords];
         for (int i = 0; i < kRecords; ++i) {
-            init[i].start_cycle = kPhaseUnset;  // start: sentinel so min()/unset-check ignore unused slots
-            init[i].end_cycle = 0;              // end: 0 so max() ignores unused slots
+            init[i].start_cycle = kPhaseUnset;  // start/dispatch: sentinel so min()/unset-check ignore unused slots
+            init[i].end_cycle = 0;              // end/finish: 0 so max() ignores unused slots
         }
         if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
             // Reset failed — disable capture for this run so stale slot data
@@ -1270,10 +1222,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1284,10 +1238,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     return 0;
@@ -1304,6 +1260,10 @@ void DeviceRunnerBase::read_device_wall_ns() {
     for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
         device_phase_ns_[p] = 0;
         device_phase_start_ns_[p] = 0;
+    }
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        task_slot_dispatch_ns_[s] = 0;
+        task_slot_finish_ns_[s] = 0;
     }
     if (device_wall_dev_ptr_ == nullptr) return;
 
@@ -1340,6 +1300,26 @@ void DeviceRunnerBase::read_device_wall_ns() {
         }
     }
     device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
+
+    // Task-timing tail: D2H the per-slot records that follow the phase region,
+    // then resolve them on the phase `origin` timeline (shared logic in
+    // device_phase.h). Platform-specific here: the rtMemcpy and the cycle→ns
+    // conversion (real-silicon sys-counter frequency).
+    constexpr int kTailRecords = task_timing_buffer_slots(kThreads);
+    TaskTimingRecord tail[kTailRecords] = {};
+    const void *tail_src = reinterpret_cast<const uint8_t *>(device_wall_dev_ptr_) + task_timing_tail_offset(kThreads);
+    int tail_rc = rtMemcpy(tail, sizeof(tail), tail_src, sizeof(tail), RT_MEMCPY_DEVICE_TO_HOST);
+    if (tail_rc != 0) {
+        LOG_WARN("rtMemcpy(task_timing) D2H failed: %d", tail_rc);
+        return;
+    }
+    resolve_task_timing_slots_ns(
+        tail, kThreads, origin,
+        [](uint64_t cyc) {
+            return static_cast<uint64_t>(cycles_to_us(cyc) * 1000.0);
+        },
+        task_slot_dispatch_ns_, task_slot_finish_ns_
+    );
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {

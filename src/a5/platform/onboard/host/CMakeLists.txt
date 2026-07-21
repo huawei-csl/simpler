@@ -32,6 +32,7 @@ if(DEFINED CUSTOM_INCLUDE_DIRS)
 else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
+set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
 # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: opt-in overlay that wires the PTO-ISA
 # async-SDMA workspace into comm_alloc_windows. When ON it pulls in pto-isa
@@ -44,11 +45,17 @@ endif()
 # Flip ON via -DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON (or the env var of the
 # same name, forwarded by simpler_setup/runtime_builder.py).
 option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE AND SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+    message(FATAL_ERROR
+        "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE and SIMPLER_ENABLE_PTO_URMA_WORKSPACE are mutually exclusive "
+        "because CommContext exposes a single workSpace/workSpaceSize pair")
+endif()
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OR SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     if(NOT DEFINED ENV{PTO_ISA_ROOT})
         message(FATAL_ERROR
-            "a5 onboard host_runtime with SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON requires PTO_ISA_ROOT "
-            "(needs pto-isa headers + CANN 9.0+ with a5 SDMA primitives)")
+            "a5 onboard host_runtime PTO async workspace overlays require PTO_ISA_ROOT "
+            "(needs pto-isa host headers)")
     endif()
     list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 endif()
@@ -80,7 +87,6 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -120,6 +126,22 @@ target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
 endif()
+if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1)
+endif()
+
+# Bake the resolved pto-isa commit into the compile command when an overlay
+# embeds pto-isa headers into this .so. A pto-isa pin bump leaves runtime HEAD
+# — and often header mtimes — untouched, so without this define ccache
+# (compiler_check=mtime) can serve a stale object. Mirror of the a2a3 block
+# (#1351); the cache var stays empty for default-OFF a5 builds, so this is a
+# no-op unless the SDMA or URMA overlay is on.
+set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
+    "PTO-ISA commit used for host_runtime cache key")
+if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
+endif()
 
 # Include directories - always include local headers
 target_include_directories(host_runtime
@@ -139,18 +161,47 @@ target_include_directories(host_runtime
         # rtsLaunchCpuKernel API used by LoadAicpuOp).
         ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
         ${ASCEND_HOME_PATH}/pkg_inc/profiling
+        ${ASCEND_ARCH_HOME}/include
+        ${ASCEND_ARCH_HOME}/pkg_inc
+        ${ASCEND_ARCH_HOME}/pkg_inc/runtime
+        ${ASCEND_ARCH_HOME}/pkg_inc/runtime/runtime
+        ${ASCEND_ARCH_HOME}/pkg_inc/profiling
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
+        ${ASCEND_ARCH_HOME}/asc/include
+        ${ASCEND_ARCH_HOME}/include/driver
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-# CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
-# Link it explicitly so comm_hccl.cpp can follow the same initialization path
-# as the pto-isa communication tests.
-find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
-if(HCOMM_LIB)
+# Prefer libhccl when the CANN package ships it. Newer CANN packages may only
+# ship libhcomm, matching pto-isa's own A5 comm tests, so fall back to hcomm.
+find_library(HCCL_LIB
+    NAMES hccl
+    PATHS
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_ARCH_HOME}/lib64
+    NO_DEFAULT_PATH
+)
+find_library(HCOMM_LIB
+    NAMES hcomm
+    PATHS
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_ARCH_HOME}/lib64
+    NO_DEFAULT_PATH
+)
+if(HCCL_LIB)
+    if(HCOMM_LIB)
+        set(HCCL_LINK_TARGETS ${HCCL_LIB} ${HCOMM_LIB})
+        message(STATUS "Using HCCL libraries: ${HCCL_LIB};${HCOMM_LIB}")
+    else()
+        set(HCCL_LINK_TARGETS ${HCCL_LIB})
+        message(STATUS "Using HCCL library: ${HCCL_LIB}")
+    endif()
+elseif(HCOMM_LIB)
     set(HCCL_LINK_TARGETS ${HCOMM_LIB})
-    message(STATUS "Using HCCL library: ${HCOMM_LIB}")
+    message(WARNING "libhccl not found; using HCCL library: ${HCOMM_LIB}")
 else()
-    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
+    message(FATAL_ERROR
+        "Neither libhccl nor libhcomm found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_ARCH_HOME}/lib64")
 endif()
 
 # Link against CANN runtime libraries
@@ -166,6 +217,8 @@ target_link_libraries(host_runtime
         runtime
         ascendcl
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
+        c_sec
+        nnopbase
         dl
 )
 
@@ -173,6 +226,9 @@ target_link_directories(host_runtime
     PRIVATE
         ${ASCEND_HOME_PATH}/lib64
         ${ASCEND_HOME_PATH}/runtime/lib64
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
+        ${ASCEND_ARCH_HOME}/lib64
+        ${ASCEND_ARCH_HOME}/runtime/lib64
 )
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)

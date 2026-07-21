@@ -62,13 +62,16 @@ enum class MailboxState : int32_t {
     SHUTDOWN = 3,
     CONTROL_REQUEST = 4,
     CONTROL_DONE = 5,
-    // Child writes this after its expensive init (ChipWorker::init / inner
-    // Worker::init) completes. Parent's _start_hierarchical spin-waits for
-    // EVERY chip child to reach INIT_DONE before any dispatch (CTRL_PREPARE
-    // or TASK_READY) goes out. This aligns the host-side stream-sync windows
-    // across distributed ranks so cross-rank init skew never charges against
-    // the per-rank PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
-    INIT_DONE = 6,
+    // Startup readiness handshake, driven entirely by the Python facade
+    // (_await_children_ready). A child writes INIT_READY after its expensive
+    // init (ChipWorker::init / inner Worker::init) succeeds, or INIT_FAILED
+    // after it fails. The parent barrier waits for EVERY child to reach
+    // INIT_READY before any dispatch (CTRL_PREPARE or TASK_READY) goes out,
+    // which also aligns the host-side stream-sync windows across distributed
+    // ranks so cross-rank init skew never charges against the per-rank
+    // PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
+    INIT_READY = 6,
+    INIT_FAILED = 7,
 };
 
 // Sized so the args region can hold any TaskArgs the runtime itself accepts
@@ -151,7 +154,9 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
-static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
+static constexpr uint64_t CTRL_L3_L2_REGION_CREATE = 16;
+static constexpr uint64_t CTRL_L3_L2_REGION_RELEASE = 17;
+
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
 //   offset 24: uint64 arg1 (src for copy)
@@ -238,7 +243,8 @@ public:
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
-    virtual void control_l3_l2_orch_comm_init(const char *control_shm_name);
+    virtual void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
+    virtual void control_l3_l2_region_release(uint64_t region_id);
 };
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
@@ -288,7 +294,8 @@ public:
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
-    void control_l3_l2_orch_comm_init(const char *control_shm_name) override;
+    void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) override;
+    void control_l3_l2_region_release(uint64_t region_id) override;
 
 private:
     WorkerEndpointCaps caps_;
@@ -425,7 +432,8 @@ public:
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
     // Caller dispatches in parallel to every chip; child runs cw.comm_init.
     void control_comm_init(const char *request_shm_name);
-    void control_l3_l2_orch_comm_init(const char *control_shm_name);
+    void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
+    void control_l3_l2_region_release(uint64_t region_id);
 
 private:
     Ring *ring_{nullptr};
@@ -487,7 +495,8 @@ public:
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
-    void control_l3_l2_orch_comm_init(int worker_id, const char *control_shm_name);
+    void control_l3_l2_region_create(int worker_id, const char *request_shm_name, const char *reply_shm_name);
+    void control_l3_l2_region_release(int worker_id, uint64_t region_id);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
     ControlResult control_remote_prepare_register(

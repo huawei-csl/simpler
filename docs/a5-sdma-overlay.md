@@ -52,11 +52,18 @@ Controlled by the build-time macro / env var `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE`
 
 ### Gating points
 
-| File | What |
-| ---- | ---- |
-| `src/a5/platform/onboard/host/CMakeLists.txt` | `option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ... OFF)`; `PTO_ISA_ROOT` check + pto-isa include guarded |
+Everything below keys on the a5 async workspace overlays. When SDMA
+(`SIMPLER_ENABLE_PTO_SDMA_WORKSPACE`) or URMA (`SIMPLER_ENABLE_PTO_URMA_WORKSPACE`)
+is ON the a5 onboard host `.so` embeds pto-isa headers, so the same pin /
+metadata / staleness / ccache guard that protects a2a3 onboard applies to a5
+too (#1351); when both are OFF none of it runs.
+
+| File / mechanism | What |
+| ---------------- | ---- |
+| `src/a5/platform/onboard/host/CMakeLists.txt` | `option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ... OFF)`; under the option: `PTO_ISA_ROOT` check + pto-isa include. After the option blocks, the shared `SIMPLER_PTO_ISA_BUILD_COMMIT` cache-string → compile-define block bakes the pinned commit into the `host_runtime` ccache key (mirror of the a2a3 block); it is a no-op until an overlay populates the cache var |
 | `src/a5/platform/onboard/host/comm_hccl.cpp` | `ensure_sdma_workspace` body under `#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` |
-| `simpler_setup/runtime_compiler.py` | `_init_a5` `PTO_ISA_ROOT` ensure + `_sdma_workspace_enabled()` |
+| `simpler_setup/runtime_compiler.py` | `_init_a5` resolves the pinned managed pto-isa checkout via `ensure_pto_isa_root` (same contract as `_init_a2a3`) when the overlay is ON, then `env_manager.ensure("PTO_ISA_ROOT")` |
+| `simpler_setup/runtime_builder.py` (`platform_embeds_pto_isa`) | Single predicate every guard site keys on: a2a3 onboard always, a5 onboard only when the SDMA or URMA overlay is on (`_sdma_workspace_enabled() or _urma_workspace_enabled()`). Drives pin resolution (`_resolve_build_pto_isa_commit`), the `SIMPLER_PTO_ISA_BUILD_COMMIT` stamp, `pto_isa_build.json` metadata write, and load-time staleness validation (`_requires_pto_isa_metadata_validation`) |
 | `simpler_setup/runtime_builder.py` | `_compile_target` forwards the env var to the host CMake define |
 | `examples/a5/.../sdma_async_completion_demo/test_sdma_async_completion_demo.py` | `pytest.skip` when env var unset |
 
@@ -91,7 +98,7 @@ pip install -e .
 The env-var→CMake-define forwarding and the test skip gate pick it up
 automatically.
 
-**Option B — make SDMA the a5 default** (revert the 5 gating points above):
+**Option B — make SDMA the a5 default** (revert the gating points above):
 flip `option(... OFF)` → `set(... ON)`, make `_init_a5`'s `PTO_ISA_ROOT`
 ensure unconditional (mirror `_init_a2a3`), and remove the test skip gate.
 

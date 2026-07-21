@@ -12,6 +12,7 @@
 
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
@@ -116,7 +117,9 @@ void SchedulerContext::complete_slot_task(
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
-                while (!mailbox->try_push_condition(token, e->addr, e->expected_value, e->engine, e->completion_type)) {
+                while (!mailbox->try_push_condition(
+                    token, e->addr, e->backend_cookie, e->expected_value, e->engine, e->completion_type
+                )) {
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
@@ -297,6 +300,14 @@ void SchedulerContext::check_running_cores_for_completion(
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
         if (t.pending_done) {
+            // Task-timing finish: latest FIN observation for a tagged task, folded
+            // as max. Sampled after the rmb above and before complete_slot_task runs
+            // fanin / deferred-completion (which may also clear pending_slot_state),
+            // matching L2's finish_time point. Independent of L2 swimlane level, so
+            // it works in SIMPLER_DFX=0 builds; untagged tasks pay only the compare.
+            if (core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+                aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
+            }
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count
@@ -308,6 +319,9 @@ void SchedulerContext::check_running_cores_for_completion(
             cur_thread_completed++;
         }
         if (t.running_done) {
+            if (core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+                aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
+            }
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count
