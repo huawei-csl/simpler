@@ -41,6 +41,14 @@ constexpr uint32_t kProbeAicpuIdleTaskId = 0x7FFFFFFDu;
 constexpr uint32_t kProbeMaxCores = 8;
 constexpr uint32_t kProbeMaxConcurrentReaders = 4;
 
+// Phase 15 — LDR/compute overlap sweep. Tests whether ALU work with no data
+// dependency on the just-issued LDR can execute while that LDR is still
+// in flight, by comparing "process(i) right after fetch(i)" (naive, true
+// dependency) against "process(i-1) after fetch(i)" (pipelined, no
+// dependency on fetch(i)) across a range of compute-block sizes.
+constexpr uint32_t kProbeOverlapSweepPoints = 9;
+constexpr uint32_t kProbeOverlapItersTable[kProbeOverlapSweepPoints] = {0, 4, 8, 16, 32, 48, 64, 128, 256};
+
 // What the AICPU writes back to GM at result_addr. All ticks are in the
 // shared system counter (CNTVCT_EL0; 50 MHz on a3 / a5 → 20 ns / tick).
 struct alignas(8) MmioProbeResult {
@@ -63,6 +71,16 @@ struct alignas(8) MmioProbeResult {
     // claim ("per-thread cost unchanged as M grows") is directly visible.
     uint32_t _pad0;
     uint64_t ldr_c_thread_ticks[kProbeMaxConcurrentReaders][kProbeMaxConcurrentReaders];
+
+    // Phase 15 — per sweep point i, kProbeOverlapItersTable[i] compute
+    // iterations. calib = compute alone (no LDR); naive = fetch(i);process(i)
+    // each iter; pipelined = fetch(i);process(i-1) each iter (process has no
+    // data dependency on the LDR issued in the same iteration).
+    uint64_t overlap_ldr_n;
+    uint64_t overlap_calib_ticks[kProbeOverlapSweepPoints];
+    uint64_t overlap_naive_ticks[kProbeOverlapSweepPoints];
+    uint64_t overlap_pipelined_ticks[kProbeOverlapSweepPoints];
+    uint64_t overlap_sink;  // accumulated compute result, prevents DCE
 
     // Diagnostics.
     uint32_t magic;         // 0xABCD_1234 on success

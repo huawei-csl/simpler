@@ -21,6 +21,13 @@ Reproduces three measurements from
   This is the result that refutes the colloquial claim "polling COND
   from AICPU is sequential" (which is true for *one thread*, false
   across threads).
+- **Phase 15** — LDR/compute overlap sweep: at each compute-block size
+  in `kProbeOverlapItersTable`, compares "fetch(i); process(i)" (naive,
+  `process` has a true data dependency on the LDR just issued) against
+  "fetch(i); process(i-1)" (pipelined, `process` depends only on the
+  *prior* LDR, never the one issued that same iteration). See
+  [`docs/investigations/2026-07-aicpu-ldr-compute-overlap.md`](../../../docs/investigations/2026-07-aicpu-ldr-compute-overlap.md)
+  for the measured result and interpretation.
 
 For the GM-vs-COND notification path comparison (Phase 13 + 14), see
 [`tools/cann-examples/aicore-notification-perf/`](../aicore-notification-perf/) —
@@ -136,6 +143,12 @@ Arguments:
          thread=0 ... per=4.75 ticks (~95 ns/LDR)
          thread=1 ... per=4.91 ticks (~98 ns/LDR)
          thread=2 ... per=4.38 ticks (~87 ns/LDR)
+
+  --- Phase 15: LDR/compute overlap sweep (ldr_n=10000) ---
+       iters     calib ns     naive ns  pipeline ns   pipe-calib
+           0            1           97           98         97
+          48           95          164          134         39
+         256          512          587          549         37
 ```
 
 The per-thread cost holding flat as M grows from 1 → 3 is the

@@ -28,6 +28,15 @@
 //                    Per-thread cost should stay ~95 ns regardless of M
 //                    (parallel scaling proves the nGnRE LDR bus is per-target,
 //                    not chip-shared).
+//   Phase 15       — LDR/compute overlap sweep. At each compute-block size in
+//                    kProbeOverlapItersTable: calibrate the compute block
+//                    alone, then compare "fetch(i); process(i)" (naive, true
+//                    dependency on the LDR just issued) against "fetch(i);
+//                    process(i-1)" (pipelined, process has no dependency on
+//                    the LDR issued that same iteration). If naive and
+//                    pipelined track each other 1:1 across the sweep, the
+//                    core has no window to execute independent work while a
+//                    Device-nGnRE LDR is outstanding.
 
 #include <cstdint>
 #include <cstring>
@@ -196,6 +205,71 @@ void RunPhase12MultiThread(uint64_t base, uint32_t n_cores, MmioProbeResult *res
     DiagLog(kDlogLevelInfo, "Phase 12 multi-thread done");
 }
 
+// --- Phase 15 LDR/compute overlap sweep ---
+// Sequential dependency chain (each step depends on the previous), so the
+// compiler cannot fold or reorder it away; cost scales with `iters`.
+static inline uint64_t DummyCompute(uint64_t x, uint32_t iters) {
+    for (uint32_t i = 0; i < iters; i++) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+    }
+    return x;
+}
+
+void RunPhase15Overlap(uint64_t base, MmioProbeResult *result) {
+    volatile uint32_t *cond0 = reinterpret_cast<volatile uint32_t *>(RegAddr(base, 0, kProbeRegSprCondOffset));
+    uint64_t sink = 0;
+
+    for (uint32_t p = 0; p < kProbeOverlapSweepPoints; p++) {
+        uint32_t iters = kProbeOverlapItersTable[p];
+
+        // Calibration: compute alone, no LDR.
+        {
+            uint64_t acc = 0x9e3779b97f4a7c15ULL ^ p;
+            uint64_t t0 = SysCntAicpu();
+            for (int j = 0; j < kLdrN; j++) {
+                acc = DummyCompute(acc, iters);
+            }
+            uint64_t t1 = SysCntAicpu();
+            result->overlap_calib_ticks[p] = t1 - t0;
+            sink ^= acc;
+        }
+
+        // Naive: fetch(j); process(j) — process has a true data dependency
+        // on the value fetch(j) just returned.
+        {
+            uint64_t acc = 0xbf58476d1ce4e5b9ULL ^ p;
+            uint64_t t0 = SysCntAicpu();
+            for (int j = 0; j < kLdrN; j++) {
+                uint32_t v = *cond0;
+                acc = DummyCompute(acc ^ v, iters);
+            }
+            uint64_t t1 = SysCntAicpu();
+            result->overlap_naive_ticks[p] = t1 - t0;
+            sink ^= acc;
+        }
+
+        // Pipelined: fetch(j); process(j-1) — process depends only on the
+        // PRIOR fetch's value, never on the LDR issued in the same iteration.
+        {
+            uint64_t acc = 0x94d049bb133111ebULL ^ p;
+            uint32_t v_prev = *cond0;
+            uint64_t t0 = SysCntAicpu();
+            for (int j = 1; j < kLdrN; j++) {
+                uint32_t v_cur = *cond0;
+                acc = DummyCompute(acc ^ v_prev, iters);
+                v_prev = v_cur;
+            }
+            acc = DummyCompute(acc ^ v_prev, iters);
+            uint64_t t1 = SysCntAicpu();
+            result->overlap_pipelined_ticks[p] = t1 - t0;
+            sink ^= acc;
+        }
+    }
+    result->overlap_ldr_n = kLdrN;
+    result->overlap_sink = sink;
+    DiagLog(kDlogLevelInfo, "Phase 15 overlap sweep done");
+}
+
 }  // namespace
 
 extern "C" {
@@ -227,6 +301,7 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     RunPhase4(base, result);
     RunPhase12SingleThread(base, n_cores, result);
     RunPhase12MultiThread(base, n_cores, result);
+    RunPhase15Overlap(base, result);
 
     result->observed_pid = static_cast<uint64_t>(getpid());
     result->magic = kMmioProbeResultMagic;

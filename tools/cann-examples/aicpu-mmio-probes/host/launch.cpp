@@ -302,6 +302,25 @@ void PrintResultTable(const MmioProbeResult &r) {
             }
         }
     }
+
+    std::printf("\n  --- Phase 15: LDR/compute overlap sweep (ldr_n=%lu) ---\n", (unsigned long)r.overlap_ldr_n);
+    std::printf("    %8s %12s %12s %12s   %8s\n", "iters", "calib ns", "naive ns", "pipeline ns", "pipe-calib");
+    if (r.overlap_ldr_n > 0) {
+        for (uint32_t p = 0; p < kProbeOverlapSweepPoints; p++) {
+            uint64_t calib_ns = tn(r.overlap_calib_ticks[p]) / r.overlap_ldr_n;
+            uint64_t naive_ns = tn(r.overlap_naive_ticks[p]) / r.overlap_ldr_n;
+            uint64_t pipe_ns = tn(r.overlap_pipelined_ticks[p]) / r.overlap_ldr_n;
+            long delta = (long)pipe_ns - (long)calib_ns;
+            std::printf(
+                "    %8u %12lu %12lu %12lu   %8ld\n", kProbeOverlapItersTable[p], (unsigned long)calib_ns,
+                (unsigned long)naive_ns, (unsigned long)pipe_ns, delta
+            );
+        }
+        std::printf(
+            "    (sink=0x%016lx — ignore; keeps the compiler from eliding the compute chain)\n",
+            (unsigned long)r.overlap_sink
+        );
+    }
 }
 
 }  // namespace
