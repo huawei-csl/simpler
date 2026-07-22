@@ -32,6 +32,8 @@
 #include <string>
 #include <vector>
 
+#include <tracr_simpler_api.hpp>
+
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
@@ -200,6 +202,15 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
+
+    // Initialize TraCR memory on the device
+#ifdef ENABLE_TRACR
+    rc = DevAllocTraCR(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
+        return rc;
+    }
+#endif
 
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
     // filter-style gate (see src/common/platform/onboard/aicpu/
@@ -435,6 +446,15 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
 
     read_device_wall_ns();
+
+    // Download and Free TraCR memory from Device and store in memory (~/ascend/)
+#ifdef ENABLE_TRACR
+    rc = StoreTracrData(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("FreeTraCR failed: %d", rc);
+        return -1;
+    }
+#endif
 
     teardown_shared_collectors_after_run();
 
