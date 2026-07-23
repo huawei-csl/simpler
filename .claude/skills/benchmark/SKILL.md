@@ -226,7 +226,42 @@ git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
 
 ## Step 6: Report Results
 
-Parse all five `Avg <Metric>:` lines per example (`Host`, `Device`, `Effective`, `Orch`, `Sched`) from benchmark output.
+**Compare mode: use `compare_benchmark_runs` instead of eyeballing the `Avg <Metric>:` delta.**
+Both `benchmark_rounds.sh` runs from Step 5 are teed to files
+(`tmp/benchmark_baseline_*.txt` / `tmp/benchmark_current_*.txt`) that contain
+the full per-round table, not just the summary line. Feed both files to the
+comparison tool:
+
+```bash
+python -m simpler_setup.tools.compare_benchmark_runs \
+    "tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt" \
+    "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+```
+
+Per example × metric, it drops the top/bottom 5% of rounds on each side
+(`--trim-pct`, default 5.0 — filters interference from other processes on
+this shared box), then reports Welch's t-test (unequal-variance, two-sided)
+and Cohen's d, verdicting `IMPROVEMENT` / `REGRESSION` / `noise` from
+statistical significance (`p < 0.05`, `--alpha`) rather than a fixed
+delta-percent cutoff — a 2% shift can be solid signal on a tight
+distribution or pure noise on a wide one, and the old flat `±2%` heuristic
+below could not tell them apart. `Effective` is the headline metric for the
+overall improved/regressed/noise count; `Host` is the noisiest column
+(Python overhead) and its own significance calls should be read
+skeptically, not treated as the verdict.
+
+This is the standard method for general kernel-level (`Host` / `Device` /
+`Effective` / `Orch` / `Sched`) comparisons. It does **not** cover
+function-specific instrumentation — e.g. a dedicated timer wrapped around
+one internal function to isolate its contribution — which is a separate,
+ad hoc technique to reach for only when deep-diving a specific function
+inside an investigation (see
+[docs/investigations/2026-07-aicpu-ldr-compute-overlap.md](../../../docs/investigations/2026-07-aicpu-ldr-compute-overlap.md)
+for an example), not part of this general standard.
+
+For a manual read (or when only the summary line is available), parse all
+five `Avg <Metric>:` lines per example (`Host`, `Device`, `Effective`, `Orch`,
+`Sched`) from benchmark output.
 
 | Metric | Source | What it captures |
 | ------ | ------ | ---------------- |
@@ -295,7 +330,10 @@ If baseline and current ran on **different devices**, add a note:
 
 > Note: Baseline and current ran on different NPU devices (4 vs 6). Results within ±2% may reflect device-to-device variance rather than code changes. For definitive comparison, re-run on the same device with `/benchmark -d <single_device>`.
 
-**Interpretation:**
+**Interpretation:** prefer `compare_benchmark_runs`'s per-example significance
+verdict (`IMPROVEMENT` / `REGRESSION` / `noise` from Welch's t-test, see Step
+6) over a flat delta-percent cutoff. When only the summary-line delta is
+available (no teed per-round files to feed the tool), fall back to:
 
 | Change (%) | Assessment |
 | ---------- | ---------- |
@@ -303,7 +341,8 @@ If baseline and current ran on **different devices**, add a note:
 | -2% to +2% | Within noise margin |
 | > +2% | Potential regression — flag for review |
 
-If any example shows > 5% regression, highlight it explicitly.
+Flag any example the tool calls `REGRESSION` on `Effective`, or (fallback
+table) any example showing > 5% regression, explicitly.
 
 ## Error Handling
 
@@ -329,4 +368,4 @@ If any example shows > 5% regression, highlight it explicitly.
 - [ ] Worktree cleaned up (compare mode)
 - [ ] Results table presented with Host / Device / Effective / Orch / Sched times
 - [ ] (Compare mode) Device difference noted if applicable
-- [ ] (Compare mode) Regressions > 2% flagged
+- [ ] (Compare mode) `compare_benchmark_runs` run on the teed baseline/current files; regressions flagged by statistical significance (fallback: > 2% delta)

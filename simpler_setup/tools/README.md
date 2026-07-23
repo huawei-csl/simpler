@@ -12,6 +12,7 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
+- **[compare_benchmark_runs](#compare_benchmark_runs)** — statistically compare two `benchmark_rounds.sh`-teed runs (5%-trimmed Welch's t-test + Cohen's d)
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
@@ -263,6 +264,58 @@ device log needed. The scene test only *emits* the markers to stderr; tee a run
 to a file (`python test_*.py … --rounds N > run.log 2>&1`) and pass `run.log`
 here. Because grouping is per `(pid, inv)`, this captures **L3 multi-round**
 (every chip-child invocation), not just round 0.
+
+---
+
+## compare_benchmark_runs
+
+Statistically compare two [`tools/benchmark_rounds.sh`](../../tools/benchmark_rounds.sh)-teed
+output files (baseline vs current), per example and per metric (`Host`,
+`Device`, `Effective`, `Orch`, `Sched`). Used by the [`benchmark`](../../.claude/skills/benchmark/SKILL.md)
+skill's compare-mode reporting step.
+
+### Overview
+
+Re-parses the full per-round table each side printed (not just the `Avg
+<Metric>:` summary line), drops the top/bottom 5% of rounds per side per
+metric (`--trim-pct`, filters interference from other processes on a shared
+box), then runs Welch's two-sample t-test (unequal-variance, two-sided) and
+computes Cohen's d, calling each example/metric `IMPROVEMENT` / `REGRESSION`
+/ `noise` by statistical significance (`p < --alpha`, default 0.05) instead
+of a flat delta-percent cutoff. Pure Python — no scipy dependency; the
+t-distribution p-value uses the standard continued-fraction regularized
+incomplete beta function.
+
+### Basic Usage
+
+```bash
+python -m simpler_setup.tools.compare_benchmark_runs \
+    tmp/benchmark_baseline_<ts>_<runtime>.txt \
+    tmp/benchmark_current_<ts>_<runtime>.txt
+
+# Looser/tighter trim or significance threshold
+python -m simpler_setup.tools.compare_benchmark_runs baseline.txt current.txt \
+    --trim-pct 10 --alpha 0.01
+```
+
+### Command-Line Options
+
+| Option | Description |
+| ------ | ----------- |
+| `baseline` | `benchmark_rounds.sh`-teed output file, baseline side |
+| `current` | `benchmark_rounds.sh`-teed output file, current side |
+| `--trim-pct` | Percent of rounds dropped from each tail per side per metric before comparing (default: 5.0) |
+| `--alpha` | Significance threshold for the Welch's t-test p-value (default: 0.05) |
+
+### Output
+
+One block per example (per `--case`/mode subsection, if the benchmark ran
+more than one), with a row per metric: trimmed base/current means, delta
+(absolute + %), p-value, Cohen's d, sample sizes, and a verdict. A final
+`Overall (Effective, alpha=...)` line tallies improved/regressed/noise
+across examples using `Effective` as the headline metric — `Host` is the
+noisiest column (includes Python dispatch overhead) and its calls should be
+read as context, not the verdict.
 
 ---
 
