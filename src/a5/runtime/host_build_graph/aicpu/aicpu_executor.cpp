@@ -31,6 +31,9 @@
 #include "spin_hint.h"
 #include "tensor_info.h"
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 constexpr int MAX_CORES = PLATFORM_MAX_CORES;
@@ -313,6 +316,16 @@ inline bool AicpuExecutor::try_dispatch_task(
         aicpu_task_timing_dispatch(timed->task_timing_slot, thread_idx);
     }
 
+    // Mark this core's TraCR lane as running the dispatched task; extraId carries
+    // the kernel func_id so post-processing maps it to a kernel name. Core lanes
+    // follow the aicpu-thread lanes in the channel layout, so the lane index is
+    // aicpu_thread_num_ + core_id.
+    if (Task *tracr_task = runtime_->get_task(task_id); tracr_task != nullptr) {
+        INSTRUMENTATION_MARK_SET(
+            aicpu_thread_num_ + core_id, Running_Task_Single, static_cast<uint32_t>(tracr_task->func_id)
+        );
+    }
+
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
     return true;
@@ -321,6 +334,7 @@ inline bool AicpuExecutor::try_dispatch_task(
 // ===== AicpuExecutor Method Implementations =====
 
 int AicpuExecutor::init(Runtime *runtime) {
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, uint32_t(tracr_getcpu()));
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return 0;
@@ -816,6 +830,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 pending_task_ids_[core_id] = AICPU_TASK_INVALID;
                 running_task_ids_[core_id] = AICPU_TASK_INVALID;
 
+                INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
+
                 // Try dispatch BEFORE resolve_dependencies
                 // This allows the core to start next task immediately
                 bool dispatched = false;
@@ -949,6 +965,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 completed_tasks_.fetch_add(1, std::memory_order_release);
 
                 running_task_ids_[core_id] = AICPU_TASK_INVALID;
+
+                INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
 
                 bool dispatched = false;
                 if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
@@ -1132,6 +1150,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     const int *cur_thread_cores = core_assignments_[thread_idx];
 
     LOG_INFO_V0("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     LOG_INFO_V0("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
@@ -1155,6 +1174,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     }
 #endif
 
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
     int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {
         return rc;
@@ -1323,6 +1343,64 @@ void AicpuExecutor::diagnose_stuck_state(
 
 // ===== Public Entry Point =====
 
+/**
+ * init tracr profiler
+ *
+ * NOTE: make sure g_TraCR_thread_idx starts at 0 and follows in the positive direction
+ */
+inline void TRACR_START() {
+    g_TraCR_thread_idx = g_TraCR_thread_idx_counter.fetch_add(1, std::memory_order_relaxed);
+
+    if (g_TraCR_thread_idx == 0) {
+        INSTRUMENTATION_START();
+    } else {
+        INSTRUMENTATION_THREAD_INIT();
+    }
+}
+
+/**
+ * finalizing tracr function
+ *
+ * NOTE: make sure g_TraCR_thread_idx starts at 0 and follows in the positive direction
+ */
+inline void TRACR_FINALIZE(Runtime *runtime) {
+    (void)(runtime);
+
+#ifdef ENABLE_TRACR
+    LOG_INFO_V9(
+        "[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx,
+        runtime->get_tracr_data()
+    );
+
+    if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->get_aicpu_thread_num()) {
+        if (runtime->get_tracr_data() != nullptr && tracrThread->_traceIdx > 0) {
+            TraCR::Payload *tracrData = reinterpret_cast<TraCR::Payload *>(runtime->get_tracr_data());
+            const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
+
+            std::memcpy(&tracrData[g_TraCR_thread_idx * TraCR::CAPACITY], tracrThread->_traces.data(), payload_size);
+        }
+
+        if (runtime->get_tracr_data_sizes() != nullptr) {
+            size_t *tracrDataSizes = reinterpret_cast<size_t *>(runtime->get_tracr_data_sizes());
+            tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
+        }
+    } else {
+        LOG_ERROR(
+            "[TraCR] thread index %d out of bounds (max=%d)", g_TraCR_thread_idx, runtime->get_aicpu_thread_num()
+        );
+    }
+#endif
+
+    if (g_TraCR_thread_idx == 0) {
+        INSTRUMENTATION_END();
+        g_TraCR_thread_idx_counter.store(0, std::memory_order_relaxed);
+    } else {
+        INSTRUMENTATION_THREAD_FINALIZE();
+    }
+
+    g_TraCR_thread_idx = -1;
+}
+
 // host_build_graph resolves orchestration on the host during prepare, so it has
 // no device-side registration: it deliberately does NOT export
 // simpler_aicpu_register_callable (only the TMARB runtime does). The host's
@@ -1355,6 +1433,12 @@ extern "C" int aicpu_execute(Runtime *runtime) {
 
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
 
+    // INIT TraCR all threads coming in
+    TRACR_START();
+    LOG_INFO_V9(
+        "[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE
+    );
+
     // Get platform register addresses from platform-level global
     g_aicpu_executor.regs_ = get_platform_regs();
 
@@ -1370,13 +1454,20 @@ extern "C" int aicpu_execute(Runtime *runtime) {
     int rc = g_aicpu_executor.run(runtime);
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
-        return rc;
     }
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+    }
+
+    INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
+    // Finalize TraCR all threads coming in
+    TRACR_FINALIZE(runtime);
+
+    if (rc != 0) {
+        return rc;
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
