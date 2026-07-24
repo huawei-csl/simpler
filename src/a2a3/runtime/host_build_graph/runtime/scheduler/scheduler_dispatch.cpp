@@ -1043,13 +1043,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
-            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_
-#if SIMPLER_SCHED_PROFILING
-                ,
-                thread_idx
-#endif
-            );
+            AsyncPollResult poll_result =
+                sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, thread_idx);
             if (poll_result.error_code != PTO2_ERROR_NONE) {
                 int32_t expected = PTO2_ERROR_NONE;
                 header->sched_error_code.compare_exchange_strong(
@@ -1163,7 +1158,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_SCHED_PROFILING
                 dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
 #else
-                dummy_consumers = sched_->on_task_complete(dummy_slot);
+                dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx);
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {

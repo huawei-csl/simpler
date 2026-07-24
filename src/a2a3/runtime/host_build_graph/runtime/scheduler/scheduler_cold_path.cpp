@@ -1095,12 +1095,12 @@ void SchedulerContext::on_orchestration_done(
                 continue;  // completed on the host (hidden alloc); nothing to dispatch
             }
             PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-            int32_t state = sched_->classify_fanin_state(&s);
+            int32_t state = sched_->classify_fanin_state(&s, thread_idx);
             if (state < 0) {
                 sched_->push_ready_routed(&s);
             } else {
                 int32_t prod_local = s.payload->fanin_local_ids[state];
-                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s, thread_idx);
             }
         }
     }

@@ -203,7 +203,7 @@ void SchedulerContext::complete_slot_task(
         // `fanout_edges` is the consumer-walk count.
         consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
 #else
-        consumers_resolved = sched_->on_task_complete(slot_state);
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx);
 #endif
 #if SIMPLER_DFX
         if (resolve_t0 != 0) {

@@ -58,6 +58,7 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
     ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
     ring.completion_flags = (std::atomic<uint8_t> *)(base + off.completion_flags);
+    ring.thread_completion_cache = (uint64_t *)(base + off.thread_completion_cache);
 }
 
 void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
@@ -194,6 +195,17 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // zero on device; stale non-zero bytes would make consumers observe a
     // producer as already completed. Zero the whole per-ring array once.
     __builtin_memset((void *)ring.completion_flags, 0, task_window_sizes[0] * sizeof(std::atomic<uint8_t>));
+
+    // Per-thread completion_flags cache: same zero-on-init rationale as above.
+    ring.thread_completion_cache_words_per_thread =
+        PTO2SharedMemoryRingHeader::thread_completion_cache_words_per_thread_for(
+            static_cast<int32_t>(task_window_sizes[0])
+        );
+    __builtin_memset(
+        (void *)ring.thread_completion_cache, 0,
+        static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS) * ring.thread_completion_cache_words_per_thread *
+            sizeof(uint64_t)
+    );
 }
 
 // =============================================================================

@@ -34,6 +34,7 @@
 
 #include <stddef.h>
 
+#include "common/platform_config.h"  // PLATFORM_MAX_AICPU_THREADS
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
@@ -105,12 +106,66 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // Zeroed host-side at init. Indexed by local_id & task_window_mask.
     std::atomic<uint8_t> *completion_flags;
 
+    // Per-AICPU-scheduler-thread monotonic cache over completion_flags: one
+    // packed bit per task slot (same count as completion_flags, i.e.
+    // task_window_mask + 1) per thread. Device-addressed,
+    // PLATFORM_MAX_AICPU_THREADS * thread_completion_cache_words_per_thread
+    // uint64_t words, zeroed host-side at init like completion_flags. Avoids a
+    // repeat atomic load on completion_flags once a thread has itself observed
+    // a producer complete -- safe because completion_flags only ever goes
+    // 0 -> 1. No C++ `thread_local`: this codebase avoids it on AICPU (glibc
+    // TLSDESC issue, docs/dynamic-linking.md), so threads are distinguished by
+    // an explicit thread_idx index instead.
+    uint64_t *thread_completion_cache;
+    // Per-thread stride, in words, padded up to a whole number of 64-byte
+    // cache lines (see thread_completion_cache_words_per_thread_for) so no two
+    // threads' slices ever share a line -- each thread only ever writes its
+    // own slice. The region's start is itself cache-line aligned (every
+    // pto2_sm_layout segment is PTO2_ALIGN_UP-padded), so this alone is enough
+    // to keep every thread's slice on its own line.
+    uint32_t thread_completion_cache_words_per_thread;
+
+    static uint32_t thread_completion_cache_words_per_thread_for(int32_t task_window_size) {
+        constexpr uint32_t kWordsPerCacheLine = PTO2_ALIGN_SIZE / sizeof(uint64_t);
+        const uint32_t words_needed = static_cast<uint32_t>((task_window_size + 63) / 64);
+        return PTO2_ALIGN_UP(words_needed, kWordsPerCacheLine);
+    }
+
+    uint64_t *thread_completion_cache_word(int32_t thread_idx, uint32_t idx) const {
+        return thread_completion_cache + static_cast<size_t>(thread_idx) * thread_completion_cache_words_per_thread +
+               (idx >> 6);
+    }
+
+    static uint64_t thread_completion_cache_bit(uint32_t idx) { return uint64_t{1} << (idx & 63); }
+
     bool is_completion_flag_set(int32_t local_id, std::memory_order order = std::memory_order_acquire) const {
         return completion_flags[local_id & task_window_mask].load(order) != 0;
     }
 
+    // Thread `thread_idx`'s cached-or-live view of completion_flags[local_id].
+    // Checks this thread's bit first; on a miss, falls back to the raw atomic
+    // flag above and, if set, latches the bit for next time.
+    bool is_completion_flag_set(int32_t local_id, int32_t thread_idx) const {
+        uint32_t idx = static_cast<uint32_t>(local_id) & static_cast<uint32_t>(task_window_mask);
+        uint64_t *w = thread_completion_cache_word(thread_idx, idx);
+        uint64_t b = thread_completion_cache_bit(idx);
+        if (*w & b) return true;
+        if (!is_completion_flag_set(local_id)) return false;
+        *w |= b;
+        return true;
+    }
+
     void set_completion_flag(int32_t local_id, std::memory_order order = std::memory_order_release) const {
         completion_flags[local_id & task_window_mask].store(1, order);
+    }
+
+    // Publishes the shared flag AND latches thread `thread_idx`'s own cache
+    // bit directly, bypassing the is_completion_flag_set() re-check above for
+    // a completion this thread just caused itself.
+    void set_completion_flag(int32_t local_id, int32_t thread_idx) const {
+        set_completion_flag(local_id);
+        uint32_t idx = static_cast<uint32_t>(local_id) & static_cast<uint32_t>(task_window_mask);
+        *thread_completion_cache_word(thread_idx, idx) |= thread_completion_cache_bit(idx);
     }
 
     int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
@@ -275,15 +330,19 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base) noexce
     );
 }
 
-// Byte offsets (from the SM base) of the ring's three segments. The layout is:
-// header, then descriptors -> payloads -> slot_states, every segment
-// PTO2_ALIGN_UP-padded.
+// Byte offsets (from the SM base) of the ring's segments. The layout is:
+// header, then descriptors -> payloads -> slot_states -> completion_flags ->
+// thread_completion_cache, every segment PTO2_ALIGN_UP-padded -- which is what
+// guarantees thread_completion_cache itself starts on a cache line, the
+// precondition PTO2SharedMemoryRingHeader::thread_completion_cache_word()
+// relies on to keep every thread's slice on its own line.
 struct PTO2RingSegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
     uint64_t slot_states;
-    uint64_t completion_flags;  // polling-completion byte array (1 byte/slot)
-    uint64_t end;               // offset just past completion_flags (total SM size)
+    uint64_t completion_flags;         // polling-completion byte array (1 byte/slot)
+    uint64_t thread_completion_cache;  // per-thread packed-bit cache over completion_flags
+    uint64_t end;                      // offset just past thread_completion_cache (total SM size)
 };
 
 // Single source of truth for the SM segment layout. Returns offsets (not
@@ -303,6 +362,13 @@ inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) no
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     o.completion_flags = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
+    o.thread_completion_cache = off;
+    const auto window_size = static_cast<int32_t>(task_window_size);
+    const uint32_t words_per_thread =
+        PTO2SharedMemoryRingHeader::thread_completion_cache_words_per_thread_for(window_size);
+    off += PTO2_ALIGN_UP(
+        static_cast<uint64_t>(PLATFORM_MAX_AICPU_THREADS) * words_per_thread * sizeof(uint64_t), PTO2_ALIGN_SIZE
+    );
     o.end = off;
     return o;
 }
@@ -326,6 +392,13 @@ inline PTO2TaskSlotState *ring_slot_states_addr(void *sm_dev_base, uint64_t task
 inline std::atomic<uint8_t> *ring_completion_flags_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
     return reinterpret_cast<std::atomic<uint8_t> *>(
         static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).completion_flags
+    );
+}
+
+// Device address of the per-thread packed-bit completion_flags cache.
+inline uint64_t *ring_thread_completion_cache_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
+    return reinterpret_cast<uint64_t *>(
+        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).thread_completion_cache
     );
 }
 
