@@ -52,7 +52,9 @@ if(BUILD_TRACR)
     target_include_directories(tracr SYSTEM PRIVATE
         ${CMAKE_SOURCE_DIR}/tools/tracr/include
         ${CMAKE_SOURCE_DIR}/tools/tracr/extern)
-    target_compile_definitions(tracr PRIVATE ENABLE_TRACR)
+    # USE_HW_COUNTER matches the device-side TraCR clock (tools/tracr.cmake), so
+    # host and (sim) device markers share one hardware-counter time base.
+    target_compile_definitions(tracr PRIVATE ENABLE_TRACR USE_HW_COUNTER)
     if(SKBUILD_MODE)
         install(TARGETS tracr DESTINATION .)
     else()

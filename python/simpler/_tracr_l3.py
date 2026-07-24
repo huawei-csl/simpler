@@ -16,6 +16,7 @@ beside the device-side ``proc.<1000+device_id>`` folders under
 ``~/ascend/tracr_<PYPTO_RUN_SAMPLE_ID>/`` so a single ``tracr_process`` run
 merges the host scheduling lane with the per-device lanes.
 """
+import json
 import os
 import shutil
 
@@ -79,7 +80,23 @@ def _relocate_proc() -> None:
             if os.path.exists(dst):
                 shutil.rmtree(dst)
             shutil.move(src, dst)
+            _anchor_to_device_timeline(os.path.join(dst, "metadata.json"))
     except OSError:
+        pass
+
+
+def _anchor_to_device_timeline(metadata_path: str) -> None:
+    # Device procs anchor on the raw hardware-counter timeline (start_time=0);
+    # with USE_HW_COUNTER the host reads the same counter, so start_time=0 keeps
+    # the host lane on that shared raw timeline instead of being normalized to
+    # its own zero (which shifts it far from the device lanes in tracr_process).
+    try:
+        with open(metadata_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["start_time"] = 0
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+    except (OSError, ValueError):
         pass
 
 
