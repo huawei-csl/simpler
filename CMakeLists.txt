@@ -28,6 +28,41 @@ find_package(nanobind CONFIG REQUIRED)
 # Include Python bindings
 add_subdirectory(python/bindings)
 
+# PyTraCR: host-side Python bindings for TraCR (`import tracr`), built and
+# installed only when the BUILD_TRACR env var is set (the same switch that
+# compiles the device-side C++ TraCR). Built from TraCR's own meson project;
+# the module lands at the wheel root like _task_interface so `import tracr`
+# resolves after install. Requires the meson, ninja, and pybind11 pip packages
+# in the build environment.
+set(BUILD_TRACR OFF)
+if(DEFINED ENV{BUILD_TRACR})
+    set(BUILD_TRACR $ENV{BUILD_TRACR})
+endif()
+if(BUILD_TRACR)
+    set(PYTRACR_SRC_DIR ${CMAKE_SOURCE_DIR}/tools/tracr)
+    set(PYTRACR_BUILD_DIR ${CMAKE_BINARY_DIR}/pytracr)
+    if(EXISTS ${PYTRACR_BUILD_DIR})
+        set(PYTRACR_SETUP_FLAGS --reconfigure)
+    else()
+        set(PYTRACR_SETUP_FLAGS)
+    endif()
+    # Invoke meson through the build Python so it resolves from the venv's
+    # `meson` pip package without depending on a `meson` script on PATH.
+    add_custom_target(pytracr_module ALL
+        COMMAND ${Python_EXECUTABLE} -m mesonbuild.mesonmain setup ${PYTRACR_SETUP_FLAGS}
+                ${PYTRACR_BUILD_DIR} ${PYTRACR_SRC_DIR}
+                -DbuildPyTraCR=true -DbuildExamples=false -DbuildTests=false
+        COMMAND ${Python_EXECUTABLE} -m mesonbuild.mesonmain compile -C ${PYTRACR_BUILD_DIR}
+        COMMENT "Building PyTraCR Python module (import tracr)"
+        VERBATIM
+    )
+    if(SKBUILD_MODE)
+        install(DIRECTORY ${PYTRACR_BUILD_DIR}/include/pytracr/
+                DESTINATION .
+                FILES_MATCHING PATTERN "tracr*.so")
+    endif()
+endif()
+
 # Compiler sanitizer for host-compiled targets (sim runtime/kernels and the
 # onboard host runtime). Default `none`. Preset (asan/ubsan/tsan) or a raw
 # -fsanitize token list. Enable at `pip install` time via

@@ -38,6 +38,7 @@ from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
+from . import _tracr_l3 as _tracr
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -195,6 +196,7 @@ class Orchestrator:
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         cpp_worker_id = int(worker)
         captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
+        _tracr.mark_set("SubmitNextLevel", cpp_worker_id)
         try:
             self._o.submit_next_level(
                 digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
@@ -203,6 +205,8 @@ class Orchestrator:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
             raise
+        finally:
+            _tracr.mark_reset()
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
@@ -274,6 +278,7 @@ class Orchestrator:
         if self._worker is not None and remote_sidecars is not None:
             for sidecar in remote_sidecars:
                 captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
+        _tracr.mark_set("SubmitNextLevelGroup", len(args_list))
         try:
             self._o.submit_next_level_group(
                 digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
@@ -282,6 +287,8 @@ class Orchestrator:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
             raise
+        finally:
+            _tracr.mark_reset()
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
@@ -352,12 +359,16 @@ class Orchestrator:
         """
         if self._worker is None:
             raise RuntimeError("allocate_domain requires an Orchestrator bound to a Worker")
-        return self._worker._allocate_domain(
-            name=str(name),
-            workers=tuple(int(w) for w in workers),
-            window_size=int(window_size),
-            buffers=list(buffers),
-        )
+        _tracr.mark_set("AllocateDomain", len(workers))
+        try:
+            return self._worker._allocate_domain(
+                name=str(name),
+                workers=tuple(int(w) for w in workers),
+                window_size=int(window_size),
+                buffers=list(buffers),
+            )
+        finally:
+            _tracr.mark_reset()
 
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Collective release.  Equivalent to ``handle.release()``."""
@@ -466,7 +477,11 @@ class Orchestrator:
         self._o._scope_end()
 
     def _drain(self) -> None:
-        self._o._drain()
+        _tracr.mark_set("Drain")
+        try:
+            self._o._drain()
+        finally:
+            _tracr.mark_reset()
 
     def _clear_error(self) -> None:
         self._o._clear_error()

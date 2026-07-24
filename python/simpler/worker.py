@@ -94,6 +94,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 )
 
 from . import _log as _simpler_log
+from . import _tracr_l3 as _tracr
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
     CallableHandle,
@@ -4917,6 +4918,10 @@ class Worker:
 
         assert self._orch is not None
         assert self._worker is not None
+        # Host-side L3 scheduling markers run on this (orchestrator main) thread;
+        # start() is idempotent and safe here because init() has completed all
+        # forks (a PyTraCR proc created before a fork would be COW-inherited).
+        _tracr.start()
         # Drop any error stashed by a previous run() so this call starts
         # clean. drain() rethrows on the way out; every successful run()
         # leaves the error slot empty, but an unrelated caller may have
@@ -5000,6 +5005,11 @@ class Worker:
                 self._hierarchical_start_cv.wait()
         if not self._initialized:
             return
+
+        # Flush the host L3 scheduling trace before teardown. No-op unless start()
+        # ran (the L3 orchestrator process only); END requires the main thread to
+        # be the only PyTraCR-initialized thread, which holds here.
+        _tracr.end()
 
         # Release any orch-allocated CommDomain handles before tearing down
         # the C++ scheduler.  Once `dw.close()` runs, the chip mailboxes
