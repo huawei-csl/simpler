@@ -4212,10 +4212,15 @@ class Worker:
             errors: dict[int, BaseException] = {}
 
             def dispatch(chip_idx: int) -> None:
+                _tracr.thread_init()
                 try:
+                    _tracr.mark_set_chip(chip_idx, "CommInit")
                     dw.control_comm_init(chip_idx, request_shms[chip_idx].name)
                 except BaseException as e:  # noqa: BLE001
                     errors[chip_idx] = e
+                finally:
+                    _tracr.mark_reset_chip(chip_idx)
+                    _tracr.thread_finalize()
 
             threads = [
                 threading.Thread(target=dispatch, args=(i,), name=f"comm_init_chip_{i}") for i in range(len(device_ids))
@@ -4486,7 +4491,9 @@ class Worker:
         errors: dict[int, BaseException] = {}
 
         def dispatch(chip_idx: int) -> None:
+            _tracr.thread_init()
             try:
+                _tracr.mark_set_chip(chip_idx, "AllocDomainChip" if op == "alloc" else "ReleaseDomainChip")
                 req_name = request_shms[chip_idx].name
                 if op == "alloc":
                     assert reply_shms is not None
@@ -4495,6 +4502,9 @@ class Worker:
                     dw.control_release_domain(chip_idx, req_name)
             except BaseException as e:  # noqa: BLE001
                 errors[chip_idx] = e
+            finally:
+                _tracr.mark_reset_chip(chip_idx)
+                _tracr.thread_finalize()
 
         threads = [threading.Thread(target=dispatch, args=(w,), name=f"{op}_domain_chip_{w}") for w in workers]
         for t in threads:

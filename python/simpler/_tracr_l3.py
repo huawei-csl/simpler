@@ -30,11 +30,21 @@ except ImportError:
 # The orchestrator main thread is the only PyTraCR-initialized thread, so all
 # host markers share this one lane.
 _ORCH_CHANNEL = 0
-_MARKER_LABELS = ("AllocateDomain", "SubmitNextLevel", "SubmitNextLevelGroup", "Drain")
+_MARKER_LABELS = (
+    "AllocateDomain",
+    "SubmitNextLevel",
+    "SubmitNextLevelGroup",
+    "Drain",
+    "CommInit",
+    "AllocDomainChip",
+    "ReleaseDomainChip",
+)
 
 _started = False
 _labels: dict[str, int] = {}
 _trace_base = ""
+# Chip ``i`` records on lane ``i + 1`` (lane 0 is the orchestrator main thread).
+_chip_ids: set[int] = set()
 
 
 def _base_dir() -> str:
@@ -65,7 +75,10 @@ def end() -> None:
     global _started
     if not active():
         return
-    _t.INSTRUMENTATION_ADD_CHANNEL_NAMES(["L3_Orchestrator"])
+    channel_names = ["L3_Orchestrator"]
+    if _chip_ids:
+        channel_names += [f"Chip_{i}" for i in range(max(_chip_ids) + 1)]
+    _t.INSTRUMENTATION_ADD_CHANNEL_NAMES(channel_names)
     _t.INSTRUMENTATION_END()
     _started = False
     _relocate_proc()
@@ -110,3 +123,30 @@ def mark_reset() -> None:
     if not active():
         return
     _t.INSTRUMENTATION_MARK_RESET(_ORCH_CHANNEL)
+
+
+def thread_init() -> None:
+    """Allocate a TraCR buffer for the calling per-chip dispatch thread. Must be
+    paired with thread_finalize() before that thread exits (else END aborts)."""
+    if not active():
+        return
+    _t.INSTRUMENTATION_THREAD_INIT()
+
+
+def thread_finalize() -> None:
+    if not active():
+        return
+    _t.INSTRUMENTATION_THREAD_FINALIZE()
+
+
+def mark_set_chip(chip_id: int, label: str, extra: int = 0) -> None:
+    if not active():
+        return
+    _chip_ids.add(int(chip_id))
+    _t.INSTRUMENTATION_MARK_SET(int(chip_id) + 1, _labels[label], int(extra) & 0xFFFFFFFF)
+
+
+def mark_reset_chip(chip_id: int) -> None:
+    if not active():
+        return
+    _t.INSTRUMENTATION_MARK_RESET(int(chip_id) + 1)
