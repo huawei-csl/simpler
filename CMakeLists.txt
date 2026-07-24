@@ -30,36 +30,34 @@ add_subdirectory(python/bindings)
 
 # PyTraCR: host-side Python bindings for TraCR (`import tracr`), built and
 # installed only when the BUILD_TRACR env var is set (the same switch that
-# compiles the device-side C++ TraCR). Built from TraCR's own meson project;
-# the module lands at the wheel root like _task_interface so `import tracr`
-# resolves after install. Requires the meson, ninja, and pybind11 pip packages
-# in the build environment.
+# compiles the device-side C++ TraCR). Compiled as a pybind11 extension and
+# placed exactly like the nanobind _task_interface module (wheel root for
+# installs, python/ for source builds) so `import tracr` resolves. Requires the
+# pybind11 pip package in the build environment.
 set(BUILD_TRACR OFF)
 if(DEFINED ENV{BUILD_TRACR})
     set(BUILD_TRACR $ENV{BUILD_TRACR})
 endif()
 if(BUILD_TRACR)
-    set(PYTRACR_SRC_DIR ${CMAKE_SOURCE_DIR}/tools/tracr)
-    set(PYTRACR_BUILD_DIR ${CMAKE_BINARY_DIR}/pytracr)
-    if(EXISTS ${PYTRACR_BUILD_DIR})
-        set(PYTRACR_SETUP_FLAGS --reconfigure)
-    else()
-        set(PYTRACR_SETUP_FLAGS)
+    execute_process(
+        COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
+        OUTPUT_VARIABLE PYBIND11_CMAKEDIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PYBIND11_CMAKEDIR_RC)
+    if(PYBIND11_CMAKEDIR_RC EQUAL 0)
+        list(APPEND CMAKE_PREFIX_PATH "${PYBIND11_CMAKEDIR}")
     endif()
-    # Invoke meson through the build Python so it resolves from the venv's
-    # `meson` pip package without depending on a `meson` script on PATH.
-    add_custom_target(pytracr_module ALL
-        COMMAND ${Python_EXECUTABLE} -m mesonbuild.mesonmain setup ${PYTRACR_SETUP_FLAGS}
-                ${PYTRACR_BUILD_DIR} ${PYTRACR_SRC_DIR}
-                -DbuildPyTraCR=true -DbuildExamples=false -DbuildTests=false
-        COMMAND ${Python_EXECUTABLE} -m mesonbuild.mesonmain compile -C ${PYTRACR_BUILD_DIR}
-        COMMENT "Building PyTraCR Python module (import tracr)"
-        VERBATIM
-    )
+    find_package(pybind11 CONFIG REQUIRED)
+    pybind11_add_module(tracr ${CMAKE_SOURCE_DIR}/tools/tracr/include/pytracr/pytracr.cpp)
+    target_include_directories(tracr SYSTEM PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/tracr/include
+        ${CMAKE_SOURCE_DIR}/tools/tracr/extern)
+    target_compile_definitions(tracr PRIVATE ENABLE_TRACR)
     if(SKBUILD_MODE)
-        install(DIRECTORY ${PYTRACR_BUILD_DIR}/include/pytracr/
-                DESTINATION .
-                FILES_MATCHING PATTERN "tracr*.so")
+        install(TARGETS tracr DESTINATION .)
+    else()
+        set_target_properties(tracr PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
     endif()
 endif()
 
