@@ -177,6 +177,19 @@ inline uint64_t read_reg(RegId reg) {
 }
 
 /**
+ * Read the high 32 bits of DATA_MAIN_BASE (early-dispatch doorbell).
+ * The high word lives one 32-bit slot above the dispatch token.
+ *
+ * Same atomic-acquire rule as read_reg(): in sim the cell is plain host memory
+ * shared with the AICPU thread that rings via a 64-bit STR of (token<<32)|token.
+ */
+inline uint32_t read_dmb_high32() {
+    uint32_t offset = reg_offset(RegId::DATA_MAIN_BASE);
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset + 4));
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+/**
  * Write to an AICore register in simulated register memory
  *
  * Supports sparse register mapping via sparse_reg_ptr() helper.

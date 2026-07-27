@@ -153,7 +153,6 @@ def _l2_config(base: CallConfig, spec: dict) -> CallConfig:
     child L2. So copy those over and override only the ring sizing.
     """
     cfg = CallConfig()
-    cfg.block_dim = base.block_dim
     cfg.aicpu_thread_num = base.aicpu_thread_num
     cfg.enable_l2_swimlane = base.enable_l2_swimlane
     cfg.enable_dump_args = base.enable_dump_args
@@ -205,7 +204,7 @@ def run(platform: str, device_id: int) -> int:
                 chip_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
                 cfg = _l2_config(_cfg, spec)
                 print(f"[per_task_runtime_env] submit '{spec['label']}': runtime_env={cfg.runtime_env!r}")
-                orch.submit_next_level(chip_handle, chip_args, cfg)
+                orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)
 
         print(f"[per_task_runtime_env] running DAG ({len(L2_TASKS)} L2 tasks, distinct rings)...")
         worker.run(orch_fn, args=None, config=CallConfig())

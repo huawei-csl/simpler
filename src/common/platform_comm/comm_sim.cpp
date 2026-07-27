@@ -219,6 +219,19 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 }
 
+extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
+
+extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+    // No async-DMA hardware under simulation; 0 makes every engine a no-op.
+    if (!addr_out || !handle_out || count < 0) return -1;
+    *handle_out = nullptr;
+    for (int i = 0; i < count; ++i)
+        addr_out[i] = 0;
+    return required_mask == 0 ? 0 : -1;
+}
+
+extern "C" void dma_workspace_release(void *handle) { (void)handle; }
+
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
     if (h == nullptr || device_ctx_out == nullptr) return -1;
 
@@ -573,6 +586,16 @@ extern "C" int comm_alloc_domain_windows(
         ctx.windowsOut[i] = addr;
     }
 
+    // Zero this rank's local window so scratch/signal protocols see a known
+    // initial state — matches the static-bootstrap contract (which zeroed
+    // the base window after alloc).  Kernels on HCCL must not observe
+    // stale aclrtMalloc bytes; same contract on sim for parity.
+    // The wipe precedes the ready barrier below: once a peer clears that
+    // barrier it may store a barrier signal into this window, and a later
+    // wipe would erase a signal this rank has not yet waited on.
+    uint8_t *local_window = win_base + domain_rank * window_size;
+    std::memset(local_window, 0, window_size);
+
     // ready_count barrier on the subset so all participants finish mapping
     // before any of them returns and starts using the windows.
     __atomic_add_fetch(&hdr->ready_count, 1, __ATOMIC_ACQ_REL);
@@ -587,13 +610,6 @@ extern "C" int comm_alloc_domain_windows(
         munmap(alloc->mmap_base, alloc->mmap_size);
         return -1;
     }
-
-    // Zero this rank's local window so scratch/signal protocols see a known
-    // initial state — matches the static-bootstrap contract (which zeroed
-    // the base window after alloc).  Kernels on HCCL must not observe
-    // stale aclrtMalloc bytes; same contract on sim for parity.
-    uint8_t *local_window = win_base + domain_rank * window_size;
-    std::memset(local_window, 0, window_size);
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->host_ctx.get());
     *local_window_base_out = reinterpret_cast<uint64_t>(local_window);

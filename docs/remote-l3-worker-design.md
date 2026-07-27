@@ -43,10 +43,9 @@ Implemented:
 - Explicit endpoint outcomes: success, task failure, endpoint failure, and
   skipped group members. Failed producers poison downstream consumers instead
   of completing successfully.
-- Stable NEXT_LEVEL `worker_id` metadata shared by local and remote
-  children, submit-time worker eligibility, worker affinity validation
-  against eligibility, and Scheduler selection from only eligible idle
-  workers.
+- Stable NEXT_LEVEL `worker_id` metadata shared by local and remote children,
+  submit-time validation of the exact target against worker eligibility, and
+  directed Scheduler dispatch to that target only.
 - C++ remote tensor sidecars, remote-aware `TensorKey` values, and submit-time
   rejection of remote sidecars against local endpoints, bare host pointers, and
   remote null OUTPUT tensors without a sidecar.
@@ -137,14 +136,14 @@ Relevant code paths:
     `MAILBOX_OFF_ERROR_MSG`.
 - `src/common/hierarchical/orchestrator.{h,cpp}`
   - `submit_next_level()` stores `TaskArgs`, `CallConfig`,
-  `CallableIdentity`, and optional worker affinity in a parent-side slot.
+  `CallableIdentity`, and the required target worker in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
   - Process dispatch writes `[T][S][Tensor x T][uint64 x S]`.
   - Tags are stripped after submit.
 - `docs/comm-domain.md`
   - Dynamic communication domains already model deferred release after
-    `drain()`.
+    their owning run's completion fence.
 
 The Scheduler should not inspect transport details, but it does need enough
 metadata to avoid dispatching a task to an endpoint that cannot run it. Remote
@@ -178,12 +177,11 @@ On dispatch, `WorkerThread` builds a task packet from `TaskSlotState`, calls
 the endpoint, reports endpoint errors, and notifies the Scheduler with an
 explicit success/failure outcome.
 
-Ready queues, group dispatch, affinities, fanin/fanout, and ring release remain
-in the existing runtime. The first-error-wins policy remains only as the error
-reporting policy for choosing which root error `drain()` raises. The important
-change is that completion is no longer implicitly success; every endpoint,
-including `LocalMailboxEndpoint`, must report an explicit success/failure
-outcome.
+Directed ready queues, exact group dispatch, fanin/fanout, and ring release
+remain in the common runtime. First-error-wins is scoped to each `RunState` and
+chooses which root error that run's wait raises. Completion is not implicitly
+success; every endpoint, including `LocalMailboxEndpoint`, reports an explicit
+success/failure outcome.
 
 ## Fork-Safe Remote Process Model
 
@@ -204,10 +202,10 @@ Use a two-process remote model:
    single-threaded pipe. This handoff is not the remote transport protocol.
 4. The session runner reads the manifest before starting transport threads and
    constructs `Worker(level=3)`.
-5. The runner then performs an explicit prestart step equivalent to
-   `inner_worker.init()` plus `_start_hierarchical()` for the inner Worker:
-   allocate local mailboxes, fork local chip/sub children, register local
-   endpoints with the inner C++ Worker, and start the inner Scheduler and
+5. The runner then performs an explicit prestart step, `inner_worker.init()`
+   for the inner Worker — `init()` is the single startup point: it allocates
+   local mailboxes, forks local chip/sub children, registers local endpoints
+   with the inner C++ Worker, and starts the inner Scheduler and
    `WorkerThread`s.
 6. Only after this local L3 child tree is established does the session runner
    bring up sockets, RDMA queue pairs, health threads, or UB doorbells for task
@@ -234,9 +232,8 @@ initialization has completed.
 ## Worker Identity and Callable Routing
 
 Remote scheduling needs explicit callable resolver scopes and an explicit
-mapping from callable identities to eligible NEXT_LEVEL workers. The current
-scheduler can otherwise choose any idle worker, which is only correct when
-every NEXT_LEVEL child has the same callable registry.
+mapping from callable identities to eligible NEXT_LEVEL workers. Every submit
+also names the exact worker that will execute the task.
 
 Required contracts:
 
@@ -322,16 +319,14 @@ Required contracts:
   is confirmed or the worker is removed from eligibility and marked failed.
   Failed-register rollback whose cleanup cannot be confirmed marks that
   worker/hashid pair cleanup-uncertain and unusable for the current session.
-- `TaskSlotState` stores the final eligible worker-id set for the slot. This is
-  the intersection of workers that can resolve the callable hashid and workers
-  that can access every tensor/buffer referenced by the slot.
-- If the user passes `worker=worker_id`, submit-time validation checks that
-  the worker id is eligible for that hashid and for the slot's tensor
-  sidecars.
-- If `worker=-1`, the Scheduler chooses only from idle workers in the
-  slot's eligible set.
-- Group submit validates each affinity independently. Unconstrained group
-  members are assigned distinct idle eligible endpoints.
+- `TaskSlotState` stores the exact target worker id for each slot member.
+  Submit-time validation checks that target against the callable's eligible
+  worker set — the intersection of workers that can resolve the callable hashid
+  and workers that can access every tensor/buffer referenced by the slot.
+- `worker=worker_id` is required. Submit-time validation checks that the worker
+  id is eligible for that hashid and for the slot's tensor sidecars.
+- Group submit requires one distinct worker id per member and validates each
+  target independently.
 - Mixed local + remote NEXT_LEVEL pools are allowed only when the callable
   hashid is registered on every endpoint that can receive the slot and the
   slot's tensors are materialized in a representation those endpoints can
@@ -346,8 +341,10 @@ from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
 w4 = Worker(level=4)
 
+# endpoint host must be a numeric IP (or "localhost"); hostnames are rejected
+# because getaddrinfo resolution is unbounded and could pin startup.
 l3 = RemoteWorkerSpec(
-    endpoint="node17:19073",
+    endpoint="10.0.0.17:19073",
     platform="a2a3",
     runtime="tensormap_and_ringbuffer",
     device_ids=list(range(16)),
@@ -519,17 +516,17 @@ Required parent-side behavior:
   `task_failure` instead of reporting a successful completion.
 - Non-zero task or endpoint errors become candidates for the worker's first
   reported error.
-- The worker still notifies the Scheduler so `drain()` cannot hang.
+- The worker still notifies the Scheduler so the originating run can finish.
 - The notification carries an outcome: success, task failure, or endpoint
   failure.
 - Failed slots transition to a failed/poisoned state rather than successful
   `COMPLETED`.
 - Downstream consumers of a failed producer are marked failed/skipped and are
   not dispatched.
-- `drain()` waits for bookkeeping and cleanup, then raises the first root
-  error with remote host, worker id, hashid, and sequence in the message.
+- The run fence waits for bookkeeping and cleanup, then raises that run's first
+  root error with remote host, worker id, hashid, and sequence in the message.
 
-Local mailbox dispatch keeps first-error-wins only for final error reporting.
+Local mailbox dispatch keeps per-run first-error-wins only for final reporting.
 It must not mark a failed child dispatch as successful `COMPLETED`. The remote
 buffer path and the local adapter both use the same poisoned dependency
 propagation before dependent tasks are exposed to failed producer outputs.

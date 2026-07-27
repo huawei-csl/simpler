@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Orchestrator — DAG builder exposed to the user's orch function during Worker.run().
+"""Orchestrator — DAG builder passed to a Worker submit/run callback.
 
 A thin Python facade over the C++ ``Orchestrator``. The Worker creates one
 Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestrator()``,
@@ -18,21 +18,24 @@ and passes the handle to the user's orch function::
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg, worker=0)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
         orch.submit_sub(sub_handle, sub_args)
 
-    w.run(my_orch, my_args, my_config)
+    handle = w.submit(my_orch, my_args, my_config)
+    handle.wait()
 
-Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
-directly.
+Scope and submission-close lifecycle is managed by ``Worker.submit()``;
+completion is managed by its ``RunHandle``. ``Worker.run()`` remains the
+blocking ``submit(...).wait()`` compatibility entry point.
 """
 
 from __future__ import annotations
 
 import contextlib
+import operator
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -86,6 +89,19 @@ def _require_handle(
             f"for {callable_or_handle.hashid}"
         )
     return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace, ()
+
+
+def _require_next_level_worker_id(value: Any, *, argument: str) -> int:
+    """Return an exact integer worker ID without accepting coercible values."""
+    if isinstance(value, bool):
+        raise TypeError(f"{argument} must be an integer NEXT_LEVEL worker id")
+    try:
+        worker_id = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{argument} must be an integer NEXT_LEVEL worker id") from exc
+    if worker_id < 0:
+        raise ValueError(f"{argument} must be a non-negative NEXT_LEVEL worker id")
+    return worker_id
 
 
 def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, _RemoteTaskArgsSidecar | None]:
@@ -154,17 +170,15 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(
-        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int = -1
-    ):
+    def submit_next_level(self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
-        ``worker``: stable NEXT_LEVEL worker id for affinity
-        (-1 = unconstrained). For L3 chip dispatch, worker ids are the
-        existing chip worker ids.
+        ``worker`` is the exact stable NEXT_LEVEL worker id that runs the
+        task. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
+        cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -177,6 +191,8 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
+            self._worker._require_local_next_level_target(cpp_worker_id, api="submit_next_level")
         c_args, explicit_remote_sidecar = _split_next_level_args(args)
         if target_namespace == "REMOTE_TASK_DISPATCHER":
             remote_sidecar = (
@@ -193,12 +209,23 @@ class Orchestrator:
         if target_namespace == "LOCAL_CHIP" and self._worker is not None:
             self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
-        cpp_worker_id = int(worker)
-        captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
+        worker = self._worker
+        # Do the (fallible) kind4 provenance analysis BEFORE capturing remote slot
+        # refs, so an exception here can never leave captured refs neither
+        # released nor adopted (which would defer a remote free forever). Capture
+        # is the last step before the rollback try.
+        child_ptrs = worker._child_ptrs_in_args(c_args) if worker is not None else []
+        prov_guard: Any = contextlib.nullcontext()
+        if child_ptrs and worker is not None:
+            prov_guard = worker._child_prov_lock
+        captured_refs = worker._capture_remote_sidecar_refs(remote_sidecar) if worker is not None else []
         try:
-            self._o.submit_next_level(
-                digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
-            )
+            with prov_guard:
+                if child_ptrs and worker is not None:
+                    worker._child_prov_check_dispatch(child_ptrs, cpp_worker_id, api="submit_next_level")
+                self._o.submit_next_level(
+                    digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
+                )
         except BaseException:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
@@ -206,22 +233,25 @@ class Orchestrator:
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
-    def submit_next_level_group(
+    def submit_next_level_group(  # noqa: PLR0912 -- linear per-member sidecar + eligibility + kind4-provenance passes, one branch each
         self,
         callable_handle: Any,
         args_list: list,
         config: CallConfig | None = None,
         *,
-        workers: list | None = None,
+        workers: list,
     ):
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
-        ``workers``: per-args stable NEXT_LEVEL worker ids. For L3 chip
-        dispatch, worker ids are the existing chip worker ids.
-        None/empty = all unconstrained.
+        ``workers`` contains the exact stable NEXT_LEVEL worker id for each
+        member. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
-        worker_ids = [int(x) for x in workers] if workers else []
+        worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
+        if len(worker_ids) != len(args_list):
+            raise ValueError("workers length must match args_list length")
+        if len(set(worker_ids)) != len(worker_ids):
+            raise ValueError("workers must not contain duplicate NEXT_LEVEL worker ids")
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -234,6 +264,9 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
+            for worker_id in worker_ids:
+                self._worker._require_local_next_level_target(worker_id, api="submit_next_level_group")
         c_args_list = []
         explicit_remote_sidecars = []
         has_explicit_remote_sidecar = False
@@ -269,15 +302,33 @@ class Orchestrator:
             if eligible_worker_ids
             else []
         )
-        cpp_worker_ids = worker_ids
+        # Per-member kind4 dispatch guard: each member's child_memory pointers
+        # must be live on that member's exact submitted target.
+        # Run this (fallible) analysis BEFORE capturing remote slot refs, so an
+        # exception here can never strand captured refs outside the rollback try.
+        worker = self._worker
+        member_checks: list[tuple[list[tuple[int, int]], int]] = []
+        if worker is not None:
+            for g, c_args in enumerate(c_args_list):
+                child_ptrs = worker._child_ptrs_in_args(c_args)
+                if not child_ptrs:
+                    continue
+                member_checks.append((child_ptrs, worker_ids[g]))
+        prov_guard: Any = (
+            worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
+        )
         captured_refs: list[Any] = []
         if self._worker is not None and remote_sidecars is not None:
             for sidecar in remote_sidecars:
                 captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
         try:
-            self._o.submit_next_level_group(
-                digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
-            )
+            with prov_guard:
+                for child_ptrs, target_worker_id in member_checks:
+                    assert worker is not None  # member_checks is only populated when worker is present
+                    worker._child_prov_check_dispatch(child_ptrs, target_worker_id, api="submit_next_level_group")
+                self._o.submit_next_level_group(
+                    digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
+                )
         except BaseException:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
@@ -391,15 +442,15 @@ class Orchestrator:
     # deeper heap ring (``min(depth, MAX_RING_DEPTH-1)``) so their
     # memory reclaims independently of the outer scope. ``scope_end`` is
     # non-blocking — it releases scope refs and returns; call
-    # ``Worker.run``/``drain`` for a synchronous wait.
+    # the ``RunHandle`` returned by ``Worker.submit`` for a synchronous wait.
     #
     # Usage::
     #
     #     def my_orch(orch, args):
     #         with orch.scope():
-    #             orch.submit_next_level(a, ...)
-    #             orch.submit_next_level(b, ...)
-    #         orch.submit_next_level(c, ...)   # back on outer-scope ring
+    #             orch.submit_next_level(a, ..., worker=0)
+    #             orch.submit_next_level(b, ..., worker=0)
+    #         orch.submit_next_level(c, ..., worker=0)  # outer-scope ring
 
     def scope_begin(self) -> None:
         self._o.scope_begin()
@@ -422,20 +473,58 @@ class Orchestrator:
             self._o.scope_end()
 
     def malloc(self, worker_id: int, size: int) -> int:
-        """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
-        return int(self._o.malloc(int(worker_id), int(size)))
+        """Allocate memory on next-level worker *worker_id*. Returns a pointer.
+
+        This is the single L3 choke for kind4 device memory: ``Worker.malloc``
+        also funnels through here, as does a user's direct ``orch.malloc``. The
+        returned pointer's ``(worker_id, ptr)`` provenance is recorded so a later
+        free / copy / kind4 dispatch to the wrong worker is rejected.
+        """
+        wid, sz = int(worker_id), int(size)
+        if self._worker is None:
+            return int(self._o.malloc(wid, sz))
+        with self._worker._child_prov_lock:
+            ptr = int(self._o.malloc(wid, sz))
+            self._worker._child_prov_record_malloc(wid, ptr)
+            return ptr
 
     def free(self, worker_id: int, ptr: int) -> None:
         """Free memory on next-level worker *worker_id*."""
-        self._o.free(int(worker_id), int(ptr))
+        wid, p = int(worker_id), int(ptr)
+        if self._worker is None:
+            self._o.free(wid, p)
+            return
+        with self._worker._child_prov_lock:
+            # Safety-first commit barrier: revoke provenance BEFORE the native
+            # free. If the native free succeeds and an async unwind (e.g. a
+            # KeyboardInterrupt delivered after the binding returns) fires before
+            # a post-free clear could run, a freed address would stay live and a
+            # later copy/dispatch would re-authorize it — a UAF. Revoking first
+            # turns a native-free failure into a terminal leak (recoverable) but
+            # never re-authorizes a maybe-freed address.
+            self._worker._child_prov_require_malloc_base(wid, p, api="free")
+            self._worker._child_prov_clear_malloc(wid, p)
+            self._o.free(wid, p)
 
     def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
         """Copy *size* bytes from host *src* to worker *dst*."""
-        self._o.copy_to(int(worker_id), int(dst), int(src), int(size))
+        wid, d = int(worker_id), int(dst)
+        if self._worker is None:
+            self._o.copy_to(wid, d, int(src), int(size))
+            return
+        with self._worker._child_prov_lock:
+            self._worker._child_prov_require_live(wid, d, api="copy_to")
+            self._o.copy_to(wid, d, int(src), int(size))
 
     def copy_from(self, worker_id: int, dst: int, src: int, size: int) -> None:
         """Copy *size* bytes from worker *src* to host *dst*."""
-        self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
+        wid, s = int(worker_id), int(src)
+        if self._worker is None:
+            self._o.copy_from(wid, int(dst), s, int(size))
+            return
+        with self._worker._child_prov_lock:
+            self._worker._child_prov_require_live(wid, s, api="copy_from")
+            self._o.copy_from(wid, int(dst), s, int(size))
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> Tensor:
         """Allocate a runtime-managed intermediate buffer.
@@ -456,7 +545,7 @@ class Orchestrator:
         return tensor
 
     # ------------------------------------------------------------------
-    # Internal (called by Worker.run)
+    # Internal (called by Worker.submit)
     # ------------------------------------------------------------------
 
     def _scope_begin(self) -> None:
@@ -465,8 +554,23 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _drain(self) -> None:
-        self._o._drain()
+    def _begin_run(self) -> int:
+        return int(self._o._begin_run())
 
-    def _clear_error(self) -> None:
-        self._o._clear_error()
+    def _close_run_submission(self, run_id: int) -> None:
+        self._o._close_run_submission(run_id)
+
+    def _fail_run_submission(self, run_id: int, message: str = "") -> None:
+        self._o._fail_run_submission(run_id, message)
+
+    def _wait_run(self, run_id: int) -> None:
+        self._o._wait_run(run_id)
+
+    def _wait_run_for(self, run_id: int, timeout_seconds: float) -> bool:
+        return bool(self._o._wait_run_for(run_id, timeout_seconds))
+
+    def _run_done(self, run_id: int) -> bool:
+        return bool(self._o._run_done(run_id))
+
+    def _release_run(self, run_id: int) -> None:
+        self._o._release_run(run_id)

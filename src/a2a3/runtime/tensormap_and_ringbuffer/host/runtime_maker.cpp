@@ -47,6 +47,7 @@
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
+#include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/strace.h"
@@ -56,6 +57,28 @@
 #include "common/host_api.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+extern "C" const PipelineContract *get_pipeline_contract(void) {
+    // Orchestration runs on the device, so this run's own content is confined to
+    // its task args. The three pooled regions are built and uploaded once per
+    // callable sizing and then served from the prebuilt-arena cache
+    // (build_and_cache_prebuilt_arena runs only on a miss), so a run reuses the
+    // instance the previous run left behind.
+    static const PipelineContract contract = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        6,
+        1,
+        {
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DEVICE_SCRATCH, 0},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        },
+    };
+    return &contract;
+}
 
 static_assert(
     RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
@@ -535,7 +558,7 @@ static bool stage_device_args(
         Tensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             out->add_tensor(t);
             continue;
         }
@@ -588,7 +611,7 @@ static bool stage_device_args(
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, release_kind});
-        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
         out->add_tensor(t);
@@ -941,10 +964,11 @@ extern "C" int prewarm_config_impl(
  * 2. Releases recorded tensor leases
  * 3. Clears tensor lease state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -964,15 +988,14 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
     LOG_INFO_V0("Tensor leases to process: %d", tensor_lease_count);
 
-    // PTO2 (device orchestration): graph output may be in packed buffer
-    uint64_t graph_out_ptr = 0;
-    uint64_t graph_out_size = 0;
-    bool skip_tensor_copy_back = false;
+    bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    if (execution_rc != 0) {
+        runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    }
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
@@ -995,19 +1018,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
                 host_header.sched_stall_core.load(std::memory_order_relaxed)
             );
         }
-        skip_tensor_copy_back = true;
-    } else {
-        graph_out_ptr = host_header.graph_output_ptr;
-        graph_out_size = host_header.graph_output_size;
-        if (graph_out_ptr != 0) {
-            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
-        }
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        bool first_output_tensor = true;
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];
 
@@ -1019,7 +1034,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (lease.host_ptr == nullptr) {
-                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -1027,27 +1042,16 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still released through release_kind below.
             if (!lease.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            void *src_ptr = lease.dev_ptr;
-            size_t copy_size = lease.size;
-
-            // Use graph_output_ptr for the first output tensor if available
-            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-                copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
-                first_output_tensor = false;
-            }
-
-            int copy_rc = api->copy_from_device(lease.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, lease.size);
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }

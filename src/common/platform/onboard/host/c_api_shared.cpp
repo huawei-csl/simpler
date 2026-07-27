@@ -44,6 +44,7 @@
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
+#include "platform_comm/comm.h"
 
 // Forward-declared (rather than `#include "dlog_pub.h"`) so this TU does not
 // require CANN's toolchain include path on the host build. Resolved at link
@@ -56,7 +57,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in each runtime's runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -554,6 +555,14 @@ int simpler_run(
         LOG_ERROR("simpler_run: callable_id=%d not registered", callable_id);
         return -1;
     }
+    if (!runner->can_accept_run()) {
+        LOG_ERROR(
+            "simpler_run: runner is unusable after a prior device failure; refusing callable_id=%d before resource "
+            "provisioning",
+            callable_id
+        );
+        return -1;
+    }
 
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
@@ -581,6 +590,23 @@ int simpler_run(
         // runtime state — the shared g_host_api table (built once at load time)
         // is passed explicitly into the runtime impls rather than stored on
         // `Runtime` or reassembled per run.
+        // Core geometry first: a host-side orchestrator runs to completion
+        // inside the bind below, and reads worker_count to size its cluster
+        // spreading. Resolving after the bind would hand it the zeros a fresh
+        // Runtime carries.
+        rc = runner->prepare_launch_shape(*r, *config);
+        if (rc != 0) {
+            r->set_gm_sm_ptr(nullptr);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            return validation_rc != 0 ? validation_rc : rc;
+        }
+
+        // Latch the diagnostic enables before the bind: a host-orch runtime
+        // builds its whole task graph inside it, so a diagnostic that hooks the
+        // orchestrator (dep_gen) has to be armed by now. run() latches again at
+        // its entry — the call is idempotent.
+        runner->apply_call_config(*config);
+
         {
             STRACE("simpler_run.bind");
             // One-step bind: restore kernel addrs + active_callable_id and run
@@ -594,8 +620,8 @@ int simpler_run(
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
-            return rc;
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
@@ -605,13 +631,13 @@ int simpler_run(
             rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
-            return rc;
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+            rc = validate_runtime_impl(r, &g_host_api, 0);
         }
         // Device-domain phase markers: the AICPU subdivision of the on-NPU wall
         // (device_wall + preamble/so_load/graph_build/post_orch/orch/sched).
@@ -648,6 +674,24 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx) {
         return static_cast<DeviceRunnerBase *>(ctx)->host_dlopen_count();
     } catch (...) {
         return 0;
+    }
+}
+
+size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->run_stream_set_create_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->provision_dma_workspace(required_mask);
+    } catch (...) {
+        return -1;
     }
 }
 

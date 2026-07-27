@@ -164,8 +164,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
 | `total_size` | Init | Both | Total shared memory size |
-| `graph_output_ptr` | Orchestrator | Host | Address of final output (packed buffer) |
-| `graph_output_size` | Orchestrator | Host | Size of final output in bytes |
 
 ### 3.2 Size Calculation
 
@@ -546,11 +544,12 @@ Each scheduler thread runs a tight loop with two main phases:
 - Poll register `COND` on each managed core
 - When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, trigger `on_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
-**Phase 2 — Dispatch**:
+**Phase 2 — Dispatch** (full model in §8.6):
 
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
-- Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
+- Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE` (DMB offset `0xD0` on a5)
+- After normal ready queues are empty, Phase **4b** may stage speculative early-dispatch candidates onto spare slots (`early_dispatch_queues[]` / `early_sync_start_queue`)
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
 
@@ -558,11 +557,13 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
+- One `PTO2ReadyQueue` per resource shape (`MIX` / `AIC` / `AIV` in the production tensormap path)
+- **Push**: any thread (orchestrator via wiring, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
+
+Unlike a2a3, a5 does **not** keep a separate `ready_sync_queues[]` tier: ready `require_sync_start` cohorts share `ready_queues[]`. Speculative sync_start early candidates still use the dedicated `early_sync_start_queue` (see §8.6).
 
 ### 8.4 Watermark Advancement (last_task_alive)
 
@@ -605,6 +606,84 @@ Private internals are split across three .cpp files by responsibility:
 
 `AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
 
+### 8.6 Dispatch model — two sources, sync tiers, occupancy order
+
+`resolve_and_dispatch` places ready and speculative work onto AICore cores under one
+occupancy model (ported from a2a3 early-dispatch; a5 specifics called out below). Two
+orthogonal axes decide *what* runs and *where*:
+
+- **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
+  pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; its dispatch
+  payload carries a non-zero `src_payload` gate and launches later by a high-32 doorbell on
+  `DATA_MAIN_BASE`). Normal strictly precedes early.
+- **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
+  block launches independently). "is it ready" (source) and "does it need a rendezvous"
+  (cohort) are orthogonal.
+
+Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV`** (shape), and per
+shape **idle ▸ pending** (an idle core takes its running slot; a busy core takes its gated
+pending slot, promoted on completion). a5 implements this order inline in
+`dispatch_ready_tasks` / `try_early_dispatch` (no separate `run_staging_order` helper).
+
+#### Queues
+
+| Source | Regular lanes | sync_start lane |
+| ------ | ------------- | --------------- |
+| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | *(same `ready_queues[]` — a5 has no `ready_sync_queues[]`)* |
+| EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
+
+A task routes to the early sync lane iff `task_attrs.requires_sync_start()`. Early
+dispatch runs only once normal `ready_queues[]` are empty **and** the local
+`CoreTracker` has a spare slot (`has_any_free_slot`, a2a3 #1288).
+
+**Direct-only eligibility (a2a3 #1285/#1292):** a consumer is an early candidate only when
+every *direct* producer is flagged `allow_early_resolve` (slot-state hint from Arg, or
+unconditional true for hidden alloc creators). There is no auto-chain inheritance.
+
+#### sync_start drain + rendezvous
+
+A sync_start cohort of `block_num` cores must occupy all its cores before any of them run.
+When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
+
+1. **Single election** — a CAS on `sync_start_pending` makes drains mutually exclusive.
+2. **All-or-nothing** — the elected thread checks global available capacity ≥ `block_num`
+   before staging; if short it aborts and retries after completions free cores.
+3. **Parallel stage** — threads barrier, then each CAS-claims a block range and stages its
+   own cores with a non-zero `src_payload` gate (`drain_stage_cores`): idle → running,
+   busy → pending (`pending_gated` when still waiting for the doorbell).
+4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
+   reaches `popcount(staged_core_mask)` **and** the producer has released,
+   `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
+
+Doorbell ownership is exclusive (`claim_all_staged_doorbell_bits` /
+`claim_late_staged_doorbell_bits`); launch is latched via `early_dispatch_launch_state`.
+
+#### Early-candidate gate: producer must publish every block
+
+Producer-side `propagate_dispatch_fanin` no-ops until the producer is **fully published**:
+`published_block_count == logical_block_num` (a2a3 #1326). Publication is recorded after
+prepare/publish makes payload + low-32 dispatch tokens visible. Early queue entries carry a
+`task_id_snapshot` generation tag (#1336) so recycled slots cannot revive stale candidates.
+
+Wiring and propagation serialize under `fanout_lock` with `PTO2_DISPATCH_PROPAGATED` so
+late-wired consumers still receive exactly one early-candidate contribution per eligible
+edge (#1405).
+
+#### a5 platform notes
+
+- `RUNTIME_MAX_WORKER = 108` — doorbell table / `staged_core_mask` words must cover 108 cores.
+- AICore index fields are `s_block_idx` / `s_block_num` (not a2a3 `block_idx` / `block_num`).
+- DMB MMIO offset is **`0xD0`** (a2a3 uses `0xA0`). Ready dispatch writes the low 32 bits;
+  early release rings high 32 via 64-bit STR `(token<<32)|token`. AICore gated path spins on
+  `read_dmb_high32() == task_id` before ACK.
+- Ready path keeps `src_payload == 0` and ACK-then-execute behavior unchanged.
+
+#### MIX per-core placement
+
+A MIX task spans a cluster (1 AIC + 2 AIV). Gated MIX may place **per core**
+(`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
+skew within a block is tolerated by AICore incore synchronization.
+
 ---
 
 ## 9. AICore Worker Interaction
@@ -632,11 +711,13 @@ Instead of polling a shared-memory status flag, the production protocol uses har
 
 **AICore execution loop**:
 
-1. Poll `DATA_MAIN_BASE` for value != AICPU_IDLE_TASK_ID
+1. Poll `DATA_MAIN_BASE` (low 32) for value != AICPU_IDLE_TASK_ID
 2. Read payload from `Handshake.task`
-3. Write ACK to `COND`
-4. Execute kernel function via `func_id_to_addr` lookup
-5. Write FIN to `COND`
+3. If `src_payload != 0` (early/gated): materialize args from `src_payload`, spin until
+   `read_dmb_high32() == task_id`, **then** ACK
+4. Else (ready path): ACK immediately
+5. Execute kernel function via `func_id_to_addr` lookup
+6. Write FIN to `COND`
 
 ### 9.3 PTO2DispatchPayload
 
@@ -649,8 +730,9 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `kernel_id` | Function ID for this subtask slot |
 | `core_type` | AIC or AIV |
 | `function_bin_addr` | GM address of compiled kernel binary |
+| `src_payload` | Non-zero ⇒ gated early path (AICore materializes args + waits high-32 doorbell) |
 | `num_args` | Number of arguments |
-| `args[]` | Tensor addresses and scalar values |
+| `args[]` | Tensor addresses and scalar values (filled by AICPU on ready path; by AICore when gated) |
 
 ---
 

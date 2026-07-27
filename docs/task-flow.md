@@ -35,7 +35,7 @@ Every task flowing through any level carries exactly three pieces of data:
 | ------ | ---- | ---------- |
 | `CallableHandle` / `CallableIdentity` | hash digest + kind + namespace | What the target worker should execute; targets resolve the digest to a local slot |
 | `TaskArgs` | user builder class | Tensors + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
-| `CallConfig` | small POD | Execution knobs (block_dim, aicpu_thread_num, profiling/dump/PMU flags, …) |
+| `CallConfig` | small POD | Execution knobs (aicpu_thread_num, profiling/dump/PMU flags, …) |
 
 Everything else in the engine is either plumbing (slots, ring, tensormap,
 scheduler) or target-local executable state resolved from the callable digest.
@@ -204,7 +204,6 @@ View does **not** own memory. Valid for the duration of a single
 
 ```cpp
 struct CallConfig {
-    int32_t block_dim = 0;  // 0 = auto (DeviceRunner resolves to stream max at run() time)
     int32_t aicpu_thread_num = 3;
     int32_t enable_l2_swimlane = 0;  // perf_level 0–4 (0=off, 4=full)
     int32_t enable_dump_args = 0;
@@ -314,13 +313,12 @@ and calls `submit_next_level` / `submit_sub`. These Python methods return
 
 ```python
 class Orchestrator:
-    # `worker=-1` means unconstrained. Non-negative affinities are stable
-    # NEXT_LEVEL worker ids. For local Python Worker children and remote
-    # L3 dispatch, these are returned by add_worker(...) or
+    # NEXT_LEVEL placement is required. For local Python Worker children and
+    # remote L3 dispatch, stable ids are returned by add_worker(...) or
     # add_remote_worker(...). For L3 ChipCallable dispatch, worker ids are
     # the existing chip worker ids.
-    def submit_next_level(self, handle, args, config=None, *, worker=-1) -> None: ...
-    def submit_next_level_group(self, handle, args_list, config=None, *, workers=None) -> None: ...
+    def submit_next_level(self, handle, args, config=None, *, worker) -> None: ...
+    def submit_next_level_group(self, handle, args_list, config=None, *, workers) -> None: ...
     def submit_sub(self, handle, args=None) -> None: ...
     def submit_sub_group(self, handle, args_list) -> None: ...
 ```
@@ -343,9 +341,14 @@ fanout wiring), see [orchestrator.md](orchestrator.md).
 
 ## 7. Data flow through dispatch
 
-After the scheduler picks an idle `WorkerThread` and calls `wt->dispatch(sid)`,
-the parent-side WorkerThread encodes `(callable digest, CallConfig, TaskArgs)`
-into the per-WT shm mailbox and the forked child decodes it:
+For local endpoints, after the Scheduler resolves the submitted NEXT_LEVEL
+target (or chooses an idle SUB worker), `LocalMailboxEndpoint` encodes
+`(callable digest, CallConfig, TaskArgs)` into the per-worker shm mailbox and
+the forked child decodes it. Remote NEXT_LEVEL dispatch through
+`RemoteL3Endpoint` serializes the same logical payload into a framed TASK
+request instead.
+
+Local mailbox path:
 
 ```text
 slot.callable.digest ─┐
@@ -365,7 +368,7 @@ The mailbox layout, fork ordering, and child loop are in
 
 | Region | Lives in | Used by | Lifetime |
 | ------ | -------- | ------- | -------- |
-| `Ring` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
+| `Ring` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; compacted only when globally quiescent |
 | `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
 | per-WT mailbox | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
 | **HeapRing[0..3]** (user OUTPUT auto-alloc + `orch.alloc`) | **4 separate shm MAP_SHARED mmaps**, one per scope-layer ring | output to user code; inherited by forked children | per-ring FIFO via `rings_[r].last_alive`; scope depth picks the ring |
@@ -374,9 +377,9 @@ The mailbox layout, fork ordering, and child loop are in
 
 Slot state lives inside `Ring` as `std::deque<std::unique_ptr<…>>` so
 `push_back` never invalidates pointers to live slots.
-`ring.slot_state(id)` hands out a stable pointer for every live slot;
-`drain()` calls `ring.reset_to_empty()` to drop all slot state at the
-end of each `Worker.run`, bounding per-run memory.
+`ring.slot_state(id)` hands out a stable pointer for every live slot. Each slot
+is reclaimed individually when it reaches CONSUMED. The deque is reset only
+when the worker has no registered runs or live slots.
 
 The HeapRing is **partitioned into `MAX_RING_DEPTH = 4` independent
 rings** (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each ring is its
@@ -492,16 +495,16 @@ L4 parent process
 | ---- | ----- | ------------ |
 | 1 | L4 parent Python | `w4.run(my_l4_orch)` → `scope_begin` → `my_l4_orch(orch4, ...)` |
 | 2 | L4 `Orchestrator.submit_next_level` | the L3 callable handle digest is stored in the slot's callable identity; slot pushed to L4's ready queue |
-| 3 | L4 Scheduler | pop slot; pick idle WorkerThread → the L3 child's mailbox |
+| 3 | L4 Scheduler | pop the target worker's FIFO → that L3 child's mailbox |
 | 4 | L4 WorkerThread (PROCESS) | encode `(callable digest, config, args_blob)` into mailbox; write `TASK_READY`; spin-poll |
 | 5 | L3 child `_child_worker_loop` | wake on `TASK_READY`; read digest → child-local slot → `my_l3_orch` |
 | 6 | L3 child | `inner_worker.run(my_l3_orch, args, cfg)` → `scope_begin` → `my_l3_orch(orch3, ...)` |
 | 7 | L3 `Orchestrator.submit_sub` | `l3_sub_handle` digest dispatched to L3's own sub worker child |
 | 8 | L3 sub child | child resolves digest to its local Python callable and executes `verify_result()` |
-| 9 | L3 drain | all L3 tasks complete; `scope_end` + `drain` return |
+| 9 | L3 run fence | all L3 tasks complete; `scope_end` + `wait_run` return |
 | 10 | L3 child | `inner_worker.run()` returns; `_child_worker_loop` writes `TASK_DONE` |
 | 11 | L4 LocalMailboxEndpoint | sees `TASK_DONE`; returns success completion |
-| 12 | L4 drain | L4 scope_end + drain; `w4.run()` returns |
+| 12 | L4 run fence | L4 `scope_end` + `wait_run`; `w4.run()` returns |
 
 Each level's orch fn receives **its own** `Orchestrator` — the recursion is
 symmetric. `Worker` code does not branch on `level`; the level is only a
@@ -527,13 +530,13 @@ def my_orch(orch, view, cfg):
     chip_args = TaskArgs()
     for i in range(view.tensor_count):
         chip_args.add_tensor(view.tensors[i], IN if i < 2 else OUT)
-    orch.submit_next_level(chip_kernel_handle, chip_args, cfg)
+    orch.submit_next_level(chip_kernel_handle, chip_args, cfg, worker=0)
 
 w3 = Worker(level=3, child_mode=PROCESS)
 w3.add_worker(NEXT_LEVEL, chip_worker_0)
 w3.init()    # fork chip_0 here
 
-w3.run(my_orch, args, CallConfig(block_dim=3))
+w3.run(my_orch, args, CallConfig(aicpu_thread_num=3))
 ```
 
 Step-by-step (one chip worker):
@@ -543,7 +546,7 @@ Step-by-step (one chip worker):
 | 1 | parent Python | user builds `args: TaskArgs`, calls `w3.run(my_orch, args, config)` |
 | 2 | `Worker::run` | `scope_begin` → call `my_orch(&orch_, args.view(), cfg)` |
 | 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
-| 4 | Scheduler thread | pop `slot`; `wt = manager.pick_idle(NEXT_LEVEL)` (WT_chip_0); `wt->dispatch(slot)` |
+| 4 | Scheduler thread | pop `slot` from worker 0's FIFO; resolve stable worker ID 0 to WT_chip_0; dispatch |
 | 5 | WT_chip_0 parent side | encode mailbox: write reserved callable field, `config`, digest prefix, `write_blob` of task_args; set `TASK_READY`; spin-poll |
 | 6 | chip_0 child process | wake on `TASK_READY`; resolve digest to local slot; `read_blob` → `view`; call `ChipWorker::run(local_slot, view, cfg)` |
 | 7 | `ChipWorker::run` | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(local_slot, &chip_storage, &cfg)` |

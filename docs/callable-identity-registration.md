@@ -45,11 +45,12 @@ dispatch. For chip targets, the local implementation also prewarms executable
 state before first use when startup or dynamic register control reaches the
 child before dispatch.
 
-The current chip child loop preserves the historical TASK_READY lazy-prepare
-safety net: if a digest is already registered in the child identity table but
-the explicit prewarm step was missed, the child prepares its private slot in
-the dispatch path and logs a warning. This is not a public cid compatibility
-path and it does not fetch missing callable bytes from the parent.
+The chip child loop requires a prepared slot at dispatch: a TASK_READY only
+consumes a slot already staged via `_CTRL_PREPARE` (dynamic register) or via the
+startup snapshot (initial callables, prepared before INIT_READY). Reaching
+TASK_READY for an unprepared slot is a control-flow error and fails loudly
+rather than lazily preparing in the dispatch path. The child never fetches
+missing callable bytes from the parent.
 
 ### Chip Executable Prewarm
 
@@ -341,11 +342,11 @@ every active child endpoint in the handle's `target_namespace` for this
 `Worker` has installed the callable identity. Registering to a user-selected
 worker subset is not part of this contract.
 `orch.submit_next_level(..., worker=...)` and
-`orch.submit_next_level_group(..., workers=...)` are submit-time affinity
-controls; they do not define registration scope. NEXT_LEVEL affinity consumes
-stable worker ids. Local Python Worker children and remote L3 workers use the
-worker ids returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip
-worker ids are the existing chip worker ids.
+`orch.submit_next_level_group(..., workers=...)` require exact submit-time
+placement; they do not define registration scope. NEXT_LEVEL placement uses
+stable worker ids. Local Python Worker children and remote L3 workers use ids
+returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip worker ids
+are the existing chip worker ids.
 
 `CallableHandle` is the public callable token returned by registration:
 
@@ -380,7 +381,7 @@ matmul = worker.register(chip_callable)
 postprocess = worker.register(py_callable)
 
 def parent_orch(orch, args, config):
-    orch.submit_next_level(matmul, args, config)
+    orch.submit_next_level(matmul, args, config, worker=0)
     orch.submit_sub(postprocess, args)
 ```
 
@@ -487,11 +488,10 @@ Worker teardown is deferred to a later design.
 
 ### Dispatch Contract
 
-Parent-side scheduling assumes the handle's `hashid` is installed on every
-active target in its registration scope. Dispatch choices are constrained by
-the handle namespace, submit-time affinity, and tensor/buffer accessibility.
-Submit-time live validation is a preflight check only. It does not pin the
-target identity through later drain or child dispatch. Callers must not
+Parent-side scheduling requires the handle's `hashid` on the submitted exact
+target. The Orchestrator validates the handle namespace and tensor/buffer
+accessibility for that target before committing the slot. The target identity
+is then fixed in `TaskSlotState` through dispatch. Callers must not
 concurrently unregister a handle while `Worker.run()` or any in-flight task may
 submit or use that handle; wait for the relevant run/drain to return before
 unregistering it.

@@ -239,7 +239,7 @@ def _build_chip_callable(platform: str, case: dict) -> ChipCallable:
     pto_isa_root = None
     if case["kernel"] is not None or not platform.endswith("sim"):
         pto_isa_root = ensure_pto_isa_root()
-        os.environ["PTO_ISA_ROOT"] = pto_isa_root
+        # Path is passed explicitly to KernelCompiler; do not export (#1403).
 
     children = []
     if case["kernel"] is not None:
@@ -279,7 +279,6 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
     handle = worker.register(chip_callable)
     worker.init()
     config = CallConfig()
-    config.block_dim = 1
     config.aicpu_thread_num = 2
     for key, value in case["runtime_env"].items():
         setattr(config.runtime_env, key, value)

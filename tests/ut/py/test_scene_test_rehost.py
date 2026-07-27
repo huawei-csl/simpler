@@ -17,12 +17,13 @@ partial-construction rollback, and non-contiguous rejection.
 
 from __future__ import annotations
 
+import ctypes
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 import torch
 
-from simpler_setup.scene_test import TaskArgsBuilder, Tensor, _RehostedTaskArgs
+from simpler_setup.scene_test import Scalar, TaskArgsBuilder, Tensor, _RehostedTaskArgs
 
 
 class _FakeHostBuffer:
@@ -130,3 +131,194 @@ def test_rehost_rejects_noncontiguous():
     # Rejected before any allocation — nothing to leak.
     assert w.created == []
     assert w.freed == []
+
+
+# ---------------------------------------------------------------------------
+# Characterization (partial) — SceneTest host-tensor rehost adapter.
+#
+# These pin CURRENT behavior of the Python rehost / arg-build layer as input to
+# a planned typed-BufferHandle change (that planning context lives in the PR
+# description). They assert what is, not what should be:
+#   - a size-1 dimension's stride is normalized away, and
+#   - non-overlapping views of one storage are split into independent buffers.
+#
+# SCOPE: they cover the rehost adapter and `make_tensor_arg` output only. They
+# do NOT exercise the C++ orchestrator's dependency-key derivation
+# (`TensorKey::local_host` in src/common/hierarchical/orchestrator.cpp), which
+# runs inside a real submit and is out of device-free reach here. The
+# canonical-identity / dependency-key behavior is therefore NOT characterized by
+# this file — that remains open work.
+# ---------------------------------------------------------------------------
+
+
+def _make_tensor_arg(t):
+    # Imported lazily: torch_interop pulls in the task_interface binding, which
+    # the builder-only tests above do not need.
+    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
+
+    return make_tensor_arg(t)
+
+
+def test_char_singleton_stride_dropped_by_make_tensor_arg():
+    # The wire Tensor's strides are a pure function of shape (row-major), so a
+    # size-1 dimension's stride value never survives into the Tensor. Two tensors
+    # equal in shape+values but differing ONLY in their singleton-dim stride get
+    # identical consumer-visible geometry (shape / stride / start_offset); the
+    # inactive-dim and padding bytes are unspecified, so this is a geometry
+    # equality, not a byte-for-byte one.
+    base = torch.arange(4, dtype=torch.float32)
+    weird = base.as_strided((4, 1), (1, 7))  # singleton-dim stride = 7
+    canon = base.as_strided((4, 1), (1, 1))  # singleton-dim stride = 1
+    # Pin the fixture strides so a future torch that normalizes them at
+    # construction fails here loudly instead of silently voiding the coverage.
+    assert weird.stride() == (1, 7)
+    assert canon.stride() == (1, 1)
+    # Both are contiguous per torch (a size-1 dim's stride is free), so
+    # make_tensor_arg accepts them rather than rejecting as non-contiguous.
+    assert weird.is_contiguous() and canon.is_contiguous()
+    assert torch.equal(weird, canon)
+
+    w_weird = _make_tensor_arg(weird)
+    w_canon = _make_tensor_arg(canon)
+    # The 7 is normalized to the row-major 1; consumer-visible geometry matches.
+    assert tuple(w_weird.strides) == (1, 1)
+    assert tuple(w_weird.strides) == tuple(w_canon.strides)
+    assert tuple(w_weird.shapes) == tuple(w_canon.shapes)
+    assert w_weird.start_offset == w_canon.start_offset == 0
+
+
+def test_char_singleton_stride_dropped_by_rehost():
+    # The rehost `.view(shape)` re-canonicalizes strides, so a non-canonical
+    # singleton-dim stride on the input host tensor is lost after rehosting into
+    # the born-shared buffer.
+    base = torch.arange(4, dtype=torch.float32)
+    weird = base.as_strided((4, 1), (1, 7))
+    assert weird.stride() == (1, 7)  # pin fixture (see note above)
+    ta = TaskArgsBuilder(Tensor("a", weird))
+    w = _FakeWorker()
+    rehosted = _RehostedTaskArgs(w, ta)
+    try:
+        assert ta.a.stride() == (1, 1)  # input singleton stride 7 → normalized
+        assert torch.equal(ta.a, weird)
+    finally:
+        rehosted.release()
+
+
+def test_char_nonoverlapping_shared_storage_not_rejected():
+    # Two non-overlapping views of ONE backing storage are not rejected (the
+    # alias guard tests byte-range overlap, not shared backing) and rehost into
+    # INDEPENDENT born-shared buffers — the shared-backing relationship is not
+    # preserved across the rehost.
+    base = torch.zeros(8, dtype=torch.float32)
+    a, b = base[:4], base[4:]  # non-overlapping byte ranges, same storage
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    ta = TaskArgsBuilder(Tensor("a", a), Tensor("b", b))
+    w = _FakeWorker()
+    rehosted = _RehostedTaskArgs(w, ta)
+    try:
+        # Not rejected; split into two independent born-shared buffers.
+        assert len(w.created) == 2
+        assert ta.a.untyped_storage().data_ptr() != ta.b.untyped_storage().data_ptr()
+    finally:
+        rehosted.release()
+
+
+def test_char_make_tensor_arg_carries_backing_as_addr_only():
+    # `make_tensor_arg` records backing location solely as the raw address
+    # (`data` == buffer.addr); there is no separate backing-identity field. Two
+    # non-overlapping views of one storage therefore get DISTINCT `data` values,
+    # offset by the view's byte offset.
+    #
+    # NOTE: this characterizes make_tensor_arg's output only, NOT the
+    # orchestrator's dependency key. It does not, on its own, pin what a future
+    # typed handle must change — a handle could add a canonical identity while
+    # leaving these addresses as-is. The dependency-key path is not exercised
+    # here (see SCOPE above).
+    base = torch.zeros(8, dtype=torch.float32)
+    a, b = base[:4], base[4:]  # both 1-D contiguous slices
+    w_a = _make_tensor_arg(a)
+    w_b = _make_tensor_arg(b)
+    assert w_b.data - w_a.data == 4 * a.element_size()
+    assert w_a.data != w_b.data
+
+
+# ---------------------------------------------------------------------------
+# TaskArgsBuilder duplicate-name fail-fast
+# ---------------------------------------------------------------------------
+
+
+def test_builder_constructor_rejects_duplicate_tensor():
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        TaskArgsBuilder(
+            Tensor("a", torch.zeros(4)),
+            Tensor("a", torch.ones(4)),
+        )
+
+
+def test_builder_constructor_rejects_tensor_scalar_name_clash():
+    with pytest.raises(ValueError, match="duplicate argument name 'x'"):
+        TaskArgsBuilder(
+            Tensor("x", torch.zeros(4)),
+            Scalar("x", ctypes.c_float(1.0)),
+        )
+
+
+def test_builder_rejects_name_shadowing_builder_attribute():
+    # A name that resolves to a real attribute/method would shadow it, so
+    # `args.specs` returns the property instead of the argument. Reject it.
+    with pytest.raises(ValueError, match="conflicts with builder attributes/methods"):
+        TaskArgsBuilder(Tensor("specs", torch.zeros(4)))
+    with pytest.raises(ValueError, match="conflicts with builder attributes/methods"):
+        TaskArgsBuilder(Scalar("clone", ctypes.c_int64(1)))
+    # A name that is not a builder member is still accepted.
+    ta = TaskArgsBuilder(Tensor("value", torch.zeros(4)))
+    assert torch.equal(ta.value, torch.zeros(4))
+
+
+def test_builder_incremental_add_rejects_duplicate():
+    ta = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        ta.add_tensor("a", torch.ones(4))
+
+
+def test_builder_duplicate_scalar_leaves_state_unchanged():
+    # A rejected duplicate scalar must not flip `_has_scalar`, so a legal tensor
+    # can still be added afterwards (tensor-before-scalar ordering intact).
+    ta = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    ta.add_scalar("s", ctypes.c_int64(7))
+    with pytest.raises(ValueError, match="duplicate argument name 's'"):
+        ta.add_scalar("s", ctypes.c_int64(9))
+    # State unchanged: names, order, and stored values are exactly as before.
+    assert [s.name for s in ta.specs] == ["a", "s"]
+    assert ta.s.value == 7
+
+    # A rejected duplicate scalar must not set `_has_scalar` before the check,
+    # or the tensor-before-scalar guard would spuriously block a later legal
+    # tensor. Fresh tensor-only builder → reject a name-clashing scalar → a
+    # subsequent add_tensor must still succeed. (Catches moving the
+    # `_has_scalar = True` assignment ahead of the duplicate check.)
+    tb = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    orig_a = tb.a
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        tb.add_scalar("a", ctypes.c_int64(3))
+    tb.add_tensor("b", torch.ones(4))
+    assert [s.name for s in tb.specs] == ["a", "b"]
+    assert tb.a is orig_a
+
+
+def test_builder_valid_args_order_named_access_and_clone():
+    ta = TaskArgsBuilder(
+        Tensor("a", torch.arange(4, dtype=torch.float32)),
+        Tensor("b", torch.ones(4, dtype=torch.float32)),
+        Scalar("scale", ctypes.c_float(1.5)),
+    )
+    assert [s.name for s in ta.specs] == ["a", "b", "scale"]
+    assert torch.equal(ta.a, torch.arange(4, dtype=torch.float32))
+    assert ta.scale.value == 1.5
+
+    clone = ta.clone()
+    assert [s.name for s in clone.specs] == ["a", "b", "scale"]
+    assert torch.equal(clone.a, torch.arange(4, dtype=torch.float32))
+    # Clone is deep: mutating the clone does not touch the original.
+    clone.a.copy_(torch.full((4,), 9.0))
+    assert torch.equal(ta.a, torch.arange(4, dtype=torch.float32))

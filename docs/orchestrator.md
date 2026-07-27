@@ -7,9 +7,9 @@ internals, not public submit arguments. See
 [callable-identity-registration.md](callable-identity-registration.md).
 
 The Orchestrator is the **DAG builder**. It runs single-threaded on the user's
-thread (inside `Worker::run` between `scope_begin` and `drain`) and owns the
-three data structures that turn a sequence of `submit_*` calls into a scheduled
-DAG: `Ring`, `TensorMap`, and `Scope`.
+thread while a run is open for submission and owns the three data structures
+that turn a sequence of `submit_*` calls into a scheduled DAG: `Ring`,
+`TensorMap`, and `Scope`.
 
 For the high-level role of the Orchestrator among the three engine components,
 see [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
@@ -34,13 +34,13 @@ public:
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config,
-                                    int32_t worker = -1,
+                                    int32_t worker,
                                     const std::vector<int32_t> &eligible_worker_ids = {},
                                     const RemoteTaskArgsSidecar &remote_sidecar = {});
     SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
                                           const CallConfig &config,
-                                          const std::vector<int32_t> &workers = {},
+                                          const std::vector<int32_t> &workers,
                                           const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
                                           const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {});
     SubmitResult submit_sub(const CallableIdentity &callable,
@@ -51,14 +51,19 @@ public:
     // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
     Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
-    // --- Internal lifecycle (invoked by Worker::run only, bound as _scope_begin
-    //     / _scope_end / _drain in the Python facade) ---
+    // --- Internal lifecycle (invoked by Python Worker.submit/RunHandle) ---
+    RunId begin_run();
+    void close_run_submission(RunId run_id);
+    void fail_run_submission(RunId run_id, std::exception_ptr error);
+    void wait_run(RunId run_id);
+    bool wait_run_for(RunId run_id, double timeout_seconds);
+    bool run_done(RunId run_id) const;
+    void release_run(RunId run_id);
     void scope_begin();
     void scope_end();
-    void drain();
 
 private:
-    // ... components: Ring, TensorMap, Scope, slot pool, active_tasks_ counter
+    // ... components: Ring, TensorMap, Scope, and the RunState registry
 };
 
 struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Python
@@ -67,19 +72,44 @@ struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Pyt
 **Status**: `submit_sub` takes only `(CallableIdentity, args)` — no
 `config`, since SUB has no per-call config.
 
-`scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
-`_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
-user-facing orch-fn API.
+The run lifecycle and outer `scope_begin` / `scope_end` are invoked from Python
+`Worker.submit` through private bindings. They are not part of the user-facing
+orch-fn API. `Worker.submit` invokes the orchestration callback and closes DAG
+submission synchronously, then returns a `RunHandle` before L3 device work has
+necessarily completed. Graph-construction errors therefore remain synchronous;
+device or endpoint errors are attached to the handle and raised by `wait()` or
+`result()`.
+
+`RunHandle.done` polls the matching native run fence. `wait(timeout)` supports
+bounded waits without cancelling or corrupting the run, and repeated waits
+replay the same terminal result. The handle keeps its `Worker`, callback
+arguments, configuration, and run-owned cleanup state alive until completion.
+`Worker.close()` rejects new submissions and drains every accepted handle
+before tearing down the worker tree.
+
+`Worker.run` remains source-compatible and blocking:
+
+```python
+worker.run(orchestration, args, config)
+# Equivalent to:
+worker.submit(orchestration, args, config).wait()
+```
+
+The current L2 backend is synchronous, so L2 `submit()` executes the existing
+blocking path and returns an already-completed handle. L3 asynchronous return
+does not yet imply overlapping runs: a later submit waits for the prior run's
+fence and cleanup before building the next DAG.
 
 Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and
 `TaskArgs.add_tensor(RemoteTensorRef(...), tag)` supplies tensor sidecars. The
-Orchestrator validates affinity, worker existence, local-vs-remote
+Orchestrator validates exact placement, worker existence, local-vs-remote
 compatibility, remote handle access rights for the tensor tag, bare host
 pointers, and remote null OUTPUT tensors before committing the slot.
-For NEXT_LEVEL tasks, `worker`/`workers` are stable worker ids rather than
-C++ worker-thread vector indices.
+For NEXT_LEVEL tasks, `worker`/`workers` are required stable worker ids rather
+than C++ worker-thread vector indices. SUB submit APIs expose no worker
+selection and use the shared SUB ready queue.
 
 ---
 
@@ -92,7 +122,8 @@ how the slot is set up.
 ```cpp
 SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
                                               TaskArgs args,
-                                              const CallConfig &config) {
+                                              const CallConfig &config,
+                                              int32_t worker) {
     // 1. Alloc slot (blocks on back-pressure if ring full)
     TaskSlot sid = ring_.alloc();
     TaskSlotState &s = slots_[sid];
@@ -103,6 +134,7 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
     s.callable    = callable;
     s.task_args   = std::move(args);
     s.config      = config;
+    s.target_worker_ids = {worker};
 
     // 3. Walk task_args tags, derive dependencies
     //    (dedup producers: same producer may appear on multiple input tensors)
@@ -130,10 +162,16 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
     // 5. Register with scope (holds slot open until scope_end releases ref)
     scope_.register_task(sid);          // increments s.fanout_total by 1
 
-    // 6. Push fanout edges onto scheduler's wiring queue
-    //    (Scheduler wires producer→consumer asynchronously; avoids blocking
-    //    the Orch thread on fanout_mu)
-    scheduler_.enqueue_wiring(sid, std::move(producers));
+    // 6. Attach fanout edges under each producer's mutex. Producers already
+    //    completed do not count as live fanins; failed producers poison this
+    //    slot. Route an immediately READY slot through enqueue_ready().
+    attach_fanout_and_count_live_producers(sid, producers);
+    if (s.fanin_count == 0) {
+        s.state = TaskState::READY;
+        enqueue_ready(sid);
+    } else {
+        s.state = TaskState::PENDING;
+    }
 
     // 7. Return handle
     return {sid};
@@ -152,9 +190,9 @@ small POD copied by value. `callable` is a `uint64_t` opaque handle (see
 **Step 3 — tag walk**: The only place tags are consumed. After this step tags
 are never inspected again; they are not carried into the slot's stored
 `task_args` value during dispatch (see [task-flow.md](task-flow.md) §3).
-Local tensors key TensorMap by `(LOCAL_HOST, ptr)` or
-`(LOCAL_CHILD, worker, ptr)`. Remote tensors with sidecars key by
-`(address_kind, owner_worker_id, buffer_id, generation, offset)`.
+Every TensorMap key starts with the current `RunId`. Local tensor identity is
+then `(LOCAL_HOST, ptr)` or `(LOCAL_CHILD, worker, ptr)`. Remote tensors with
+sidecars use `(address_kind, owner_worker_id, buffer_id, generation, offset)`.
 
 | Tag | `tensormap.lookup` | `tensormap.insert` |
 | --- | ------------------ | ------------------ |
@@ -172,16 +210,21 @@ remote buffer identity and logical offset.
 
 **Step 4 — fanin count**: The number of live producers. Decremented by
 `fanin_released++` each time a producer completes; when `fanin_released ==
-fanin_count`, the slot is ready.
+fanin_count`, the slot is ready. A ready NEXT_LEVEL single task is routed to
+the FIFO for its required stable worker id. The same routing function is used
+for immediately-ready submissions and tasks released by Scheduler dependency
+processing. A ready NEXT_LEVEL group is routed to the dedicated group FIFO;
+SUB tasks remain on their shared queue.
 
 **Step 5 — scope ref**: Each slot starts with one "scope reference" in its
 fanout_total. Without this, a task with no downstream consumer would never be
 reclaimable. See [§6 Scope](#6-scope).
 
-**Step 6 — wiring queue**: Fanout edges (producer knows its consumers) are
-wired **asynchronously** by the Scheduler thread. This decouples submit from
-`fanout_mu` contention. See [scheduler.md](scheduler.md) §2 for the wiring
-phase.
+**Step 6 — fanout attachment and READY routing**: Submission synchronously
+locks each producer's `fanout_mu`, attaches the consumer, and counts only live
+producers. An immediately READY task is routed to its exact NEXT_LEVEL worker
+FIFO, the NEXT_LEVEL group FIFO, or the shared SUB FIFO. See
+[scheduler.md](scheduler.md) §1.
 
 ---
 
@@ -192,49 +235,29 @@ Each worker gets its own `TaskArgs`; the node only reaches COMPLETED when all
 N finish.
 
 ```cpp
-SubmitResult Orchestrator::submit_next_level_group(const CallableIdentity &callable,
-                                                    std::vector<TaskArgs> args_list,
-                                                    const CallConfig &config) {
-    TaskSlot sid = ring_.alloc();
-    TaskSlotState &s = slots_[sid];
-    s.reset();
-    s.worker_type     = WorkerType::NEXT_LEVEL;
-    s.callable        = callable;
-    s.config          = config;
-    s.group_size      = args_list.size();
-    s.sub_complete_count = 0;
-    s.task_args_list  = std::move(args_list);
-
-    // Tag walk unions all entries in args_list (any input in any member → fanin)
-    // Dedup both producers and outputs across all args_list entries.
-    std::vector<TaskSlot> producers;
-    std::unordered_set<TaskSlot> producers_seen;
-    std::unordered_set<uint64_t> outputs_seen;
-    for (auto &a : s.task_args_list) {
-        for (int i = 0; i < a.tensor_count(); i++) {
-            TensorArgType tag = a.tag(i);
-            uint64_t ptr      = a.tensor(i).data;
-            if (tag == INPUT || tag == INOUT)
-                if (auto prod = tensormap_.lookup(ptr); prod != INVALID)
-                    if (producers_seen.insert(prod).second)
-                        producers.push_back(prod);
-            if (tag == OUTPUT || tag == INOUT || tag == OUTPUT_EXISTING)
-                if (outputs_seen.insert(ptr).second)
-                    tensormap_.insert(ptr, sid);
-        }
-    }
-
-    s.fanin_count    = static_cast<int32_t>(producers.size());
-    s.fanin_released = 0;
-    scope_.register_task(sid);
-    scheduler_.enqueue_wiring(sid, std::move(producers));
-    return {sid};
+SubmitResult Orchestrator::submit_next_level_group(
+    const CallableIdentity &callable, const std::vector<TaskArgs> &args_list,
+    const CallConfig &config, const std::vector<int32_t> &worker_ids,
+    const std::vector<std::vector<int32_t>> &eligible_worker_ids,
+    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
+) {
+    return submit_impl(
+        WorkerType::NEXT_LEVEL, callable, config, args_list, worker_ids,
+        eligible_worker_ids, remote_sidecars
+    );
 }
 ```
 
-At dispatch time the Scheduler reserves `group_size` idle WorkerThreads, and
-each WorkerThread runs `worker->run` with its own `task_args_list[i]`.
-Completion is gated on `sub_complete_count.fetch_add(1) + 1 == group_size`.
+`submit_impl` validates that `worker_ids` contains one unique, eligible target
+per group member before it performs shared dependency inference and READY
+routing.
+
+At dispatch time the Scheduler checks the group FIFO head and resolves every
+entry in `workers` to that exact stable worker ID. It dispatches only if the
+entire target set is idle; a blocked group reserves no partial worker set and
+does not cause a scan past the FIFO head. Each WorkerThread runs `worker->run`
+with its own `task_args_list[i]`. Completion remains aggregated at the group
+slot, so downstream consumers are released once after every member is terminal.
 
 ---
 
@@ -282,8 +305,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
    state lives in parent-process heap (never crossed into child workers),
    so the ring-index addressing scheme L2 needs for shmem descriptors
    buys us nothing here. A monotonic `int32_t` gives ~2 billion ids per
-   `reset_to_empty()` interval, reset to 0 at the end of every
-   `Worker.run()`.
+   globally quiescent compaction interval.
 2. **`MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
    (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each slab has its own
    `mmap(MAP_SHARED | MAP_ANONYMOUS)` region, bump cursor, FIFO
@@ -305,7 +327,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
    records its `ring_idx` and `ring_slot_idx` (position within that
    ring's FIFO order). `std::deque::push_back` never invalidates pointers
    to existing elements, so the pointer returned by `slot_state(id)`
-   stays valid until `reset_to_empty()` drops the whole deque.
+   stays valid until globally quiescent `reset_to_empty()` drops the deque.
 
 ```cpp
 struct AllocResult {
@@ -357,12 +379,13 @@ next-oldest in-ring slot is released, walking the ring's `heap_tail`
 forward. Rings never touch each other — inner-scope tasks reclaim
 without waiting for an outer-scope task to finish.
 
-**End-of-run reset**: `Orchestrator::drain()` waits for
-`active_tasks_` to hit 0, then calls `ring.reset_to_empty()` which
-drops the whole slot-state deque *and* rewinds every ring's cursors /
-`released[]` / `slot_heap_end[]` back to 0. Memory per `Worker.run()`
-is bounded by that run's peak alive task count; nothing accumulates
-across runs.
+**Run completion and compaction**: every committed slot increments its owning
+`RunState.active_tasks`; `on_consumed` decrements that same run exactly once. A
+run becomes terminal only after submission is closed and its count reaches
+zero. Slot and heap reclamation still happens incrementally through
+`ring.release(slot)`. `release_run()` may call `ring.reset_to_empty()` only
+when no registered runs or live slots remain, so one run never resets storage
+owned by another.
 
 **Locking**: each ring has its own `mu` / `cv`; the shared
 `next_task_id_` and slot deque are guarded by a separate `slots_mu_`.
@@ -443,11 +466,11 @@ Flow:
 ```python
 def my_orch(orch, args, cfg):
     with orch.scope():                             # ring 1
-        orch.submit_next_level(chip_a, a_args, cfg)
-        orch.submit_next_level(chip_b, b_args, cfg)
+        orch.submit_next_level(chip_a, a_args, cfg, worker=0)
+        orch.submit_next_level(chip_b, b_args, cfg, worker=1)
     # Inner tasks are now eligible for reclamation on ring 1,
     # without waiting for any outer-scope task.
-    orch.submit_next_level(chip_c, c_args, cfg)    # ring 0 (outer)
+    orch.submit_next_level(chip_c, c_args, cfg, worker=0)  # ring 0
 ```
 
 `with orch.scope():` is the recommended form. Raw `orch.scope_begin()` /
@@ -463,29 +486,28 @@ threshold transitions to CONSUMED inline; others stay COMPLETED or PENDING
 until the scheduler and consumers finish their own releases. This mirrors
 L2's `pto2_scope_end`.
 
-Users who need a synchronous wait for *all* in-flight tasks must call
-`drain()` (or let `Worker::run` finish — its outer `scope_end` is followed
-by `drain()` before the call returns). There is deliberately no
-per-scope drain primitive: the extra machinery (per-scope active counter
-and cv) would only pay for itself in patterns we do not have yet.
+The internal run fence, not `scope_end`, provides synchronous completion.
+`Worker.run` closes its outer scope, closes submission, and waits for that
+run's active count to reach zero before returning. There is deliberately no
+per-scope wait primitive.
 
 ---
 
 ## 7. TensorMap
 
-The TensorMap maps `tensor_base_ptr → current_producer_slot`. It drives
-automatic dependency inference.
+The TensorMap maps `(RunId, TensorKey) → current_producer_slot`. It drives
+automatic dependency inference without resolving a producer from another run.
 
 ```cpp
 class TensorMap {
 public:
-    TaskSlot lookup(uint64_t base_ptr) const;         // returns INVALID if absent
-    void     insert(uint64_t base_ptr, TaskSlot sid); // overwrites; previous
-                                                      // producer remains wire-referenced
-    void     erase(uint64_t base_ptr);                // called when producer
-                                                      // reaches CONSUMED
+    TaskSlot lookup(RunId run_id, TensorKey key) const;
+    void insert(RunId run_id, TensorKey key, TaskSlot sid);
+    void erase_task_outputs(RunId run_id, TaskSlot owner,
+                            const std::vector<TensorKey> &keys);
 private:
-    std::unordered_map<uint64_t, TaskSlot> map_;
+    std::mutex mu_;
+    std::unordered_map<RunTensorKey, TaskSlot, RunTensorKeyHash> map_;
 };
 ```
 
@@ -495,7 +517,11 @@ private:
   entry → fanin edge recorded.
 - **WAW (write-after-write)**: a new `OUTPUT` on the same address replaces
   the entry. The previous producer remains live (still has wire references
-  from any prior consumers); new consumers depend only on the latest.
+  from any prior consumers); new consumers depend only on the latest. The two
+  writers carry no edge between them, so the earlier one can reach CONSUMED
+  first — `erase_task_outputs` therefore drops a key only while it still maps
+  to the consumed slot, leaving the later writer's entry for new consumers to
+  find.
 - **WAR (write-after-read)** is not tracked directly. Read tasks don't
   register in TensorMap; write tasks only look up current producer. If a
   consumer reads `X` (recording fanin on producer P1) and then a later task
@@ -509,11 +535,9 @@ private:
 
 ### Thread safety
 
-TensorMap is written only by the Orch thread (in `submit_*`) and modified by
-the Scheduler thread via `erase` (on CONSUMED). Since `submit_*` and `erase`
-for different entries are non-overlapping in practice, a single mutex guards
-the map in the current implementation. If contention becomes a concern, a
-concurrent hash map can replace it.
+TensorMap is written by the Orch thread in `submit_*` and modified by the
+Scheduler thread when a slot becomes CONSUMED. A mutex serializes lookup,
+insert, erase, and size operations across those threads.
 
 ---
 
@@ -583,7 +607,8 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     // 2. Register as this slot's output so downstream tensors with the same
     //    data pointer look up this slot as producer.
     uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
-    tensormap_.insert(key, ar.slot);
+    s.run_id = current_run_id;
+    tensormap_.insert(current_run_id, key, ar.slot);
     s.output_keys.push_back(key);
     // 3. No fanin — alloc has no work to wait on.
     s.fanin_count = 0;
@@ -597,7 +622,7 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     s.fanout_released = 1;
     // 6. Straight to COMPLETED — no dispatch needed.
     s.state = TaskState::COMPLETED;
-    active_tasks_++;
+    current_run.active_tasks++;
     return Tensor{key, shape, dtype};
 }
 ```
@@ -701,9 +726,9 @@ instead of stalling forever. Default timeout: 10 s.
 
 ## 9. Invariants
 
-1. **Orch is single-threaded**: only one thread ever calls `submit_*` or holds
-   the `Orchestrator`. No locking is needed on TensorMap, Scope, or Ring-head
-   for self-writes.
+1. **Orch is single-threaded**: only one thread builds a run and calls
+   `submit_*` at a time. TensorMap still uses a mutex because Scheduler-driven
+   consumption erases entries concurrently.
 2. **Tags are consumed at submit**: `task_args.tag(i)` is read only inside
    `submit_*`. Phases after submit (slot storage, dispatch, execution) do not
    see tags.
@@ -722,8 +747,8 @@ instead of stalling forever. Default timeout: 10 s.
 
 - [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — how
   Orchestrator fits alongside Scheduler and Worker
-- [scheduler.md](scheduler.md) — what happens to slots after they're pushed
-  onto the wiring queue
+- [scheduler.md](scheduler.md) — READY dispatch and completion-time dependency
+  release
 - [task-flow.md](task-flow.md) — the data (Callable / TaskArgs / CallConfig)
   being moved by `submit_*`
 - [comm-domain.md](comm-domain.md) — `orch.allocate_domain` dynamic

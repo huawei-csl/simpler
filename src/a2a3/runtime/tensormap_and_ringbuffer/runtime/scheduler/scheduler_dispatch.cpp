@@ -243,7 +243,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 #endif
 
     return PublishHandle{
-        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task->task_timing_slot
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
     };
 }
 
@@ -360,7 +360,7 @@ void SchedulerContext::dispatch_shape(
         // one register write.
         bool any_sync_start = false;
         for (int bi = 0; bi < got; bi++) {
-            if (batch[bi]->active_mask.requires_sync_start()) {
+            if (batch[bi]->task_attrs.requires_sync_start()) {
                 any_sync_start = true;
                 break;
             }
@@ -424,7 +424,7 @@ void SchedulerContext::dispatch_shape(
             // released by their doorbell in release_fanin_and_check_ready the
             // instant their last producer completes — see try_early_dispatch_release.)
 
-            if (slot_state->active_mask.requires_sync_start()) {
+            if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
                     disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
@@ -779,7 +779,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
             if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
-                LOG_INFO_V9(
+                LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
                     static_cast<int64_t>(c->task->task_id.raw)
                 );
@@ -830,8 +830,8 @@ int32_t SchedulerContext::try_early_dispatch(
     // so this arms at most one drain and adds no blocks to total_staged here.
     uint64_t sync_task_id_snapshot = 0;
     if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
-        bool current_sync_task = static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot &&
-                                 c->active_mask.requires_sync_start();
+        bool current_sync_task =
+            static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
@@ -874,24 +874,14 @@ int32_t SchedulerContext::try_early_dispatch(
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
-    LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);
 
     PTO2SharedMemoryHeader *header = sched_->sm_header;
     if (!header) {
         LOG_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    LOG_INFO_V0(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
-        static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
-    LOG_INFO_V0(
-        "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
@@ -1210,10 +1200,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
             }
 #if SIMPLER_DFX
-            // Dummy outer phase: covers handling of all dummies popped this
-            // (Worker View AICPU_N) by the converter, so they do not nest
-            // under this bar. Resolve emits below DO land on the sched lane
-            // and nest under this Dummy outer by time containment.
+            // Dummy outer phase: covers all dependency-only items popped this
+            // iter. Per-item identity markers are emitted to a SEPARATE lane
+            // (Worker View AICPU_N) by the converter, so they do not nest under
+            // this bar. Resolve emits below DO land on the sched lane and nest
+            // under this Dummy outer by time containment.
             uint64_t dummy_outer_t0 =
                 (dummy_got > 0 && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
@@ -1247,15 +1238,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                             sched_l2_swimlane_[thread_idx].sched_loop_count, dummy_consumers
                         );
                     }
-                    l2_swimlane_aicpu_record_dummy_task(
-                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
-                        dummy_slot.task->task_id.raw
-                    );
+                    if (dummy_slot.task_attrs.has_predicate()) {
+                        l2_swimlane_aicpu_record_predicated_skip(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    } else {
+                        l2_swimlane_aicpu_record_dummy_task(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    }
                 }
 #endif
-                // Dummy tasks have no subtasks to retire and no fanout pre-conditions
-                // beyond their own producers; release self-reference so the slot can
-                // reach CONSUMED once all consumers drain.
+                // Dependency-only completions have no dispatched subtasks to retire
+                // and no fanout pre-conditions beyond their own producers; release
+                // self-reference so the slot can reach CONSUMED once all consumers drain.
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
                     while (deferred_release_count > 0) {

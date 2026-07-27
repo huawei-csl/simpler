@@ -17,7 +17,6 @@
 #include <tracr_simpler_markers.hpp>
 
 #include "common/unified_log.h"
-#include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -236,8 +235,18 @@ void SchedulerContext::log_stall_diagnostics(
             for (int32_t si = 0; si < ring_task_count; si++) {
                 PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
                 PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-                int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-                int32_t fi = slot_state.fanin_count;
+                // Polling: no fanin_refcount. Recompute met/total from the inline
+                // fanin ids vs the ring completion_flags (rc = satisfied producers,
+                // fi = raw producer count) so the stall dump still shows readiness.
+                int32_t fi = slot_state.payload != nullptr ? slot_state.payload->fanin_count : 0;
+                int32_t rc = 0;
+                if (slot_state.payload != nullptr) {
+                    for (int32_t k = 0; k < fi; k++) {
+                        int32_t pid = slot_state.payload->fanin_local_ids[k];
+                        if (ring.completion_flags[pid & ring.task_window_mask].load(std::memory_order_relaxed) != 0)
+                            rc++;
+                    }
+                }
                 int32_t kid_aic = slot_state.task->kernel_id[0];
                 int32_t kid_aiv0 = slot_state.task->kernel_id[1];
                 int32_t kid_aiv1 = slot_state.task->kernel_id[2];
@@ -269,7 +278,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_running > STALL_DUMP_READY_MAX) continue;
                     LOG_INFO_V9(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                        " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
+                        " state=RUNNING fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                         "running_on=[owner_thread=%d cores=[%s]]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
                     );
@@ -280,7 +289,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_ready > STALL_DUMP_READY_MAX) continue;
                     LOG_INFO_V9(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                        " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
+                        " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                     );
                     continue;
@@ -289,7 +298,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
                 LOG_INFO_V9(
                     "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                    " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
+                    " state=WAIT    fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                     thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
                 );
             }
@@ -557,7 +566,6 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
     }
-    LOG_INFO_V0("Thread %d: Shutdown complete", thread_idx);
     return rc;
 }
 
@@ -695,7 +703,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+    active_sched_threads_ = aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
 
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
@@ -735,11 +743,11 @@ bool SchedulerContext::assign_cores_to_threads() {
 
         core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
 
-        LOG_INFO_V0("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+        LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
     for (int32_t t = 0; t < aicpu_thread_num_; t++) {
-        LOG_INFO_V0(
+        LOG_DEBUG(
             "Thread %d: total %d cores (%d clusters)", t, core_trackers_[t].core_num(),
             core_trackers_[t].get_cluster_count()
         );
@@ -773,23 +781,19 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     if (timeout_count > 0) {
         LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
     }
-    LOG_WARN("Emergency shutdown complete");
 }
 
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t SchedulerContext::pre_handshake_init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
-) {
+int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base) {
     always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
 
-    // Wire thread/transition configuration that handshake/assign need to read.
+    // Wire thread configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
-    sched_thread_num_ = sched_thread_num;
     regs_ = regs_base;
 
 #if SIMPLER_DFX
@@ -807,12 +811,11 @@ int32_t SchedulerContext::pre_handshake_init(
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
             // below. This block runs before assign_cores_to_threads, so the
-            // active_sched_threads_ member isn't set yet — recompute the same
-            // normalization locally: sched_thread_num_ <= 0 means "use all AICPU
-            // threads as scheduler threads" (see assign_cores_to_threads'
-            // active_sched_threads_). Without it, init_phase would prime zero
-            // sched pools and all sched_phase emits would silently drop.
-            const int sched_phase_threads = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            // active_sched_threads_ member isn't set yet; every AICPU thread is a
+            // scheduler, so the count is aicpu_thread_num_. Without it, init_phase
+            // would prime zero sched pools and all sched_phase emits would silently
+            // drop.
+            const int sched_phase_threads = aicpu_thread_num_;
             // Orchestration is always single-threaded, so orch-phase is one pool
             // (ordinal 0) — see record_orch_phase.
             const int orch_phase_threads = 1;
@@ -873,23 +876,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // only), so the "do it once" guarantee is structural (no CAS needed). Runs
     // after the handshake / assign_cores_to_threads because pmu_aicpu_init needs
     // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
-    // convention above; the per-thread *_set_orch_thread_idx setters stay on the
-    // orchestrator thread (see aicpu_executor.cpp).
+    // convention above.
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-    }
-    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
-    // and compiles out with the other profiling subsystems at SIMPLER_DFX=0.
-    // init() only pops the initial buffer from instance 0's free_queue; the
-    // orchestrator thread still records its idx via
-    // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
-    if (is_dep_gen_enabled()) {
-        dep_gen_aicpu_init();
     }
 #endif
 
@@ -923,7 +916,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 
     // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
     // This is done once at startup and never modified afterwards.
-    for (int32_t t = 0; t < sched_thread_num_; t++) {
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
         CoreTracker &tracker = core_trackers_[t];
         for (int32_t c = 0; c < tracker.get_cluster_count(); c++) {
             int32_t cluster_offset = c * 3;  // Each cluster = 1 AIC + 2 AIV
@@ -975,7 +968,7 @@ void SchedulerContext::deinit() {
     // worker_count (== cores_total_num_ here), so a reset on a higher lane emits a
     // trace event on a channelId the metadata never names.
     for (int32_t i = 0; i < cores_total_num_; i++) {
-        INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + i);
+        INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + i);
     }
 
     // Reset all per-core execution state
@@ -1019,7 +1012,6 @@ void SchedulerContext::deinit() {
     aiv_count_ = 0;
     cores_total_num_ = 0;
     aicpu_thread_num_ = 0;
-    sched_thread_num_ = 0;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
@@ -1075,6 +1067,34 @@ void SchedulerContext::on_orchestration_done(
     if (orch_err != PTO2_ERROR_NONE) {
         if (!completed_.exchange(true, std::memory_order_acq_rel)) {
             emergency_shutdown(runtime);
+        }
+    }
+
+    // Polling initial classify (device boot): the host built the whole graph and
+    // no producer has executed yet — every completion_flags byte is 0 except the
+    // hidden-alloc tasks the host completed inline (pre-set to 1). Classify each
+    // submitted task exactly once: route roots (all fanin met) to the ready queues
+    // and register the rest on their first unmet producer's wake list. This
+    // replaces the host-side wiring drain the wiring model deferred to a device
+    // queue. Runs on the boot leader BEFORE the caller publishes
+    // runtime_init_ready_ (release), so it is race-free against the scheduler
+    // threads (they acquire that store before dispatching) and nothing completes
+    // during the scan.
+    if (orch_err == PTO2_ERROR_NONE && sched_->ring_sched_state.ring != nullptr) {
+        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
+        const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
+        for (int32_t id = 0; id < submitted; id++) {
+            if (ring.completion_flags[id & ring.task_window_mask].load(std::memory_order_acquire) != 0) {
+                continue;  // completed on the host (hidden alloc); nothing to dispatch
+            }
+            PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
+            int32_t state = sched_->classify_fanin_state(&s);
+            if (state < 0) {
+                sched_->push_ready_routed(&s);
+            } else {
+                int32_t prod_local = s.payload->fanin_local_ids[state];
+                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+            }
         }
     }
 

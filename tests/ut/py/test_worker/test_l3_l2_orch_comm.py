@@ -110,8 +110,8 @@ class _FakeDirectCWorker:
 
 
 class _EndpointFailingOrch:
-    def _clear_error(self) -> None:
-        pass
+    def _begin_run(self) -> int:
+        return 1
 
     def _scope_begin(self) -> None:
         pass
@@ -119,11 +119,21 @@ class _EndpointFailingOrch:
     def _scope_end(self) -> None:
         pass
 
-    def _drain(self) -> None:
+    def _close_run_submission(self, run_id: int) -> None:
+        assert run_id == 1
+
+    def _fail_run_submission(self, run_id: int) -> None:
+        assert run_id == 1
+
+    def _wait_run(self, run_id: int) -> None:
+        assert run_id == 1
         raise RuntimeError(
             "child failed: L3-L2 endpoint error op=signal_wait kind=3 region=2 "
             "counter_addr=0x200000 counter_operand=7 observed_counter=0 msg=wait timed out"
         )
+
+    def _release_run(self, run_id: int) -> None:
+        assert run_id == 1
 
 
 class _NamedOnboardRegionExport:
@@ -157,8 +167,7 @@ def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker()
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = fake_c_worker
     worker._chip_shms = [shm]
     return worker, shm, fake_c_worker
@@ -173,8 +182,7 @@ def _make_started_onboard_worker(platform: str = "a2a3") -> tuple[Worker, Shared
         access_profile=int(l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM),
         device_id=2,
     )
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = fake_c_worker
     worker._chip_shms = [shm]
     return worker, shm, fake_c_worker

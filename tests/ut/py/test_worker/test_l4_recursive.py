@@ -28,22 +28,30 @@ from simpler.worker import Worker
 # ---------------------------------------------------------------------------
 
 
-def _make_shared_counter():
-    """Allocate a 4-byte shared counter accessible from forked subprocesses."""
-    shm = SharedMemory(create=True, size=4)
+def _make_shared_counter(slots: int = 1):
+    """Allocate `slots` 4-byte shared counters accessible from forked subprocesses.
+
+    `_increment_counter` is a non-atomic read-modify-write, so a slot tolerates
+    at most one writing process: two processes that read before either writes
+    both store the same value and one increment is lost. A test whose
+    increments come from more than one process must give each process its own
+    slot.
+    """
+    shm = SharedMemory(create=True, size=4 * slots)
     buf = shm.buf
     assert buf is not None
-    struct.pack_into("i", buf, 0, 0)
+    for slot in range(slots):
+        struct.pack_into("i", buf, 4 * slot, 0)
     return shm, buf
 
 
-def _read_counter(buf) -> int:
-    return struct.unpack_from("i", buf, 0)[0]
+def _read_counter(buf, slot: int = 0) -> int:
+    return struct.unpack_from("i", buf, 4 * slot)[0]
 
 
-def _increment_counter(buf) -> None:
-    v = struct.unpack_from("i", buf, 0)[0]
-    struct.pack_into("i", buf, 0, v + 1)
+def _increment_counter(buf, slot: int = 0) -> None:
+    v = struct.unpack_from("i", buf, 4 * slot)[0]
+    struct.pack_into("i", buf, 4 * slot, v + 1)
 
 
 def _slot_for(worker: Worker, handle: CallableHandle) -> int:
@@ -104,7 +112,7 @@ class TestL4Validation:
         child = Worker(level=3, num_sub_workers=0)
         child.init()
         w4 = Worker(level=4, num_sub_workers=0)
-        with pytest.raises(RuntimeError, match="must not be initialized"):
+        with pytest.raises(RuntimeError, match="must be NEW"):
             w4.add_worker(child)
         child.close()
         w4.close()
@@ -200,11 +208,11 @@ class TestL4DynamicRegister:
 
             w4 = Worker(level=4, num_sub_workers=0)
             bootstrap_handle = w4.register(lambda orch, args, config: None)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def bootstrap(orch, args, config):
-                orch.submit_next_level(bootstrap_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(bootstrap_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(bootstrap)
 
@@ -214,7 +222,7 @@ class TestL4DynamicRegister:
             dynamic_handle = w4.register(dynamic_l3_orch)
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(dynamic_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(dynamic_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -250,11 +258,11 @@ class TestL4ToL3SingleDispatch:
             # L4 parent: one next-level child, register L3 orch fn
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -284,12 +292,12 @@ class TestL4ToL3MultipleDispatches:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
                 for _ in range(3):
-                    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -309,15 +317,20 @@ class TestL4WithOwnSubs:
     def test_l4_sub_and_l3_dispatch(self):
         """L4 has its own sub workers AND dispatches to an L3 child.
 
-        Both L4's sub callable and L3's sub callable increment the same
-        shared counter. Verifies both paths execute.
+        L4's sub callable and L3's sub callable each increment a counter, and
+        both paths must execute. They are the only two increments in this file
+        that run in *different* processes — L4's own SubWorker and the L3
+        child's SubWorker — dispatched from independent WorkerThreads with no
+        ordering between them, so each gets its own slot. Sharing one slot
+        would make the pair a cross-process non-atomic read-modify-write.
         """
-        counter_shm, counter_buf = _make_shared_counter()
+        counter_shm, counter_buf = _make_shared_counter(slots=2)
+        L3_SLOT, L4_SLOT = 0, 1
 
         try:
             # L3 child: sub worker increments counter
             l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
+            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf, L3_SLOT))
 
             def l3_orch(orch, args, config):
                 orch.submit_sub(l3_sub_handle)
@@ -325,19 +338,19 @@ class TestL4WithOwnSubs:
             # L4: own sub worker + L3 child
             w4 = Worker(level=4, num_sub_workers=1)
             l3_handle = w4.register(l3_orch)
-            l4_verify_handle = w4.register(lambda args: _increment_counter(counter_buf))
-            w4.add_worker(l3)
+            l4_verify_handle = w4.register(lambda args: _increment_counter(counter_buf, L4_SLOT))
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
                 orch.submit_sub(l4_verify_handle)
 
             w4.run(l4_orch)
             w4.close()
 
-            # L3 sub + L4 sub = 2
-            assert _read_counter(counter_buf) == 2
+            assert _read_counter(counter_buf, L3_SLOT) == 1, "L3 sub callable did not run"
+            assert _read_counter(counter_buf, L4_SLOT) == 1, "L4 sub callable did not run"
         finally:
             counter_shm.close()
             counter_shm.unlink()
@@ -362,11 +375,11 @@ class TestL4MultipleRuns:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             for _ in range(5):
                 w4.run(l4_orch)
@@ -403,11 +416,11 @@ class TestL4L3WithMultipleSubs:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -439,11 +452,11 @@ class TestL3OwnOrchestrator:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()

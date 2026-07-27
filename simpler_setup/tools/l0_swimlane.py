@@ -152,7 +152,10 @@ ARCH_CONFIG = {
 #                   one source. Detected by load_kernel_meta; everything else
 #                   (incl. independent kernels packed into a mix dispatch, like
 #                   mixed_example) goes through the AIC/AIV-only path.
-#   * hw_block_dim / block_num — the case's `block_dim` (the SPMD grid width).
+#   * hw_block_dim / block_num — the SPMD grid width, from `--spmd-block-num`
+#                   (defaults to 1). Cohorts size themselves from
+#                   rt_available_cluster_count() at run time, so the width is
+#                   not statically known from the test file.
 #   * aiv_lanes_per_block      — the arch's hardware subblockdim (ARCH_CONFIG).
 # The mix path additionally needs ONE incore to declare the full tensor
 # `signature` (so the dump captures the shared args) — a standard CALLABLE
@@ -168,8 +171,7 @@ def _first_platform_case(cls, platform):
     always dumps with `--manual include`). None if no case lists the platform.
     Auto-pinning one case makes the dump deterministic (no "run all cases,
     reconstruct from the newest dump dir" ambiguity), and ties the synthesized
-    slot-48 block_num to the SAME case the dump ran (block_dim resolved via the
-    caller's per-case map)."""
+    slot-48 replay to the SAME case the dump ran."""
     for c in getattr(cls, "CASES", []):
         if platform in c.get("platforms", []):
             return c.get("name")
@@ -224,12 +226,6 @@ def load_kernel_meta(test_path: Path, func_id: int, platform: str):
     tgt = by_func[func_id]
     cls = owner_cls[func_id]
     auto_case = _first_platform_case(cls, platform)
-    # name -> block_dim for every case, so main can resolve block_dim from the
-    # case actually selected (--case X, or the auto-pinned first-platform case),
-    # not an arbitrary CASES entry. A case declaring no block_dim maps to 1.
-    block_dim_by_case = {
-        c.get("name"): int(c.get("config", {}).get("block_dim") or 1) for c in getattr(cls, "CASES", [])
-    }
     return {
         "by_func": by_func,
         "target_func_id": func_id,
@@ -238,7 +234,6 @@ def load_kernel_meta(test_path: Path, func_id: int, platform: str):
         "name": tgt["name"],
         "class_name": cls.__name__,
         "auto_case": auto_case,
-        "block_dim_by_case": block_dim_by_case,
     }
 
 
@@ -763,7 +758,7 @@ int main() {{
     // positional kernels (they ignore 48/49); required for SPMD kernels that
     // read get_block_idx / get_block_num / get_sub_block_id, which would
     // otherwise dereference a null context. block_idx=0 traces a representative
-    // block; block_num={block_num} (the case's block_dim) keeps steady-state
+    // block; block_num={block_num} (from --spmd-block-num) keeps steady-state
     // branches (e.g. `block_idx+1 < block_num`) on their normal path.
     uint8_t h_local[64] = {{0}};   // LocalContext: block_idx@0, block_num@4
     *reinterpret_cast<int32_t *>(h_local + 0) = 0;
@@ -821,7 +816,11 @@ if(NOT DEFINED ENV{{ASCEND_HOME_PATH}})
 endif()
 set(ASCEND_HOME_PATH $ENV{{ASCEND_HOME_PATH}})
 set(SOC_VERSION {cfg["soc"]} CACHE STRING "Simulator SoC version")
-set(PTO_ISA_ROOT $ENV{{PTO_ISA_ROOT}} CACHE PATH "PTO ISA root")
+# Passed by the Python driver as -DPTO_ISA_ROOT= (pin-resolved); never $ENV (#1403).
+set(PTO_ISA_ROOT "" CACHE PATH "PTO ISA root")
+if(NOT PTO_ISA_ROOT)
+    message(FATAL_ERROR "PTO_ISA_ROOT must be passed as -DPTO_ISA_ROOT=<pin-resolved path>")
+endif()
 set(REPO_ROOT $ENV{{REPO_ROOT}} CACHE PATH "simpler repo root")
 
 add_compile_options(
@@ -883,20 +882,21 @@ target_link_libraries(replay_host PRIVATE
 """
 
 
-def emit_run_collect(cfg) -> str:
-    # Plain string (bash uses ${} braces) — substitute the SoC default via token.
-    return _RUN_COLLECT_TEMPLATE.replace("__SOC_DEFAULT__", cfg["soc"])
+def emit_run_collect(cfg, pto_isa_root: str) -> str:
+    # Plain string (bash uses ${} braces) — bake SoC default and the
+    # pin-resolved pto-isa path via tokens (no ambient PTO_ISA_ROOT env #1403).
+    return _RUN_COLLECT_TEMPLATE.replace("__SOC_DEFAULT__", cfg["soc"]).replace("__PTO_ISA_ROOT__", pto_isa_root)
 
 
 _RUN_COLLECT_TEMPLATE = """\
 #!/usr/bin/env bash
 set -euo pipefail
 : "${CANN_HOME:?CANN_HOME must be set}"
-: "${PTO_ISA_ROOT:?PTO_ISA_ROOT must be set}"
 : "${REPO_ROOT:?REPO_ROOT must be set}"
 
 WS="${WS:-$(dirname "$(readlink -f "$0")")}"
 SOC_VERSION="${SOC_VERSION:-__SOC_DEFAULT__}"
+PTO_ISA_ROOT="__PTO_ISA_ROOT__"
 DEVICE_ID="${TARGET_DEVICE_ID:-${NPU_LOCKED_DEVICE:-0}}"
 BUILD_DIR="$WS/build"
 COLLECT_DIR="$WS/msprof_collect"
@@ -941,6 +941,7 @@ def generate_workspace(  # noqa: PLR0913
     name: str,
     tensor_count: int,
     args,
+    pto_isa_root: str,
     debug: bool = False,
     block_num: int = 1,
 ):
@@ -954,7 +955,7 @@ def generate_workspace(  # noqa: PLR0913
     (ws / "replay_host.cpp").write_text(emit_replay_host(tensor_count, args, block_num))
     (ws / "CMakeLists.txt").write_text(emit_cmakelists(arch, name, cfg, debug))
     rc = ws / "run_collect.sh"
-    rc.write_text(emit_run_collect(cfg))
+    rc.write_text(emit_run_collect(cfg, pto_isa_root))
     rc.chmod(0o755)
 
 
@@ -969,11 +970,10 @@ def _build_env():
     env["ASCEND_HOME_PATH"] = cann
     env["CANN_HOME"] = cann
     env["REPO_ROOT"] = str(PROJECT_ROOT)
-    env["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
     return env
 
 
-def smoke_build(ws: Path, env, cfg):
+def smoke_build(ws: Path, env, cfg, pto_isa_root: str):
     build = ws / "build"
     build.mkdir(exist_ok=True)
     subprocess.run(
@@ -986,7 +986,7 @@ def smoke_build(ws: Path, env, cfg):
             "-B",
             str(build),
             f"-DSOC_VERSION={cfg['soc']}",
-            f"-DPTO_ISA_ROOT={env['PTO_ISA_ROOT']}",
+            f"-DPTO_ISA_ROOT={pto_isa_root}",
             f"-DREPO_ROOT={env['REPO_ROOT']}",
         ],
         cwd=str(ws),
@@ -1157,8 +1157,8 @@ def collect(ws: Path, env, max_time: int, device=None, dest_name: str = "trace.j
             "--max-time",
             str(max_time),
             "--run",
-            f"CANN_HOME={env['CANN_HOME']} PTO_ISA_ROOT={env['PTO_ISA_ROOT']} "
-            f"REPO_ROOT={env['REPO_ROOT']} TARGET_DEVICE_ID=$TASK_DEVICE "
+            f"CANN_HOME={env['CANN_HOME']} REPO_ROOT={env['REPO_ROOT']} "
+            f"TARGET_DEVICE_ID=$TASK_DEVICE "
             f"bash {ws}/run_collect.sh",
         ]
     else:
@@ -1311,7 +1311,8 @@ def main():
         default=None,
         metavar="N",
         help="block_num written into the synthesized SPMD LocalContext "
-        "(slot 48). Default: the case's block_dim. Only matters for "
+        "(slot 48). Default: 1. Required to replay an SPMD cohort, whose "
+        "width is resolved on device. Only matters for "
         "kernels that branch/stride on block_num; set the real grid "
         "width for those.",
     )
@@ -1347,14 +1348,11 @@ def main():
     selected_case = args.case or meta["auto_case"]
     if not args.case and meta["auto_case"]:
         print(f"[l0_swimlane] no --case; auto-pinned first {args.platform} case: {meta['auto_case']}")
-    # block_num for the synthesized slot-48 LocalContext: the grid width of the
-    # SELECTED case (--case bare name, ignoring any ClassName:: prefix), not an
-    # arbitrary CASES entry. Defaults to 1 (a non-SPMD single block) when the
-    # selected case declares no block_dim, or when no case is selected (a
-    # single-case / no-CASES test) — never guessed from a different case.
-    case_key = selected_case.split("::")[-1] if selected_case else None
-    block_dim = meta["block_dim_by_case"].get(case_key, 1)
-    block_num = args.spmd_block_num if args.spmd_block_num is not None else block_dim
+    # block_num for the synthesized slot-48 LocalContext. An SPMD cohort sizes
+    # itself from rt_available_cluster_count() on device, so its width is not
+    # readable from the test file; pass --spmd-block-num to replay one. Default
+    # 1 is a non-SPMD single block.
+    block_num = args.spmd_block_num if args.spmd_block_num is not None else 1
 
     # task-submit hands the locked device by appending --device <id> to argv
     # (and may also set $TASK_DEVICE). One resolved value threads through both
@@ -1380,7 +1378,7 @@ def main():
     member_desc = ", ".join(f"{m['name']}({m['core_type']},func {m['func_id']})" for m in members)
     print(
         f"[l0_swimlane] func_id={func_id_list} task={chosen} mix={mix_func_ids} mode={mode} "
-        f"block_dim={block_dim}\n              members=[{member_desc}]"
+        f"block_num={block_num}\n              members=[{member_desc}]"
     )
 
     scalars = [a for a in kargs if a["kind"] == "scalar"]
@@ -1403,6 +1401,10 @@ def main():
     label = f"{class_name}_{case}_{args.platform}_{name}_mix{mix_tag}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     ws = PROJECT_ROOT / "outputs" / f"l0_swimlane_{label}_{ts}"
+    # Pin-resolved checkout, threaded by value into the workspace generator (bakes
+    # it into run_collect.sh) and smoke_build (-DPTO_ISA_ROOT=). Never exported
+    # into the subprocess environment — CMakeLists does not read $ENV (#1403).
+    pto_isa_root = ensure_pto_isa_root(verbose=True)
     generate_workspace(
         ws,
         arch,
@@ -1411,13 +1413,14 @@ def main():
         name,
         tensor_count,
         kargs,
+        pto_isa_root,
         debug=args.debug_line,
         block_num=block_num,
     )
     print(f"[l0_swimlane] workspace: {ws}")
 
     env = _build_env()
-    smoke_build(ws, env, cfg)
+    smoke_build(ws, env, cfg, pto_isa_root)
     if args.no_collect:
         print(f"[l0_swimlane] --no-collect: stopping after smoke build.\n  {ws}")
         return

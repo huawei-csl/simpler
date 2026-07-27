@@ -21,21 +21,25 @@ There are **three distinct qwen3 entry points with different invocation
 styles**. They measure different things; don't confuse them:
 
 | aspect | Path 0 (in-repo) | Path A (serving) | Path B (decode_fwd) |
-| ------ | ---------------- | ---------------- | --------------------- |
+| ------ | ---------------- | ---------------- | ------------------- |
 | repo | simpler (this) | pypto-serving | pypto-lib |
 | entry | qwen3_14b_decode | npu_generate.py | decode_fwd.py |
 | cross-repo? | no | yes | yes |
-| measures | 2-layer decode correctness/timing | end-to-end TPOT | device decode TPOT + sched DFX |
+| measures | full 40-layer decode correctness/timing | end-to-end TPOT | device decode TPOT + sched DFX |
 | see | this section | sections 2-5 | section 6 |
 
 - **Path 0 — in-repo example (simpler itself, NO cross-repo).** Start here
   if you just want qwen3 decode running on simpler. simpler ships a
   self-contained SceneTestCase at
-  `examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/` — a fused chunk
-  of **two** Qwen3-14B decode layers (harvested pypto codegen: 8 AIC + 27
-  AIV + orchestration, golden in `simpler_setup/goldens/qwen3_14b_decode.py`).
-  No pypto / pypto-lib / JIT descent — it builds and runs like any simpler
-  example. Onboard rules still apply (per-die lock + `onboard-arch-precheck`):
+  `examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/` — **all 40**
+  Qwen3-14B decode layers as one fused dispatch (harvested pypto codegen: 18
+  AIC + 16 AIV + orchestration, plus the vendored CANN FusedInferAttentionScore
+  extern under `kernels/paged_attention_cce/`; golden in
+  `simpler_setup/goldens/qwen3_14b_decode.py`). No pypto / pypto-lib / JIT
+  descent — it builds and runs like any simpler example. Budget ~5 min wall and
+  a 38 GiB fixture (weights + paged KV, bf16), and note it needs CANN devkit
+  headers to build the attention extern. Onboard rules still apply (per-die
+  lock + `onboard-arch-precheck`):
 
   ```bash
   .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
@@ -264,7 +268,9 @@ the pinned PTO-ISA + a context length:
 ```bash
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
 cd "$PWD/build/pypto-lib"
-export PTO_ISA_ROOT="$PWD/build/pto-isa" SIMPLER_PTO_ISA_COMMIT=<pinned-commit>
+# PTO-ISA is auto-resolved from simpler's pto_isa.pin via ensure_pto_isa_root();
+# do NOT export PTO_ISA_ROOT (#1403). An ambient path can drift off-pin and
+# simpler now rejects a checkout whose HEAD does not match the pin.
 export PTO2_MANUAL_MAX_SEQ=3338   # ctx length used by --max-seq
 ```
 

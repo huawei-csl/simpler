@@ -44,6 +44,15 @@ namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 }
 
+// AICore materializes args[] from src_payload on the gated path using these
+// offsets; pin them against the live PTO2TaskPayload layout.
+static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
+static_assert(RUNTIME_MAX_WORKER <= PTO2_EARLY_DISPATCH_CORE_MASK_WORDS * 64);
+
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     switch (shape) {
     case PTO2ResourceShape::AIC:
@@ -107,19 +116,26 @@ int SchedulerContext::pop_ready_tasks_batch(
 
 void SchedulerContext::build_payload(
     PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    const AsyncCtx &async_ctx, int32_t block_idx
+    const AsyncCtx &async_ctx, int32_t block_idx, bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
     dispatch_payload.function_bin_addr = callable->resolved_addr();
     auto &payload = *slot_state.payload;
-    int n = 0;
-    for (int32_t i = 0; i < payload.tensor_count; i++) {
-        dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
-    }
-    for (int32_t i = 0; i < payload.scalar_count; i++) {
-        dispatch_payload.args[n++] = payload.scalars[i];
+    if (PTO2SchedulerState::should_gate_early_dispatch(
+            force_gate, payload.early_dispatch_state.load(std::memory_order_relaxed)
+        )) {
+        dispatch_payload.src_payload = reinterpret_cast<uint64_t>(&payload);
+    } else {
+        dispatch_payload.src_payload = 0;
+        int n = 0;
+        for (int32_t i = 0; i < payload.tensor_count; i++) {
+            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+        }
+        for (int32_t i = 0; i < payload.scalar_count; i++) {
+            dispatch_payload.args[n++] = payload.scalars[i];
+        }
     }
     dispatch_payload.local_context.s_block_idx = block_idx;
     dispatch_payload.local_context.s_block_num = slot_state.logical_block_num;
@@ -128,14 +144,14 @@ void SchedulerContext::build_payload(
     dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
 }
 
-void SchedulerContext::dispatch_subtask_to_core(
-    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    bool to_pending, int32_t block_idx
+SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
+    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending,
+    int32_t block_idx, bool force_gate
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
-    (void)runtime;
     CoreExecState &core_exec_state = core_exec_states_[core_id];
+
     core_exec_state.dispatch_seq++;
     uint32_t reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
     static_assert(
@@ -148,11 +164,15 @@ void SchedulerContext::dispatch_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
+    // a5 clears the deferred slab per dispatch (unlike a2a3's init-once path):
+    // AsyncCtx::make wires the slab into the payload, and a stale count from a
+    // prior deferred completion on this (core, buf) would be observed as a live
+    // wait entry.
     DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
     deferred_slab->count = 0;
     deferred_slab->error_code = PTO2_ERROR_NONE;
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-    build_payload(payload, slot_state, subslot, async_ctx, block_idx);
+    build_payload(payload, slot_state, subslot, async_ctx, block_idx, force_gate);
 
     // Carry the dispatched kernel's func_id in the marker extraId so TraCR
     // traces record task identity (which kernel ran). subslot selects this
@@ -171,6 +191,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
         tracker.change_core_state(core_offset);
     }
+    tracker.set_pending_occupied(core_offset);
 
     LOG_DEBUG(
         "Thread %d: Dispatched %s %s task %" PRId64 " kernel_id=[%d,%d,%d] block_idx=%d/total_blocks=%d to"
@@ -192,68 +213,22 @@ void SchedulerContext::dispatch_subtask_to_core(
     }
 #endif
 
-    // Publish task data (slot_state / args writes done above) before AICore
-    // can observe the dispatched task_id. ARM64 needs an explicit store-store
-    // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
-    // helper provided this implicitly via __sync_synchronize.
-    wmb();
-
-    // Capture dispatch timestamp at the latest possible moment — after wmb,
-    // immediately before the DATA_MAIN_BASE write.
+    uint64_t *dispatch_timestamp_slot = nullptr;
 #if SIMPLER_DFX
     if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-        uint64_t dispatch_ts = get_sys_cnt_aicpu();
-        if (to_pending) {
-            core_exec_state.pending_dispatch_timestamp = dispatch_ts;
-        } else {
-            core_exec_state.running_dispatch_timestamp = dispatch_ts;
-        }
+        dispatch_timestamp_slot =
+            to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
     }
 #endif
 
-    // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
-    // task, folded as min. Untagged tasks pay only this cache-hot compare and
-    // never read the sys counter. Independent of L2 swimlane level.
-    if (slot_state.task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-        aicpu_task_timing_dispatch(slot_state.task->task_timing_slot, thread_idx);
-    }
-
-    write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
-    tracker.set_pending_occupied(core_offset);
+    return PublishHandle{
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
+    };
 }
 
-void SchedulerContext::dispatch_mix_block_to_cluster(
-    Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending,
-    int32_t block_idx
-) {
-    CoreTracker &tracker = core_trackers_[thread_idx];
-    uint8_t cmask = slot_state.active_mask.core_mask();
-    if (cmask & PTO2_SUBTASK_MASK_AIC) {
-        bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
-        dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-            aic_to_pending, block_idx
-        );
-    }
-    if (cmask & PTO2_SUBTASK_MASK_AIV0) {
-        bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
-        dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-            aiv0_to_pending, block_idx
-        );
-    }
-    if (cmask & PTO2_SUBTASK_MASK_AIV1) {
-        bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
-        dispatch_subtask_to_core(
-            runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-            aiv1_to_pending, block_idx
-        );
-    }
-}
-
-void SchedulerContext::dispatch_block(
-    Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-    bool to_pending, int32_t block_idx
+int SchedulerContext::prepare_block_for_dispatch(
+    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
+    int32_t block_idx, PublishHandle *out_handles, bool force_gate
 ) {
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -268,26 +243,63 @@ void SchedulerContext::dispatch_block(
         );
     }
 #endif
+    CoreTracker &tracker = core_trackers_[thread_idx];
     if (shape == PTO2ResourceShape::MIX) {
-        dispatch_mix_block_to_cluster(runtime, thread_idx, core_offset, slot_state, to_pending, block_idx);
-    } else if (shape == PTO2ResourceShape::AIC) {
-        dispatch_subtask_to_core(
-            runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx
-        );
-    } else {
-        dispatch_subtask_to_core(
-            runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx
-        );
-    }
+        uint8_t cmask = slot_state.active_mask.core_mask();
+        int n = 0;
+        // Preserve a5 MIX per-core slot placement: idle used cores take the
+        // running slot; busy used cores take pending when to_pending. Cluster
+        // selection remains classify_mix_cluster (uniform RUNNING/PENDING), not
+        // a2a3 gated MIX split.
+        if (cmask & PTO2_SUBTASK_MASK_AIC) {
+            bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
+            out_handles[n++] = prepare_subtask_to_core(
+                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx,
+                force_gate
+            );
+        }
+        if (cmask & PTO2_SUBTASK_MASK_AIV0) {
+            bool p = to_pending && !tracker.is_aiv0_core_idle(core_offset);
+            out_handles[n++] = prepare_subtask_to_core(
+                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx,
+                force_gate
+            );
+        }
+        if (cmask & PTO2_SUBTASK_MASK_AIV1) {
+            bool p = to_pending && !tracker.is_aiv1_core_idle(core_offset);
+            out_handles[n++] = prepare_subtask_to_core(
+                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx,
+                force_gate
+            );
+        }
 #if SIMPLER_DFX
-    sched_l2_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(slot_state.active_mask.core_mask());
+        sched_l2_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(cmask);
 #endif
+        return n;
+    } else if (shape == PTO2ResourceShape::AIC) {
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx, force_gate
+        );
+#if SIMPLER_DFX
+        sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
+#endif
+        return 1;
+    } else {
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx, force_gate
+        );
+#if SIMPLER_DFX
+        sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
+#endif
+        return 1;
+    }
 }
 
 void SchedulerContext::dispatch_shape(
     Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
     CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
+    (void)runtime;
 #if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
@@ -304,7 +316,67 @@ void SchedulerContext::dispatch_shape(
         int got = pop_ready_tasks_batch(shape, thread_idx, batch, want);
         if (got == 0) break;
 
+        // sync_start exclusion gate.
+        //
+        // When the popped batch contains a sync_start task we MUST publish each
+        // prior task with its own wmb so AICore receives them with time
+        // separation. The drain coordinator's `count_global_available()` check
+        // reads the per-thread CoreTracker, and although `prepare_block_for_dispatch`
+        // marks cores occupied synchronously, the head-start between successive
+        // tasks is what lets the surrounding completion loop catch up on FINs in
+        // the retry window when the sync_start task hits insufficient resources.
+        // Bursting all prior tasks at the end of the pop (cross-task batching)
+        // collapses that head-start and causes spmd_sync_start_stress to time
+        // out via 507018 on ~40% of runs — see
+        // docs/investigations/2026-06-cross-task-batched-publish.md.
+        //
+        // When the batch carries no sync_start task, no drain entry can happen
+        // in this pop, so we hoist `handles[]`, `wmb()`, and the publish loop
+        // out of the per-task body. One wmb amortizes across all tasks and one
+        // dispatch_ts is shared, which restores ~60 ns first-to-last AICore
+        // start span for single-block decode kernels (out_proj, q_proj, ...).
+        // Detection is a single mask check per task — cheap relative to even
+        // one register write.
+        bool any_sync_start = false;
+        for (int bi = 0; bi < got; bi++) {
+            if (batch[bi]->task_attrs.requires_sync_start()) {
+                any_sync_start = true;
+                break;
+            }
+        }
+
+        // handles[] is sized for the MIX worst case: total claims across the
+        // pop bounded by `cores.count() ≤ MAX_CLUSTERS`, and each block
+        // contributes ≤ 3 subtasks for MIX.
+        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+        int handle_count = 0;
+        PTO2TaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
+        int16_t published_counts[CoreTracker::MAX_CLUSTERS * 3];
+        int published_n = 0;
         bool dispatched_any = false;
+#if SIMPLER_SCHED_PROFILING
+        uint64_t t_setup_start = get_sys_cnt_aicpu();
+#endif
+
+        // Flush prepared-but-unpublished handles. Required before
+        // `enter_drain_mode` so the drain coordinator sees cores as occupied,
+        // and at the per-task boundary when `any_sync_start` is true.
+        auto flush_publish = [&]() {
+            if (handle_count == 0) return;
+            wmb();
+            uint64_t dispatch_ts = 0;
+#if SIMPLER_DFX
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+                dispatch_ts = get_sys_cnt_aicpu();
+            }
+#endif
+            for (int i = 0; i < handle_count; i++) {
+                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
+            }
+            handle_count = 0;
+            made_progress = true;
+        };
+
         for (int bi = 0; bi < got; bi++) {
             PTO2TaskSlotState *slot_state = batch[bi];
             CoreTracker::BitStates selected_mix_clusters(0ULL);
@@ -325,13 +397,14 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            if (slot_state->active_mask.requires_sync_start()) {
+            if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
+                    flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     }
@@ -344,29 +417,25 @@ void SchedulerContext::dispatch_shape(
             }
 
             if (!cores.has_value()) {
+                flush_publish();
                 sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
                 break;
             }
 
-            dispatched_any = true;
-            try_pushed = true;
-#if SIMPLER_SCHED_PROFILING
-            uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
-            // This lets other schedulers concurrently claim and dispatch the
-            // remaining blocks of the same SPMD task instead of spinning while
-            // this thread fills all its own cores.  Only local `start + b` is
-            // read after the push -- `next_block_idx` may already be advanced
-            // by another scheduler that popped the slot.
-            int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
             int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
-            int32_t claim = std::min(available, remaining);
-            int32_t start = slot_state->next_block_idx;
-            slot_state->next_block_idx += claim;
+            int32_t start = 0;
+            int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
+            if (claim == 0) continue;
+            dispatched_any = true;
+            try_pushed = true;
 
-            if (slot_state->next_block_idx < slot_state->logical_block_num) {
+            published_list[published_n] = slot_state;
+            published_counts[published_n] = static_cast<int16_t>(claim);
+            published_n++;
+
+            if (start + claim < slot_state->logical_block_num) {
                 sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
             }
 
@@ -375,13 +444,28 @@ void SchedulerContext::dispatch_shape(
                 if (is_mix) {
                     cores.clear_bit(core_offset);
                 }
-                dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
+                handle_count += prepare_block_for_dispatch(
+                    thread_idx, core_offset, *slot_state, shape, is_pending, start + b, &handles[handle_count]
+                );
             }
-            made_progress = true;
-#if SIMPLER_SCHED_PROFILING
-            l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
+
+            // Sync_start exclusion: flush per task so prior tasks have head-
+            // start time before any sync_start drain check. Normal batches
+            // fall through and accumulate for one cross-task flush at the
+            // end of the pop.
+            if (any_sync_start) {
+                flush_publish();
+            }
         }
+
+        flush_publish();
+        for (int i = 0; i < published_n; i++) {
+            sched_->record_published_blocks(*published_list[i], published_counts[i]);
+            sched_->propagate_dispatch_fanin(*published_list[i]);
+        }
+#if SIMPLER_SCHED_PROFILING
+        l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+#endif
 
         if (!dispatched_any) break;
 
@@ -389,6 +473,188 @@ void SchedulerContext::dispatch_shape(
             cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
         }
     }
+}
+
+int32_t SchedulerContext::stage_consumer_blocks(
+    int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+    CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+) {
+    CoreTracker &tracker = core_trackers_[thread_idx];
+    uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
+    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
+    int32_t staged = 0;
+    int32_t block = start;
+    PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+    int n = 0;
+    auto prepare_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
+        while (count > 0 && avail.has_value()) {
+            int32_t core_offset = avail.pop_first();
+            n += prepare_block_for_dispatch(
+                thread_idx, core_offset, *c, shape, to_pending, block, &handles[n], /*force_gate=*/true
+            );
+            block++;
+            count--;
+            staged++;
+        }
+    };
+    if (idle.has_value()) prepare_from(idle, /*to_pending=*/false);
+    if (pend.has_value()) prepare_from(pend, /*to_pending=*/true);
+    if (n > 0) {
+        wmb();
+        for (int i = 0; i < n; i++) {
+            publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
+            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+            sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+            sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+            my_cores[cid >> 6] |= (1ULL << (cid & 63));
+        }
+    }
+    for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
+        if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
+
+    bool released = staged > 0 &&
+                    c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED;
+    if (released) {
+        uint64_t owned[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+            if (my_cores[w] != 0) {
+                owned[w] =
+                    PTO2SchedulerState::claim_late_staged_doorbell_bits(c->payload->staged_core_mask[w], my_cores[w]);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+            PTO2SchedulerState::ring_claimed_local_doorbell(
+                owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
+            );
+        }
+        wmb();
+    }
+    sched_->record_published_blocks(*c, staged);
+    sched_->propagate_dispatch_fanin(*c);
+    return staged;
+}
+
+int32_t
+SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
+    CoreTracker &tracker = core_trackers_[thread_idx];
+    int32_t s = static_cast<int32_t>(shape);
+    bool is_mix = (shape == PTO2ResourceShape::MIX);
+    bool is_idle = (phase == CoreTracker::DispatchPhase::IDLE);
+
+    CoreTracker::BitStates cores =
+        is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+    if (!cores.has_value()) return 0;
+
+    int32_t total_staged = 0;
+    PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+    uint64_t task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
+    for (int bi = 0; bi < got; bi++) {
+        PTO2TaskSlotState *c = batch[bi];
+        if (static_cast<uint64_t>(c->task->task_id.raw) != task_id_snapshots[bi]) continue;
+        if (c->payload->early_dispatch_state.load(std::memory_order_acquire) != PTO2_EARLY_DISPATCH_STAGING) continue;
+
+        CoreTracker::BitStates bucket;
+        if (is_mix) {
+            auto wanted = is_idle ? CoreTracker::MixPlacement::RUNNING : CoreTracker::MixPlacement::PENDING;
+            uint8_t cmask = c->active_mask.core_mask();
+            CoreTracker::BitStates candidates = tracker.get_cluster_offset_states();
+            while (candidates.has_value()) {
+                int32_t cluster_offset = candidates.pop_first();
+                if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                    bucket |= CoreTracker::BitStates(1ULL << cluster_offset);
+                }
+            }
+        } else {
+            bucket = tracker.get_dispatchable_cores(shape, phase);
+        }
+        int32_t freecores = bucket.has_value() ? bucket.count() : 0;
+        if (freecores == 0) {
+            sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi);
+            break;
+        }
+        int32_t start = 0;
+        int32_t claim = c->claim_block_range(c->logical_block_num, freecores, start);
+        if (claim == 0) continue;
+        if (start + claim < c->logical_block_num) {
+            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
+                LOG_DEBUG(
+                    "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
+                    static_cast<int64_t>(c->task->task_id.raw)
+                );
+        }
+        CoreTracker::BitStates empty(0ULL);
+        total_staged += is_idle ? stage_consumer_blocks(thread_idx, c, shape, start, claim, bucket, empty) :
+                                  stage_consumer_blocks(thread_idx, c, shape, start, claim, empty, bucket);
+    }
+    return total_staged;
+}
+
+int32_t SchedulerContext::try_early_dispatch(
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    // Gate (a2a3 #1288): owned here rather than by the caller.
+    //   - pmu_active: staging gated work perturbs single-issue PMU windows.
+    //   - has_any_free_slot: spare capacity (local read; fully-occupied bails
+    //     before touching shared queues) — not the old fully-idle pass.
+    //   - ready queues empty: normal dispatch strictly precedes early.
+    // a5 has no ready_sync_queues[]; ready_queues[] cover the normal lane.
+    if (pmu_active || !tracker.has_any_free_slot()) return 0;
+    for (int s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+        if (sched_->ready_queues[s].size() > 0) return 0;
+    }
+
+    // Tier 0: sync_start early cohorts (shape-agnostic, all-or-nothing drain).
+    uint64_t sync_task_id_snapshot = 0;
+    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
+        bool current_sync_task =
+            static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
+        if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
+            if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
+                sched_->cancel_early_sync_drain(*c);
+            } else if (enter_drain_mode(c, c->logical_block_num)) {
+                PTO2SchedulerState::mark_early_sync_drain_armed(*c->payload);
+            } else {
+                sched_->cancel_early_sync_drain(*c);
+            }
+        }
+    }
+
+    using Phase = CoreTracker::DispatchPhase;
+    static constexpr PTO2ResourceShape kAicAivOrder[2][2] = {
+        {PTO2ResourceShape::AIC, PTO2ResourceShape::AIV},
+        {PTO2ResourceShape::AIV, PTO2ResourceShape::AIC},
+    };
+    const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
+
+    int32_t total_staged = 0;
+    total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE);
+    bool skip_aic_aiv = has_residual_early_mix();
+    if (!skip_aic_aiv) {
+        for (int i = 0; i < 2; i++) {
+            total_staged += early_dispatch_shape(thread_idx, aic_aiv[i], Phase::IDLE);
+        }
+    }
+    if (!pmu_active) {
+        if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
+            total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::PENDING);
+        }
+        if (!skip_aic_aiv && has_residual_early_mix()) skip_aic_aiv = true;
+        if (!skip_aic_aiv) {
+            for (int i = 0; i < 2; i++) {
+                PTO2ResourceShape s = aic_aiv[i];
+                if (has_idle_in_other_threads(thread_idx, s)) continue;
+                total_staged += early_dispatch_shape(thread_idx, s, Phase::PENDING);
+            }
+        }
+    }
+
+    if (total_staged > 0) {
+        made_progress = true;
+        try_pushed = true;
+    }
+    return total_staged;
 }
 
 void SchedulerContext::dispatch_ready_tasks(
@@ -469,24 +735,14 @@ void SchedulerContext::dispatch_ready_tasks(
 
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);
 
     PTO2SharedMemoryHeader *header = sched_->sm_header;
     if (!header) {
         LOG_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    LOG_INFO_V0(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
-        static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
-    LOG_INFO_V0(
-        "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
     int32_t cur_thread_completed = 0;
@@ -753,7 +1009,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
-            handle_drain_mode(runtime, thread_idx);
+            handle_drain_mode(thread_idx);
             continue;
         }
 
@@ -790,10 +1046,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
-                    l2_swimlane_aicpu_record_dummy_task(
-                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
-                        dummy_slot.task->task_id.raw
-                    );
+                    if (dummy_slot.task_attrs.has_predicate()) {
+                        l2_swimlane_aicpu_record_predicated_skip(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    } else {
+                        l2_swimlane_aicpu_record_dummy_task(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    }
                 }
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
@@ -841,6 +1104,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
 
         dispatch_ready_tasks(runtime, thread_idx, tracker, pmu_active, made_progress, try_pushed);
+
+        // Phase 4b: early-dispatch onto spare cores after normal dispatch.
+        (void)try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 
 #if SIMPLER_DFX
         if (!try_pushed) {

@@ -32,7 +32,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -117,6 +119,34 @@ static constexpr int32_t MAX_SCOPE_DEPTH = 64;
 static constexpr int32_t MAX_RING_DEPTH = 4;
 
 static constexpr int32_t INVALID_SLOT = -1;
+
+using RunId = uint64_t;
+static constexpr RunId INVALID_RUN_ID = 0;
+
+// No transition assigns PREPARED while one run builds at a time: closing
+// submission moves BUILDING straight to EXECUTING, or to a terminal phase when
+// the run holds no tasks. Bounded prepared-run admission is what occupies it.
+enum class RunPhase : int32_t {
+    BUILDING = 0,
+    PREPARED = 1,
+    EXECUTING = 2,
+    COMPLETED = 3,
+    FAILED = 4,
+};
+
+struct RunState {
+    explicit RunState(RunId run_id) :
+        id(run_id) {}
+
+    RunId id{INVALID_RUN_ID};
+    std::atomic<RunPhase> phase{RunPhase::BUILDING};
+    std::atomic<int32_t> active_tasks{0};
+    mutable std::mutex completion_mu;
+    std::condition_variable completion_cv;
+    std::exception_ptr first_error;
+    bool submission_closed{false};
+    bool submission_failed{false};
+};
 
 // =============================================================================
 // Task slot index type
@@ -290,6 +320,7 @@ struct WorkerCompletion {
 
 struct TaskSlotState {
     std::atomic<TaskState> state{TaskState::FREE};
+    RunId run_id{INVALID_RUN_ID};
 
     // --- Fanin (orch writes once; scheduler reads atomically) ---
     int32_t fanin_count{0};
@@ -305,21 +336,11 @@ struct TaskSlotState {
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
     std::vector<TensorKey> output_keys;
 
-    // Empty outer vector means legacy/unconstrained dispatch. When present,
-    // each group member's vector is the final callable/data worker-id
-    // intersection and must be non-empty.
-    std::vector<std::vector<int32_t>> eligible_worker_ids;
+    // Exact stable NEXT_LEVEL worker id for each task/group member. SUB slots
+    // leave this empty because SUB has no worker-selection API.
+    std::vector<int32_t> target_worker_ids;
 
-    // --- Submit affinity (set by submit_next_level with worker= parameter) ---
-    // Empty = unconstrained. For NEXT_LEVEL, non-negative values are stable
-    // worker ids. SUB has no public affinity surface and keeps index
-    // semantics for any internal callers that populate this vector.
-    std::vector<int32_t> affinities;
-
-    int32_t get_affinity(int i) const {
-        if (affinities.empty()) return -1;
-        return affinities[static_cast<size_t>(i)];
-    }
+    int32_t target_worker_id(int32_t i) const { return target_worker_ids.at(static_cast<size_t>(i)); }
 
     // --- Producer tasks this task depends on (for deferred release) ---
     // When this task reaches COMPLETED, the Scheduler releases one fanout ref
@@ -328,7 +349,7 @@ struct TaskSlotState {
 
     // --- Failure state ---
     // Root worker failures and downstream poison both land here. The
-    // WorkerManager still owns first-error-wins reporting for drain().
+    // originating RunState owns first-error-wins reporting.
     std::string failure_message;
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
@@ -362,36 +383,16 @@ struct TaskSlotState {
     int32_t ring_slot_idx{0};
 
     // --- Group bookkeeping ---
-    std::atomic<int32_t> sub_complete_count{0};
     std::mutex group_mu;
     std::vector<GroupMemberState> group_member_states;
     std::vector<EndpointOutcome> group_member_outcomes;
     std::atomic<int32_t> group_terminal_count{0};
-    std::atomic<int32_t> group_dispatched_count{0};
     bool group_failed{false};
     int32_t group_first_failure_index{-1};
     std::string group_first_failure_message;
 
     bool is_group() const { return is_group_; }
     int32_t group_size() const { return is_group_ ? static_cast<int32_t>(task_args_list.size()) : 1; }
-    bool has_worker_constraints() const { return !eligible_worker_ids.empty(); }
-
-    const std::vector<int32_t> &eligible_workers_for(int32_t i) const {
-        static const std::vector<int32_t> empty;
-        if (eligible_worker_ids.empty()) return empty;
-        if (i < 0 || static_cast<size_t>(i) >= eligible_worker_ids.size()) return empty;
-        return eligible_worker_ids[static_cast<size_t>(i)];
-    }
-
-    bool worker_allowed(int32_t i, int32_t worker_id) const {
-        if (eligible_worker_ids.empty()) return true;
-        const auto &eligible = eligible_workers_for(i);
-        for (int32_t id : eligible) {
-            if (id == worker_id) return true;
-        }
-        return false;
-    }
-
     const RemoteTaskArgsSidecar &remote_sidecar_for(int32_t i) const {
         static const RemoteTaskArgsSidecar empty;
         if (is_group_) {
@@ -427,15 +428,31 @@ public:
 
     bool empty() const;
 
-    // Blocking: waits until a slot is available or shutdown() is called.
-    // Returns false only when shutdown and queue is empty.
-    bool wait_pop(TaskSlot &out);
-
-    void shutdown();
+    // Non-blocking: copies the front without removing it.
+    bool try_front(TaskSlot &out);
 
 private:
     std::queue<TaskSlot> q_;
     mutable std::mutex mu_;
-    std::condition_variable cv_;
-    bool shutdown_{false};
+};
+
+// Directed NEXT_LEVEL queues. Worker registration is complete before reset()
+// and the worker-id mapping is immutable while scheduling is active.
+class NextLevelReadyQueues {
+public:
+    void reset(const std::vector<int32_t> &worker_ids);
+    void push_single(int32_t worker_id, TaskSlot slot);
+    bool try_pop_single(int32_t worker_id, TaskSlot &out);
+    void push_group(TaskSlot slot);
+    bool try_front_group(TaskSlot &out);
+    bool try_pop_group(TaskSlot &out);
+    bool empty() const;
+    const std::vector<int32_t> &worker_ids() const { return worker_ids_; }
+
+private:
+    size_t index_for(int32_t worker_id) const;
+
+    std::vector<int32_t> worker_ids_;
+    std::vector<std::unique_ptr<ReadyQueue>> queues_;
+    ReadyQueue group_queue_;
 };

@@ -11,6 +11,8 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -247,22 +249,51 @@ private:
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        const AsyncCtx &async_ctx, int32_t block_idx
+        const AsyncCtx &async_ctx, int32_t block_idx, bool force_gate = false
     );
 
-    void dispatch_subtask_to_core(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2SubtaskSlot subslot, bool to_pending, int32_t block_idx
+    // Batched-dispatch primitives. prepare_* builds the payload and per-core
+    // state; publish_* issues the MMIO register write. Callers must wmb()
+    // between the prepare batch and the publish batch, then sample
+    // get_sys_cnt_aicpu() once and pass it to publish_* for every handle.
+    //
+    // dispatch_timestamp_slot points to the CoreExecState slot
+    // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
+    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // dispatch timestamp is being recorded.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+        uint64_t *dispatch_timestamp_slot;
+        int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+    };
+
+    PublishHandle prepare_subtask_to_core(
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+        bool to_pending, int32_t block_idx, bool force_gate = false
     );
 
-    void dispatch_mix_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending,
-        int32_t block_idx
-    );
+    // `thread_idx` is the publishing Scheduler thread's index, used to select the
+    // per-thread task-timing record; every call site already has it in scope.
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
+        if (h.dispatch_timestamp_slot != nullptr) {
+            *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+        // task, folded as min. Untagged tasks pay only this cache-hot compare and
+        // never read the sys counter. Independent of L2 swimlane level.
+        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
+        }
+        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+    }
 
-    void dispatch_block(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2ResourceShape shape, bool to_pending, int32_t block_idx
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
     void dispatch_shape(
@@ -287,6 +318,16 @@ private:
         bool &try_pushed
     );
 
+    // Phase 4b: early-dispatch onto spare cores after normal dispatch.
+    int32_t try_early_dispatch(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    );
+    int32_t early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase);
+
     // Returns true if any *other* scheduler thread currently has an idle core
     // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
     // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
@@ -302,12 +343,17 @@ private:
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
+    bool has_residual_early_mix() const {
+        return sched_->early_dispatch_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
+
     // =========================================================================
     // Completion & drain (scheduler_completion.cpp)
     // =========================================================================
 
-    static SlotTransition
-    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id);
+    static SlotTransition decide_slot_transition(
+        int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
+    );
 
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
@@ -328,9 +374,9 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
-    void drain_worker_dispatch(Runtime *runtime, int32_t block_num);
-    void handle_drain_mode(Runtime *runtime, int32_t thread_idx);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending = false);
+    int32_t drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated);
+    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)

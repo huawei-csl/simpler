@@ -167,8 +167,15 @@ class KernelCompiler:
         exposes them. Both compile_incore and _compile_incore_sim prepend
         these regardless of what extra_include_dirs the caller passes, so
         kernels can include them without the call site knowing the dependency.
+
+        Also carries ``src/common/platform/include`` so kernel-facing runtime
+        headers (e.g. ``intrinsic.h``) can pull shared platform headers like
+        ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [str(Path(__file__).resolve().parent / "incore")]
+        return [
+            str(Path(__file__).resolve().parent / "incore"),
+            str(self.project_root / "src" / "common" / "platform" / "include"),
+        ]
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -324,7 +331,7 @@ class KernelCompiler:
     ) -> bytes:
         """
         Compile a kernel source file. Dispatches based on platform:
-        - a2a3: Uses ccec compiler (requires pto_isa_root)
+        - a2a3: Uses ccec compiler (requires pto_isa_root), then links
         - a2a3sim: Uses compile_incore_sim (g++-15)
 
         Args:
@@ -334,7 +341,9 @@ class KernelCompiler:
             extra_include_dirs: Additional include directories
 
         Returns:
-            Binary contents of the compiled .o file
+            On hardware platforms, the linked AICore image (see
+            :meth:`_link_incore`) that ``elf_parser.extract_text_section``
+            takes the loadable payload from; on sim, the compiled shared object.
 
         Raises:
             FileNotFoundError: If source file or PTO-ISA headers not found
@@ -395,11 +404,45 @@ class KernelCompiler:
         logger.info(f"[Incore] Compiling ({core_type_name}): {source_path}")
         logger.debug(f"  Command: {' '.join(cmd)}")
 
-        return self._compile_to_bytes(
+        self._compile_to_bytes(
             cmd,
             output_path,
             "Incore",
             error_hint=f"ccec compiler not found at {self.ccec.cxx_path}",
+            delete_output=False,
+        )
+        try:
+            return self._link_incore(output_path, build_dir=build_dir)
+        finally:
+            if build_dir is None:
+                os.remove(output_path)
+
+    def _link_incore(self, object_path: str, build_dir: Optional[str] = None) -> bytes:
+        """Link a compiled incore object into a self-contained AICore image.
+
+        The AICore loader copies the literal ``.text`` bytes and jumps to offset
+        0 (``simpler_setup/elf_parser.py``), so the payload must carry no
+        unapplied relocations and must begin at ``kernel_entry``. ``ld.lld``
+        resolves ``.rela.text`` — notably the ``.bl.uninit.*`` block-local
+        globals CANN AscendC headers declare, such as ``g_vecTPipePtr`` and
+        ``g_kfcClient``, which share one merged block-local region and so cannot
+        all sit at offset 0 — and folds ``.text.*`` COMDAT groups holding
+        out-of-line template instantiations into the single output ``.text``.
+
+        The linked image is position-independent: ``--image-base`` does not
+        change the emitted ``.text`` bytes.
+        """
+        assert self.ccec is not None, "incore linking is only available for hardware platforms"
+        linked_path = self._make_temp_path(
+            prefix=f"{os.path.basename(object_path)}.linked_", suffix=".elf", build_dir=build_dir
+        )
+        cmd = [self.ccec.linker_path, "-e", "kernel_entry", "-o", linked_path, object_path]
+        logger.debug(f"  Link command: {' '.join(cmd)}")
+        return self._compile_to_bytes(
+            cmd,
+            linked_path,
+            "Incore-link",
+            error_hint=f"ccec linker not found at {self.ccec.linker_path}",
             delete_output=build_dir is None,
         )
 
@@ -598,7 +641,9 @@ class KernelCompiler:
         cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
         cmd += self._sanitizer_flags(self.gxx15)
 
-        # Add PTO ISA header paths if provided
+        # Add PTO ISA header paths if provided. The path always comes from
+        # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,
+        # so no per-compile re-check is needed here.
         if pto_isa_root:
             pto_include = os.path.join(pto_isa_root, "include")
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")

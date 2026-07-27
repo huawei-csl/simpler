@@ -45,9 +45,17 @@ public:
     /// runtime-arena for its ring sizing right after the device comes up (the
     /// sizing is fork-constant, delivered by COW into init). A no-op for
     /// runtimes without a prebuilt arena.
+    /// `dma_workspace_mask` (a bitmask of DmaWorkspaceKind bits, 0 = none)
+    /// provisions those async-DMA workspaces once at init, so kernels can use
+    /// get_dma_workspace. Empty by default; a Worker that does not opt in creates
+    /// no SDMA streams. Provisioning fails fast (init throws) on a
+    /// platform/runtime that does not support a requested engine. The mask stays
+    /// a raw integer here so this platform-agnostic worker needs no platform
+    /// headers; the binding derives it from the DmaWorkspaceKind enum.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr
+        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
+        uint32_t dma_workspace_mask = 0
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -81,6 +89,13 @@ public:
     /// Number of host-side dlopens (host_build_graph variant). Mirrors
     /// `aicpu_dlopen_count` for the trb path; returns 0 on device-orch variants.
     size_t host_dlopen_count() const;
+
+    /// Number of run stream sets the bound runner has created. A set belongs
+    /// to a pipeline slot and is reused for every run on that slot, so a
+    /// runner that has served any number of runs on one slot reports 1;
+    /// platforms whose runs use the persistent bootstrap pair report 0. Used
+    /// by tests to assert that repeated runs do not rebuild the set per run.
+    size_t run_stream_set_create_count() const;
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
@@ -132,6 +147,7 @@ public:
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
+    unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
 
 private:
     using CreateDeviceContextFn = void *(*)();
@@ -149,8 +165,10 @@ private:
     );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using GetPipelineContractFn = const PipelineContract *(*)();
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
+    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -197,6 +215,8 @@ private:
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
+    SimplerProvisionDmaWorkspaceFn simpler_provision_dma_workspace_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
@@ -216,6 +236,7 @@ private:
     uint64_t base_comm_handle_ = 0;
 
     std::vector<uint8_t> runtime_buf_;
+    PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     // device_id_ is set once in init() and never modified afterward. All
     // ChipWorker callers run on the thread that called init() (the same
     // thread is the only one that subsequently calls malloc / copy_to /

@@ -37,6 +37,8 @@
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+#include "aicpu/platform_regs.h"
+#include "common/memory_barrier.h"
 
 #if SIMPLER_SCHED_PROFILING
 #include "aicpu/device_time.h"
@@ -59,6 +61,7 @@
 struct PTO2ReadyQueueSlot {
     std::atomic<int64_t> sequence;
     PTO2TaskSlotState *slot_state;
+    uint64_t task_id_snapshot;  // generation tag for early-dispatch queue entries
 };
 
 /**
@@ -91,7 +94,9 @@ struct alignas(64) PTO2ReadyQueue {
 
     void reset_for_reuse() {}
 
-    bool push(PTO2TaskSlotState *slot_state) {
+    bool push(PTO2TaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
+
+    bool push_tagged(PTO2TaskSlotState *slot_state, uint64_t task_id_snapshot) {
         uint64_t pos;
         PTO2ReadyQueueSlot *slot;
         while (true) {
@@ -111,13 +116,16 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         slot->slot_state = slot_state;
+        slot->task_id_snapshot = task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
-    void push_batch(PTO2TaskSlotState **items, int count) {
+    void push_batch(PTO2TaskSlotState **items, int count) { push_batch_tagged(items, nullptr, count); }
+
+    void push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
         if (count == 0) return;
 
         uint64_t pos;
@@ -146,6 +154,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
+            slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
     }
@@ -185,12 +194,15 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         slot->slot_state = slot_state;
+        slot->task_id_snapshot = 0;
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 #endif
 
-    PTO2TaskSlotState *pop() {
+    PTO2TaskSlotState *pop() { return pop_tagged(nullptr); }
+
+    PTO2TaskSlotState *pop_tagged(uint64_t *task_id_snapshot) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
@@ -216,6 +228,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         PTO2TaskSlotState *result = slot->slot_state;
+        if (task_id_snapshot != nullptr) *task_id_snapshot = slot->task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
@@ -271,7 +284,9 @@ struct alignas(64) PTO2ReadyQueue {
 
     // Batch pop: reserve a contiguous run of ready slots with a single CAS.
     // Returns actual number of items popped (may be less than max_count).
-    int pop_batch(PTO2TaskSlotState **out, int max_count) {
+    int pop_batch(PTO2TaskSlotState **out, int max_count) { return pop_batch_tagged(out, nullptr, max_count); }
+
+    int pop_batch_tagged(PTO2TaskSlotState **out, uint64_t *task_id_snapshots, int max_count) {
         uint64_t pos;
         int count;
         while (true) {
@@ -303,6 +318,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
+            if (task_id_snapshots != nullptr) task_id_snapshots[i] = slot->task_id_snapshot;
             slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
         }
         return count;
@@ -403,6 +419,8 @@ struct CompletionStats {
 struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_early_dispatch_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
+    size_t off_early_sync_start_queue_slots;
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
     uint64_t ready_queue_capacity;
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
@@ -507,7 +525,7 @@ struct PTO2SchedulerState {
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
-            (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
+            (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
             dummy_ready_queue.push(slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -623,36 +641,334 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state) {
+    // =========================================================================
+    // Early-dispatch (#1079 foundation + #1304 sync_start early queue)
+    // =========================================================================
+
+    struct EarlyDispatchDoorbell {
+        uint64_t addr{0};
+        uint32_t token{0};
+    };
+    EarlyDispatchDoorbell early_dispatch_doorbell_table[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS * 64]{};
+    PTO2ReadyQueue early_dispatch_queues[PTO2_NUM_RESOURCE_SHAPES];
+    PTO2ReadyQueue early_sync_start_queue;
+
+    static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
+        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
+        uint64_t tk = static_cast<uint64_t>(token);
+        *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+    }
+
+    inline void ring_staged_doorbell_bits(int word, uint64_t bits) {
+        while (bits != 0) {
+            int core_id = word * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            ring_one_doorbell(
+                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+            );
+        }
+    }
+
+    static inline uint64_t claim_all_staged_doorbell_bits(std::atomic<uint64_t> &mask) {
+        return mask.exchange(0, std::memory_order_seq_cst);
+    }
+
+    static inline uint64_t claim_late_staged_doorbell_bits(std::atomic<uint64_t> &mask, uint64_t candidates) {
+        return mask.fetch_and(~candidates, std::memory_order_seq_cst) & candidates;
+    }
+
+    static inline bool should_gate_early_dispatch(bool force_gate, uint8_t early_dispatch_state) {
+        return force_gate || early_dispatch_state == PTO2_EARLY_DISPATCH_STAGING;
+    }
+
+    static inline bool
+    ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
+        if ((claimed_word & (1ULL << (core_id & 63))) == 0) return false;
+        ring_one_doorbell(reg_addr, token);
+        return true;
+    }
+
+    static inline bool try_claim_early_dispatch_launch(PTO2TaskPayload &payload) {
+        uint8_t expected = PTO2_EARLY_DISPATCH_LAUNCH_NONE;
+        return payload.early_dispatch_launch_state.compare_exchange_strong(
+            expected, PTO2_EARLY_DISPATCH_LAUNCH_RINGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+    }
+
+    inline void record_published_blocks(PTO2TaskSlotState &slot_state, int32_t count) {
+        if (count <= 0 || !slot_state.task_attrs.allow_early_resolve()) return;
+        slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
+    }
+
+    inline void ring_all_staged_doorbells(PTO2TaskSlotState &slot_state) {
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
+            while (bits != 0) {
+                int core_id = w * 64 + __builtin_ctzll(bits);
+                bits &= bits - 1;
+                ring_one_doorbell(
+                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                );
+            }
+        }
+    }
+
+    static inline bool try_claim_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t expected = PTO2_EARLY_SYNC_DRAIN_NONE;
+        return payload.early_sync_drain_state.compare_exchange_strong(
+            expected, PTO2_EARLY_SYNC_DRAIN_OWNER, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+    }
+
+    static inline bool owns_early_sync_drain(const PTO2TaskPayload &payload) {
+        return (payload.early_sync_drain_state.load(std::memory_order_acquire) & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0;
+    }
+
+    static inline void mark_early_sync_drain_armed(PTO2TaskPayload &payload) {
+        payload.early_sync_drain_state.fetch_or(PTO2_EARLY_SYNC_DRAIN_ARMED, std::memory_order_seq_cst);
+    }
+
+    static inline bool publish_ready_to_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t previous =
+            payload.early_sync_drain_state.fetch_or(PTO2_EARLY_SYNC_DRAIN_READY, std::memory_order_seq_cst);
+        return (previous & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0;
+    }
+
+    inline void cancel_early_sync_drain(PTO2TaskSlotState &slot_state) {
+        uint8_t previous =
+            slot_state.payload->early_sync_drain_state.exchange(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_seq_cst);
+        if ((previous & PTO2_EARLY_SYNC_DRAIN_OWNER) == 0) return;
+        if ((previous & PTO2_EARLY_SYNC_DRAIN_READY) != 0) {
+            push_ready_routed(&slot_state);
+            return;
+        }
+        if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING) {
+            early_sync_start_queue.push_tagged(&slot_state, static_cast<uint64_t>(slot_state.task->task_id.raw));
+        }
+    }
+
+    static inline void finish_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t state = payload.early_sync_drain_state.load(std::memory_order_seq_cst);
+        while ((state & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0 && (state & PTO2_EARLY_SYNC_DRAIN_COMPLETE) == 0) {
+            uint8_t desired = state | PTO2_EARLY_SYNC_DRAIN_COMPLETE;
+            if (payload.early_sync_drain_state.compare_exchange_weak(
+                    state, desired, std::memory_order_seq_cst, std::memory_order_seq_cst
+                )) {
+                return;
+            }
+        }
+    }
+
+    inline bool maybe_rendezvous_ring(PTO2TaskSlotState &slot_state) {
+        int32_t staged_cores = 0;
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
+            staged_cores +=
+                __builtin_popcountll(slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst));
+        if (staged_cores == 0) return false;
+        if (slot_state.payload->running_slot_count.load(std::memory_order_seq_cst) != staged_cores) return false;
+        if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_DISPATCHED)
+            return false;
+        if (!try_claim_early_dispatch_launch(*slot_state.payload)) return false;
+        ring_all_staged_doorbells(slot_state);
+        wmb();
+        slot_state.payload->early_dispatch_launch_state.store(
+            PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_release
+        );
+        return true;
+    }
+
+    inline bool retry_sync_start_rendezvous_after_drain(PTO2TaskSlotState &slot_state) {
+        if (!maybe_rendezvous_ring(slot_state)) return false;
+        propagate_dispatch_fanin(slot_state);
+        return true;
+    }
+
+    inline void try_enqueue_early_dispatch_candidate(PTO2TaskSlotState &consumer) {
+        if (consumer.task_attrs.has_predicate()) return;
+        PTO2ResourceShape shape = consumer.active_mask.to_shape();
+        if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX) {
+            return;
+        }
+
+        uint8_t expected = PTO2_EARLY_DISPATCH_NONE;
+        if (!consumer.payload->early_dispatch_state.compare_exchange_strong(
+                expected, PTO2_EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return;
+        }
+
+        uint64_t task_id = static_cast<uint64_t>(consumer.task->task_id.raw);
+        if (consumer.task_attrs.requires_sync_start()) {
+            early_sync_start_queue.push_tagged(&consumer, task_id);
+        } else {
+            early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
+        }
+    }
+
+    // Only codegen-flagged (direct) producers propagate: a task's successors
+    // early-dispatch off its DIRECT producers' marks, never an inherited chain
+    // (a2a3 #1285 — a5 never had auto-chain / spec_chain_*).
+    void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
+        if (!p.task_attrs.allow_early_resolve()) return;
+        if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
+        if (p.payload->early_dispatch_state.load(std::memory_order_acquire) == PTO2_EARLY_DISPATCH_STAGING) return;
+        uint8_t launch_state = p.payload->early_dispatch_launch_state.load(std::memory_order_acquire);
+        if (launch_state == PTO2_EARLY_DISPATCH_LAUNCH_RINGING) return;
+        if (p.task_attrs.requires_sync_start()) {
+            bool was_pre_staged = false;
+            for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                was_pre_staged |= p.payload->staged_core_mask[w].load(std::memory_order_acquire) != 0;
+            }
+            if (was_pre_staged && launch_state != PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE) return;
+        }
+        if (p.has_dispatch_propagated()) return;
+        p.lock_fanout();
+        if (!p.try_mark_dispatch_propagated()) {
+            p.unlock_fanout();
+            return;
+        }
+        PTO2DepListEntry *edge = p.fanout_head;
+        p.unlock_fanout();
+        for (; edge != nullptr; edge = edge->next) {
+            PTO2TaskSlotState *c = edge->slot_state;
+            if (c->task_attrs.has_predicate()) continue;
+            int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (nf != c->payload->fanin_actual_count) continue;
+            try_enqueue_early_dispatch_candidate(*c);
+        }
+    }
+
+    struct EarlyDispatchReleaseSink {
+        static constexpr int CAP = 32;
+        PTO2TaskSlotState *items[CAP];
+        int n = 0;
+        inline bool push(PTO2TaskSlotState *s) {
+            if (n >= CAP) return false;
+            items[n++] = s;
+            return true;
+        }
+    };
+
+    inline bool try_early_dispatch_release(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+        if (slot_state.task_attrs.has_predicate()) return false;
+        uint8_t expect = PTO2_EARLY_DISPATCH_NONE;
+        if (slot_state.payload->early_dispatch_state.compare_exchange_strong(
+                expect, PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return false;
+        }
+        if (expect != PTO2_EARLY_DISPATCH_STAGING) return true;
+        bool sync_start = slot_state.task_attrs.requires_sync_start();
+        if (!sync_start && !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
+        expect = PTO2_EARLY_DISPATCH_STAGING;
+        slot_state.payload->early_dispatch_state.compare_exchange_strong(
+            expect, PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+        bool launched = true;
+        if (sync_start) {
+            launched = maybe_rendezvous_ring(slot_state);
+        } else {
+            for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                uint64_t owned = claim_all_staged_doorbell_bits(slot_state.payload->staged_core_mask[w]);
+                ring_staged_doorbell_bits(w, owned);
+            }
+            wmb();
+            slot_state.payload->early_dispatch_launch_state.store(
+                PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst
+            );
+        }
+        if (launched) {
+            if (sink == nullptr || !sink->push(&slot_state)) {
+                propagate_dispatch_fanin(slot_state);
+            }
+        }
+        return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
+    }
+
+    bool try_claim_ready_once(PTO2TaskSlotState &slot_state) {
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
+        for (;;) {
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                return true;
+            }
+        }
+    }
+
+    bool route_ready_once(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+        if (!try_claim_ready_once(slot_state)) return false;
+        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        if (slot_state.task_attrs.requires_sync_start()) {
+            bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
+            if (early_handled || drain_owned) return true;
+        } else if (early_handled) {
+            return true;
+        }
+        push_ready_routed(&slot_state);
+        return true;
+    }
+
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+    bool route_ready_once(
+        PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
+        EarlyDispatchReleaseSink *sink = nullptr
+    ) {
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
+        atomic_count += 1;
+        for (;;) {
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                atomic_count += 1;
+                break;
+            }
+            atomic_count += 1;
+        }
+        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        if (slot_state.task_attrs.requires_sync_start()) {
+            bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
+            if (early_handled || drain_owned) return true;
+        } else if (early_handled) {
+            return true;
+        }
+        PTO2ResourceShape shape = slot_state.active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY ||
+            (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
+            dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+        } else {
+            ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
+        }
+        return true;
+    }
+#endif
+
+    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
-            push_ready_routed(&slot_state);
-            return true;
+            return route_ready_once(slot_state, sink);
         }
         return false;
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
-    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait) {
+    bool release_fanin_and_check_ready(
+        PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
+        EarlyDispatchReleaseSink *sink = nullptr
+    ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
-            // Dummy slots go to dummy_ready_queue; everything else to the per-shape
-            // ready_queues[]. Use the profiling-aware push so atomic_count / push_wait
-            // stay consistent with the non-dummy path.
-            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (shape == PTO2ResourceShape::DUMMY ||
-                (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
-                dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
-            } else {
-                ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
-            }
-            return true;
+            return route_ready_once(slot_state, atomic_count, push_wait, sink);
         }
         return false;
     }
@@ -734,7 +1050,7 @@ struct PTO2SchedulerState {
 #else
         slot_state.lock_fanout();
 #endif
-        slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        slot_state.mark_completed();
         PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
         slot_state.unlock_fanout();
 
@@ -749,17 +1065,21 @@ struct PTO2SchedulerState {
 #if SIMPLER_SCHED_PROFILING
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
+        EarlyDispatchReleaseSink rel_sink;
         while (current != nullptr) {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
 #if SIMPLER_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait)) {
+            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_slot);
+            release_fanin_and_check_ready(consumer_slot, &rel_sink);
 #endif
             current = current->next;
+        }
+        for (int i = 0; i < rel_sink.n; i++) {
+            propagate_dispatch_fanin(*rel_sink.items[i]);
         }
 
 #if SIMPLER_SCHED_PROFILING

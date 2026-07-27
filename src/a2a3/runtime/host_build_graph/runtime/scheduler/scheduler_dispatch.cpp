@@ -53,9 +53,7 @@ static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
 // Dispatch helpers
 // =============================================================================
 
-namespace {
-inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
-}
+namespace {}
 
 // The early-dispatch core bitmask (PTO2_EARLY_DISPATCH_CORE_MASK_WORDS * 64 bits) must cover
 // every global core_id, and the per-core doorbell table is sized to match.
@@ -199,12 +197,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // func_id -> kernel name via the run's kernel_config.py.
     const uint32_t tracr_func_id = static_cast<uint32_t>(slot_state.task->kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
-        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, tracr_func_id);
+        INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Pair, tracr_func_id);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
-        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, tracr_func_id);
+        INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Single, tracr_func_id);
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -242,7 +240,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 #endif
 
     return PublishHandle{
-        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task->task_timing_slot
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
     };
 }
 
@@ -359,7 +357,7 @@ void SchedulerContext::dispatch_shape(
         // one register write.
         bool any_sync_start = false;
         for (int bi = 0; bi < got; bi++) {
-            if (batch[bi]->active_mask.requires_sync_start()) {
+            if (batch[bi]->task_attrs.requires_sync_start()) {
                 any_sync_start = true;
                 break;
             }
@@ -423,7 +421,7 @@ void SchedulerContext::dispatch_shape(
             // released by their doorbell in release_fanin_and_check_ready the
             // instant their last producer completes — see try_early_dispatch_release.)
 
-            if (slot_state->active_mask.requires_sync_start()) {
+            if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
                     disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
@@ -778,7 +776,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
             if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
-                LOG_INFO_V9(
+                LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
                     static_cast<int64_t>(c->task->task_id.raw)
                 );
@@ -829,8 +827,8 @@ int32_t SchedulerContext::try_early_dispatch(
     // so this arms at most one drain and adds no blocks to total_staged here.
     uint64_t sync_task_id_snapshot = 0;
     if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
-        bool current_sync_task = static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot &&
-                                 c->active_mask.requires_sync_start();
+        bool current_sync_task =
+            static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
@@ -873,24 +871,14 @@ int32_t SchedulerContext::try_early_dispatch(
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
-    LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);
 
     PTO2SharedMemoryHeader *header = sched_->sm_header;
     if (!header) {
         LOG_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    LOG_INFO_V0(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
-        static_cast<uint64_t>(header->ring.task_descriptors_offset),
-        static_cast<uint64_t>(header->ring.task_window_size)
-    );
 
     Handshake *hank = static_cast<Handshake *>(runtime->workers);
-    LOG_INFO_V0(
-        "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
-        static_cast<uint64_t>(header->ring.task_window_size)
-    );
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
@@ -905,9 +893,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_swimlane.reset();
     l2_swimlane.l2_swimlane_enabled = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
 #endif
-
-    PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
-    int32_t deferred_release_count = 0;
 
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
     // pollute per-task PMU counters, so skip the PENDING pre-load phase.
@@ -1036,8 +1021,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool try_completed = tracker.has_any_running_cores();
         if (try_completed) {
             check_running_cores_for_completion(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count
+                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress
             );
         }
         if (completed_this_turn > 0) {
@@ -1061,8 +1045,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count,
-                PTO2_DEFERRED_RELEASE_CAP
+                rt_->aicore_mailbox, sched_
 #if SIMPLER_SCHED_PROFILING
                 ,
                 thread_idx
@@ -1205,21 +1188,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     );
                 }
 #endif
-                // Dummy tasks have no subtasks to retire and no fanout pre-conditions
-                // beyond their own producers; release self-reference so the slot can
-                // reach CONSUMED once all consumers drain.
-                deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
-                if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
-                    while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-                        (void)sched_->on_task_release(
-                            *deferred_release_slot_states[--deferred_release_count], thread_idx
-                        );
-#else
-                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-                    }
-                }
+                // Polling: on_task_complete already published this slot's
+                // completion + drained its wake list inline. There is no deferred
+                // producer-release phase — consumer retirement is observed via the
+                // per-ring completed_watermark, not by bumping producer refcounts.
                 int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
                 last_progress_count = prev + 1;
                 cur_thread_completed++;
@@ -1341,35 +1313,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
-#if SIMPLER_DFX
-            uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
-                                  get_sys_cnt_aicpu() :
-                                  0;
-            // Snapshot the slot count before the drain loop decrements it to 0,
-            // so the Release bar can report how many slots it drained.
-            uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
-#endif
-            while (deferred_release_count > 0) {
-                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
-
-#if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-            }
-#if SIMPLER_DFX
-            // Release is a distinct operation from the poll scan — emit it with
-            // its own span (Perfetto nests it inside the surrounding poll/idle
-            // run by time-containment) rather than competing with poll for one
-            // per-iteration label.
-            if (rel_t0 != 0) {
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, released_count
-                );
-            }
-#endif
+            // Polling: no deferred producer-release phase to drain on an idle pass.
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
             idle_iterations++;
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
@@ -1433,18 +1378,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
-    // Drain any entries left in the deferred-release batch. The in-loop flush
-    // only fires on idle iterations and on buffer-full; a loop exit while the
-    // last iteration made progress can leave entries un-released. Drop them
-    // here so every consumed producer slot completes its on_task_release
-    // regardless of which loop-exit path fired.
-    while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-    }
+    // Polling: no deferred producer-release batch to drain at loop exit.
 
 #if SIMPLER_DFX
     // Final-drain: emit any pop_hit / pop_miss accrued since the last
