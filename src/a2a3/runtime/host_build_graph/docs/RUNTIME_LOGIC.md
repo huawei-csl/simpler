@@ -612,15 +612,15 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
 ### 8.4 Completion Watermark (host consumer-wait gate)
 
-`completed_watermark` is the highest id such that every task in
-`[0, completed_watermark]` has its `completion_flags` byte set. The tail of
+`completed_watermark` is the lowest id not yet guaranteed complete: every task
+in `[0, completed_watermark)` has its `completion_flags` byte set. The tail of
 `on_mixed_task_complete` CAS-advances it over the **full contiguous completed
 prefix** (bounded by `current_task_index`, not by the completing task's own id)
 — capping at `my_id` would make the final value completion-order-dependent and
 strand it below the true prefix.
 
 It is **load-bearing**: the host `wait_for_tensor_ready(..., wait_for_consumers)`
-gates on `completed_watermark >= producer.last_consumer_local_id` to observe
+gates on `completed_watermark > producer.last_consumer_local_id` to observe
 "every consumer of this producer has retired" — replacing the wiring model's
 `fanout_refcount == fanout_count` check.
 

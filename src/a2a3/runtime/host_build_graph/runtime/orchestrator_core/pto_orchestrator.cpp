@@ -316,7 +316,7 @@ static bool append_fanin_or_fail(
     fanin_builder->payload->fanin_local_ids[fanin_builder->count++] = static_cast<int32_t>(producer_task_id.local());
 
     // Reclaim gate: record this task as a consumer of the producer. The producer
-    // slot retires once the per-ring completed_watermark reaches this consumer id.
+    // slot retires once the per-ring completed_watermark exceeds this consumer id.
     if (fanin_builder->self_local > prod_state->last_consumer_local_id) {
         prod_state->last_consumer_local_id = fanin_builder->self_local;
     }
@@ -434,7 +434,7 @@ static bool prepare_task(
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
     // Reclaim gate: seed last_consumer to self, so a producer with no consumers
-    // is retirable once completed_watermark >= its own id. Each fanin edge bumps
+    // is retirable once completed_watermark > its own id. Each fanin edge bumps
     // it in append_fanin_or_fail. completion_flags for this slot are already 0
     // (zeroed once at init; whole-graph-resident hbg never reuses a slot).
     out->slot_state->last_consumer_local_id = static_cast<int32_t>(out->task_id.local());

@@ -80,12 +80,13 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
 
-    // Highest task_id such that every task with id in [0, completed_watermark]
-    // has its completion_flags byte set. Advanced over the full contiguous
-    // completed prefix at task-completion time (on_mixed_task_complete). The host
-    // consumer-wait gates on it: a producer slot P's consumers have all retired
-    // once completed_watermark >= P.last_consumer_local_id. On its own cache line
-    // (concurrent CAS-advance by completing threads).
+    // Lowest task_id not yet guaranteed complete: every task with id in
+    // [0, completed_watermark) has its completion_flags byte set. Advanced over
+    // the full contiguous completed prefix at task-completion time
+    // (on_mixed_task_complete). The host consumer-wait gates on it: a producer
+    // slot P's consumers have all retired once completed_watermark >
+    // P.last_consumer_local_id. On its own cache line (concurrent CAS-advance by
+    // completing threads).
     alignas(64) std::atomic<int32_t> completed_watermark;
 
     // Layout metadata (set once at init)
@@ -120,7 +121,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
 
         int32_t next = curr_watermark;
         while (true) {
-            while (next + 1 < submitted && is_completion_flag_set(next + 1)) {
+            while (next < submitted && is_completion_flag_set(next)) {
                 ++next;
             }
             if (next == curr_watermark) {

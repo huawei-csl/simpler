@@ -547,7 +547,7 @@ struct PTO2SchedulerState {
     // mirror + the device-visible completion_flags byte, drain the wake list
     // (route/re-register each waiter), then CAS-advance the monotonic
     // completed_watermark (load-bearing: the host wait_for_consumers gates on
-    // watermark >= producer.last_consumer_local_id). Whole-graph-resident hbg
+    // watermark > producer.last_consumer_local_id). Whole-graph-resident hbg
     // has no device slot reclaim, so no advance_ring_pointers here.
     void on_mixed_task_complete(PTO2TaskSlotState &slot_state) {
         const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
@@ -573,19 +573,20 @@ struct PTO2SchedulerState {
             waiter = next;
         }
 
-        // completed_watermark = highest id such that every task in [0, watermark]
-        // has its completion_flags byte set. The host wait_for_consumers gates on
-        // watermark >= producer.last_consumer_local_id, so the walk must extend to
-        // the full contiguous completed prefix — NOT cap at task_id. Capping at task_id
-        // makes the final value order-dependent: a low-id task completing after a
-        // higher one would leave the watermark stuck below the true prefix, hanging
-        // any wait_for_consumers whose last_consumer sits in the gap.
+        // completed_watermark = lowest id not yet guaranteed complete: every task
+        // in [0, watermark) has its completion_flags byte set. The host
+        // wait_for_consumers gates on watermark > producer.last_consumer_local_id,
+        // so the walk must extend to the full contiguous completed prefix — NOT
+        // cap at task_id. Capping at task_id makes the final value order-dependent:
+        // a low-id task completing after a higher one would leave the watermark
+        // stuck below the true prefix, hanging any wait_for_consumers whose
+        // last_consumer sits in the gap.
         ring.update_completed_watermark();
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
     // once via the wake-list drain) and no per-producer consumer/scope refcount.
-    // Consumer retirement is observed by the host through completed_watermark >=
+    // Consumer retirement is observed by the host through completed_watermark >
     // producer.last_consumer_local_id, not by bumping a producer refcount.
 
     // Early-dispatch release. If the now-ready task was pre-staged
@@ -813,7 +814,7 @@ struct PTO2SchedulerState {
 
     // Polling: scope-end takes no per-producer action. Under the wiring model
     // this bumped each task's scope refcount (PTO2_FANOUT_SCOPE_BIT); reclaim now
-    // gates on completed_watermark >= last_consumer_local_id, which needs no
+    // gates on completed_watermark > last_consumer_local_id, which needs no
     // scope reference. Kept as a no-op so the orchestrator call site is unchanged.
     void on_scope_end(PTO2TaskSlotState ** /*task_slot_states*/, int32_t /*count*/) {}
 

@@ -154,9 +154,9 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // Flow control (starts at 0)
     header->ring.fc.init();
 
-    // Polling completion: -1 = "no task completed yet"; the first task to
-    // complete (local_id 0) advances the watermark to 0.
-    header->ring.completed_watermark.store(-1, std::memory_order_relaxed);
+    // Polling completion: 0 = "no task completed yet"; the first task to
+    // complete (local_id 0) advances the watermark to 1.
+    header->ring.completed_watermark.store(0, std::memory_order_relaxed);
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
 
