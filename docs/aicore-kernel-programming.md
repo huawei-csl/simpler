@@ -47,13 +47,15 @@ accessor functions defined in that header.
 
 ## 2. SPMD execution context
 
-Three pieces of topology data are exposed to user kernels:
+The runtime context exposes three topology values plus an optional async-DMA
+workspace address:
 
 | Accessor (use these) | Returns | Lifetime | Source |
 | -------------------- | ------- | -------- | ------ |
 | `get_block_idx(args)` | logical block index in `[0, block_num)` | per-dispatch | `LocalContext.block_idx` |
 | `get_block_num(args)` | total logical blocks for this task | per-dispatch | `LocalContext.block_num` |
 | `get_sub_block_id(args)` | AIV lane in cluster (0 = AIV0, 1 = AIV1) | per-core, init once | `GlobalContext.sub_block_id` |
+| `get_dma_workspace(args, kind)` | engine workspace GM pointer, or `nullptr` | Worker init (SDMA-enabled) | `GlobalContext.dma_workspace[kind]` |
 
 `sub_block_id` is **only meaningful for AIV kernels in MIX tasks**.
 AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
@@ -61,10 +63,22 @@ AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
 binary and use `sub_block_id` to pick which half of the work they own
 (for example: head 0 of a `(head0, head1)` pair vs head 1).
 
-The scheduler initialises `GlobalContext.sub_block_id` once per AIV
-core at startup, based on each core's position in its cluster
-(`scheduler_cold_path.cpp::SchedulerContext::init`). `LocalContext` is
-rewritten by `build_payload()` before each dispatch.
+The scheduler initialises `GlobalContext.sub_block_id` once per AIV core at
+startup, based on each core's position in its cluster
+(`scheduler_cold_path.cpp::SchedulerContext::init`). It also copies the
+async-DMA workspace addresses from `KernelArgs` into
+`GlobalContext.dma_workspace`.
+Async-DMA is opt-in per Worker: construct the Worker with `enable_sdma=True`
+and the runtime provisions the SDMA workspace once at init, latches its address
+into `KernelArgs`, and injects it into every run's `GlobalContext`. A Worker
+that does not opt in creates no SDMA streams, and `get_dma_workspace` returns
+`nullptr`. Provisioning fails fast (Worker init raises) on a platform/runtime
+without SDMA support. Every event submitted through the workspace must be waited
+before the kernel returns or registered with the runtime's deferred-completion
+mechanism.
+An invalid kind or unprovisioned slot returns `nullptr` and must not be used to
+submit DMA work. `LocalContext` is rewritten by `build_payload()` before each
+dispatch.
 
 ### Logical vs physical block_dim
 
@@ -74,10 +88,10 @@ that the runtime launches:
 
 | Symbol | Meaning |
 | ------ | ------- |
-| `RUNTIME_CONFIG.block_dim` (Python `CallConfig.block_dim`) | Number of physical AICore blocks the runtime launches per dispatch. |
+| `rt_available_cluster_count()` | Number of physical AICore blocks this run launches — the whole device; there is no per-call knob. |
 | `get_block_num(args)` | Logical block count the kernel partitions work across. Currently always 1; multi-logical-block (`block_num > 1`) is not yet implemented. |
 
-When you set `CallConfig.block_dim = 24` in Python and your kernel sees
+When the device reports 24 clusters and your kernel sees
 `get_block_num(args) == 1`, that is by design — every physical block
 runs the same kernel and the kernel partitions work however it likes
 using `get_block_idx()` against whatever it expects. Don't conflate
@@ -205,55 +219,67 @@ thread `args` into a third-party library template.
 **Do not** bridge `get_subblockid()` with a file-scope cache:
 
 ```cpp
-// WRONG — the .o will not load. See §4.
+// WRONG — hides per-core state from the orchestrator.
 [[block_local]] static int32_t lane;   // per-core static
 #define get_subblockid() lane          // redirect the library's no-arg call
 // ... lane = get_sub_block_id(args); once in kernel_entry
 ```
 
-A `[[block_local]]` (or any non-const) static is read via a `.text` relocation
-that the AICore loader rejects (§4). If onboard `get_subblockid()` does not
-match `get_sub_block_id(args)`, prefer fixing platform/launch identity; until
-then add the lane split explicitly with `setEntryOffset` computed inline from
+The link step resolves the `.text` relocation such a static needs (§4), so this
+loads — but it is still the wrong shape: it hides per-core state the
+orchestrator cannot see, behind a macro that silently changes what a library
+template computes. If onboard `get_subblockid()` does not match
+`get_sub_block_id(args)`, prefer fixing platform/launch identity; until then add
+the lane split explicitly with `setEntryOffset` computed inline from
 `get_sub_block_id(args)` (see the `run_aiv` `setEntryOffset` call sites in
 [`spmd_paged_attention/kernels/mix/paged_attention_parallel.cpp`](../tests/st/a2a3/tensormap_and_ringbuffer/spmd_paged_attention/kernels/mix/paged_attention_parallel.cpp)).
 
 ---
 
-## 4. The AICore loader runs raw `.text` only
+## 4. The AICore loader runs a linked `.text`
 
-simpler loads a kernel by copying the **literal `.text` section bytes** out of
-the compiled `.o` and jumping to them
-([`simpler_setup/elf_parser.py`](../simpler_setup/elf_parser.py)). It does
-**not**:
+simpler loads a kernel by copying the **literal `.text` section bytes** and
+jumping to offset 0. To make those bytes self-contained,
+[`KernelCompiler.compile_incore`](../simpler_setup/kernel_compiler.py) links
+each compiled object with `ld.lld` (`-e kernel_entry`) before
+[`elf_parser.extract_text_section`](../simpler_setup/elf_parser.py) takes the
+payload. Linking is what:
 
-- apply ELF relocations (`.rela.text`), or
-- merge out-of-line template instantiations (`.text._Z*` COMDAT groups).
+- applies ELF relocations (`.rela.text`), and
+- folds out-of-line template instantiations (`.text._Z*` COMDAT groups) into
+  the single output `.text`.
 
-If a kernel `.o` carries either, the loader refuses it with
-"AICore loader cannot extract a runnable payload …" rather than load a binary
-whose `BL`/`B` targets are left as `imm26 = 0` — those would branch to garbage
-on device, producing CANN 507018 watchdog timeouts or silently-wrong partial
-output (the failure modes behind issue #900, PR #830 / issue #831). The loader
-is strict **by design**; it is not relaxed to let "benign" relocations through.
+The linked image is position-independent — `--image-base` does not change the
+emitted `.text` — so the loader can place it anywhere.
 
-Two things produce a rejected `.o`:
+`extract_text_section` still refuses an image that carries either, and also one
+whose `kernel_entry` is not at the start of `.text` (the loader would enter the
+wrong function). Reaching one of those now means the **link** left the image
+incomplete — an undefined symbol kept as a relocation, or out-of-line code the
+linker placed ahead of the entry point — not that a kernel merely needs
+inlining. The alternative, loading a binary whose `BL`/`B` targets are left as
+`imm26 = 0`, branches to garbage on device: CANN 507018 watchdog timeouts or
+silently-wrong partial output (issue #900, PR #830 / issue #831).
 
-| Cause | Why it relocates | Fix |
-| ----- | ---------------- | --- |
-| Out-of-line call to another function (a non-inlined `static` helper, or a template instantiation emitted to its own section) | `BL <fn>` needs an `R_AARCH64_CALL26` relocation the loader can't apply | Mark every function in the call chain `__attribute__((always_inline))` so the compiler folds them into one `.text` |
-| Reading a non-const global / `static` / `[[block_local]]` variable | The address load needs a relocation against the data symbol | Don't use module-level mutable data on AICore — pass the value as a function argument down from `kernel_entry` |
+What linking does and does not rescue:
 
-Verify a kernel object before chasing a device hang:
+| Cause | Why it relocates | Status |
+| ----- | ---------------- | ------ |
+| Out-of-line call to another function (a non-inlined `static` helper, or a template instantiation emitted to its own section) | `BL <fn>` needs an `R_AARCH64_CALL26` relocation | Resolved by the link, provided the linker keeps `kernel_entry` first. `__attribute__((always_inline))` on the call chain still avoids the question entirely and keeps the payload smaller |
+| Reading a non-const global / `static` / `[[block_local]]` variable | The address load needs a relocation against the data symbol | Resolved by the link: block-locals merge into one `.bl_uninit` region and each reference gets its true offset. Still prefer passing the value as an argument down from `kernel_entry` — a per-core global is state the orchestrator cannot see |
+
+That second row is why CANN AscendC kernels load at all: AscendC declares
+`g_vecTPipePtr` / `g_cubeTPipePtr` and `g_kfcClient` as block-local globals in
+separate `.bl.uninit.*` sections, and they cannot all sit at offset 0. Without
+the link, whichever one is not first silently aliases onto another's slot.
+
+Verify a kernel image before chasing a device hang:
 
 ```bash
-readelf -SW kernel.o | grep -E '\.text'  # want only ".text"; ".text._Z*" or ".rela.text" = reject
-readelf -r  kernel.o                      # want: no relocation entries
+readelf -SW kernel.elf | grep -E '\.text'   # want only ".text"
+readelf -rW kernel.elf                      # want: no relocation entries
+readelf -sW kernel.elf | grep kernel_entry  # want: value == .text address
 ```
-
-This is exactly why §3 rejects a cached `[[block_local]]` static to redirect
-`get_subblockid()`: the static would reintroduce a `.rela.text` the loader
-rejects.
 
 ---
 

@@ -51,7 +51,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding
@@ -538,7 +538,24 @@ int simpler_run(
         // runtime state — the shared g_host_api table (built once at load time)
         // is passed explicitly into the runtime impls rather than stored on
         // `Runtime` or reassembled per run.
-        int rc;
+        // Core geometry first: a host-side orchestrator runs to completion
+        // inside the bind below, and reads worker_count to size its cluster
+        // spreading. Resolving after the bind would hand it the zeros a fresh
+        // Runtime carries.
+        int rc = runner->prepare_launch_shape(*r, *config);
+        if (rc != 0) {
+            r->set_gm_sm_ptr(nullptr);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            pthread_setspecific(g_runner_key, nullptr);
+            return validation_rc != 0 ? validation_rc : rc;
+        }
+
+        // Latch the diagnostic enables before the bind: a host-orch runtime
+        // builds its whole task graph inside it, so a diagnostic that hooks the
+        // orchestrator (dep_gen) has to be armed by now. run() latches again at
+        // its entry — the call is idempotent.
+        runner->apply_call_config(*config);
+
         {
             STRACE("simpler_run.bind");
             // One-step bind: replay CallableState + run the per-run binding. The
@@ -550,9 +567,9 @@ int simpler_run(
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
@@ -562,14 +579,14 @@ int simpler_run(
             rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+            rc = validate_runtime_impl(r, &g_host_api, 0);
         }
         pthread_setspecific(g_runner_key, nullptr);
         emit_device_phase_markers(runner);
@@ -605,6 +622,19 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
     } catch (...) {
         return 0;
     }
+}
+
+size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
+    // Simulation has no ACL streams, so it owns no run stream sets.
+    (void)ctx;
+    return 0;
+}
+
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+    // Simulation provides no async-DMA workspaces; a non-empty request fails
+    // fast so an SDMA-enabled Worker cannot come up on sim.
+    (void)ctx;
+    return required_mask == 0 ? 0 : -1;
 }
 
 }  // extern "C"

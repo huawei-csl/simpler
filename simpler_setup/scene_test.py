@@ -36,7 +36,31 @@ from .pto_isa import ensure_pto_isa_root
 
 logger = logging.getLogger(__name__)
 
-_compile_cache: dict[tuple[str, str, str], object] = {}
+_compile_cache: dict[tuple, object] = {}
+
+
+def _pto_isa_compile_cache_token() -> str:
+    """Pin SHA included in session compile-cache keys.
+
+    ``ensure_pto_isa_root()`` always resolves the managed checkout, but the
+    session cache previously keyed only on (qualname, platform, runtime). A
+    mid-session pin bump could then reuse kernels built against the old ISA.
+    """
+    from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+    return read_pto_isa_pin()
+
+
+def l3_compile_cache_key(qualname: str, name: str, platform: str, runtime: str) -> tuple:
+    """Session compile-cache key for an L3 orchestration entry.
+
+    Every L3 compile path (scene-test ``test_run``, standalone worker, the
+    ``st_worker`` pytest fixture) keys ``_compile_cache`` through here so they
+    share one entry per orchestration; a divergent key format recompiles the
+    same kernels once per path. The pin token pins the key to the current
+    pto-isa revision.
+    """
+    return (qualname, name, platform, runtime, _pto_isa_compile_cache_token())
 
 
 def clear_compile_cache() -> None:
@@ -115,15 +139,31 @@ class TaskArgsBuilder:
         self._add_scalar(Scalar(name, value))
 
     def _add_tensor(self, spec: Tensor) -> None:
+        # Names are this container's lookup keys, so reject a bad name before any
+        # mutation — a rejected add leaves the builder untouched.
+        self._reject_bad_name(spec.name)
         if self._has_scalar:
             raise ValueError("Cannot add tensor after scalar (tensor-before-scalar ordering required)")
         self._specs.append(spec)
         self._data[spec.name] = spec.value
 
     def _add_scalar(self, spec: Scalar) -> None:
+        self._reject_bad_name(spec.name)
         self._has_scalar = True
         self._specs.append(spec)
         self._data[spec.name] = spec.value
+
+    def _reject_bad_name(self, name: str) -> None:
+        # A name already stored duplicates an argument. A name that resolves to a
+        # real attribute (the `specs`/`clone`/`tensor_names`/`add_*` members)
+        # would shadow that member: `__getattr__` only fires on lookup miss, so
+        # `args.<name>` would return the member, not the argument value. Reject
+        # both — names must be unique across tensors and scalars and must not
+        # collide with the container's own surface.
+        if name in self._data:
+            raise ValueError(f"TaskArgsBuilder: duplicate argument name {name!r}")
+        if hasattr(self, name):
+            raise ValueError(f"TaskArgsBuilder: argument name {name!r} conflicts with builder attributes/methods")
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
@@ -375,7 +415,7 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     """Build a tagged `TaskArgs` (vector-backed, with `TensorArgType` tags) from
     `TaskArgsBuilder`.
 
-    Used by the L3 path (`orch.submit_next_level(callable, args, config)`):
+    Used by the L3 path (`orch.submit_next_level(callable, args, config, worker=chip_id)`):
     the orchestrator reads the tags to drive dependency inference.
 
     Returns:
@@ -470,8 +510,50 @@ def _resolve_chip_entry_paths(entry, cls_dir):
             k = dict(k)
             if "source" in k and not os.path.isabs(k["source"]):
                 k["source"] = str(cls_dir / k["source"])
+            if k.get("extra_include_dirs"):
+                k["extra_include_dirs"] = [
+                    d if "$" in str(d) or os.path.isabs(str(d)) else str((cls_dir / str(d)).resolve())
+                    for d in k["extra_include_dirs"]
+                ]
             resolved.append(k)
         entry["incores"] = resolved
+
+
+def _resolve_incore_include_dirs(dirs, incore):
+    """Resolve an incore's ``extra_include_dirs`` down to usable ``-I`` paths.
+
+    Entries may use ``$VAR`` (typically ``$ASCEND_HOME_PATH``, so a CANN-linked
+    kernel does not hardcode a machine-specific path); relative ones were made
+    absolute against the test file's directory when the class was declared.
+
+    This runs when the kernel is compiled, not when its module is imported —
+    a case declaring a CANN dependency is still collected on sim and macOS
+    runners that have no CANN at all, and must not fail there.
+
+    A vendored toolkit ships one over-broad candidate list across SDK versions,
+    so paths that do not exist here are dropped. An unset variable raises, and so
+    does a declared set where nothing survived: that means the SDK is absent, and
+    saying so beats a "file not found" from deep inside vendored code.
+    """
+    name = incore.get("name", incore.get("source", "?"))
+    resolved = []
+    for raw in dirs:
+        expanded = os.path.expandvars(str(raw))
+        if "$" in expanded:
+            raise ValueError(
+                f"incore {name}: extra_include_dirs entry {raw!r} references an environment "
+                f"variable that is not set. Export it (e.g. ASCEND_HOME_PATH for CANN headers) "
+                f"before running."
+            )
+        if Path(expanded).is_dir():
+            resolved.append(expanded)
+    if not resolved:
+        raise ValueError(
+            f"incore {name}: none of its {len(dirs)} extra_include_dirs exist on this machine, "
+            f"so the SDK they come from is not installed where the test expects. Tried:\n  "
+            + "\n  ".join(os.path.expandvars(str(d)) for d in dirs)
+        )
+    return resolved
 
 
 def _extract_name_map(callable_spec: dict) -> dict:
@@ -881,8 +963,12 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     kernel_binaries = []
     for k in incores:
         signature = k.get("signature", [])
+        extra = _resolve_incore_include_dirs(k["extra_include_dirs"], k) if k.get("extra_include_dirs") else []
         incore = kc.compile_incore(
-            k["source"], core_type=k["core_type"], pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs
+            k["source"],
+            core_type=k["core_type"],
+            pto_isa_root=pto_isa_root,
+            extra_include_dirs=inc_dirs + extra,
         )
         if not is_sim:
             incore = extract_text_section(incore)
@@ -941,6 +1027,13 @@ class SceneTestCase:
     CASES: list[dict] = []
     RTOL: float = 1e-5
     ATOL: float = 1e-5
+    # Class-wide default for `CASES[*]["skip_golden"]`. True means the case has
+    # no host-computable expected output — it passes by running clean, and
+    # `compute_golden` is never called. Use it for cases whose output depends on
+    # a shape only the device knows (e.g. the SPMD grid width the runtime
+    # resolved). Prefer a `compare_outputs` override when the output is
+    # self-describing enough to still be checked.
+    SKIP_GOLDEN: bool = False
     RUNTIME_ENV: dict = {}
 
     def generate_args(self, params) -> TaskArgsBuilder:
@@ -951,6 +1044,17 @@ class SceneTestCase:
         """Compute expected outputs in-place on a cloned TaskArgsBuilder."""
         raise NotImplementedError
 
+    def compare_outputs(self, test_args, golden_args, output_names, params) -> None:
+        """Assert the run's outputs match golden. Raises AssertionError on mismatch.
+
+        The default is `torch.allclose` on every output at the class RTOL/ATOL.
+        Override to compare a subset, to apply a per-tensor tolerance, or when
+        the valid extent of an output is carried in the output itself (a task
+        that writes one slot per SPMD block reports the grid width it actually
+        ran with, and only that prefix is defined).
+        """
+        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
     # ------------------------------------------------------------------
     # Callable compilation
     # ------------------------------------------------------------------
@@ -958,7 +1062,7 @@ class SceneTestCase:
     @classmethod
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
-        cache_key = (cls.__qualname__, platform, cls._st_runtime)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
         return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
@@ -968,7 +1072,7 @@ class SceneTestCase:
         for entry in cls.CALLABLE["callables"]:
             if "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
@@ -1023,11 +1127,6 @@ class SceneTestCase:
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
         config = CallConfig()
-        # Default to 0 (CallConfig "auto" sentinel) when a case omits
-        # block_dim — DeviceRunner resolves it to the stream's max capacity
-        # at run() time. Cases that need a specific value still set it
-        # explicitly in their config dict.
-        config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
@@ -1128,6 +1227,7 @@ class SceneTestCase:
     ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
+        skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
         # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
@@ -1183,7 +1283,7 @@ class SceneTestCase:
                 worker.run(handle, chip_args, config=config)
 
             if not skip_golden:
-                _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+                self.compare_outputs(test_args, golden_args, output_names, params)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
@@ -1214,6 +1314,7 @@ class SceneTestCase:
 
         params = case.get("params", {})
         config_dict = case.get("config", {})
+        skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
 
         # Build args
         test_args = self.generate_args(params)
@@ -1274,7 +1375,7 @@ class SceneTestCase:
                     worker.run(task_orch)
 
                 if not skip_golden:
-                    _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+                    self.compare_outputs(test_args, golden_args, all_tensor_names, params)
         finally:
             rehosted.release()
 
@@ -1524,7 +1625,9 @@ class SceneTestCase:
                     f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
                 )
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
+        # Eager pin checkout for kernel/orchestration compiles that pass
+        # pto_isa_root explicitly. Do not export PTO_ISA_ROOT (#1403).
+        ensure_pto_isa_root(verbose=True)
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
@@ -1935,7 +2038,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle

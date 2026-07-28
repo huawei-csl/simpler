@@ -43,7 +43,7 @@ def run_dag(orch, callables, task_args, config):
     args1 = _chip_args(task_args.a1, task_args.b1, task_args.f1)
     callables.keep(args0, args1)  # prevent GC before drain
 
-    orch.submit_next_level_group(callables.vector_kernel, [args0, args1], config)
+    orch.submit_next_level_group(callables.vector_kernel, [args0, args1], config, workers=[0, 1])
 
     # SubTask depends on both group outputs (f0, f1) — tag both as INPUT.
     sub_args = TaskArgs()
@@ -95,7 +95,7 @@ class TestL3Group(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"device_count": 2, "num_sub_workers": 1, "block_dim": 3, "aicpu_thread_num": 4},
+            "config": {"device_count": 2, "num_sub_workers": 1, "aicpu_thread_num": 4},
             "params": {},
         },
     ]

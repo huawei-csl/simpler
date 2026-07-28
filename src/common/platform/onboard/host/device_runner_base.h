@@ -23,7 +23,7 @@
  *     `configure_aicore_op_timeout`, `ensure_device_initialized`,
  *     `ensure_binaries_loaded`, persistent AICPU/AICore streams,
  *     dispatcher/executor bytes, `LoadAicpuOp`, `KernelArgsHelper`.
- *   - block_dim resolution: `query_max_block_dim`, `validate_block_dim`.
+ *   - block_dim resolution: `query_max_block_dim`, `resolve_block_dim`.
  *   - Debug: `print_handshake_results`, `create_thread`.
  *
  * Subclasses (`{a2a3,a5}::DeviceRunner`) add arch-specific state
@@ -51,6 +51,7 @@
 #include "arg_direction.h"
 #include "callable.h"
 #include "common/device_phase.h"
+#include "common/dma_workspace.h"
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
@@ -339,6 +340,19 @@ public:
     bool has_callable(int32_t callable_id) const;
 
     /**
+     * Provision the async-DMA workspaces named in `required_mask` once at Worker
+     * init and latch their device addresses into the resident KernelArgs so every
+     * subsequent run carries them (AICPU injects them into GlobalContext via
+     * get_dma_workspace). Called only for a Worker created with SDMA enabled;
+     * `required_mask` bits outside dma_workspace_supported_mask() are rejected, so
+     * a platform/runtime without SDMA fails fast. The provider handle is released
+     * by finalize_common().
+     *
+     * @return 0 on success, negative on unsupported/failed provisioning.
+     */
+    int provision_dma_workspace(uint32_t required_mask);
+
+    /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
      * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
@@ -350,6 +364,23 @@ public:
      * per-stage timing to a specific callable.
      */
     uint64_t callable_hash(int32_t callable_id) const;
+
+    /**
+     * Publish this run's core geometry onto `Runtime` before the graph is
+     * built: resolves `block_dim`, derives `num_aicore = block_dim *
+     * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
+     * publishes `worker_count` / `worker_count_` / `aicpu_thread_num`,
+     * and zero-initializes the handshake worker array with AIC/AIV core
+     * typing (first `block_dim` cores are AIC, remaining are AIV).
+     *
+     * Callers run this before `bind_callable_to_runtime` so a host-side
+     * orchestrator sees the real core count while it submits, rather than
+     * the zeros a freshly constructed `Runtime` carries. Needs
+     * `ensure_device_initialized()` to have latched `max_block_dim_`.
+     *
+     * Returns 0 on success, -1 on a bad `block_dim` / `aicpu_thread_num`.
+     */
+    int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
 
     /**
      * Replay a previously-registered callable's state onto a fresh Runtime and
@@ -389,6 +420,14 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
+     * Number of run stream sets this runner has created. A set belongs to a
+     * pipeline slot and is reused for every run on that slot, so a runner that
+     * has served any number of runs on one slot reports 1. Arches whose runs
+     * use the persistent pair report 0.
+     */
+    virtual size_t run_stream_set_create_count() const { return 0; }
+
+    /**
      * Device-orchestration callable registration used internally by
      * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
      * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
@@ -412,6 +451,14 @@ public:
     // through these virtuals. Each arch's `DeviceRunner` overrides
     // `run` and `finalize`; a2a3 and a5 both override `set_dep_gen_enabled`
     // (an arch without dep_gen keeps the base no-op default).
+
+    /**
+     * Whether this runner may start another run without first being finalized.
+     * The shared c_api checks this before attaching the thread or provisioning
+     * optional resources, so a poisoned runner cannot create SDMA streams on
+     * its way to the arch-specific run() fail-fast guard.
+     */
+    virtual bool can_accept_run() const = 0;
 
     /**
      * Execute a Runtime. Each arch implements its own `run()` — the bodies
@@ -562,9 +609,9 @@ protected:
     int ensure_binaries_loaded();
 
     /**
-     * Per-device one-shot launch of `simpler_aicpu_init`, latching the
-     * invariants (orch device id, log config) into the resident AICPU SO
-     * globals. Idempotent via `aicpu_init_launched_`; called from
+     * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
+     * device id, log config) into the resident AICPU SO globals. Idempotent via
+     * `aicpu_init_launched_`; called from
      * `ensure_device_initialized()` after the binaries are loaded.
      *
      * @return 0 on success, error code on failure.
@@ -585,13 +632,6 @@ protected:
      * success path in error logs.
      */
     int query_max_block_dim(rtStream_t stream, uint32_t *out_cube = nullptr, uint32_t *out_vector = nullptr);
-
-    /**
-     * Validate block_dim against the stream's CUBE/VECTOR core limits
-     * (via `query_max_block_dim`). Returns 0 if block_dim fits, -1
-     * otherwise (or if block_dim < 1).
-     */
-    int validate_block_dim(rtStream_t stream, int block_dim);
 
     // ---- run() sub-sequence helpers --------------------------------------
     //
@@ -619,31 +659,26 @@ protected:
     void ensure_device_wall_buffer();
 
     /**
-     * Resolve the caller's `requested_block_dim` into a concrete
-     * block_dim:
-     *  - `requested_block_dim == 0`: auto-resolve from
-     *    `query_max_block_dim(stream_aicore_)`.
-     *  - otherwise: pass through `validate_block_dim`.
+     * Resolve this run's block_dim: every cluster the device has, i.e.
+     * the cached `max_block_dim_`. A run is never narrower than the
+     * device — orchestration sizes its cohorts from
+     * `rt_available_cluster_count()` instead.
      *
-     * Returns the resolved block_dim on success, -1 on failure.
-     * Updates `block_dim_` on success.
+     * Reads the cached ceiling only — no ACL call, so it is safe to run
+     * at bind time, before any stream work for the run.
+     *
+     * Returns the resolved block_dim on success, -1 if the ceiling was
+     * never latched. Updates `block_dim_` on success.
      */
-    int resolve_block_dim(int requested_block_dim);
+    int resolve_block_dim();
 
     /**
-     * Per-run Runtime setup: derives `num_aicore = block_dim *
-     * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
-     * publishes `worker_count`, `worker_count_`,
-     * `aicpu_thread_num` (via the Runtime accessors), zero-initializes
-     * the handshake
-     * worker array with AIC/AIV core typing (first `block_dim` cores
-     * are AIC, remaining are AIV), and rewrites each task's
-     * `function_bin_addr` from `runtime.get_function_bin_addr(func_id)
-     * + CoreCallable::binary_data_offset()`.
-     *
-     * Returns 0 on success, -1 on `block_dim`-too-large error.
+     * Rewrites each task's `function_bin_addr` from
+     * `runtime.get_function_bin_addr(func_id) +
+     * CoreCallable::binary_data_offset()`. Runs inside `run()`, after the
+     * bind that populates the task table.
      */
-    int prepare_runtime_for_launch(Runtime &runtime, int block_dim, int launch_aicpu_num);
+    void resolve_task_binary_addrs(Runtime &runtime);
 
     /**
      * Wait for both per-Worker streams (AICPU first, then AICore) with
@@ -653,6 +688,9 @@ protected:
      * block_dim) context in the log. Returns the first non-zero rc encountered.
      */
     int sync_run_streams();
+
+    /** Wait for an explicit AICPU/AICore stream pair. */
+    int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
     /**
      * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
@@ -780,6 +818,16 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Opaque provider handle from dma_workspace_provision(), owned for the
+    // Worker's life and released by finalize_common(). Null unless the Worker
+    // was created with SDMA enabled.
+    void *dma_workspace_handle_{nullptr};
+    // Provisioned async-DMA workspace device addresses, indexed by
+    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
+    // so the resident AICPU SO latches them into g_dma_workspace_addr; the
+    // scheduler prefills each core's GlobalContext from there. All-zero until a
+    // Worker opts into SDMA via provision_dma_workspace().
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of successful AICPU dlopens (incremented after prewarm
     // or first-run fallback succeeds; never decremented). Diverges from
@@ -803,6 +851,15 @@ protected:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
+
+    // This device's block_dim ceiling and the raw ACL core limits behind it,
+    // resolved once against the persistent AICore stream in
+    // ensure_device_initialized(). Nothing in this codebase calls
+    // aclrtSetStreamResLimit, so the limits hold for that stream's lifetime;
+    // finalize_common() clears them along with the stream.
+    int max_block_dim_{0};
+    uint32_t max_cube_cores_{0};
+    uint32_t max_vector_cores_{0};
     HostRuntimeTimeoutConfig timeout_config_{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
 
     // Executor binaries — populated once via `set_executors()` during
@@ -865,7 +922,9 @@ protected:
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's
-    // `finalize()`. `nullptr` before init.
+    // `finalize()`. A2A3 reserves these for bootstrap/control operations and
+    // submits runs on its own per-slot stream sets; A5 submits runs on these.
+    // `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     KernelArgsHelper kernel_args_;
@@ -891,9 +950,8 @@ protected:
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
-    // Per-device one-shot guard for the simpler_aicpu_init launch.
+    // Per-device guard for the initial simpler_aicpu_init launch.
     bool aicpu_init_launched_{false};
-
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live

@@ -268,10 +268,10 @@ inline void bind_worker(nb::module_ &m) {
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
-            nb::arg("worker") = int32_t(-1), nb::arg("eligible_worker_ids") = std::vector<int32_t>{},
+            nb::arg("worker"), nb::arg("eligible_worker_ids") = std::vector<int32_t>{},
             nb::arg("remote_sidecar") = nb::none(),
             "Submit a NEXT_LEVEL task by registered callable digest. "
-            "worker= pins to a stable NEXT_LEVEL worker id (-1 = any)."
+            "worker= selects the exact stable NEXT_LEVEL worker id."
         )
         .def(
             "submit_next_level_group",
@@ -284,11 +284,10 @@ inline void bind_worker(nb::module_ &m) {
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"), nb::arg("config"),
-            nb::arg("workers") = std::vector<int32_t>{},
-            nb::arg("eligible_worker_ids") = std::vector<std::vector<int32_t>>{},
+            nb::arg("workers"), nb::arg("eligible_worker_ids") = std::vector<std::vector<int32_t>>{},
             nb::arg("remote_sidecars") = nb::none(),
             "Submit a group of NEXT_LEVEL tasks by registered callable digest. "
-            "workers= per-args stable NEXT_LEVEL worker id affinity (empty = any)."
+            "workers= selects one exact stable NEXT_LEVEL worker id per member."
         )
         .def(
             "submit_sub",
@@ -351,14 +350,29 @@ inline void bind_worker(nb::module_ &m) {
         .def("scope_end", &Orchestrator::scope_end, "Close the innermost scope. Non-blocking.")
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
+        .def("_begin_run", &Orchestrator::begin_run)
+        .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
-            "_drain", &Orchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
-            "Block until all submitted tasks are CONSUMED (releases GIL). "
-            "Rethrows the first dispatch failure seen in this run, if any."
+            "_fail_run_submission",
+            [](Orchestrator &self, RunId run_id, const std::string &message) {
+                self.fail_run_submission(
+                    run_id,
+                    message.empty() ? std::exception_ptr{} : std::make_exception_ptr(std::runtime_error(message))
+                );
+            },
+            nb::arg("run_id"), nb::arg("message") = std::string(),
+            "Close a run whose submission failed. A non-empty message becomes the run's first error."
         )
         .def(
-            "_clear_error", &Orchestrator::clear_error, "Clear any stored dispatch error so the next run can proceed."
-        );
+            "_wait_run", &Orchestrator::wait_run, nb::arg("run_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Block until one run is terminal and raise only that run's error."
+        )
+        .def(
+            "_wait_run_for", &Orchestrator::wait_run_for, nb::arg("run_id"), nb::arg("timeout_seconds"),
+            nb::call_guard<nb::gil_scoped_release>(), "Wait up to timeout_seconds for one run to become terminal."
+        )
+        .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
+        .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
 
     // --- Worker ---
     // Bound as `_Worker` because the Python user-facing `Worker` factory
@@ -373,47 +387,55 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
+                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid);
             },
-            nb::arg("mailbox_ptr"),
+            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
-            "Python-managed (fork + _chip_process_loop)."
+            "Python-managed (fork + _chip_process_loop). `child_pid` is that "
+            "forked child, used to detect an exit before mailbox completion."
         )
         .def(
             "add_next_level_worker_at",
-            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr) {
-                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, int child_pid) {
+                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr), child_pid);
             },
-            nb::arg("worker_id"), nb::arg("mailbox_ptr"), "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
+            "Add a NEXT_LEVEL sub-worker with an explicit worker id."
         )
         .def(
             "add_sub_worker",
-            [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
+                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);
             },
-            nb::arg("mailbox_ptr"),
+            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
             "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
-            "Python-managed (fork + _sub_worker_loop)."
+            "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
+            "forked child, used to detect an exit before mailbox completion."
         )
         .def(
             "add_remote_l3_socket",
             [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
                const std::string &host, uint16_t port, const std::string &health_host, uint16_t health_port,
-               double timeout_s) {
+               double attach_timeout_s, double runtime_timeout_s) {
                 nb::gil_scoped_release release;
                 self.add_remote_l3_socket(
-                    worker_id, session_id, transport_name, host, port, health_host, health_port, timeout_s
+                    worker_id, session_id, transport_name, host, port, health_host, health_port, attach_timeout_s,
+                    runtime_timeout_s
                 );
             },
             nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("host"), nb::arg("port"),
-            nb::arg("health_host"), nb::arg("health_port"), nb::arg("timeout_s") = 30.0,
-            "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
+            nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
+            nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
 
-        .def("init", &Worker::init, "Start the Scheduler thread.")
+        // Release the GIL while starting the Scheduler thread so another Python
+        // thread can run during it — e.g. a concurrent close() observing
+        // INITIALIZING and failing fast. init/close remain same-thread-only
+        // (enforced by Worker.close()).
+        .def("init", &Worker::init, nb::call_guard<nb::gil_scoped_release>(), "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
 
         .def(

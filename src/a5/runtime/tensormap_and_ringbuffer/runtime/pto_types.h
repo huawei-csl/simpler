@@ -45,6 +45,11 @@
 #include "tensor.h"
 #include "tensor_create_info.h"  // runtime-only TensorCreateInfo + materialization helpers
 
+// TaskAttrs packs the timing tag into a 4-bit field and reports "untagged" as
+// -1, so the tag domain must fit 0..15 and the untagged sentinel must be -1.
+static_assert(NUM_TASK_TIMING_SLOTS <= 16, "timing tag must fit TaskAttrs' 4-bit field");
+static_assert(TASK_TIMING_SLOT_NONE == -1, "TaskAttrs::timing_slot() reports untagged as -1");
+
 typedef enum {
     ASYNC_ENGINE_SDMA = 0,
     ASYNC_ENGINE_ROCE = 1,
@@ -242,6 +247,15 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
+    // Early-dispatch hint (codegen-author set, off by default). When
+    // true, the scheduler may stage this task on an idle core before its producer
+    // finishes, gating execution on the DATA_MAIN_BASE doorbell — only safe when
+    // the author knows the task's data dependencies allow it. Read in-process by
+    // the runtime; never crosses the wire format.
+    bool allow_early_resolve_{false};
+    void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
+    bool allow_early_resolve() const { return allow_early_resolve_; }
+
     // Dispatch predicate (codegen-author set; default op == NONE = always
     // dispatch). A FALSE result at the dispatch point retires the task inline
     // through the dep-only path — never dispatched to an AICore — while still
@@ -273,6 +287,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        allow_early_resolve_ = false;
         predicate_ = L0TaskPredicate{};
         task_timing_slot_ = TASK_TIMING_SLOT_NONE;
     }

@@ -119,6 +119,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
     uint32_t reg_val = AICPU_IDLE_TASK_ID;
     uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
+    bool exiting = false;
 
     while (true) {
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
@@ -142,6 +143,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // hardware-bound) and the AICore-local dcci+ack cost
             // (receive_time → start_time, software-tunable). Stored in the
             // record as a 32-bit delta `start_time - receive_time`.
+            //
+            // Early-dispatch (src_payload != 0): receive_time stays at pickup —
+            // before the doorbell wait — so it may precede the producer's end.
             uint64_t receive_time = get_sys_cnt_aicore();
 
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
@@ -156,6 +160,48 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(exec_payload, ENTIRE_DATA_CACHE);
+
+            // Early-dispatch gate. A gated task was staged on this core before its
+            // dependencies resolved; wait until AICPU rings the doorbell
+            // (DATA_MAIN_BASE high 32 == task_id) before executing. The ACK is
+            // deferred until AFTER the gate so the scheduler keeps the core
+            // off-limits (pending_occupied stays set) while the task is gated.
+            // src_payload == 0 (ready path) skips this; a non-zero src_payload is
+            // both the gate flag and the source PTO2TaskPayload.
+            if (exec_payload->src_payload != 0) {
+                __gm__ char *src = reinterpret_cast<__gm__ char *>(exec_payload->src_payload);
+                int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
+                int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+                __gm__ uint64_t *src_scalars =
+                    reinterpret_cast<__gm__ uint64_t *>(src + PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+                int n = 0;
+                for (int32_t i = 0; i < tensor_count; i++) {
+                    exec_payload->args[n++] = reinterpret_cast<uint64_t>(
+                        src + PTO2_TASKPAYLOAD_TENSORS_OFFSET + i * PTO2_TASKPAYLOAD_TENSOR_STRIDE
+                    );
+                }
+                for (int32_t i = 0; i < scalar_count; i++) {
+                    exec_payload->args[n++] = src_scalars[i];
+                }
+                OUT_OF_ORDER_STORE_BARRIER();
+                while (true) {
+                    if (read_dmb_high32() == task_id) {
+                        if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                            exiting = true;
+                        }
+                        break;
+                    }
+                    if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                        exiting = true;
+                        break;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+                if (exiting) {
+                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+                    break;
+                }
+            }
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 

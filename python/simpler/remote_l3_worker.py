@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import select
 import signal
@@ -67,14 +68,27 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
 
 def _session_timeout_s(manifest: dict[str, Any]) -> float:
     timeout_s = float(manifest.get("session_timeout_s", 30.0))
-    if timeout_s <= 0:
-        raise ValueError("manifest session_timeout_s must be positive")
+    if not (timeout_s > 0 and math.isfinite(timeout_s)):
+        raise ValueError("manifest session_timeout_s must be a positive finite number of seconds")
     return timeout_s
 
 
-def _read_runner_ready(fd: int, timeout_s: float) -> dict[str, Any]:
+def _startup_remaining_s(manifest: dict[str, Any]) -> float:
+    # The parent's remaining slice of the single root startup budget bounds how
+    # long the runner may take to bring up its subtree. Absent only from a
+    # pre-P0.3 parent; fall back to the runtime command timeout then. The
+    # fallback is evaluated only when the key is absent, so a valid
+    # startup_remaining_s is not held hostage to an invalid session_timeout_s.
+    if "startup_remaining_s" not in manifest:
+        return _session_timeout_s(manifest)
+    remaining_s = float(manifest["startup_remaining_s"])
+    if not (remaining_s > 0 and math.isfinite(remaining_s)):
+        raise ValueError("manifest startup_remaining_s must be a positive finite number of seconds")
+    return remaining_s
+
+
+def _read_runner_ready(fd: int, deadline: float) -> dict[str, Any]:
     chunks = bytearray()
-    deadline = time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -126,18 +140,43 @@ def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
         pass
 
 
-def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
+def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess.Popen[Any] | None]:
+    # Returns (reply, proc). proc is the live, ready runner handle when the reply
+    # is ok — the caller owns it: hand it to a background reaper once the reply
+    # send to the parent succeeds, or reclaim it if the send raises. proc is None
+    # when no runner survives (a failed handshake has already been killed and
+    # reaped here), so a failed send then leaves nothing to reclaim. A successful
+    # send only means the bytes were queued locally, not that the parent read
+    # them; unobserved receipt would need an ACK / lease, which sim does not have.
     _validate_manifest(manifest)
-    timeout_s = _session_timeout_s(manifest)
+    # Both numeric timeouts are validated before any spawn resource (ready pipe,
+    # manifest tempfile, runner Popen) exists: the runner is never launched only
+    # to die on an invalid session_timeout_s or startup_remaining_s.
+    _session_timeout_s(manifest)
+    # One local absolute deadline for this session's startup: the runner-ready
+    # wait below and the budget handed to the runner both derive from it, so the
+    # daemon's own setup and the runner's init cannot each restart the full slice.
+    deadline = time.monotonic() + _startup_remaining_s(manifest)
     ready_r, ready_w = os.pipe()
     manifest_path = ""
     proc: subprocess.Popen[Any] | None = None
     try:
+        runner_remaining = deadline - time.monotonic()
+        if runner_remaining <= 0:
+            raise TimeoutError("remote L3 session: startup deadline exceeded before runner launch")
+        runner_manifest = dict(manifest)
+        # Hand the runner this daemon's ABSOLUTE monotonic deadline. Daemon and
+        # runner share CLOCK_MONOTONIC (same host, Popen-spawned), so the runner
+        # derives its remaining post-spawn and its deadline equals this one — the
+        # spawn/import/registry time is charged, not restarted from a frozen
+        # duration. startup_remaining_s stays for a pre-P0.3 runner's fallback.
+        runner_manifest["startup_deadline_monotonic"] = deadline
+        runner_manifest["startup_remaining_s"] = runner_remaining
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="simpler-remote-l3-", suffix=".json", delete=False
         ) as f:
             manifest_path = f.name
-            json.dump(manifest, f, sort_keys=True)
+            json.dump(runner_manifest, f, sort_keys=True)
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -157,16 +196,15 @@ def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
         os.close(ready_w)
         ready_w = -1
         try:
-            ready = _read_runner_ready(ready_r, timeout_s)
+            ready = _read_runner_ready(ready_r, deadline)
         except BaseException:
             _wait_or_kill_runner(proc)
             raise
         ready["pid"] = int(proc.pid)
         if not ready.get("ok", False):
             _wait_or_kill_runner(proc)
-        else:
-            threading.Thread(target=_reap_session_runner, args=(proc,), daemon=True).start()
-        return ready
+            return ready, None
+        return ready, proc
     finally:
         if ready_w >= 0:
             try:
@@ -184,22 +222,63 @@ def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
                 pass
 
 
+def _serve_connection(conn: socket.socket) -> None:
+    # One parent connection, fully isolated: any Exception on this socket affects
+    # only this session, never the shared accept loop. KeyboardInterrupt /
+    # SystemExit are BaseException, not Exception, so they propagate out for a
+    # clean daemon shutdown instead of turning into a spurious error reply. A live
+    # runner is disposed of exactly once on every exit path — handed to the reaper
+    # only once its reply send returns, otherwise reclaimed by the finally — so no
+    # session runner is orphaned (until its own timeout) or double-reaped, even
+    # when the send fails, the reaper cannot be launched, or a control exception
+    # unwinds mid-connection.
+    proc: subprocess.Popen[Any] | None = None
+    try:
+        try:
+            manifest = _read_json(conn)
+            reply, proc = _start_session(manifest)
+        except Exception as exc:  # noqa: BLE001
+            # Handshake failed (bad manifest, runner start error); _start_session
+            # already reaped any runner it started. Best-effort error reply,
+            # swallowing only a send that itself fails on a dead parent.
+            with contextlib.suppress(OSError):
+                _send_json(conn, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        try:
+            _send_json(conn, reply)
+            if proc is not None:
+                threading.Thread(target=_reap_session_runner, args=(proc,), daemon=True).start()
+                proc = None
+        except Exception:  # noqa: BLE001
+            # Local send raised (parent gone) or the reaper thread could not be
+            # started; the finally reclaims the still-owned runner.
+            return
+    finally:
+        if proc is not None:
+            _wait_or_kill_runner(proc)
+
+
+def _serve_loop(server: socket.socket) -> None:
+    while True:
+        try:
+            conn, _addr = server.accept()
+        except OSError:
+            # Listener closed (shutdown); stop accepting.
+            return
+        with conn:
+            _serve_connection(conn)
+
+
 def serve(host: str, port: int) -> int:
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((host, port))
     server.listen()
     try:
-        while True:
-            conn, _addr = server.accept()
-            with conn:
-                try:
-                    manifest = _read_json(conn)
-                    _send_json(conn, _start_session(manifest))
-                except BaseException as exc:  # noqa: BLE001
-                    _send_json(conn, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        _serve_loop(server)
     finally:
         server.close()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

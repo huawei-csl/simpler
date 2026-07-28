@@ -74,14 +74,17 @@ public:
     // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
     // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
     // child and consumes the mailbox via the Python child loop.
-    void add_worker(WorkerType type, void *mailbox);
-    void add_next_level_worker(int32_t worker_id, void *mailbox);
+    // `child_pid` is the forked child servicing `mailbox`, or -1 when the
+    // caller owns no waitable child.
+    void add_worker(WorkerType type, void *mailbox, int child_pid = -1);
+    void add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid = -1);
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.
     void add_remote_l3_socket(
         int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
-        uint16_t port, const std::string &health_host, uint16_t health_port, double timeout_s
+        uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
+        double runtime_timeout_s
     );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
@@ -204,10 +207,9 @@ private:
     TensorMap tensormap_;
     Ring allocator_;
     Scope scope_;
-    // One ready queue per WorkerType. Submit routes by s.worker_type;
-    // the Scheduler drains each queue independently so saturation of
-    // one pool cannot head-of-line-block the other.
-    ReadyQueue ready_next_level_queue_;
+    // NEXT_LEVEL singles use one FIFO per stable worker id; groups use one
+    // FIFO whose head launches only when every requested worker is idle.
+    NextLevelReadyQueues ready_next_level_queues_;
     ReadyQueue ready_sub_queue_;
     Orchestrator orchestrator_;
     Scheduler scheduler_;

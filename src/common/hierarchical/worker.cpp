@@ -68,23 +68,25 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox) {
+void Worker::add_worker(WorkerType type, void *mailbox, int child_pid) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
-    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox);
-    else manager_.add_sub(mailbox);
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox, child_pid);
+    else manager_.add_sub(mailbox, child_pid);
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox) {
+void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid) {
     if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox);
+    manager_.add_next_level_at(worker_id, mailbox, child_pid);
 }
 
 void Worker::add_remote_l3_socket(
     int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
-    const std::string &health_host, uint16_t health_port, double timeout_s
+    const std::string &health_host, uint16_t health_port, double attach_timeout_s, double runtime_timeout_s
 ) {
     if (initialized_) throw std::runtime_error("Worker: add_remote_l3_socket after init");
-    auto transport = std::make_unique<RemoteL3SocketTransport>(host, port, health_host, health_port, timeout_s);
+    auto transport = std::make_unique<RemoteL3SocketTransport>(
+        host, port, health_host, health_port, attach_timeout_s, runtime_timeout_s
+    );
     transport->expect_hello_ready(session_id, worker_id, transport_name);
     manager_.add_next_level_endpoint(
         std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))
@@ -94,30 +96,35 @@ void Worker::add_remote_l3_socket(
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    orchestrator_.init(
-        &tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_, [this] {
-            scheduler_.notify_ready();
-        }
-    );
-
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
     manager_.start(&allocator_, [this](WorkerCompletion completion) {
         scheduler_.worker_done(std::move(completion));
     });
+    ready_next_level_queues_.reset(manager_.next_level_worker_ids());
+    orchestrator_.init(
+        &tensormap_, &allocator_, &scope_, &ready_sub_queue_, &ready_next_level_queues_, &manager_, [this] {
+            scheduler_.notify_ready();
+        }
+    );
 
     Scheduler::Config cfg;
     cfg.ring = &allocator_;
-    cfg.ready_next_level_queue = &ready_next_level_queue_;
     cfg.ready_sub_queue = &ready_sub_queue_;
+    cfg.ready_next_level_queues = &ready_next_level_queues_;
     cfg.manager = &manager_;
+    cfg.enqueue_ready_cb = [this](TaskSlot slot) {
+        orchestrator_.enqueue_ready(slot);
+    };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
+    cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
+        orchestrator_.report_task_error(slot, message);
+    };
 
     scheduler_.start(cfg);
-    // Let drain() hold the scheduler's loop mutex across ring teardown so slots
-    // aren't freed while the scheduler thread is mid-on_task_complete.
+    // Allocator compaction and scheduler slot access share this mutex.
     orchestrator_.set_scheduler_loop_mutex(&scheduler_.loop_mutex());
     initialized_ = true;
 }

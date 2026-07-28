@@ -49,6 +49,7 @@
 
 #include "../common/pto_runtime_status.h"
 #include "../runtime/common.h"
+#include "../runtime/dep_gen_host_graph.h"
 #include "../runtime/pto_orchestrator.h"
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
@@ -56,11 +57,30 @@
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
+#include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+extern "C" const PipelineContract *get_pipeline_contract(void) {
+    // Host orchestration materializes this run's own graph into the image it
+    // uploads, so every device-resident region carries per-run content.
+    static const PipelineContract contract = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        5,
+        1,
+        {
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        },
+    };
+    return &contract;
+}
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
@@ -201,38 +221,31 @@ static uint64_t read_ring_override(const uint64_t *base, int idx) {
     return value;
 }
 
-// Each of ring_task_window / ring_heap / ring_dep_pool is a per-ring array of
-// PTO2_MAX_RING_DEPTH entries (0 = unset). Precedence per ring: per-task entry >
-// PTO2_RING_* env value > compile-time default. A "size all rings the same"
-// request arrives already broadcast to every entry by the caller.
+// Each of ring_task_window / ring_heap is a per-ring array of PTO2_MAX_RING_DEPTH
+// entries (0 = unset). Precedence per ring: per-task entry > PTO2_RING_* env value
+// > compile-time default. A "size all rings the same" request arrives already
+// broadcast to every entry by the caller. (Polling has no dep_pool, so the former
+// PTO2_RING_DEP_POOL knob is gone.)
 static bool resolve_ring_config(
-    const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH],
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+    const uint64_t *ring_task_window, const uint64_t *ring_heap, uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
+    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH]
 ) {
-    uint64_t dep_pool_values[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         eff_task_window_sizes[r] = PTO2_TASK_WINDOW_SIZE;
         eff_heap_sizes[r] = PTO2_HEAP_SIZE;
-        dep_pool_values[r] = PTO2_DEP_LIST_POOL_SIZE;
     }
 
     apply_env_ring_values("PTO2_RING_TASK_WINDOW", 4, static_cast<uint64_t>(INT32_MAX), true, eff_task_window_sizes);
     apply_env_ring_values("PTO2_RING_HEAP", 1024, std::numeric_limits<uint64_t>::max(), false, eff_heap_sizes);
-    apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         const uint64_t task_window_override = read_ring_override(ring_task_window, r);
         const uint64_t heap_override = read_ring_override(ring_heap, r);
-        const uint64_t dep_pool_override = read_ring_override(ring_dep_pool, r);
         if (task_window_override != 0) {
             eff_task_window_sizes[r] = task_window_override;
         }
         if (heap_override != 0) {
             eff_heap_sizes[r] = heap_override;
-        }
-        if (dep_pool_override != 0) {
-            dep_pool_values[r] = dep_pool_override;
         }
 
         if (eff_task_window_sizes[r] < 4 || eff_task_window_sizes[r] > static_cast<uint64_t>(INT32_MAX) ||
@@ -246,11 +259,6 @@ static bool resolve_ring_config(
             LOG_ERROR("ring_heap[%d]=%" PRIu64 " must be >= 1024", r, eff_heap_sizes[r]);
             return false;
         }
-        if (dep_pool_values[r] < 4 || dep_pool_values[r] > static_cast<uint64_t>(INT32_MAX)) {
-            LOG_ERROR("ring_dep_pool[%d]=%" PRIu64 " must be in [4, INT32_MAX]", r, dep_pool_values[r]);
-            return false;
-        }
-        eff_dep_pool_capacities[r] = static_cast<int32_t>(dep_pool_values[r]);
     }
 
     return true;
@@ -369,8 +377,8 @@ struct HostOrchEntryPoints {
 // (returns false) rather than shipping un-relocated host pointers to the device.
 // Returns false on any unrelocatable pointer so the caller can fail the prepare.
 static bool relocate_host_orch_image(
-    PTO2SharedMemoryHandle &host_sm_handle, PTO2Runtime *rt, uint64_t host_sm, uint64_t sm_size, int64_t sm_delta,
-    uint64_t host_arena, uint64_t arena_size, int64_t arena_delta
+    PTO2SharedMemoryHandle &host_sm_handle, [[maybe_unused]] PTO2Runtime *rt, uint64_t host_sm, uint64_t sm_size,
+    int64_t sm_delta, uint64_t host_arena, uint64_t arena_size, int64_t arena_delta
 ) {
     // host_build_graph is single-ring; the loops below iterate the lone ring and
     // index header->ring (singular). If the ring depth ever grows, those loops
@@ -418,68 +426,15 @@ static bool relocate_host_orch_image(
             int32_t count = ring.fc.current_task_index.load(std::memory_order_acquire);
             for (int32_t slot = 0; slot < count; slot++) {
                 PTO2TaskSlotState *ss = &ring.slot_states[slot];
+                // Polling: fanin is a flat array of position-independent local-id
+                // integers on the payload, so only the two per-slot arena/SM
+                // pointers need relocating. There is no fanout_head/dep_pool graph
+                // and no host-seeded ready queue (the device boot scan classifies),
+                // so those relocation passes are gone.
                 reloc(ss->task);
                 reloc(ss->payload);
-                reloc(ss->fanout_head);
-
-                PTO2TaskPayload *payload = &ring.task_payloads[slot];
-                int32_t nf = payload->fanin_actual_count;
-                if (nf > PTO2_FANIN_INLINE_CAP) {
-                    // host-orch does not yet relocate the multi-fanin spill pool,
-                    // so a task with more than the inline cap of producers would
-                    // ship un-relocated host pointers to the device. Fail loud
-                    // rather than silently clamp (tensormap handles this via the
-                    // on-device spill pool; that path is not wired here yet).
-                    LOG_ERROR(
-                        "host-orch: task slot %d has fanin %d > inline cap %d; multi-fanin spill relocation is not "
-                        "implemented",
-                        slot, nf, PTO2_FANIN_INLINE_CAP
-                    );
-                    ok = false;
-                    nf = PTO2_FANIN_INLINE_CAP;
-                }
-                for (int32_t i = 0; i < nf; i++) {
-                    reloc(payload->fanin_inline_slot_states[i]);
-                }
             }
         }
-    }
-
-    // Per-ring fanout adjacency (dep_pool entries) built inline during host
-    // submit (orch_wire_fanin_task). Each live entry [tail, top) carries a
-    // consumer slot_state pointer (into the SM) and a next pointer (into the
-    // arena).
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        PTO2DepListPool &dp = rt->scheduler.ring_sched_state.dep_pool;
-        if (dp.base == nullptr || dp.capacity == 0) {
-            continue;
-        }
-        for (int32_t i = dp.tail; i < dp.top; i++) {
-            PTO2DepListEntry &e = dp.base[i % dp.capacity];
-            reloc(e.slot_state);
-            reloc(e.next);
-        }
-    }
-
-    // Ready queues seeded by push_ready_routed on the host. Each populated slot
-    // [dequeue_pos, enqueue_pos) holds a slot_state pointer into the SM.
-    auto reloc_ready = [&](PTO2ReadyQueue &q) {
-        if (q.slots == nullptr) {
-            return;
-        }
-        uint64_t enq = q.enqueue_pos.load(std::memory_order_relaxed);
-        uint64_t deq = q.dequeue_pos.load(std::memory_order_relaxed);
-        for (uint64_t pos = deq; pos < enq; pos++) {
-            reloc(q.slots[pos & q.mask].slot_state);
-        }
-    };
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        reloc_ready(rt->scheduler.ready_queues[i]);
-        reloc_ready(rt->scheduler.ready_sync_queues[i]);
-    }
-    reloc_ready(rt->scheduler.dummy_ready_queue);
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        reloc_ready(rt->scheduler.early_dispatch_queues[i]);
     }
     return ok;
 }
@@ -490,6 +445,9 @@ int32_t run_host_orchestration(
     const uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
     void *host_orch_func_ptr, const L2TaskArgs &orch_l2
 ) {
+    // The dep_gen graph belongs to the orchestration that is about to run.
+    dep_gen_host_graph_begin_capture();
+
     std::vector<uint8_t> host_sm_buf(sm_size, 0);
     void *host_sm = host_sm_buf.data();
 
@@ -510,11 +468,18 @@ int32_t run_host_orchestration(
         return -1;
     }
 
-    // Install the ops table (host s_runtime_ops). The SPMD core counts are
-    // re-applied with the real device values on the AICPU at boot; the values
-    // here only feed cluster spreading during this host submit and are unused
-    // by the migrated non-cluster examples.
-    runtime_finalize_after_wire(rt, /*aic*/ 24, /*aiv*/ 48);
+    // Install the ops table (host s_runtime_ops) and latch this run's cluster
+    // counts. worker_count is published by DeviceRunner::prepare_launch_shape
+    // before this bind, so the host orchestrator sees the same geometry the
+    // AICPU re-derives from the handshake at boot.
+    const int32_t block_dim = runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM;
+    if (block_dim < 1) {
+        LOG_ERROR("host-orch: worker_count %d yields no clusters", runtime->get_worker_count());
+        return -1;
+    }
+    runtime_finalize_after_wire(
+        rt, block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM, block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM
+    );
     rt->mode = PTO2_MODE_EXECUTE;
     // get_tensor_data/set_tensor_data dereference buffer.addr directly: the
     // input tensors were mapped into host address space at staging time
@@ -685,7 +650,7 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
+    [[maybe_unused]] const uint64_t *ring_dep_pool  // polling has no dep_pool; kept for ABI stability
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -710,19 +675,12 @@ extern "C" int bind_callable_to_runtime_impl(
 
     uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH];
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH];
-    if (!resolve_ring_config(
-            ring_task_window, ring_heap, ring_dep_pool, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities
-        )) {
+    if (!resolve_ring_config(ring_task_window, ring_heap, eff_task_window_sizes, eff_heap_sizes)) {
         return -1;
     }
     const std::string task_window_log = format_ring_array(eff_task_window_sizes);
     const std::string heap_log = format_ring_array(eff_heap_sizes);
-    const std::string dep_pool_log = format_ring_array(eff_dep_pool_capacities);
-    LOG_INFO_V0(
-        "Ring buffer sizes: task_window=%s heap=%s dep_pool=%s", task_window_log.c_str(), heap_log.c_str(),
-        dep_pool_log.c_str()
-    );
+    LOG_INFO_V0("Ring buffer sizes: task_window=%s heap=%s", task_window_log.c_str(), heap_log.c_str());
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;
@@ -732,7 +690,7 @@ extern "C" int bind_callable_to_runtime_impl(
         Tensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             device_args.add_tensor(t);
             continue;
         }
@@ -767,7 +725,7 @@ extern "C" int bind_callable_to_runtime_impl(
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
-        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
         // control tensors (e.g. paged_attention's context_lens/block_table) via
@@ -799,15 +757,6 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     int64_t t_args_end = _now_ms();
 
-    // Read orchestrator-to-scheduler transition flag from environment
-    {
-        const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
-        if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
-            runtime->orch_to_sched = true;
-        }
-        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
-    }
-
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena all live in a single backing allocation;
     // setup_static_arena reserves the three regions and commits in one shot.
@@ -826,8 +775,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes);
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return -1;
@@ -946,10 +894,11 @@ extern "C" int bind_callable_to_runtime_impl(
  * 2. Frees device memory for recorded tensors
  * 3. Clears tensor pair state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -969,32 +918,23 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
     LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
 
-    // PTO2: graph output may be in packed buffer
-    uint64_t graph_out_ptr = 0;
-    uint64_t graph_out_size = 0;
-    bool skip_tensor_copy_back = false;
+    bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    if (execution_rc != 0) {
+        runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    }
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
-        skip_tensor_copy_back = true;
-    } else {
-        graph_out_ptr = host_header.graph_output_ptr;
-        graph_out_size = host_header.graph_output_size;
-        if (graph_out_ptr != 0) {
-            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
-        }
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        bool first_output_tensor = true;
         for (int i = 0; i < tensor_pair_count; i++) {
             const TensorPair &pair = tensor_pairs[i];
 
@@ -1006,7 +946,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (pair.host_ptr == nullptr) {
-                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -1014,27 +954,16 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still device_free'd in the cleanup loop below.
             if (!pair.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            void *src_ptr = pair.dev_ptr;
-            size_t copy_size = pair.size;
-
-            // Use graph_output_ptr for the first output tensor if available
-            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-                copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
-                first_output_tensor = false;
-            }
-
-            int copy_rc = api->copy_from_device(pair.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
             }
         }
     }

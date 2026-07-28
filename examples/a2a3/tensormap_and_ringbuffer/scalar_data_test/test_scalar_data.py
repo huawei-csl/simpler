@@ -49,7 +49,7 @@ class TestScalarData(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "config": {"aicpu_thread_num": 4},
             "params": {},
         },
     ]
@@ -60,7 +60,10 @@ class TestScalarData(SceneTestCase):
             Tensor("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
             Tensor("b", torch.arange(SIZE, dtype=torch.float32)),
             Tensor("result", torch.zeros(SIZE, dtype=torch.float32)),
-            Tensor("check", torch.zeros(10, dtype=torch.float32)),
+            # Exactly 9 slots: the orchestration writes check[0..8] via
+            # set_tensor_data. Output-tensor slots are not seeded from the host,
+            # so any extra slot reads undefined device memory.
+            Tensor("check", torch.zeros(9, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):

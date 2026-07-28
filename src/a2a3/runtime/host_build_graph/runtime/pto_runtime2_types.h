@@ -86,7 +86,6 @@
 
 // Memory pools (total = value, single ring)
 #define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB
-#define PTO2_DEP_LIST_POOL_SIZE 16384       // Per-ring dependency list pool entries
 #define PTO2_TENSORMAP_POOL_SIZE (65536)    // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
@@ -107,6 +106,12 @@
 
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
+
+// Polling-scheduler inline fanin cap. The polling model stores producer
+// dependencies as flat position-independent local-id integers on the payload
+// (no dep-pool spill), so a task's fanin degree is hard-capped here. Must cover
+// the worst-case fanin of any workload (paged_attention is the densest).
+#define PTO2_MAX_FANIN 128
 
 // Dependency-degree diagnostic: warn once when a task's fanin or a producer's
 // fanout first exceeds this degree, so dense dependency graphs surface without
@@ -174,25 +179,7 @@ struct PTO2OutputLayout {
 // Dependency List Entry
 // =============================================================================
 
-/**
- * Fanin spill entry
- * Stored in the dedicated fanin spill ring buffer.
- */
-struct PTO2TaskSlotState;  // Forward declaration
-struct PTO2FaninPool;      // Forward declaration
-struct PTO2FaninSpillEntry {
-    PTO2TaskSlotState *slot_state;
-};
-static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
-
-/**
- * Dependency list entry (singly-linked list node)
- * Stored in DepListPool ring buffer.
- */
-struct PTO2DepListEntry {
-    PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
-    PTO2DepListEntry *next;         // next entry
-};
+struct PTO2TaskSlotState;  // Forward declaration (defined below)
 
 // =============================================================================
 // Task Descriptor
@@ -214,26 +201,14 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
-    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
-    // Occupies the 4-byte alignment pad that already followed kernel_id[3], so
-    // the descriptor does not grow; the scheduler folds this task's dispatch/
-    // finish cycles into the tagged slot (see common/device_phase.h).
-    int32_t task_timing_slot;
-
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-// task_timing_slot must occupy the former padding after kernel_id[3] without
-// growing the descriptor or shifting packed_buffer_base — the scheduler and
-// shared-memory ABI depend on the existing size and pointer offset.
-static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor must not grow: slot uses the existing pad");
-static_assert(
-    offsetof(PTO2TaskDescriptor, task_timing_slot) ==
-        offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT,
-    "task_timing_slot must sit immediately after kernel_id in the former pad"
-);
+// A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
+// ABI depend on the descriptor size and packed_buffer_base offset staying fixed.
+static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor size is part of the shared-memory ABI");
 static_assert(offsetof(PTO2TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
 // =============================================================================
@@ -282,10 +257,16 @@ struct PTO2TaskPayload {
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
-    PTO2FaninPool *fanin_spill_pool{nullptr};
-    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    int32_t fanin_count{0};  // Producer dependency count (raw, no +1 redundance)
+    // Producer dependencies as position-independent local task ids. Single-ring
+    // hbg: every producer is ring 0, so no per-edge ring id is stored. Scanned
+    // by fanin_satisfied / classify_fanin_state against the ring completion_flags.
+    // Hard-capped at PTO2_MAX_FANIN (no dep-pool spill).
+    int32_t fanin_local_ids[PTO2_MAX_FANIN];
+    // Reserved: preserves the early-dispatch block and tensors[] offsets. tensors
+    // must stay at byte 576 (AICore arg-materialization contract), so this fanin
+    // region keeps its original 528-byte footprint.
+    int32_t _fanin_reserved[3];
     // Early-dispatch metadata (AICPU-side only). Ordered by descending
     // alignment (8B mask, 4B fanin, then 2B/1B counters and flags) so the block packs with no
     // internal padding. Kept here after the fanin array (not moved up front): on
@@ -337,9 +318,15 @@ struct PTO2TaskPayload {
     // reinitialization. READY records that producer release observed OWNER;
     // only cancellation clears OWNER during the current task lifetime.
     std::atomic<uint8_t> early_sync_drain_state{PTO2_EARLY_SYNC_DRAIN_NONE};
-    // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
+    // === Cache line 9 (byte 576) — dispatch predicate (AICPU-only) ===
+    // Offset is a fixed 576, independent of MAX_TENSOR_ARGS / MAX_SCALAR_ARGS.
+    // AICore never reads it — args are materialized from the tensor_count / tensors
+    // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
+    // dispatch.
+    alignas(64) DispatchPredicate predicate;
+    // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 73-74 (128B) — scalars ===
+    // === Cache lines 74-75 (128B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
@@ -427,91 +414,76 @@ struct PTO2TaskPayload {
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
+static_assert(offsetof(PTO2TaskPayload, fanin_local_ids) == 12, "inline fanin id array must follow fanin_count");
 static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
+    offsetof(PTO2TaskPayload, predicate) == 576,
+    "dispatch predicate occupies cache line 9 at fixed byte 576 (before tensors, never moves)"
 );
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
 static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    offsetof(PTO2TaskPayload, tensors) == 640, "tensors must start at byte 640 (cache line 10, after predicate)"
+);
+static_assert(
+    offsetof(PTO2TaskPayload, scalars) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
 );
 static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
+    sizeof(PTO2TaskPayload) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    "PTO2TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars"
 );
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
- * Consolidates all hot-path scheduling fields into a single cache-friendly
- * structure (64 bytes = one cache line). Accessing any field of a task's
- * slot state brings all related fields into the same cache line.
+ * 64 bytes = one cache line. Under the polling completion model a task's
+ * readiness is derived from its producers' completion_flags (in the ring
+ * header); producer completion is published by setting this task's own
+ * completion_flag + draining its wake list. There is no fanout adjacency,
+ * refcount, or per-task lock here.
  *
- * Concurrency notes:
- * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
- * - fanin_count set once at submission, read-only after (hot path for ready check)
- * - task_state, fanin_refcount, fanout_refcount updated atomically
+ * task_state is retained (a COMPLETED store on completion) because the HOST
+ * still polls it: the completion-wait in pto_runtime2.cpp, the allocator
+ * deadlock detector, and the cold-path stall dump. completion_flags is the
+ * device-side readiness truth; task_state is the host-visible mirror.
  */
-
-// fanout_count / fanout_refcount bit encoding (both uint32):
-//   bits [30:0] = consumer references (count: # consumers; refcount: # released)
-//   bit  [31]   = the owning scope's reference (PTO2_FANOUT_SCOPE_BIT)
-// fanout_count is seeded to PTO2_FANOUT_SCOPE_BIT and ++'d per consumer, so it
-// ends as (SCOPE_BIT | num_consumers). release adds 1 (consumer completion) or
-// SCOPE_BIT (scope_end). CONSUMED iff fanout_refcount == fanout_count (every
-// consumer released AND scope bit set). Keeping the scope ref in a distinct bit
-// (rather than folding scope + consumers into one count) lets a consumer reach
-// fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
-// is still unset -- i.e. "all consumers done but scope still open" stays
-// distinguishable from "fully consumed". The heap/task deadlock detector keys
-// off exactly that complement: that condition with state==COMPLETED means the
-// head can only be released by scope_end, which a blocked orchestrator can
-// never reach -> provable deadlock.
-static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
-
-enum PTO2TaskLifecycleFlag : uint8_t {
-    PTO2_LIFECYCLE_FLAGS_NONE = 0,
-    PTO2_READY_CLAIMED = 1U << 0,
-    PTO2_COMPLETION_DONE = 1U << 1,
-    PTO2_SUBTASK_DEFERRED = 1U << 2,
-};
-
 struct alignas(64) PTO2TaskSlotState {
-    // Fanout lock + list (accessed together under lock in on_task_complete)
-    std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    uint32_t fanout_count;             // SCOPE_BIT (owning scope) | number of consumers
+    // Highest local task id among this slot's consumers. Reclaim gate: the slot
+    // is safe to retire once the per-ring completed_watermark reaches this id.
+    // Whole-graph-resident hbg never reclaims at runtime, so this is
+    // inert-but-scaffolded for parity. Seeded to own local_id in prepare_task;
+    // bumped via max() at submit for each consumer.
+    int32_t last_consumer_local_id;
 
-    PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
-
-    // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;  // PENDING/COMPLETED/CONSUMED
-
-    // Fanin (accessed together in release_fanin_and_check_ready)
-    std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
-    int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
-
-    // Fanout refcount (read alongside fanout_count by consumer-wait checks)
-    std::atomic<uint32_t> fanout_refcount;  // Dynamic: low bits = released consumers, bit31 = scope released
+    // Host-visible completion mirror. PENDING at submit; COMPLETED at
+    // on_mixed_task_complete. Read by the host completion-wait / deadlock
+    // detector / cold-path dump; the device readiness path uses completion_flags.
+    std::atomic<PTO2TaskState> task_state;
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
-    // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
-    // but written here per-submit instead of in an O(window_size) init loop —
-    // these are the only "scale-dependent" pointers in this struct, so moving
-    // them out of init makes startup cost independent of task_window_size.
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
 
+    // --- Wake list: last-fanin notification (intrusive, lock-free) ---
+    // A pending consumer whose fanin scan finds an unmet producer registers on
+    // that producer's wake list (CAS push through next_in_wake_list). On
+    // completion the producer atomic-exchanges wake_list_head to
+    // WAKE_LIST_SENTINEL and routes every waiter. Reset to nullptr at init.
+    std::atomic<PTO2TaskSlotState *> wake_list_head{nullptr};
+    PTO2TaskSlotState *next_in_wake_list{nullptr};
+
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
-    // These one-byte flags live in the padding before dep_pool_mark to keep
-    // PTO2TaskSlotState at 64 bytes.
-    // Codegen early-dispatch hint, copied from Arg at submit. Lives on
-    // slot_state (not payload) so fanin walks read the already-hot producer
-    // slot_state cache line.
-    bool allow_early_resolve{false};
-    std::atomic<uint8_t> lifecycle_flags{PTO2_LIFECYCLE_FLAGS_NONE};
-    int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
+    // Single per-task attributes byte (early-dispatch hint, sync_start,
+    // has_predicate, selective timing tag). Lives on slot_state (not payload) so
+    // fanin walks and the completion path read them off the already-hot producer
+    // slot_state cache line. Plain-write (set once at submit, before the slot is
+    // scheduler-visible).
+    TaskAttrs task_attrs{};
+    // Set by any subtask FIN that pushed a deferred-completion CONDITION to the
+    // runtime mailbox; read by the last subtask FIN to decide inline vs
+    // MPSC-deferred completion. The release write is sequenced before
+    // on_subtask_complete's acq_rel fetch_add and the acquire read after.
+    std::atomic<bool> any_subtask_deferred{false};
+    uint8_t _async_pad{0};
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -538,117 +510,46 @@ struct alignas(64) PTO2TaskSlotState {
         return 0;
     }
 
-    /**
-     * Re-bind the per-slot payload/task pointers. Called by
-     * orch::prepare_task on every submit. Value is constant for a given
-     * slot, but we pay the cheap re-write each submit (both fields land on
-     * the same 64B slot_state cache line that prepare_task is already
-     * dirtying) to avoid the init-time per-slot loop.
-     */
     void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
         payload = p;
         task = t;
     }
 
-    void mark_completed() {
-        task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        lifecycle_flags.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
-    }
+    // Host-visible completion mirror. The device readiness truth
+    // (completion_flags[slot]) is published by the scheduler's
+    // on_mixed_task_complete; this store makes the same fact visible to the
+    // host completion-wait / deadlock detector.
+    void mark_completed() { task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release); }
 
-    bool is_completion_flag_set() const {
-        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
-    }
+    void mark_any_subtask_deferred() { any_subtask_deferred.store(true, std::memory_order_release); }
 
-    // Set by any subtask FIN that pushed deferred-completion CONDITIONs to the
-    // runtime mailbox; read by the last subtask FIN to decide whether the task
-    // needs MPSC-deferred completion or can complete inline on this thread. The
-    // release write is sequenced before on_subtask_complete's acq_rel fetch_add
-    // and the acquire read after, so all earlier subtasks' writes are visible to
-    // the last subtask.
-    void mark_any_subtask_deferred() { lifecycle_flags.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
-
-    bool has_any_subtask_deferred() const {
-        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
-    }
-
-    void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
+    bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
     /**
-     * Reset dynamic scheduling fields to their pristine values.
-     * In host_build_graph this runs once per slot at init (pto_shared_memory.cpp)
-     * to zero the scheduling state before the host orchestrator populates it —
-     * there is no execution-time slot recycle (whole-graph-resident, no reclaim),
-     * so unlike the device-orch path this is not re-invoked after CONSUMED.
-     *
-     * Skips payload, task (immutable, bound once at init).
-     * Skips task_state: the orchestrator sets it to PENDING when it populates
-     * the slot.
+     * Reset dynamic scheduling fields to their pristine values. Runs once per
+     * slot at init (pto_shared_memory.cpp) — whole-graph-resident hbg has no
+     * execution-time slot recycle. Skips payload/task (bound once) and
+     * task_state (the orchestrator sets PENDING when it populates the slot).
+     * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
      */
     void reset_for_reuse() {
-        fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = PTO2_FANOUT_SCOPE_BIT;  // bit31 = owning-scope ref; consumers ++ into low bits
-        fanout_head = nullptr;
-        fanin_refcount.store(0, std::memory_order_relaxed);
-        fanout_refcount.store(0, std::memory_order_relaxed);
+        wake_list_head.store(nullptr, std::memory_order_relaxed);
+        next_in_wake_list = nullptr;
+        any_subtask_deferred.store(false, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        lifecycle_flags.store(PTO2_LIFECYCLE_FLAGS_NONE, std::memory_order_relaxed);
-        allow_early_resolve = false;
-        // Note: payload early-dispatch fields (state, masks, fanin, publication count)
-        // are NOT reset here — this method skips the payload by contract. They are
-        // (re)initialized in PTO2TaskPayload::init on every submit, before the slot
-        // becomes visible to the scheduler.
+        // Note: active_mask and task_attrs are per-submit-constant fields
+        // rewritten in prepare_task on every reuse, so they are not reset here.
+        // last_consumer_local_id is seeded in prepare_task once the id is known.
+        // Payload early-dispatch/fanin fields are (re)initialized in
+        // PTO2TaskPayload::init on every submit, before the slot is visible.
     }
-
-    // === Per-task fanout spinlock ===
-    //
-    // Used by BOTH the orchestrator and the scheduler. The fanout_lock MUST
-    // be held whenever reading or writing fanout_head / fanout_count, because
-    // the orchestrator adds consumers concurrently with the scheduler
-    // traversing the list after task completion.
-
-#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
-    void lock_fanout(uint64_t &atomic_count, uint64_t &wait_cycle) {
-        uint64_t t0 = get_sys_cnt_aicpu();
-        bool contended = false;
-        uint32_t atomic_ops = 0;
-
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                contended = true;
-                atomic_ops++;
-                SPIN_WAIT_HINT();
-            }
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                atomic_ops++;
-                atomic_count += atomic_ops;
-                if (contended) {
-                    wait_cycle += (get_sys_cnt_aicpu() - t0);
-                }
-                return;
-            }
-            contended = true;
-            atomic_ops++;
-        }
-    }
-#endif
-
-    void lock_fanout() {
-        for (;;) {
-            while (fanout_lock.load(std::memory_order_acquire) != 0) {
-                SPIN_WAIT_HINT();
-            }
-            int32_t expected = 0;
-            if (fanout_lock.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
-                return;
-            }
-        }
-    }
-
-    void unlock_fanout() { fanout_lock.store(0, std::memory_order_release); }
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
+
+// Sentinel marking a wake list as "owner already completed; no more
+// registrations accepted". Distinct from any real slot_state pointer.
+inline PTO2TaskSlotState *const WAKE_LIST_SENTINEL = reinterpret_cast<PTO2TaskSlotState *>(static_cast<uintptr_t>(0x1));
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

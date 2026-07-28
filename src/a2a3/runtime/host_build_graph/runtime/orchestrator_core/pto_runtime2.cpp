@@ -159,8 +159,12 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         int32_t local_id = slot.task->task_id.local();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while ((slot.fanout_refcount.load(std::memory_order_acquire) & ~PTO2_FANOUT_SCOPE_BIT) <
-               (slot.fanout_count & ~PTO2_FANOUT_SCOPE_BIT)) {
+        // Polling: all consumers of this producer have retired once the per-ring
+        // completed_watermark reaches the producer's highest consumer id (set at
+        // submit in append_fanin_or_fail). Replaces the fanout_refcount ==
+        // fanout_count wiring check, which polling removes.
+        PTO2SharedMemoryRingHeader &cons_ring = orch.sm_header->ring;
+        while (cons_ring.completed_watermark.load(std::memory_order_acquire) < slot.last_consumer_local_id) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere (e.g. the scheduler-side wiring
@@ -280,6 +284,9 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
 static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
 #endif
 
+static int32_t available_cluster_count_impl(PTO2Runtime *rt) { return rt->orchestrator.total_cluster_count; }
+static int32_t available_aiv_count_impl(PTO2Runtime *rt) { return rt->orchestrator.total_aiv_count; }
+
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
     .scope_begin = rt_scope_begin,
@@ -295,6 +302,8 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
+    .available_cluster_count = available_cluster_count_impl,
+    .available_aiv_count = available_aiv_count_impl,
 #if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else

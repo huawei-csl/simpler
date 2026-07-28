@@ -46,6 +46,7 @@
 #include "host/acl_error_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "platform_comm/comm.h"
 #include "pto_runtime_c_api.h"
 #include "task_args.h"
 #include "utils/elf_build_id.h"
@@ -391,6 +392,16 @@ int DeviceRunnerBase::ensure_device_initialized() {
         LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
     }
 
+    // Latch the AICore stream's block_dim ceiling. resolve_block_dim() is then
+    // pure arithmetic and can run before any per-run stream work.
+    if (max_block_dim_ == 0) {
+        max_block_dim_ = query_max_block_dim(stream_aicore_, &max_cube_cores_, &max_vector_cores_);
+        LOG_INFO_V0(
+            "DeviceRunner: device=%d max_block_dim=%d (cube=%u, vector=%u)", device_id_, max_block_dim_,
+            max_cube_cores_, max_vector_cores_
+        );
+    }
+
     rc = ensure_binaries_loaded();
     if (rc != 0) return rc;
 
@@ -398,10 +409,6 @@ int DeviceRunnerBase::ensure_device_initialized() {
 }
 
 int DeviceRunnerBase::ensure_aicpu_init_launched() {
-    // Per-device one-shot: latch the invariants (orch device id, log config)
-    // into the resident AICPU SO globals via simpler_aicpu_init, so exec /
-    // record_device_orch_callable launches no longer carry them. The inner SO stays
-    // dlopen'd across launches, so a single init holds for the runner's life.
     if (aicpu_init_launched_) {
         return 0;
     }
@@ -413,6 +420,13 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    // Publish the provisioned async-DMA workspace addresses (all-zero until a
+    // Worker opts into SDMA). provision_dma_workspace() re-launches this entry to
+    // re-latch them; the AICPU SO stays resident, so the latest values survive
+    // every subsequent per-task launch.
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        init_args.dma_workspace_addr[kind] = dma_workspace_addr_[kind];
+    }
 
     LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
@@ -428,7 +442,6 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
         LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
     }
-
     aicpu_init_launched_ = true;
     return 0;
 }
@@ -520,30 +533,6 @@ int DeviceRunnerBase::query_max_block_dim(rtStream_t stream, uint32_t *out_cube,
         return std::min(from_stream, PLATFORM_MAX_BLOCKDIM);
     }
     return PLATFORM_MAX_BLOCKDIM;
-}
-
-int DeviceRunnerBase::validate_block_dim(rtStream_t stream, int block_dim) {
-    if (block_dim < 1) {
-        LOG_ERROR("block_dim (%d) must be >= 1", block_dim);
-        return -1;
-    }
-    uint32_t cube_limit = 0, vector_limit = 0;
-    int max_bd = query_max_block_dim(stream, &cube_limit, &vector_limit);
-    if (block_dim > max_bd) {
-        if (cube_limit > 0 && vector_limit > 0) {
-            LOG_ERROR(
-                "block_dim (%d) exceeds available cores (max_block_dim=%d, cube=%u, vector=%u)", block_dim, max_bd,
-                cube_limit, vector_limit
-            );
-        } else {
-            LOG_ERROR(
-                "aclrtGetStreamResLimit unavailable; block_dim (%d) exceeds static cap PLATFORM_MAX_BLOCKDIM (%d)",
-                block_dim, PLATFORM_MAX_BLOCKDIM
-            );
-        }
-        return -1;
-    }
-    return 0;
 }
 
 void DeviceRunnerBase::print_handshake_results() {
@@ -847,6 +836,48 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+int DeviceRunnerBase::provision_dma_workspace(uint32_t required_mask) {
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((required_mask & ~supported) != 0) {
+        LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
+        return -1;
+    }
+    if (dma_workspace_handle_ != nullptr) {
+        LOG_ERROR("provision_dma_workspace: workspace already provisioned");
+        return -1;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+        dma_workspace_addr_[kind] = 0;
+
+    // The provisioned addresses are stable for the Worker's life.
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+
+    // Re-latch the resident AICPU globals: simpler_aicpu_init publishes the
+    // provisioned addresses into g_dma_workspace_addr, which the scheduler
+    // prefills into every core's GlobalContext (get_dma_workspace). The AICPU SO
+    // stays dlopen'd, so the values survive every subsequent per-task launch.
+    aicpu_init_launched_ = false;
+    rc = ensure_aicpu_init_launched();
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: re-latch of simpler_aicpu_init failed: %d", rc);
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        return rc;
+    }
+    return 0;
+}
+
 uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
     auto it = callables_.find(callable_id);
     return it == callables_.end() ? 0 : it->second.hash;
@@ -979,6 +1010,14 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicore_ = nullptr;
     }
 
+    // Release the async-DMA provider (SDMA STARS streams + workspace) while RTS
+    // is live, before the subclass device reset. Null unless the Worker was
+    // created with SDMA enabled; idempotent so a reused runner re-provisions.
+    if (dma_workspace_handle_ != nullptr) {
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+    }
+
     // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it
     // here while RTS is live so ~LoadAicpuOp's idempotent Finalize() no-ops
     // instead of unloading after aclFinalize (see the invariant above).
@@ -1047,6 +1086,11 @@ int DeviceRunnerBase::finalize_common() {
 
     block_dim_ = 0;
     worker_count_ = 0;
+    // Tied to stream_aicore_, destroyed above: a re-provisioned runner
+    // re-queries rather than trusting the previous stream's limits.
+    max_block_dim_ = 0;
+    max_cube_cores_ = 0;
+    max_vector_cores_ = 0;
     aicore_kernel_binary_.clear();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
@@ -1154,29 +1198,28 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     }
 }
 
-int DeviceRunnerBase::resolve_block_dim(int requested_block_dim) {
-    // Auto sentinel (block_dim == 0) is resolved directly from
-    // query_max_block_dim; explicit values still go through validate. The
-    // auto branch skips validate so we don't pay the ACL syscalls twice.
-    int resolved = requested_block_dim;
-    if (resolved == 0) {
-        resolved = query_max_block_dim(stream_aicore_);
-        LOG_INFO_V0("block_dim auto-resolved to %d", resolved);
-        if (resolved < 1) {
-            LOG_ERROR("block_dim auto-resolved to invalid value %d", resolved);
-            return -1;
-        }
-    } else {
-        int rc = validate_block_dim(stream_aicore_, resolved);
-        if (rc != 0) {
-            return -1;
-        }
+int DeviceRunnerBase::resolve_block_dim() {
+    if (max_block_dim_ < 1) {
+        LOG_ERROR(
+            "block_dim ceiling not resolved (cube=%u, vector=%u); ensure_device_initialized must run first",
+            max_cube_cores_, max_vector_cores_
+        );
+        return -1;
     }
-    block_dim_ = resolved;
-    return resolved;
+    block_dim_ = max_block_dim_;
+    LOG_INFO_V0("block_dim resolved to %d (cube=%u, vector=%u)", block_dim_, max_cube_cores_, max_vector_cores_);
+    return block_dim_;
 }
 
-int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
+    if (validate_launch_aicpu_num(config.aicpu_thread_num) != 0) {
+        return -1;
+    }
+    int block_dim = resolve_block_dim();
+    if (block_dim < 0) {
+        return -1;
+    }
+
     int num_aicore = block_dim * cores_per_blockdim_;
     if (num_aicore > RUNTIME_MAX_WORKER) {
         LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)", block_dim, RUNTIME_MAX_WORKER);
@@ -1185,7 +1228,7 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
 
     runtime.set_worker_count(num_aicore);
     worker_count_ = num_aicore;  // Stored for print_handshake_results in destructor
-    runtime.set_aicpu_thread_num(launch_aicpu_num);
+    runtime.set_aicpu_thread_num(config.aicpu_thread_num);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
     int num_aic = block_dim;
@@ -1196,12 +1239,13 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
         workers[i].task = 0;
         workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
+    return 0;
+}
 
-    // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores
-    // a CoreCallable device address; the binary code address is one
-    // compile-time offset further in. The dispatch path then reads
-    // resolved_addr_ from the on-device CoreCallable header.
-    LOG_DEBUG("Setting function_bin_addr for Tasks");
+void DeviceRunnerBase::resolve_task_binary_addrs(Runtime &runtime) {
+    // Runtime::func_id_to_addr_[] stores a CoreCallable device address; the
+    // binary code address is one compile-time offset further in. The dispatch
+    // path then reads resolved_addr_ from the on-device CoreCallable header.
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
         if (task != nullptr) {
@@ -1210,13 +1254,13 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
             LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
         }
     }
-    LOG_DEBUG("");
-    return 0;
 }
 
-int DeviceRunnerBase::sync_run_streams() {
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
-    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, timeout_config_.stream_sync_timeout_ms);
+int DeviceRunnerBase::sync_run_streams() { return sync_stream_pair(stream_aicpu_, stream_aicore_); }
+
+int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICPU stream ===");
+    int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
@@ -1231,8 +1275,8 @@ int DeviceRunnerBase::sync_run_streams() {
         return rc;
     }
 
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, timeout_config_.stream_sync_timeout_ms);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICore stream ===");
+    rc = aclrtSynchronizeStreamWithTimeout(aicore_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",

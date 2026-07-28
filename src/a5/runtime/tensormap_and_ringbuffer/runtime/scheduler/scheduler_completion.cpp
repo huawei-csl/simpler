@@ -13,6 +13,8 @@
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
 
+#include <algorithm>
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -39,7 +41,7 @@ inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
-    int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id
+    int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated
 ) {
     SlotTransition t;
     if (pending_id != AICPU_TASK_INVALID && reg_task_id == pending_id) {
@@ -58,9 +60,14 @@ SlotTransition SchedulerContext::decide_slot_transition(
                 t.matched = true;
                 t.running_done = true;
                 t.running_freed = true;
+            } else if (pending_gated) {
+                // Case 3.3: running FIN, pending is early-dispatch gated. Complete
+                // running now and promote; waiting for a gated ACK would deadlock.
+                t.matched = true;
+                t.running_done = true;
+                t.running_freed = true;
             }
-            // Case 3.1: running FIN, pending exists -> skip (transient state).
-            // Case 1/2 (pending ACK/FIN) will complete running implicitly via running_done=true.
+            // Case 3.1: running FIN, NON-gated pending exists -> skip (transient).
         } else {
             // Case 4: running ACK -- only pending_freed (slot now hardware-latched)
             t.matched = true;
@@ -73,7 +80,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
-    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
+    [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if SIMPLER_DFX
     ,
@@ -115,7 +122,7 @@ void SchedulerContext::complete_slot_task(
         }
 
         if (cond_count > 0) {
-            slot_state.any_subtask_deferred.store(true, std::memory_order_release);
+            slot_state.mark_any_subtask_deferred();
 
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
@@ -132,8 +139,7 @@ void SchedulerContext::complete_slot_task(
 
     bool task_complete = sched_->on_subtask_complete(slot_state);
 
-    if (task_complete && slot_state.payload != nullptr &&
-        slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
+    if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
@@ -169,7 +175,6 @@ void SchedulerContext::complete_slot_task(
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
-            LOG_INFO_V9("Thread %d: release", thread_idx);
             while (deferred_release_count > 0) {
 #if SIMPLER_SCHED_PROFILING
                 // SCHED_PROFILING variant takes thread_idx for the per-thread
@@ -256,6 +261,15 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
 
+        // Skip gated early-dispatch cores still waiting for their doorbell.
+        {
+            PTO2TaskSlotState *rs = core.running_slot_state;
+            if (rs != nullptr && rs->payload != nullptr &&
+                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
+                continue;
+            }
+        }
+
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
@@ -278,8 +292,19 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        SlotTransition t =
-            decide_slot_transition(reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id);
+        // Phase 1+: gated == not yet launched (STAGING, or sync_start DISPATCHED rendezvous).
+        uint8_t pending_ss =
+            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr) ?
+                core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) :
+                static_cast<uint8_t>(PTO2_EARLY_DISPATCH_NONE);
+        bool pending_gated =
+            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
+             (pending_ss == PTO2_EARLY_DISPATCH_STAGING ||
+              (pending_ss == PTO2_EARLY_DISPATCH_DISPATCHED &&
+               core.pending_slot_state->task_attrs.requires_sync_start())));
+        SlotTransition t = decide_slot_transition(
+            reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
+        );
         if (!t.matched) continue;
 
 #if SIMPLER_SCHED_PROFILING
@@ -308,8 +333,8 @@ void SchedulerContext::check_running_cores_for_completion(
             // fanin / deferred-completion (which may also clear pending_slot_state),
             // matching L2's finish_time point. Independent of L2 swimlane level, so
             // it works in SIMPLER_DFX=0 builds; untagged tasks pay only the compare.
-            if (core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-                aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
+            if (core.pending_slot_state->task_attrs.is_timed()) {
+                aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
@@ -323,8 +348,8 @@ void SchedulerContext::check_running_cores_for_completion(
             INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + core_id);
         }
         if (t.running_done) {
-            if (core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-                aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
+            if (core.running_slot_state->task_attrs.is_timed()) {
+                aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
@@ -341,7 +366,15 @@ void SchedulerContext::check_running_cores_for_completion(
         // 2. Update slot data
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
-                promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
+                PTO2TaskSlotState *promoted = core.pending_slot_state;
+                bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
+                promote_pending_to_running(core);
+                if (sync_start_promote) {
+                    promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
+                    if (sched_->maybe_rendezvous_ring(*promoted)) {
+                        sched_->propagate_dispatch_fanin(*promoted);
+                    }
+                }
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
                 if (t.pending_done) {
@@ -395,6 +428,9 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
     drain_state_.pending_task.store(slot_state, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
     // Release store: all stores above are now visible to any thread that
     // acquire-loads sync_start_pending and sees block_num > 0.
     drain_state_.sync_start_pending.store(block_num, std::memory_order_release);
@@ -402,74 +438,97 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
         if (shape == PTO2ResourceShape::MIX) {
-            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+            total += include_pending ? core_trackers_[t].count_mix_split_clusters(core_mask) :
+                                       core_trackers_[t].count_mix_running_clusters(core_mask);
         } else {
             total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+            if (include_pending) {
+                total += core_trackers_[t].get_pending_core_offset_states(shape).count();
+            }
         }
     }
     return total;
 }
 
-// Drain worker: dispatch all blocks in one pass across all threads' trackers.
-// Called only when global resources >= block_num, so one pass always suffices.
-// All other threads are spinning -- the drain worker has exclusive tracker access.
-void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num) {
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    if (!slot_state) {
-        drain_state_.sync_start_pending.store(0, std::memory_order_release);
-        return;
-    }
+int32_t
+SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated) {
+    CoreTracker &tracker = core_trackers_[thread_idx];
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
     uint8_t core_mask = slot_state->active_mask.core_mask();
+    bool mix_split = gated && shape == PTO2ResourceShape::MIX;
+    int32_t running_staged = 0;
 
-    for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
-        auto valid = (shape == PTO2ResourceShape::MIX) ?
-                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
-                         core_trackers_[t].get_idle_core_offset_states(shape);
-        while (valid.has_value() && slot_state->next_block_idx < block_num) {
-            dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false, slot_state->next_block_idx);
-            slot_state->next_block_idx++;
+    auto stage = [&](CoreTracker::BitStates valid, bool to_pending) {
+        while (valid.has_value()) {
+            int32_t avail = valid.count();
+            int32_t start = 0;
+            int32_t claim = slot_state->claim_block_range(block_num, avail, start);
+            if (claim == 0) return;
+            PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+            int handle_count = 0;
+            int32_t claimed[CoreTracker::MAX_CLUSTERS * 3];
+            for (int32_t b = 0; b < claim; b++)
+                claimed[b] = valid.pop_first();
+            for (int32_t b = 0; b < claim; b++) {
+                auto core_offset = claimed[b];
+                if (shape == PTO2ResourceShape::MIX) {
+                    running_staged += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
+                }
+                handle_count += prepare_block_for_dispatch(
+                    thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count], gated
+                );
+            }
+            wmb();
+            uint64_t dispatch_ts = 0;
+#if SIMPLER_DFX
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+                dispatch_ts = get_sys_cnt_aicpu();
+            }
+#endif
+            uint64_t my_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
+            for (int i = 0; i < handle_count; i++) {
+                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
+                if (gated) {
+                    int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+                    sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+                    sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+                    my_mask[cid >> 6] |= 1ULL << (cid & 63);
+                }
+            }
+            if (gated) {
+                for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                    if (my_mask[w] != 0) {
+                        slot_state->payload->staged_core_mask[w].fetch_or(my_mask[w], std::memory_order_seq_cst);
+                    }
+                }
+            }
+            sched_->record_published_blocks(*slot_state, claim);
+            if (gated && shape != PTO2ResourceShape::MIX && !to_pending) running_staged += handle_count;
+        }
+    };
+
+    if (mix_split) {
+        stage(tracker.get_mix_split_cluster_offset_states(core_mask), /*to_pending=*/true);
+    } else {
+        auto idle = (shape == PTO2ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(core_mask) :
+                                                        tracker.get_idle_core_offset_states(shape);
+        stage(idle, /*to_pending=*/false);
+        if (gated) {
+            stage(tracker.get_pending_core_offset_states(shape), /*to_pending=*/true);
         }
     }
-
-    // All blocks dispatched -- clear drain state.
-    // Release fence ensures tracker mutations are visible to threads that
-    // acquire-load sync_start_pending == 0 and resume normal operation.
-    std::atomic_thread_fence(std::memory_order_release);
-    drain_state_.pending_task.store(nullptr, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
-    drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
-    drain_state_.sync_start_pending.store(0, std::memory_order_release);
+    return running_staged;
 }
 
-// Called by each scheduler thread when drain_state_.sync_start_pending != 0.
-//
-// Protocol (single-stage ack barrier):
-//   1. Ack barrier: all threads signal they've stopped dispatch, then spin
-//      until all ack bits are set.
-//      If this thread's bit gets cleared while waiting, a reset occurred -- return.
-//   2. Election: one thread wins the CAS and becomes the drain worker.
-//      If resources are insufficient, reset ack/election fields and return --
-//      all threads resume completion polling to free running cores, then retry.
-//   3. Dispatch: elected thread dispatches all blocks (one pass, resources guaranteed).
-//      Non-elected threads spin-wait until sync_start_pending == 0.
-//      During dispatch the elected thread has exclusive tracker access.
-void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
-    // Every spin in this function honors is_completed(): once the run latches
-    // completed_ (all tasks done, or a fatal error raised elsewhere), peers leave
-    // the dispatch loop and stop participating in the drain. A thread parked in a
-    // drain spin would then wait forever for acks / a gate-open that can no longer
-    // arrive -- the AICPU watchdog never fires here because these spins live
-    // outside the dispatch loop's wall-clock budget, so the hang escalates straight
-    // to the 3 s STARS op-exec timeout (507018) and poisons the device. Bailing on
-    // completed_ is always safe: any pending sync_start task is either already
-    // dispatched (a stale re-popped slot) or moot under teardown, and deinit()
-    // resets drain_state_ before the next run, so leaving it dirty is harmless.
-    // Spin until drain is fully initialized (sentinel -1 -> block_num > 0).
+void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] uint64_t *out_stage_wall_cycles) {
+#if SIMPLER_DFX
+    bool drain_prof = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && out_stage_wall_cycles != nullptr);
+    uint64_t drain_acked_ts = 0;
+#endif
     int32_t block_num;
     do {
         if (is_completed()) return;
@@ -479,11 +538,8 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
 
     uint32_t all_acked = (1u << active_sched_threads_) - 1;
 
-    // Ack barrier -- signal this thread has stopped dispatch.
     drain_state_.drain_ack_mask.fetch_or(1u << thread_idx, std::memory_order_release);
 
-    // Spin until all threads have acked.
-    // If our bit is cleared while waiting, elected reset due to insufficient resources.
     while (true) {
         if (is_completed()) return;
         uint32_t ack = drain_state_.drain_ack_mask.load(std::memory_order_acquire);
@@ -492,14 +548,54 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
         SPIN_WAIT_HINT();
     }
 
-    // Election -- exactly one thread wins the CAS.
     int32_t expected = 0;
     drain_state_.drain_worker_elected.compare_exchange_strong(
         expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
     );
+    bool elected = drain_state_.drain_worker_elected.load(std::memory_order_relaxed) == thread_idx + 1;
 
-    if (drain_state_.drain_worker_elected.load(std::memory_order_relaxed) != thread_idx + 1) {
-        // Non-elected: spin-wait for drain completion or resource-insufficient reset.
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    bool gated = slot_state != nullptr && slot_state->payload != nullptr &&
+                 PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
+
+    if (elected) {
+        if (slot_state == nullptr) {
+            drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+            return;
+        }
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        int32_t available =
+            count_global_available(shape, slot_state->active_mask.core_mask(), /*include_pending=*/gated);
+        if (available < block_num) {
+            drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+            drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+            return;
+        }
+        drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+        drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+        drain_state_.drain_stage_go.store(1, std::memory_order_release);
+    } else {
+        while (drain_state_.drain_stage_go.load(std::memory_order_acquire) == 0) {
+            if (is_completed()) return;
+            if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
+            SPIN_WAIT_HINT();
+        }
+        slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+        if (slot_state == nullptr) return;
+        gated = slot_state->payload != nullptr && PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
+    }
+
+#if SIMPLER_DFX
+    if (drain_prof) drain_acked_ts = get_sys_cnt_aicpu();
+#endif
+    int32_t my_running = drain_stage_cores(slot_state, block_num, thread_idx, gated);
+#if SIMPLER_DFX
+    if (drain_prof && drain_acked_ts != 0) *out_stage_wall_cycles = get_sys_cnt_aicpu() - drain_acked_ts;
+#endif
+    drain_state_.drain_running_staged.fetch_add(my_running, std::memory_order_acq_rel);
+    drain_state_.drain_stage_done_mask.fetch_or(1u << thread_idx, std::memory_order_release);
+
+    if (!elected) {
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
@@ -508,29 +604,28 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
         return;
     }
 
-    // Elected: check if global resources are sufficient.
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    if (slot_state == nullptr) {
-        // pending_task is observed null only when a concurrent drain completion
-        // already cleared it (drain_worker_dispatch nulls it before reopening the
-        // gate). That drain is done and this is a stale-elected thread, so just
-        // release the election lock and return. Do NOT clear drain_ack_mask or
-        // sync_start_pending: a *new* drain run may already be active and
-        // accumulating acks, and zeroing them would corrupt it into a hang.
-        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-        return;
+    while ((drain_state_.drain_stage_done_mask.load(std::memory_order_acquire) & all_acked) != all_acked) {
+        if (is_completed()) return;
+        SPIN_WAIT_HINT();
     }
-    PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
-
-    if (available < block_num) {
-        // Insufficient resources -- reset drain fields so threads can resume
-        // completion polling to free running cores, then retry.
-        drain_state_.drain_ack_mask.store(0, std::memory_order_release);
-        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-        return;
+    if (gated) {
+        slot_state->payload->running_slot_count.store(
+            static_cast<int16_t>(drain_state_.drain_running_staged.load(std::memory_order_acquire)),
+            std::memory_order_seq_cst
+        );
     }
+    std::atomic_thread_fence(std::memory_order_release);
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
+    drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
+    drain_state_.sync_start_pending.store(0, std::memory_order_release);
 
-    // Dispatch -- all other threads are spinning, elected thread has exclusive tracker access.
-    drain_worker_dispatch(runtime, block_num);
+    if (gated) {
+        sched_->retry_sync_start_rendezvous_after_drain(*slot_state);
+    } else {
+        sched_->propagate_dispatch_fanin(*slot_state);
+    }
+    PTO2SchedulerState::finish_early_sync_drain(*slot_state->payload);
 }
