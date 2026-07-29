@@ -595,16 +595,23 @@ once and either pushes the fanin-free ones to the ready queue or registers
 each remaining task on its first unmet producer.
 
 **Flag-slot reuse.** `completion_flags` holds `task_window_size` entries,
-indexed by `local_id & task_window_mask`; the array does not grow with the
-number of tasks a run submits, so the slot written for `local_id` is later
-reused for `local_id + task_window_size`. The number of tasks a run may
-submit is therefore not bounded by the array's size — only the reuse of a
-given slot is ordered: `set_completion_flag` spin-waits until
-`completed_watermark` certifies task `t` complete before letting task
-`t + task_window_size` store into their shared slot. `is_completion_flag_set`
-stays correct across reuse by falling back to `completed_watermark`: once a
-task's id is behind the watermark it is reported complete regardless of
-what a later lap has since written into its slot.
+indexed by `flag_index(local_id)` rather than the raw `local_id &
+task_window_mask`: `flag_index` swaps the low `shuffle_lower_bits` bits of
+`local_id & task_window_mask` into the high position (and the remaining high
+bits down into the low position), so consecutive `local_id`s land on
+different cachelines instead of packing `64 / sizeof(int32_t)` consecutive
+ids onto the same one — the layout `update_completed_watermark` scans
+linearly. This is a bijection on `[0, task_window_size)`, so the reuse
+period is unchanged: the array does not grow with the number of tasks a run
+submits, and the slot written for `local_id` is later reused for `local_id +
+task_window_size`. The number of tasks a run may submit is therefore not
+bounded by the array's size — only the reuse of a given slot is ordered:
+`set_completion_flag` spin-waits until `completed_watermark` certifies task
+`t` complete before letting task `t + task_window_size` store into their
+shared slot. `is_completion_flag_set` stays correct across reuse by falling
+back to `completed_watermark`: once a task's id is behind the watermark it
+is reported complete regardless of what a later lap has since written into
+its slot.
 
 **Phase 2 — Dispatch**:
 

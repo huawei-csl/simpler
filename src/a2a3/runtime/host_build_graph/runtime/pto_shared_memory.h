@@ -105,6 +105,8 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // Layout metadata (set once at init)
     alignas(64) uint64_t task_window_size;
     int32_t task_window_mask;
+    static constexpr int32_t shuffle_lower_bits{4};  // At least 0 and at most log_2(task_window_size)
+    int32_t shuffle_higher_bits;                     // log_2(task_window_size) - shuffle_lower_bits
     uint64_t heap_size;
     uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
 
@@ -120,13 +122,26 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // distinguishable from "not yet completed". Writer = the task's completer
     // at on_mixed_task_complete; reader = consumer fanin polling
     // (is_completion_flag_set). Set to -1 host-side at init. Indexed by
-    // local_id & task_window_mask, so the entry for local_id is reused by
-    // local_id + task_window_size once the run submits more tasks than the
-    // array has slots for — see set_completion_flag for the ordering this
-    // reuse requires.
+    // flag_index(local_id), a bit-reindexing of local_id & task_window_mask
+    // (same task_window_size-entry period, different physical slot — see
+    // flag_index), so the entry for local_id is reused by local_id +
+    // task_window_size once the run submits more tasks than the array has
+    // slots for — see set_completion_flag for the ordering this reuse
+    // requires.
     std::atomic<int32_t> *completion_flags;
 
-    constexpr int32_t flag_index(const int32_t local_id) const { return local_id & task_window_mask; }
+    // To have subsequent tasks on different cachelines one needs shuffle_lower_bits >= 4 (because 64 / sizeof(int32_t)
+    // = 2^4). Every 2^shuffle_lower_bits will typically be on the same cacheline which is good for
+    // update_completion_watermark
+    constexpr int32_t flag_index(const int32_t local_id) const {
+        int32_t low_bits = local_id & ((static_cast<int32_t>(1) << shuffle_lower_bits) - static_cast<int32_t>(1));
+        low_bits <<= shuffle_higher_bits;
+
+        int32_t high_bits = local_id & task_window_mask;
+        high_bits >>= shuffle_lower_bits;
+
+        return low_bits | high_bits;
+    }
 
     // Once local_id falls behind completed_watermark it is reported set for
     // the rest of the run, even after a later lap overwrites its slot: the

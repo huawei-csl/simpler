@@ -173,6 +173,7 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     header->ring.task_window_size = task_window_sizes[0];
     header->ring.task_window_mask = static_cast<int32_t>(task_window_sizes[0] - 1);
+    header->ring.shuffle_higher_bits = __builtin_ctzll(task_window_sizes[0]) - header->ring.shuffle_lower_bits;
     header->ring.heap_size = heap_sizes[0];
     header->ring.task_descriptors_offset = offset;
     offset += PTO2_ALIGN_UP(task_window_sizes[0] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
