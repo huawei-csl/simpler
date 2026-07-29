@@ -83,9 +83,11 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
 
     // Lowest task_id not yet guaranteed complete: every task with id in
-    // [0, completed_watermark) has its completion_flags entry set. Advanced over
-    // the full contiguous completed prefix at task-completion time
-    // (on_mixed_task_complete). The host consumer-wait gates on it: a producer
+    // [0, completed_watermark) has its completion_flags entry set. Every completer
+    // (device on_mixed_task_complete, or the host orchestrator for an inline-completed
+    // hidden-alloc task) calls update_completed_watermark right after setting its own
+    // flag; only the one landing exactly at the current watermark walks it forward over
+    // the contiguous completed prefix. The host consumer-wait gates on it: a producer
     // slot P's consumers have all retired once completed_watermark >
     // P.last_consumer_local_id. On its own cache line (concurrent CAS-advance by
     // completing threads).
@@ -147,7 +149,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // the rest of the run, even after a later lap overwrites its slot: the
     // watermark fallback is itself monotonic and outlives the raw slot value.
     bool is_completion_flag_set(
-        int32_t thread_idx, int32_t local_id, std::memory_order order = std::memory_order_acquire
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_acquire
     ) const {
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
         return (local_id < cached_cw) || (completion_flags[flag_index(local_id)].load(order) == local_id) ||
@@ -161,8 +163,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // task t + task_window_size may publish its own entry into the shared
     // slot. This bounds how far a slot can be reused ahead of retirement, not
     // how many tasks a run may submit in total.
+    // Must be followed by a call to update_completed_watermark with same thread_idx and local_id (logical requirement)
     void set_completion_flag(
-        int32_t thread_idx, int32_t local_id, std::memory_order order = std::memory_order_release
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
     ) const {
         const int32_t earlier_task = local_id - task_window_mask;
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
@@ -173,29 +176,46 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         completion_flags[flag_index(local_id)].store(local_id, order);
     }
 
-    // set completion flag first before updating the watermark (logic requirement)
-    void update_completed_watermark(int32_t thread_idx) {
+    // Must be called for `local_id` only after set_completion_flag(thread_idx, local_id):
+    // the walk below never checks local_id's own completion_flags entry, it trusts the
+    // caller already set it, so calling out of order could advance the watermark past
+    // local_id before that write is actually visible.
+    void update_completed_watermark(const int32_t thread_idx, const int32_t local_id) {
+        // Thread fence required such that setting the flag of task local_id is written to GM before completed_watermark
+        // is read
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
+        // No-op unless this call sits exactly at the frontier: every completer calls this
+        // eagerly, but only the one whose own local_id equals the current watermark performs
+        // the advance walk below. A completer that finishes out of order (local_id ahead of
+        // the watermark) defers to whichever thread later completes the frontier task.
+        if (curr_watermark != local_id) {
+            return;
+        }
+
         const int32_t submitted = fc.current_task_index.load(std::memory_order_acquire);
 
-        int32_t next = curr_watermark;
+        int32_t next = local_id + 1;
         while (true) {
             while (next < submitted && is_completion_flag_set(thread_idx, next)) {
                 ++next;
             }
-            if (next == curr_watermark) {
-                return;
-            }
 
-            if (completed_watermark.compare_exchange_strong(
+            if (not completed_watermark.compare_exchange_strong(
                     curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
-                curr_watermark = next;
-            } else {
-                // The acquire release semantics of the successful CAS guarantee that in the case of failure this thread
-                // also synchronises with the thread reporting the completion through the intermediary thread(s).
-                next = std::max(next, curr_watermark);
+                // In case of failure, we hand off the update responsibility to the thread who succeeded
+                break;
             }
+            // Thread fence required such that completed_watermark is written to GM before the next flag is read
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            cached_completed_watermark[thread_idx].val_ = next;
+
+            if (not(next < submitted && is_completion_flag_set(thread_idx, next))) {
+                break;
+            }
+            curr_watermark = next++;
         }
     }
 

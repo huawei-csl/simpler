@@ -583,7 +583,7 @@ struct PTO2SchedulerState {
         // a low-id task completing after a higher one would leave the watermark
         // stuck below the true prefix, hanging any wait_for_consumers whose
         // last_consumer sits in the gap.
-        ring.update_completed_watermark(thread_idx);
+        ring.update_completed_watermark(thread_idx, task_id);
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly

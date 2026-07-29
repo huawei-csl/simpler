@@ -459,9 +459,11 @@ Key members:
 > **Note**: There is no fanout adjacency, dep-pool, or per-producer lock. A
 > producer inline-completed on the host (e.g. a hidden-alloc task) pre-sets its
 > own `completion_flags[id] = id` in the H2D image so device consumers see it as
-> already satisfied. The only cross-task pointers the image carries are the
-> per-slot `task` / `payload` pointers, which `relocate_host_orch_image` shifts
-> to device addresses before H2D.
+> already satisfied, and calls `update_completed_watermark` itself right after —
+> the frontier-gating in §8.4 means no later on-device completion can advance the
+> watermark past this task on its behalf. The only cross-task pointers the image
+> carries are the per-slot `task` / `payload` pointers, which
+> `relocate_host_orch_image` shifts to device addresses before H2D.
 
 ### 7.3 Dependency Recording and Relocation
 
@@ -580,8 +582,9 @@ Each scheduler thread runs a tight loop with two main phases:
      is pushed via `push_ready_routed`; otherwise it re-registers on its next
      unmet producer. After the exchange the head is `SENTINEL`, so a consumer
      registering concurrently re-checks the flags instead of being lost;
-  3. CAS-advances `completed_watermark` over the contiguous completed prefix
-     (§8.4).
+  3. calls `update_completed_watermark(thread_idx, my_id)`, which CAS-advances
+     `completed_watermark` over the contiguous completed prefix if — and only
+     if — `my_id` is exactly the current watermark (§8.4).
 
 **Readiness / wake registration.** A task is ready iff every id in its
 `fanin_local_ids` has its `completion_flags` entry set to its own id
@@ -634,11 +637,29 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 ### 8.4 Completion Watermark (host consumer-wait gate)
 
 `completed_watermark` is the lowest id not yet guaranteed complete: every task
-in `[0, completed_watermark)` has its `completion_flags` entry set. The tail of
-`on_mixed_task_complete` CAS-advances it over the **full contiguous completed
-prefix** (bounded by `current_task_index`, not by the completing task's own id)
-— capping at `my_id` would make the final value completion-order-dependent and
-strand it below the true prefix.
+in `[0, completed_watermark)` has its `completion_flags` entry set.
+
+Every completer — device `on_mixed_task_complete`, and the host orchestrator
+for an inline-completed hidden-alloc task (§7.2) — calls
+`set_completion_flag(thread_idx, my_id)` followed by
+`update_completed_watermark(thread_idx, my_id)`, in that order: the watermark
+walk trusts `my_id`'s own `completion_flags` entry is already set rather than
+re-checking it, so calling out of order could advance the watermark past
+`my_id` before that write is visible.
+
+The call is **eager but frontier-gated**: every completer makes it, but
+`update_completed_watermark` is a no-op unless `my_id` equals the watermark
+it currently observes. Only the completer landing exactly at the frontier
+does the work, CAS-advancing over the **full contiguous completed prefix**
+(bounded by `current_task_index`, not by `my_id`) — capping at `my_id` would
+make the final value completion-order-dependent and strand it below the true
+prefix. A completer that finishes out of order (its id ahead of the
+watermark) defers: it does not retry or block, it relies on whichever thread
+later completes the frontier task to walk forward through its already-set
+flag. This is why the call cannot be skipped or deferred for *any* completion
+path, including host-side ones — a task sitting at the frontier with no
+completer ever calling `update_completed_watermark` for it stalls the
+watermark permanently.
 
 It is **load-bearing**: the host `wait_for_tensor_ready(..., wait_for_consumers)`
 gates on `completed_watermark > producer.last_consumer_local_id` to observe

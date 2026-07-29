@@ -1065,14 +1065,18 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // image. Consumers poll completion_flags (not task_state), so a hidden-alloc
         // producer completed here on the host must publish its flag too — otherwise
         // every consumer register_wakes on a producer that never runs on device and
-        // the run hangs. (The device watermark walk transparently steps past this
-        // pre-set flag when a later on-device task completes.)
+        // the run hangs. update_completed_watermark only advances when called with
+        // local_id equal to the current watermark, so this task's own call is the
+        // only chance to move the watermark past it — a later on-device completer
+        // whose local_id no longer matches the (still-stuck) watermark will no-op,
+        // not walk past this pre-set flag on our behalf.
         // Runs on the host, before any AICPU scheduler thread exists — pass
         // PLATFORM_MAX_AICPU_THREADS (one past the last valid device thread
         // index) as the thread_idx, marking this store as host-originated.
         PTO2SharedMemoryRingHeader &done_ring = orch->sm_header->ring;
         int32_t done_local = static_cast<int32_t>(prepared.task_id.local());
         done_ring.set_completion_flag(PLATFORM_MAX_AICPU_THREADS, done_local);
+        done_ring.update_completed_watermark(PLATFORM_MAX_AICPU_THREADS, done_local);
     }
     orch->inline_completed_tasks++;
 
