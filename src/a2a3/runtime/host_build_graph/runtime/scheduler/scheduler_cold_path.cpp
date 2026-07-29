@@ -74,6 +74,15 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
 
     task_count = total_tasks_;
     if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+        // The regular scheduler_dispatch.cpp loop body only reaches its
+        // once-per-iteration full-prefix update_completed_watermark call after
+        // Phase 4/4b; the sync_start drain's `continue` (Phase 2) can skip
+        // straight past it. Run the full-prefix walk here too so a thread that
+        // records the final completion and then drain-continues still leaves
+        // completed_watermark covering the full completed prefix before this
+        // regular exit — wait_for_consumers gates on watermark >
+        // producer.last_consumer_local_id for every producer.
+        header->ring.update_completed_watermark(thread_idx);
         completed_.store(true, std::memory_order_release);
         LOG_INFO_V0(
             "Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed),
