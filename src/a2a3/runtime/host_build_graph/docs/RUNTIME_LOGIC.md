@@ -238,9 +238,10 @@ local-ids:
 
 - `fanin_local_ids[fanin_count]` — the local-ids of this task's direct producers
   (`fanin_count <= PTO2_MAX_FANIN`; there is no spill, so an overflow is fatal).
-- A per-slot `completion_flags[id]` byte in the ring header is the device-side
-  readiness truth: a task is ready iff every id in its `fanin_local_ids` has its
-  `completion_flags` byte set (see §8.2).
+- A per-slot `completion_flags[id]` entry (`int32`: `-1` pending, else the id
+  itself) in the ring header is the device-side readiness truth: a task is
+  ready iff every id in its `fanin_local_ids` has its `completion_flags` entry
+  set to its own id (see §8.2).
 
 Because the fanin is integer ids rather than pointers, the host→device image
 needs no fanout/dep-pool relocation — only the per-slot `task` / `payload`
@@ -407,7 +408,7 @@ slot state, not the payload; the host consumer-wait gates on it (§8.4).
 ### 6.2 Task State Machine
 
 `task_state` is the **host-visible mirror** of completion; the device-side
-readiness truth is the per-slot `completion_flags` byte (§8.2). The host polls
+readiness truth is the per-slot `completion_flags` entry (§8.2). The host polls
 `task_state` in `wait_for_tensor_ready`, the allocator deadlock detector, and
 the cold-path stall dump.
 
@@ -457,7 +458,7 @@ Key members:
 
 > **Note**: There is no fanout adjacency, dep-pool, or per-producer lock. A
 > producer inline-completed on the host (e.g. a hidden-alloc task) pre-sets its
-> own `completion_flags[id] = 1` in the H2D image so device consumers see it as
+> own `completion_flags[id] = id` in the H2D image so device consumers see it as
 > already satisfied. The only cross-task pointers the image carries are the
 > per-slot `task` / `payload` pointers, which `relocate_host_orch_image` shifts
 > to device addresses before H2D.
@@ -573,7 +574,7 @@ Each scheduler thread runs a tight loop with two main phases:
   `completed_subtasks == total_required_subtasks`, call `on_mixed_task_complete`,
   which:
   1. mirrors `task_state = COMPLETED` (host-visible) and sets the device
-     readiness truth `completion_flags[my_id] = 1` (release);
+     readiness truth `completion_flags[my_id] = my_id` (release);
   2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
      — reclassifying each waiter: a waiter whose remaining fanin is now all met
      is pushed via `push_ready_routed`; otherwise it re-registers on its next
@@ -583,14 +584,27 @@ Each scheduler thread runs a tight loop with two main phases:
      (§8.4).
 
 **Readiness / wake registration.** A task is ready iff every id in its
-`fanin_local_ids` has its `completion_flags` byte set (`fanin_satisfied` /
-`classify_fanin_state`, acquire loads). A not-yet-ready task registers itself on
-its **first unmet** producer's wake list (`register_wake`); that producer's
-completion re-drives the classification. The decision is terminal — tasks are
-never re-polled — because `completion_flags` are monotonic. This wake machinery
-is seeded by the device **boot classify** (`on_orchestration_done`), which scans
-the submitted tasks once and either pushes the fanin-free ones to the ready
-queue or registers each remaining task on its first unmet producer.
+`fanin_local_ids` has its `completion_flags` entry set to its own id
+(`fanin_satisfied` / `classify_fanin_state`, acquire loads). A not-yet-ready
+task registers itself on its **first unmet** producer's wake list
+(`register_wake`); that producer's completion re-drives the classification.
+The decision is terminal — tasks are never re-polled — because
+`completion_flags` are monotonic. This wake machinery is seeded by the device
+**boot classify** (`on_orchestration_done`), which scans the submitted tasks
+once and either pushes the fanin-free ones to the ready queue or registers
+each remaining task on its first unmet producer.
+
+**Flag-slot reuse.** `completion_flags` holds `task_window_size` entries,
+indexed by `local_id & task_window_mask`; the array does not grow with the
+number of tasks a run submits, so the slot written for `local_id` is later
+reused for `local_id + task_window_size`. The number of tasks a run may
+submit is therefore not bounded by the array's size — only the reuse of a
+given slot is ordered: `set_completion_flag` spin-waits until
+`completed_watermark` certifies task `t` complete before letting task
+`t + task_window_size` store into their shared slot. `is_completion_flag_set`
+stays correct across reuse by falling back to `completed_watermark`: once a
+task's id is behind the watermark it is reported complete regardless of
+what a later lap has since written into its slot.
 
 **Phase 2 — Dispatch**:
 
@@ -613,7 +627,7 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 ### 8.4 Completion Watermark (host consumer-wait gate)
 
 `completed_watermark` is the lowest id not yet guaranteed complete: every task
-in `[0, completed_watermark)` has its `completion_flags` byte set. The tail of
+in `[0, completed_watermark)` has its `completion_flags` entry set. The tail of
 `on_mixed_task_complete` CAS-advances it over the **full contiguous completed
 prefix** (bounded by `current_task_index`, not by the completing task's own id)
 — capping at `my_id` would make the final value completion-order-dependent and

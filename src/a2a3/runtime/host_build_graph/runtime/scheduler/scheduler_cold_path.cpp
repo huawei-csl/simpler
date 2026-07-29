@@ -240,7 +240,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (slot_state.payload != nullptr) {
                     for (int32_t k = 0; k < fi; k++) {
                         int32_t pid = slot_state.payload->fanin_local_ids[k];
-                        if (ring.is_completion_flag_set(pid, std::memory_order_relaxed)) rc++;
+                        if (ring.is_completion_flag_set(thread_idx, pid, std::memory_order_relaxed)) rc++;
                     }
                 }
                 int32_t kid_aic = slot_state.task->kernel_id[0];
@@ -1028,7 +1028,7 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 // dispatching.
 // =============================================================================
 void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
+    Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if SIMPLER_DFX
     if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
@@ -1062,8 +1062,9 @@ void SchedulerContext::on_orchestration_done(
     }
 
     // Polling initial classify (device boot): the host built the whole graph and
-    // no producer has executed yet — every completion_flags byte is 0 except the
-    // hidden-alloc tasks the host completed inline (pre-set to 1). Classify each
+    // no producer has executed yet — every completion_flags entry is -1 (pending)
+    // except the hidden-alloc tasks the host completed inline (pre-set to their
+    // own local_id). Classify each
     // submitted task exactly once: route roots (all fanin met) to the ready queues
     // and register the rest on their first unmet producer's wake list. This
     // replaces the host-side wiring drain the wiring model deferred to a device
@@ -1075,16 +1076,16 @@ void SchedulerContext::on_orchestration_done(
         PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
         const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
         for (int32_t id = 0; id < submitted; id++) {
-            if (ring.is_completion_flag_set(id)) {
+            if (ring.is_completion_flag_set(thread_idx, id)) {
                 continue;  // completed on the host (hidden alloc); nothing to dispatch
             }
             PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-            int32_t state = sched_->classify_fanin_state(&s);
+            int32_t state = sched_->classify_fanin_state(thread_idx, &s);
             if (state < 0) {
                 sched_->push_ready_routed(&s);
             } else {
                 int32_t prod_local = s.payload->fanin_local_ids[state];
-                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+                sched_->register_wake(thread_idx, &ring.get_slot_state_by_task_id(prod_local), &s);
             }
         }
     }

@@ -57,7 +57,7 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
     ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
     ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
-    ring.completion_flags = (std::atomic<uint8_t> *)(base + off.completion_flags);
+    ring.completion_flags = (std::atomic<int32_t> *)(base + off.completion_flags);
 }
 
 void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
@@ -158,6 +158,15 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // complete (local_id 0) advances the watermark to 1.
     header->ring.completed_watermark.store(0, std::memory_order_relaxed);
 
+    // Per-thread cache of the last-observed completed_watermark (including the
+    // host's own slot at index PLATFORM_MAX_AICPU_THREADS). Shared memory is
+    // not guaranteed zero on device; a stale nonzero entry would make
+    // is_completion_flag_set's cache short-circuit report a not-yet-completed
+    // local_id as done.
+    for (auto &cached : header->ring.cached_completed_watermark) {
+        cached.val_ = 0;
+    }
+
     header->orchestrator_done.store(0, std::memory_order_relaxed);
 
     // Ring layout info
@@ -190,10 +199,12 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
         ring.slot_states[i].active_mask = ActiveMask{};
     }
 
-    // Polling completion flags: 0 = pending. Shared memory is not guaranteed
-    // zero on device; stale non-zero bytes would make consumers observe a
-    // producer as already completed. Zero the whole per-ring array once.
-    __builtin_memset((void *)ring.completion_flags, 0, task_window_sizes[0] * sizeof(std::atomic<uint8_t>));
+    // Polling completion flags: -1 = pending (0 is a valid completion stamp —
+    // local_id 0 — so it cannot double as the pending sentinel). Shared memory
+    // is not guaranteed zero on device; stale bytes would make consumers
+    // observe a producer as already completed. 0xFF fills every int32 slot
+    // with -1 regardless of endianness. Set the whole per-ring array once.
+    __builtin_memset((void *)ring.completion_flags, 0xFF, task_window_sizes[0] * sizeof(std::atomic<int32_t>));
 }
 
 // =============================================================================
