@@ -86,6 +86,12 @@ bool PTO2SharedMemoryHandle::init_per_ring(
 ) {
     if (!sm_base_arg || sm_size_arg == 0) return false;
     if (sm_size_arg < calculate_size_per_ring(task_window_sizes)) return false;
+    // flag_index() shifts a value left by shuffle_higher_bits; task_window_size must
+    // contribute at least shuffle_lower_bits trailing zero bits or that shift amount
+    // goes negative, which is undefined behavior.
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (__builtin_ctzll(task_window_sizes[r]) < PTO2SharedMemoryRingHeader::shuffle_lower_bits) return false;
+    }
 
     sm_base = sm_base_arg;
     sm_size = sm_size_arg;
