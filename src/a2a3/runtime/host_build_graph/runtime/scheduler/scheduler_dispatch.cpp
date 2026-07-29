@@ -976,6 +976,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
+            header->ring.update_completed_watermark(thread_idx);
             break;
         }
         bool made_progress = false;
@@ -1269,6 +1270,16 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             _t0_phase = early_dispatch_t1;
         }
 #endif
+
+        // Full-prefix completed_watermark advance, once per iteration, after
+        // this iteration's completions (Phase 1 / Phase 3) and dispatch (Phase 4
+        // / 4b). completed_watermark must cover the full contiguous completed
+        // prefix, not just the newest completed id, because wait_for_consumers
+        // gates on watermark > producer.last_consumer_local_id for every
+        // producer — see on_mixed_task_complete (pto_scheduler.h) for the
+        // per-completion bounded advance this complements.
+        // Can be made less frequent
+        header->ring.update_completed_watermark(thread_idx);
 
 #if SIMPLER_DFX
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier

@@ -34,6 +34,7 @@
 
 #include <stddef.h>
 #include <array>
+#include <limits>
 
 #include "common/platform_config.h"
 #include "utils/device_arena.h"
@@ -147,7 +148,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // the rest of the run, even after a later lap overwrites its slot: the
     // watermark fallback is itself monotonic and outlives the raw slot value.
     bool is_completion_flag_set(
-        int32_t thread_idx, int32_t local_id, std::memory_order order = std::memory_order_acquire
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_acquire
     ) const {
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
         return (local_id < cached_cw) || (completion_flags[flag_index(local_id)].load(order) == local_id) ||
@@ -162,19 +163,42 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // slot. This bounds how far a slot can be reused ahead of retirement, not
     // how many tasks a run may submit in total.
     void set_completion_flag(
-        int32_t thread_idx, int32_t local_id, std::memory_order order = std::memory_order_release
-    ) const {
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
+    ) {
         const int32_t earlier_task = local_id - task_window_mask;
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
         while ((cached_cw < earlier_task) &&
                ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
+            weak_update_completed_watermark(thread_idx, earlier_task);
             SPIN_WAIT_HINT();
         }
         completion_flags[flag_index(local_id)].store(local_id, order);
     }
 
+    void weak_update_completed_watermark(
+        const int32_t thread_idx, int32_t max_local_id = std::numeric_limits<int32_t>::max()
+    ) {
+        const int32_t submitted = fc.current_task_index.load(std::memory_order_acquire);
+        max_local_id = std::min(max_local_id, submitted);
+        int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
+
+        int32_t next = curr_watermark;
+        while (next < max_local_id && is_completion_flag_set(thread_idx, next)) {
+            ++next;
+        }
+        if (next == curr_watermark) {
+            return;
+        }
+
+        if (completed_watermark.compare_exchange_strong(
+                curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            cached_completed_watermark[thread_idx].val_ = next;
+        }
+    }
+
     // set completion flag first before updating the watermark (logic requirement)
-    void update_completed_watermark(int32_t thread_idx) {
+    void update_completed_watermark(const int32_t thread_idx) {
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
         const int32_t submitted = fc.current_task_index.load(std::memory_order_acquire);
 
@@ -191,10 +215,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
                     curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 curr_watermark = next;
+                cached_completed_watermark[thread_idx].val_ = next;
             } else {
                 // The acquire release semantics of the successful CAS guarantee that in the case of failure this thread
                 // also synchronises with the thread reporting the completion through the intermediary thread(s).
                 next = std::max(next, curr_watermark);
+                cached_completed_watermark[thread_idx].val_ = curr_watermark;
             }
         }
     }

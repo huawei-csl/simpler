@@ -1073,6 +1073,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         PTO2SharedMemoryRingHeader &done_ring = orch->sm_header->ring;
         int32_t done_local = static_cast<int32_t>(prepared.task_id.local());
         done_ring.set_completion_flag(PLATFORM_MAX_AICPU_THREADS, done_local);
+        done_ring.weak_update_completed_watermark(PLATFORM_MAX_AICPU_THREADS, done_local + 1);
     }
     orch->inline_completed_tasks++;
 

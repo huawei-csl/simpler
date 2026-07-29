@@ -576,14 +576,15 @@ struct PTO2SchedulerState {
         }
 
         // completed_watermark = lowest id not yet guaranteed complete: every task
-        // in [0, watermark) has its completion_flags entry set. The host
-        // wait_for_consumers gates on watermark > producer.last_consumer_local_id,
-        // so the walk must extend to the full contiguous completed prefix — NOT
-        // cap at task_id. Capping at task_id makes the final value order-dependent:
-        // a low-id task completing after a higher one would leave the watermark
-        // stuck below the true prefix, hanging any wait_for_consumers whose
-        // last_consumer sits in the gap.
-        ring.update_completed_watermark(thread_idx);
+        // in [0, watermark) has its completion_flags entry set. This bounded
+        // advance publishes at most task_id + 1 — low-latency unblocking for a
+        // wait_for_consumers whose last_consumer_local_id is exactly this task.
+        // The uncapped full-prefix walk that keeps the watermark order-independent
+        // (needed when a low-id task completes after a higher one already
+        // advanced it partway) is in resolve_and_dispatch (scheduler_dispatch.cpp),
+        // called once per scheduler loop iteration after that iteration's
+        // dispatch phase.
+        ring.weak_update_completed_watermark(thread_idx, task_id + 1);
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
