@@ -51,7 +51,9 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Allocating)          \
     X(Running_Task_Single) \
     X(Running_Task_Pair)   \
-    X(Barrier)
+    X(Barrier)             \
+    X(CopyH2D)             \
+    X(CopyD2H)
 
 enum MarkerType {
 #define X(name) name,

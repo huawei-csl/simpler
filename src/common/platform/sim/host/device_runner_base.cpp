@@ -31,6 +31,10 @@
 #include "task_args.h"
 #include "utils/elf_build_id.h"
 
+#ifdef ENABLE_TRACR
+#include <tracr_host_copy.hpp>
+#endif
+
 namespace simpler::common::sim_host {
 
 namespace {
@@ -286,11 +290,17 @@ void SimDeviceRunnerBase::free_tensor(void *dev_ptr) {
 }
 
 int SimDeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
+#ifdef ENABLE_TRACR
+    tracr_host_copy::Span tracr_span(CopyH2D, bytes);
+#endif
     std::memcpy(dev_ptr, host_ptr, bytes);
     return 0;
 }
 
 int SimDeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes) {
+#ifdef ENABLE_TRACR
+    tracr_host_copy::Span tracr_span(CopyD2H, bytes);
+#endif
     std::memcpy(host_ptr, dev_ptr, bytes);
     return 0;
 }

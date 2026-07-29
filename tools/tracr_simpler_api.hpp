@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include <tracr/tracr.hpp>
+#include <tracr_host_copy.hpp>
 #include <tracr_simpler_markers.hpp>
 
 namespace fs = std::filesystem;
@@ -98,6 +99,65 @@ inline int TracrData2BTS(const TraCR::Payload *tracrData, const size_t *tracrDat
 }
 
 /**
+ * Number of channels the device lanes occupy, and therefore the id of the first
+ * host lane. MUST match the device half of the channel_names array built by
+ * StoreTracrMetaData(), which checks the two agree.
+ */
+template <typename RuntimeT>
+inline size_t DeviceChannelCount(RuntimeT &runtime) {
+    return static_cast<size_t>(runtime.get_aicpu_thread_num()) +        // AICPU_i
+           static_cast<size_t>(runtime.get_worker_count() / 3) +        // AICube_i
+           static_cast<size_t>(2 * runtime.get_worker_count() / 3) +    // AIVector_i
+           1;                                                          // INVALID
+}
+
+/**
+ * A function for storing the host-side copy lanes (see tracr_host_copy.hpp)
+ *
+ * Continues the `thread.<n>` numbering after the device's AICPU threads and stamps
+ * each payload with its channel id, which recording could not know.
+ *
+ * Recording is expected to be quiescent here: the caller dumps on the same thread
+ * that issued the run's copies, after the streams have been synced.
+ */
+inline int HostCopyTraces2BTS(size_t first_thread_index, size_t first_channel_id) {
+    fs::path base_dir = expand_user_path(tracr_dir);
+
+    std::lock_guard<std::mutex> guard(tracr_host_copy::registry_mutex());
+    auto &lanes = tracr_host_copy::lanes();
+    for (size_t i = 0; i < lanes.size(); ++i) {
+        std::vector<TraCR::Payload> &traces = lanes[i]->traces;
+
+        if (traces.empty()) continue;
+
+        const uint16_t channel_id = static_cast<uint16_t>(first_channel_id + i);
+        for (TraCR::Payload &payload : traces) {
+            payload.channelId = channel_id;
+        }
+
+        fs::path thread_dir = base_dir / ("thread." + std::to_string(first_thread_index + i + 1));
+
+        fs::create_directories(thread_dir);
+
+        fs::path file_path = thread_dir / "traces.bts";
+
+        std::ofstream out(file_path, std::ios::binary);
+        if (!out) {
+            LOG_ERROR("Cannot open %s", file_path.c_str());
+            return -1;
+        }
+
+        out.write(reinterpret_cast<const char *>(traces.data()), traces.size() * sizeof(TraCR::Payload));
+
+        if (!out) {
+            LOG_ERROR("Write failed for %s", file_path.c_str());
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/**
  * A method for storing the TraCR metadata.json
  */
 template <typename RuntimeT>
@@ -119,6 +179,23 @@ int StoreTracrMetaData(RuntimeT &runtime) {
         channel_names.push_back("AIVector_" + std::to_string(i));
     }
     channel_names.push_back("INVALID");
+
+    if (channel_names.size() != DeviceChannelCount(runtime)) {
+        LOG_ERROR(
+            "TraCR channel bookkeeping drift: %zu device channel names vs %zu counted",
+            channel_names.size(), DeviceChannelCount(runtime)
+        );
+        return -1;
+    }
+
+    // Host copy lanes are appended after INVALID so every device channel keeps the
+    // id its already-recorded payloads carry.
+    {
+        std::lock_guard<std::mutex> guard(tracr_host_copy::registry_mutex());
+        for (size_t i = 0; i < tracr_host_copy::lanes().size(); ++i) {
+            channel_names.push_back("HostCopy_" + std::to_string(i));
+        }
+    }
 
     metadata["channel_names"] = channel_names;
     metadata["num_channels"] = channel_names.size();
@@ -161,6 +238,10 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     static_assert(
         std::is_trivially_copyable_v<TraCR::Payload>, "TraCR::Payload must be trivially copyable for raw binary dump"
     );
+
+    // The trace-buffer downloads below are profiling overhead (tens of MB per AICPU
+    // thread), not workload data movement — keep them out of the copy lanes.
+    tracr_host_copy::Suppress suppress_trace_download;
 
     if (runtime.get_tracr_data() == nullptr) {
         LOG_ERROR("runtime.tracrData_ is a nullptr");
@@ -208,6 +289,12 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
         return rc;
     }
 
+    rc = HostCopyTraces2BTS(static_cast<size_t>(runtime.get_aicpu_thread_num()), DeviceChannelCount(runtime));
+    if (rc != 0) {
+        LOG_ERROR("HostCopyTraces2BTS() failed");
+        return rc;
+    }
+
     // Free device TraCR memory data placeholder
     device_runner->free_tensor(runtime.get_tracr_data());
     device_runner->free_tensor(runtime.get_tracr_data_sizes());
@@ -217,6 +304,11 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
         LOG_ERROR("StoreTracrMetaData failed: %d", rc);
         return rc;
     }
+
+    // Each run serializes into its own `~/ascend/tracr_<N>/`, so the lanes start
+    // empty for the next one. The lane objects themselves stay alive: recording
+    // threads cache pointers to them.
+    tracr_host_copy::clear();
 
     return 0;
 }

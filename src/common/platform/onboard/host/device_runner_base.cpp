@@ -50,6 +50,10 @@
 #include "pto_runtime_c_api.h"
 #include "task_args.h"
 #include "utils/elf_build_id.h"
+
+#ifdef ENABLE_TRACR
+#include <tracr_host_copy.hpp>
+#endif
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /
@@ -134,10 +138,16 @@ void DeviceRunnerBase::free_tensor(void *dev_ptr) {
 }
 
 int DeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes) {
+#ifdef ENABLE_TRACR
+    tracr_host_copy::Span tracr_span(CopyH2D, bytes);
+#endif
     return rtMemcpy(dev_ptr, bytes, host_ptr, bytes, RT_MEMCPY_HOST_TO_DEVICE);
 }
 
 int DeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes) {
+#ifdef ENABLE_TRACR
+    tracr_host_copy::Span tracr_span(CopyD2H, bytes);
+#endif
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
