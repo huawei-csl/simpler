@@ -704,6 +704,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, thread_idx);
+            // Close the host->device causal flow: the arrow tail is the host
+            // submit event, its head is this per-run Orchestrating event.
+            if (runtime->get_flow_id() != 0) {
+                INSTRUMENTATION_FLOW_END(g_TraCR_thread_idx, static_cast<uint32_t>(runtime->get_flow_id()));
+            }
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);

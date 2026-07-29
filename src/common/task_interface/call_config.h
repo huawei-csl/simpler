@@ -19,6 +19,11 @@
  * (`l2_swimlane_records.json` / `args_dump/` / `pmu.csv` / `deps.json` /
  * `scope_stats/scope_stats.jsonl`).
  *
+ * `flow_id` is the per-run TraCR causal-flow id: the host stamps it before a
+ * NEXT_LEVEL submit and the AICPU orchestrator emits a matching FLOW_END, so a
+ * merged trace draws an arrow from the host scheduling event to the device work
+ * it triggered. 0 means "no flow" (TraCR host lane inactive).
+ *
  * There is no block_dim knob: a run always takes the whole device. Onboard that
  * is every cluster the AICore stream reports (aclrtGetStreamResLimit, capped by
  * PLATFORM_MAX_BLOCKDIM); sim takes SIM_AUTO_BLOCKDIM, deliberately narrower
@@ -115,6 +120,7 @@ struct CallConfig {
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
+    int32_t flow_id = 0;             // TraCR host->device causal-flow id for this run (0 = no flow)
     RuntimeEnv runtime_env;          // per-task PTO2_RING_* overrides
     char output_prefix[1024] = {};
 
@@ -143,6 +149,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

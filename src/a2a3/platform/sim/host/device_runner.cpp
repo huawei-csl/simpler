@@ -230,6 +230,9 @@ void DeviceRunner::set_dep_gen_enabled(bool enable) {
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     apply_call_config(config);
+    // Carry this run's TraCR causal-flow id onto the device-copied descriptor so
+    // the AICPU orchestrator can emit a matching FLOW_END (0 = no flow).
+    runtime.set_flow_id(config.flow_id);
     // prepare_launch_shape() resolved block_dim before the graph was built, so
     // the geometry this run launches with is already on the runner.
     const int block_dim = block_dim_;

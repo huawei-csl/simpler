@@ -164,6 +164,11 @@ public:
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // TraCR host->device causal-flow id for this run (0 = no flow). Kept for
+    // parity with the tensormap_and_ringbuffer Runtime so the shared platform
+    // layer can set it uniformly; host_build_graph has no device-side FLOW_END.
+    int32_t flow_id;
+
     // TraCR data placeholder
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
@@ -236,6 +241,8 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    int get_flow_id() const { return flow_id; }
+    void set_flow_id(int v) { flow_id = v; }
     void *get_tracr_data() const { return tracrData_; }
     void set_tracr_data(void *p) { tracrData_ = p; }
     void *get_tracr_data_sizes() const { return tracrDataSizes_; }

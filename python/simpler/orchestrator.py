@@ -221,6 +221,14 @@ class Orchestrator:
             prov_guard = worker._child_prov_lock
         captured_refs = worker._capture_remote_sidecar_refs(remote_sidecar) if worker is not None else []
         _tracr.mark_set("SubmitNextLevel", cpp_worker_id)
+        # Stamp a causal-flow id onto this submit's config so the device work it
+        # triggers can close the arrow (FLOW_END at the AICPU Orchestrating
+        # marker). next_flow_id() is 0 when the host TraCR lane is inactive, so
+        # cfg.flow_id stays at its default and no flow is drawn.
+        fid = _tracr.next_flow_id()
+        if fid:
+            cfg.flow_id = fid
+            _tracr.flow_start(fid)
         try:
             with prov_guard:
                 if child_ptrs and worker is not None:

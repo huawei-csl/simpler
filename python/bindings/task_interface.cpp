@@ -1246,6 +1246,7 @@ NB_MODULE(_task_interface, m) {
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
+        .def_rw("flow_id", &CallConfig::flow_id)
         // runtime_env returns an internal reference so `cfg.runtime_env.ring_heap = X`
         // writes through to the owning CallConfig (rv_policy::reference_internal).
         .def_prop_rw(
@@ -1334,7 +1335,8 @@ NB_MODULE(_task_interface, m) {
             os << "CallConfig(aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << self.enable_l2_swimlane << ", enable_dump_args=" << self.enable_dump_args
                << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
-               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
+               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
+               << ", flow_id=" << self.flow_id;
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
                 append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);

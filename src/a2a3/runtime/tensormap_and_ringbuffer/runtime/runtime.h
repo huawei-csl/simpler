@@ -169,6 +169,11 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // TraCR host->device causal-flow id for this run (0 = no flow). Set per run
+    // from CallConfig.flow_id; the AICPU orchestrator emits a FLOW_END with it so
+    // a merged trace links the host submit event to this device work.
+    int32_t flow_id;
+
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
@@ -246,6 +251,8 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    int get_flow_id() const { return dev.flow_id; }
+    void set_flow_id(int v) { dev.flow_id = v; }
     void *get_tracr_data() const { return dev.tracrData_; }
     void set_tracr_data(void *p) { dev.tracrData_ = p; }
     void *get_tracr_data_sizes() const { return dev.tracrDataSizes_; }

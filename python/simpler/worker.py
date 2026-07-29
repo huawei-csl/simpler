@@ -170,13 +170,13 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 6 int32 (aicpu_thread_num, enable_l2_swimlane, enable_dump_args,
-# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64 ring sizing
+# 7 int32 (aicpu_thread_num, enable_l2_swimlane, enable_dump_args,
+# enable_pmu, enable_dep_gen, enable_scope_stats, flow_id) + uint64 ring sizing
 # overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT: ring_task_window,
 # ring_heap, ring_dep_pool) + 1024-byte NUL-terminated output_prefix. Log config
 # travels separately via ChipWorker.init(log_level, log_info_v) — not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
@@ -1765,6 +1765,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
         pmu,
         dep_gen,
         scope_stats,
+        flow_id,
         *ring_values,
         prefix_bytes,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
@@ -1778,6 +1779,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)
+    cfg.flow_id = flow_id
     cfg.runtime_env.ring_task_window = ring_task_window
     cfg.runtime_env.ring_heap = ring_heap
     cfg.runtime_env.ring_dep_pool = ring_dep_pool

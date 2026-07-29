@@ -43,6 +43,9 @@ _MARKER_LABELS = (
 _started = False
 _labels: dict[str, int] = {}
 _trace_base = ""
+# Monotonic per-process source of host->device flow ids. 0 is reserved for "no
+# flow", so ids start at 1. Only the orchestrator main thread advances it.
+_flow_counter = 0
 # Chip ``i`` records on lane ``i + 1`` (lane 0 is the orchestrator main thread).
 _chip_ids: set[int] = set()
 
@@ -94,6 +97,13 @@ def _relocate_proc() -> None:
                 shutil.rmtree(dst)
             shutil.move(src, dst)
             _anchor_to_device_timeline(os.path.join(dst, "metadata.json"))
+            # PyTraCR wrote proc.<pid> under <base>/tracr/; once it is relocated
+            # beside the device procs, drop the now-empty tracr/ container (rmdir
+            # no-ops via OSError if anything else still lives there).
+            try:
+                os.rmdir(os.path.join(_trace_base, "tracr"))
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -123,6 +133,27 @@ def mark_reset() -> None:
     if not active():
         return
     _t.INSTRUMENTATION_MARK_RESET(_ORCH_CHANNEL)
+
+
+def next_flow_id() -> int:
+    """Return a fresh nonzero host->device flow id, or 0 when inactive so callers
+    can cheaply skip flow emission (and leave CallConfig.flow_id at its 0 =
+    'no flow' default)."""
+    global _flow_counter
+    if not active():
+        return 0
+    _flow_counter += 1
+    return _flow_counter
+
+
+def flow_start(flow_id: int) -> None:
+    """Open a causal-flow arrow whose tail attaches to the event currently set on
+    the orchestrator channel — call right after the ``mark_set`` that opens it.
+    The matching FLOW_END is emitted device-side at the AICPU Orchestrating
+    marker (see aicpu_executor.cpp)."""
+    if not active() or not flow_id:
+        return
+    _t.INSTRUMENTATION_FLOW_START(_ORCH_CHANNEL, int(flow_id) & 0xFFFFFFFF)
 
 
 def thread_init() -> None:
