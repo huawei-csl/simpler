@@ -243,8 +243,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (slot_state.payload != nullptr) {
                     for (int32_t k = 0; k < fi; k++) {
                         int32_t pid = slot_state.payload->fanin_local_ids[k];
-                        if (ring.completion_flags[pid & ring.task_window_mask].load(std::memory_order_relaxed) != 0)
-                            rc++;
+                        if (ring.is_completion_flag_set(pid, std::memory_order_relaxed)) rc++;
                     }
                 }
                 int32_t kid_aic = slot_state.task->kernel_id[0];
@@ -703,7 +702,21 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    active_sched_threads_ = aicpu_thread_num_;
+    //
+    // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
+    // partition across the remaining (aicpu_thread_num_ - 1) scheduler threads
+    // only, so P never owns a cluster and never polls a COND register. P is
+    // mandatory — like tmr's scheduler + orchestrator split, host_build_graph
+    // needs at least two AICPU threads (one S + one P); one thread cannot own
+    // cores and resolve on a dedicated thread at once.
+    if (aicpu_thread_num_ < 2) {
+        LOG_ERROR(
+            "host_build_graph requires aicpu_thread_num >= 2 (1 scheduler + 1 resolution); got %d", aicpu_thread_num_
+        );
+        return false;
+    }
+    p_thread_idx_ = aicpu_thread_num_ - 1;
+    active_sched_threads_ = aicpu_thread_num_ - 1;
     int32_t cluster_count = aic_count_;
 
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
@@ -993,10 +1006,12 @@ void SchedulerContext::deinit() {
     // the count-gated consumer never reads entries[] past the fresh count.
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
-    // would otherwise leave dirty pending/elected/ack state for the next reuse.
+    // would otherwise leave dirty pending/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
-    drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.drain_attempt.store(0, std::memory_order_release);
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
+        drain_ack_tokens_[t].store(0, std::memory_order_release);
+    }
     drain_state_.drain_stage_go.store(0, std::memory_order_release);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);
     drain_state_.drain_running_staged.store(0, std::memory_order_release);
@@ -1050,6 +1065,29 @@ void SchedulerContext::on_orchestration_done(
 
     total_tasks_ = total_tasks;
 
+    // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
+    // releases runtime_init_ready_ — no scheduler thread can push until then.
+    // Completed-but-unresolved tasks in flight are bounded by BOTH the total task
+    // count and the ring's task window (a task must occupy a ring slot to run and
+    // complete), so size to the tighter of the two, rounded up to a power of two
+    // and floored at 256. The window already caps this, so there is no artificial
+    // ceiling and a producer never has to spin on a full queue.
+    uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
+    if (sched_->ring_sched_state.ring != nullptr) {
+        uint64_t window = static_cast<uint64_t>(sched_->ring_sched_state.ring->task_window_mask) + 1;
+        if (window < sp_bound) {
+            sp_bound = window;
+        }
+    }
+    uint64_t sp_cap = 256;
+    while (sp_cap < sp_bound) {
+        sp_cap <<= 1;
+    }
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        sp_queues_[t].destroy();  // free a prior run's buffer before re-alloc
+        sp_queues_[t].init(sp_cap);
+    }
+
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
     if (inline_completed > 0) {
@@ -1070,33 +1108,11 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-    // Polling initial classify (device boot): the host built the whole graph and
-    // no producer has executed yet — every completion_flags byte is 0 except the
-    // hidden-alloc tasks the host completed inline (pre-set to 1). Classify each
-    // submitted task exactly once: route roots (all fanin met) to the ready queues
-    // and register the rest on their first unmet producer's wake list. This
-    // replaces the host-side wiring drain the wiring model deferred to a device
-    // queue. Runs on the boot leader BEFORE the caller publishes
-    // runtime_init_ready_ (release), so it is race-free against the scheduler
-    // threads (they acquire that store before dispatching) and nothing completes
-    // during the scan.
-    if (orch_err == PTO2_ERROR_NONE && sched_->ring_sched_state.ring != nullptr) {
-        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
-        const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
-        for (int32_t id = 0; id < submitted; id++) {
-            if (ring.completion_flags[id & ring.task_window_mask].load(std::memory_order_acquire) != 0) {
-                continue;  // completed on the host (hidden alloc); nothing to dispatch
-            }
-            PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-            int32_t state = sched_->classify_fanin_state(&s);
-            if (state < 0) {
-                sched_->push_ready_routed(&s);
-            } else {
-                int32_t prod_local = s.payload->fanin_local_ids[state];
-                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
-            }
-        }
-    }
+    // The polling initial classify (seed the ready queues + wake lists for the
+    // whole graph) runs AFTER this, partitioned across all AICPU threads in
+    // classify_partition() — see AicpuExecutor::run. It is kept out of this
+    // leader-only setup so the O(total_tasks) scan is not serial on one thread
+    // while the others idle-wait for runtime_init_ready_.
 
 #if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
@@ -1110,4 +1126,44 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 #endif
+}
+
+// Polling initial classify (device boot), partitioned across all AICPU threads.
+// The host built the whole graph and no producer has executed yet — every
+// completion_flags byte is 0 except the hidden-alloc tasks the host completed
+// inline (pre-set to 1). Each thread classifies its contiguous slice of the
+// submitted-task range exactly once: route roots (all fanin met) to the ready
+// queues and register the rest on their first unmet producer's wake list.
+//
+// This is the same work the wiring model deferred to a device queue, now run
+// N-way parallel. push_ready_routed (MPMC ready queues) and register_wake
+// (lock-free wake-list CAS) are the same concurrency-safe primitives the
+// scheduler threads use during the run, and at boot no producer has completed
+// (wake_list heads are nullptr, never SENTINEL), so registration never
+// re-classifies. The caller barriers all threads here BEFORE any of them
+// publishes runtime_init_ready_, so the whole ready-set / wake-list graph is
+// fully seeded before the first dispatch.
+void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
+    if (completed_.load(std::memory_order_acquire) || sched_->ring_sched_state.ring == nullptr) {
+        return;
+    }
+    PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
+    const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
+    // Disjoint contiguous slices covering [0, submitted): thread t owns
+    // [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
+    for (int32_t id = lo; id < hi; id++) {
+        if (ring.is_completion_flag_set(id)) {
+            continue;  // completed on the host (hidden alloc); nothing to dispatch
+        }
+        PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
+        int32_t state = sched_->classify_fanin_state(&s);
+        if (state < 0) {
+            sched_->push_ready_routed(&s);
+        } else {
+            int32_t prod_local = s.payload->fanin_local_ids[state];
+            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+        }
+    }
 }

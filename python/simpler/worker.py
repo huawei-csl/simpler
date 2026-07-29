@@ -186,7 +186,13 @@ _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
 # Python reader can bounds-check incoming args blobs. Source-of-truth for the
 # constants on the right is the nanobind binding (cannot drift).
-_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_TASK_ARGS_BLOB - MAILBOX_ERROR_MSG_SIZE
+# Mirrors MAILBOX_OFF_ACCEPTED / MAILBOX_TASK_ACCEPTED: launch acceptance is a
+# sticky word rather than a MailboxState, because a state carrying it is lost
+# whenever the child reaches TASK_DONE between two parent polls. The parent
+# clears it when it publishes the next TASK_READY.
+_OFF_ACCEPTED = MAILBOX_SIZE - MAILBOX_ERROR_MSG_SIZE - 8
+_TASK_ACCEPTED = 1
+_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_TASK_ARGS_BLOB - MAILBOX_ERROR_MSG_SIZE - 8
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -377,15 +383,23 @@ class RemoteCallable:
 
     @property
     def module(self) -> str:
+        """Module half of the ``module:qualname`` target."""
         return self.target.split(":", 1)[0]
 
     @property
     def qualname(self) -> str:
+        """Qualified-name half of the ``module:qualname`` target."""
         return self.target.split(":", 1)[1]
 
 
 @dataclass(frozen=True)
 class RemoteWorkerSpec:
+    """Describes a remote L3 worker to attach via ``Worker.add_remote_worker``.
+
+    ``transport`` selects the data plane and is simulation-backed today; the
+    daemon rejects any other value.
+    """
+
     # endpoint is "host:port"; host must be a numeric IP (or "localhost").
     # Hostnames are rejected at add_remote_worker time — getaddrinfo resolution is
     # unbounded and uncancellable and would risk pinning startup on a hung DNS.
@@ -436,22 +450,28 @@ _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
 
 
 class _ChildProvEntry:
-    """Provenance record for one exact ``(worker_id, device_ptr)`` child pointer.
+    """Provenance record for one exact ``(worker_id, device_ptr)`` allocation base.
 
     Typed rather than a bare presence bit because the same ``(worker_id, ptr)``
     can carry more than one role at once: a ``malloc`` base and a CommDomain
     window / carved buffer pointer can legally alias the same device address.
     The key is live while ``malloc_owned or domain_allocation_ids``; only an
     exact ``malloc`` base is ``free``-able, while a domain pointer is revoked by
-    its domain's release. Interior pointers are never recorded, so a pointer
-    that merely lands inside a live allocation has no entry and is rejected.
+    its domain's release.
+
+    ``ptr`` is the allocation's base; each role also carries the allocation's
+    byte extent so a copy landing at ``base + offset`` can be validated against
+    ``[base, base + extent)``. ``malloc_size`` is the ``malloc`` extent (0 when
+    not malloc-owned); ``domain_allocation_ids`` maps each owning CommDomain
+    allocation id to the extent of the window / buffer recorded at this base.
     """
 
-    __slots__ = ("malloc_owned", "domain_allocation_ids")
+    __slots__ = ("malloc_owned", "malloc_size", "domain_allocation_ids")
 
     def __init__(self) -> None:
         self.malloc_owned: bool = False
-        self.domain_allocation_ids: set[int] = set()
+        self.malloc_size: int = 0
+        self.domain_allocation_ids: dict[int, int] = {}
 
     def is_live(self) -> bool:
         """True iff this entry still carries a role. A role-less entry is dead —
@@ -459,6 +479,15 @@ class _ChildProvEntry:
         entry momentarily left empty (e.g. an interrupted revoke) never
         re-authorizes a freed pointer."""
         return self.malloc_owned or bool(self.domain_allocation_ids)
+
+    def live_extent(self) -> int:
+        """Byte extent of the largest live role recorded at this base. A copy
+        range is admitted iff it fits within ``[base, base + live_extent())``,
+        so aliased roles of differing sizes admit up to the widest of them."""
+        extent = self.malloc_size if self.malloc_owned else 0
+        if self.domain_allocation_ids:
+            extent = max(extent, *self.domain_allocation_ids.values())
+        return extent
 
 
 @dataclass
@@ -1534,7 +1563,14 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # it in Python is N×40B of avoidable work and a permanent
             # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
             # is the source of truth.
-            cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+            cw._impl.run_from_blob(
+                cid,
+                mailbox_addr + _OFF_TASK_ARGS_BLOB,
+                _MAILBOX_ARGS_CAPACITY,
+                cfg,
+                mailbox_addr + _OFF_ACCEPTED,
+                _TASK_ACCEPTED,
+            )
         except Exception as e:  # noqa: BLE001
             code = 1
             msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -1903,9 +1939,10 @@ class _CloseAttempt:
 
     Teardown is single-shot and terminal: once it *runs* (``_teardown_attempted``
     latches True), an un-reclaimed resource LEAKS — a later close() never re-drives
-    a half-torn tree. The one retry path is a *drain-timeout*, which leaves
-    teardown UN-attempted and the tree intact; a later close() may then drive
-    drain+teardown once the in-flight operation finishes.
+    a half-torn tree. Teardown stays UN-attempted, with the tree intact and a
+    later close() free to drive drain+teardown, only where the drain itself did
+    not complete: in-flight leases outlived the cleanup budget, or an async
+    interruption left an accepted run fence undrained.
     """
 
     __slots__ = ("done", "error", "incomplete")
@@ -1967,6 +2004,8 @@ class RunHandle:
         self._resources = resources if resources is not None else _RunResources()
         self._cv = threading.Condition()
         self._wait_in_progress = False
+        self._accept_wait_in_progress = False
+        self._launch_accepted = False
         self._terminal = False
         self._error: BaseException | None = None
 
@@ -1979,6 +2018,8 @@ class RunHandle:
         handle._resources = _RunResources()
         handle._cv = threading.Condition()
         handle._wait_in_progress = False
+        handle._accept_wait_in_progress = False
+        handle._launch_accepted = True
         handle._terminal = True
         handle._error = None
         return handle
@@ -2064,6 +2105,20 @@ class RunHandle:
                 self._cv.notify_all()
             raise TimeoutError("RunHandle.wait() timed out")
 
+        # An acceptance waiter that already captured this run id must leave the
+        # native wait before finalize releases that id. It is terminal now, so
+        # this is only a short ownership hand-off and does not serialize device
+        # execution with acceptance waiting.
+        try:
+            with self._cv:
+                while self._accept_wait_in_progress:
+                    self._cv.wait(timeout=_RUN_HANDLE_WAIT_RECHECK_S)
+        except BaseException:
+            self._wait_in_progress = False
+            with self._cv:
+                self._cv.notify_all()
+            raise
+
         # Cleanup runs exactly once, on this waiter, and its outcome IS the
         # handle's result: an interruption mid-finalize is cached like any other
         # error rather than lost, so the publication below is unconditional.
@@ -2074,8 +2129,10 @@ class RunHandle:
         self._error = error
         self._run_id = None
         self._keepalive = None
+        self._launch_accepted = True
         self._terminal = True
         self._wait_in_progress = False
+        self._accept_wait_in_progress = False
         with self._cv:
             self._cv.notify_all()
         if error is not None:
@@ -2092,6 +2149,30 @@ class RunHandle:
         except Exception:
             # The result remains cached for this handle's public wait/result.
             pass
+
+    def _wait_for_acceptance(self) -> None:
+        """Wait until this run's dispatches cross their acceptance boundary."""
+        with self._cv:
+            while not self._terminal and self._accept_wait_in_progress:
+                self._cv.wait(timeout=_RUN_HANDLE_WAIT_RECHECK_S)
+            if self._terminal or self._launch_accepted:
+                return
+            self._accept_wait_in_progress = True
+            run_id = self._run_id
+
+        assert run_id is not None
+        try:
+            self._worker._wait_run_handle_accepted(run_id)
+        except BaseException:
+            self._accept_wait_in_progress = False
+            with self._cv:
+                self._cv.notify_all()
+            raise
+
+        self._launch_accepted = True
+        self._accept_wait_in_progress = False
+        with self._cv:
+            self._cv.notify_all()
 
 
 def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
@@ -2396,6 +2477,16 @@ class Worker:
         return worker_id
 
     def add_remote_worker(self, spec: RemoteWorkerSpec) -> int:
+        """Register a remote L3 worker and return its NEXT_LEVEL worker id.
+
+        Must be called before ``init()`` — the topology freezes there — and only
+        on a ``level >= 4`` parent. ``spec.endpoint`` is validated here rather
+        than at activation, so a bad address fails before any process is forked;
+        its host must be a numeric IPv4 address or ``localhost``. IPv6 is not
+        reachable here: the endpoint is parsed as a single ``host:port`` pair, so
+        a literal carrying more than one colon is rejected before the numeric
+        check runs (see ``RemoteWorkerSpec``).
+        """
         # Hold the lifecycle lock across the state check and the topology
         # mutation so a concurrent init() cannot freeze the topology snapshot
         # between them.
@@ -2737,6 +2828,11 @@ class Worker:
         )
 
     def remote_malloc(self, *, worker: int, nbytes: int) -> RemoteBufferHandle:
+        """Allocate ``nbytes`` on a started remote worker and return an owner handle.
+
+        ``nbytes`` must be positive. The target remote worker must already be
+        started, so this is callable only after ``init()``.
+        """
         worker_id = int(worker)
         size = int(nbytes)
         if size <= 0:
@@ -2757,6 +2853,14 @@ class Worker:
             )
 
     def remote_free(self, handle: RemoteBufferHandle) -> None:
+        """Free an owner remote allocation.
+
+        Idempotent: freeing an already-released handle is a no-op. Rejects
+        imported handles (use ``remote_release_import``) and ``HOST_INLINE``
+        handles, which are not remote allocations. If the buffer is still
+        referenced by a live task slot or by an outstanding import, the free is
+        recorded and deferred until those references drop rather than issued now.
+        """
         if not isinstance(handle, RemoteBufferHandle):
             raise TypeError("expected a RemoteBufferHandle returned by Worker.remote_malloc/import")
         if handle.address_space == RemoteAddressSpace.HOST_INLINE:
@@ -2778,6 +2882,11 @@ class Worker:
             handle._mark_released()
 
     def remote_copy_to(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
+        """Copy ``nbytes`` from host memory into an owner remote buffer.
+
+        Requires an owner handle, not an imported one. ``offset + nbytes`` must
+        fall within ``handle.nbytes``.
+        """
         with self._operation_lease("remote_copy_to"):
             self._require_live_remote_buffer(handle)
             if handle.is_imported:
@@ -2800,6 +2909,11 @@ class Worker:
             )
 
     def remote_copy_from(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
+        """Copy ``nbytes`` out of an owner remote buffer into host memory.
+
+        Requires an owner handle, not an imported one. ``offset + nbytes`` must
+        fall within ``handle.nbytes``.
+        """
         with self._operation_lease("remote_copy_from"):
             self._require_live_remote_buffer(handle)
             if handle.is_imported:
@@ -2830,6 +2944,12 @@ class Worker:
         access: str | int = "readwrite",
         transport_profile: str = "sim",
     ) -> RemoteBufferExport:
+        """Export a range of an owner buffer so another worker can import it.
+
+        ``nbytes=None`` exports from ``offset`` to the end of the buffer. The
+        requested ``access`` must be a subset of the handle's own access flags —
+        an export can narrow permissions but never widen them.
+        """
         with self._operation_lease("remote_export"):
             return self._remote_export_locked(
                 handle, offset=offset, nbytes=nbytes, access=access, transport_profile=transport_profile
@@ -2889,6 +3009,11 @@ class Worker:
     def remote_import(
         self, exported: RemoteBufferExport, *, worker: int, access: str | int | None = None
     ) -> RemoteBufferHandle:
+        """Import an exported buffer on ``worker`` and return an imported handle.
+
+        ``access`` defaults to the export's own flags. Rejects an export minted
+        by a different ``Worker`` and one whose owner buffer has been freed.
+        """
         # Argument validation (type / forged / stale) is independent of lifecycle
         # and runs before admission; the lease guards the actual transport.
         if not isinstance(exported, RemoteBufferExport):
@@ -2957,6 +3082,12 @@ class Worker:
             raise
 
     def remote_release_import(self, handle: RemoteBufferHandle) -> None:
+        """Release an imported remote handle.
+
+        Idempotent, and rejects owner handles (use ``remote_free``). Deferred
+        while a live task slot still references it. Releasing the last import of
+        a buffer whose owner already called ``remote_free`` completes that free.
+        """
         if not isinstance(handle, RemoteBufferHandle):
             raise TypeError("expected a RemoteBufferHandle returned by Worker.remote_import")
         if not handle.is_imported:
@@ -4092,7 +4223,7 @@ class Worker:
                     f"has no eligible dispatch target (needs {need})"
                 )
 
-    def init(self, prewarm_config=None, *, _startup_deadline: float | None = None) -> None:
+    def init(self, prewarm_config: CallConfig | None = None, *, _startup_deadline: float | None = None) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
         For an L3+ worker ``init`` is the single startup submission point: it
@@ -5222,11 +5353,14 @@ class Worker:
         # one of them is validated against its owning chip. Revoked by
         # _release_domain_now just before the backend free (a commit barrier),
         # not by the deferred marker — so the deferred window stays dispatchable.
+        buf_nbytes = {b.name: int(b.nbytes) for b in buffers}
         with self._child_prov_lock:
             for chip_idx, ctx in contexts.items():
-                self._child_prov_record_domain(chip_idx, int(ctx.local_window_base), allocation_id)
-                for buf_ptr in ctx.buffer_ptrs.values():
-                    self._child_prov_record_domain(chip_idx, int(buf_ptr), allocation_id)
+                self._child_prov_record_domain(
+                    chip_idx, int(ctx.local_window_base), allocation_id, int(ctx.actual_window_size)
+                )
+                for buf_name, buf_ptr in ctx.buffer_ptrs.items():
+                    self._child_prov_record_domain(chip_idx, int(buf_ptr), allocation_id, buf_nbytes[buf_name])
         return handle
 
     def _release_domain_handle(self, handle: CommDomainHandle, resources: _RunResources) -> None:
@@ -5489,17 +5623,20 @@ class Worker:
     # successful native alloc; revoke before the native free.
     # ------------------------------------------------------------------
 
-    def _child_prov_record_malloc(self, worker_id: int, ptr: int) -> None:
-        """Mark ``(worker_id, ptr)`` as a live malloc base (after a successful malloc)."""
+    def _child_prov_record_malloc(self, worker_id: int, ptr: int, size: int) -> None:
+        """Mark ``(worker_id, ptr)`` as a live malloc base spanning ``size`` bytes
+        (after a successful malloc)."""
         entry = self._child_alloc_prov.get((worker_id, ptr))
         if entry is None:
             # Fully initialise the role BEFORE inserting, so the dict never holds
             # a role-less (dead) entry even if an async unwind lands here.
             entry = _ChildProvEntry()
             entry.malloc_owned = True
+            entry.malloc_size = size
             self._child_alloc_prov[(worker_id, ptr)] = entry
         else:
             entry.malloc_owned = True
+            entry.malloc_size = size
 
     def _child_prov_require_malloc_base(self, worker_id: int, ptr: int, *, api: str) -> None:
         """Require ``(worker_id, ptr)`` to be an exact live malloc base (freeable).
@@ -5528,22 +5665,46 @@ class Worker:
         else:
             del self._child_alloc_prov[key]  # last role — delete directly, no empty state
 
-    def _child_prov_require_live(self, worker_id: int, ptr: int, *, api: str) -> None:
-        """Require ``(worker_id, ptr)`` to be a live child pointer (malloc or domain)."""
-        entry = self._child_alloc_prov.get((worker_id, ptr))
-        if entry is None or not entry.is_live():
-            raise ValueError(
-                f"Worker.{api}: device pointer 0x{ptr:x} is not a live allocation on worker "
-                f"{worker_id} (wrong worker, freed/stale, or an interior pointer)"
-            )
+    def _child_prov_require_live_range(self, worker_id: int, ptr: int, nbytes: int, *, api: str) -> None:
+        """Require ``[ptr, ptr + nbytes)`` to lie wholly within one live allocation
+        (malloc or domain) on ``worker_id``.
 
-    def _child_prov_record_domain(self, worker_id: int, ptr: int, allocation_id: int) -> None:
-        """Record a CommDomain window / buffer pointer at exact ``(worker_id, ptr)``."""
+        Accepts an interior range of a live allocation — ``base + offset`` up to
+        the allocation's extent — so a partial update of a persistent buffer is
+        valid. Still rejects a wrong-worker pointer, a freed/stale pointer, and a
+        range that overruns its allocation. Python ints are unbounded, so the
+        ``ptr + nbytes`` bound is exact with no wraparound.
+
+        A copy to the exact base is the common case and resolves in O(1); only an
+        interior address falls back to scanning the worker's live allocations.
+        """
+        if nbytes < 0:
+            raise ValueError(f"Worker.{api}: nbytes must be non-negative, got {nbytes}")
+        exact = self._child_alloc_prov.get((worker_id, ptr))
+        if exact is not None and exact.is_live() and nbytes <= exact.live_extent():
+            return
+        end = ptr + nbytes
+        for (wid, base), entry in self._child_alloc_prov.items():
+            if wid != worker_id or base >= ptr or not entry.is_live():
+                continue
+            if end <= base + entry.live_extent():
+                return
+        raise ValueError(
+            f"Worker.{api}: device range [0x{ptr:x}, 0x{ptr:x}+{nbytes}) is not contained in a live "
+            f"allocation on worker {worker_id} (wrong worker, freed/stale, or out of allocation range)"
+        )
+
+    def _child_prov_record_domain(self, worker_id: int, ptr: int, allocation_id: int, extent: int) -> None:
+        """Record a CommDomain window / buffer pointer at exact ``(worker_id, ptr)``,
+        spanning ``extent`` bytes from that base. A carved buffer at offset 0
+        aliases its window's base under the same allocation id; keep the widest
+        extent so recording the smaller buffer never narrows the window's range."""
         entry = self._child_alloc_prov.get((worker_id, ptr))
         if entry is None:
             entry = _ChildProvEntry()
             self._child_alloc_prov[(worker_id, ptr)] = entry
-        entry.domain_allocation_ids.add(allocation_id)
+        prior = entry.domain_allocation_ids.get(allocation_id, 0)
+        entry.domain_allocation_ids[allocation_id] = max(prior, extent)
 
     def _child_prov_drop_domain(self, allocation_id: int) -> None:
         """Drop every pointer recorded by a CommDomain allocation (at the start of
@@ -5553,7 +5714,7 @@ class Worker:
             if allocation_id not in entry.domain_allocation_ids:
                 continue
             if entry.malloc_owned or len(entry.domain_allocation_ids) > 1:
-                entry.domain_allocation_ids.discard(allocation_id)  # other roles remain
+                del entry.domain_allocation_ids[allocation_id]  # other roles remain
             else:
                 del self._child_alloc_prov[key]  # last role — delete directly, no empty state
 
@@ -5622,7 +5783,7 @@ class Worker:
                 # provenance is keyed on the canonical worker 0.
                 with self._child_prov_lock:
                     ptr = self._chip_worker.malloc(size)
-                    self._child_prov_record_malloc(0, int(ptr))
+                    self._child_prov_record_malloc(0, int(ptr), int(size))
                     return ptr
             self._check_chip_worker_id(worker_id)
             assert self._orch is not None
@@ -5651,7 +5812,7 @@ class Worker:
             if self.level == 2:
                 assert self._chip_worker is not None
                 with self._child_prov_lock:
-                    self._child_prov_require_live(0, int(dst), api="copy_to")
+                    self._child_prov_require_live_range(0, int(dst), int(size), api="copy_to")
                     self._chip_worker.copy_to(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
@@ -5664,7 +5825,7 @@ class Worker:
             if self.level == 2:
                 assert self._chip_worker is not None
                 with self._child_prov_lock:
-                    self._child_prov_require_live(0, int(src), api="copy_from")
+                    self._child_prov_require_live_range(0, int(src), int(size), api="copy_from")
                     self._chip_worker.copy_from(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
@@ -5989,8 +6150,9 @@ class Worker:
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
 
-        Only one live device run is admitted: a later submission waits for the
-        previous handle's fence and cleanup before building its DAG.
+        Graph construction remains serialized. A later submission waits until
+        prior dispatches are accepted; completion and cleanup stay attached to
+        each returned handle.
         """
         with self._operation_lease("submit"):
             return self._submit_locked(callable, args, config)
@@ -6017,13 +6179,12 @@ class Worker:
             return RunHandle._completed(self)
 
         with self._submit_mu:
-            # Cleanup is Worker-global while only one live device run is
-            # admitted. Drain prior handles before a new callback can mutate
-            # those resources; errors remain attached only to their origin.
+            # Graph callbacks are serialized, but accepted runs may remain live:
+            # their Python resources are isolated in each RunHandle.
             with self._hierarchical_start_cv:
                 prior_handles = tuple(self._accepted_run_handles)
             for handle in prior_handles:
-                handle._wait_for_serialization()
+                handle._wait_for_acceptance()
             return self._submit_l3_locked(callable, args, cfg)
 
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
@@ -6079,6 +6240,10 @@ class Worker:
             self._orch._wait_run(run_id)
             return True
         return self._orch._wait_run_for(run_id, timeout)
+
+    def _wait_run_handle_accepted(self, run_id: int) -> None:
+        assert self._orch is not None
+        self._orch._wait_run_accepted(run_id)
 
     def _finalize_run_handle(
         self, handle: RunHandle, run_id: int, native_error: BaseException | None
@@ -6155,12 +6320,12 @@ class Worker:
 
     @property
     def run_stream_set_create_count(self) -> int:
-        """L2 only: number of run stream sets the bound runner has created.
+        """L2 only: number of AICore run streams the runner has created.
 
-        A set belongs to a pipeline slot and is reused for every run on that
-        slot, so a worker that has served any number of runs reports 1.
-        Returns 0 on non-L2 workers and on platforms whose runs use the
-        persistent bootstrap stream pair (simulation, a5).
+        AICPU streams belong to pipeline slots for the worker's lifetime, while
+        each run creates and retires its own AICore stream, so this advances
+        once per run. Returns 0 on non-L2 workers and on platforms whose runs
+        use the persistent bootstrap stream pair (simulation, a5).
         """
         if self.level != 2 or self._chip_worker is None:
             return 0
@@ -6214,6 +6379,26 @@ class Worker:
         return ", ".join(parts) if parts else "(none)"
 
     def close(self) -> None:  # noqa: PLR0912, PLR0915 -- lifecycle linearization: reentrancy / init-guard / join / owner / claim / drain / teardown
+        """Release this worker's resources. Terminal and single-shot.
+
+        A permanent commitment, not a reversible attempt: CLOSED is published
+        atomically and never reverts to READY, and the leased live-tree APIs are
+        rejected from then on. Put the call in a ``finally`` — a worker that is
+        never closed keeps its device held.
+
+        - Reentrant ``close()`` from inside a leased operation is rejected.
+        - ``close()`` during an in-progress ``init()`` fails fast; this worker
+          does not cancel initialization. Wait for READY or FAILED.
+        - A concurrent ``close()`` joins the in-flight attempt and observes its
+          result; teardown never runs twice at once.
+        - Teardown is single-shot. Once it runs, a later ``close()`` re-raises
+          the same result rather than re-driving a half-torn tree. A retry is
+          permitted only where the drain did not complete and so left teardown
+          un-attempted and the tree intact: either in-flight leases outlived
+          the cleanup budget, or an asynchronous interruption left an accepted
+          run fence undrained.
+        - Native teardown runs on the ``init()``-owner thread, being device-bound.
+        """
         # close() is a permanent commitment against a resource, not a reversible
         # attempt: it publishes CLOSED atomically (the sole public admission
         # fence — the leased live-tree APIs are rejected once CLOSED) and NEVER
@@ -6225,9 +6410,11 @@ class Worker:
         #     result; the same worker's teardown never runs twice at once;
         #   - teardown is single-shot and TERMINAL: once it runs, an un-reclaimed
         #     resource leaks and a later close() re-raises the same result — it
-        #     never re-drives a half-torn tree. Only a drain-timeout (teardown
-        #     un-attempted, tree intact) lets a later close() retry once the
-        #     in-flight op finishes; a tree with a live op is never torn down;
+        #     never re-drives a half-torn tree. A later close() may retry only
+        #     where the drain left teardown un-attempted and the tree intact —
+        #     leases outliving the budget, or an async interruption leaving an
+        #     accepted run fence undrained; a tree with a live op is never torn
+        #     down;
         #   - native teardown runs only on the init-owner thread (device-bound).
         # `attempt` is None until the claim installs it. The pre-claim checks
         # raise/return before that, so the finally skips completion for them. From
@@ -6300,7 +6487,8 @@ class Worker:
                 # rejects new leases; a tree with a live op is never torn down.
                 # If an op outlives the budget, teardown stays UN-attempted and
                 # the tree intact so a later close() can retry once it drains —
-                # the one retryable close() path.
+                # one of the two paths that keep close() retryable (the other is
+                # an async interruption leaving an accepted run fence undrained).
                 if self._active_ops > 0:
                     drain_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
                     while self._active_ops > 0:

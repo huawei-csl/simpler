@@ -123,6 +123,20 @@ typedef struct PipelineContract {
     PipelineResource resources[PTO_PIPELINE_MAX_RESOURCES];
 } PipelineContract;
 
+/**
+ * Ownership token for one pipeline resource slot.
+ *
+ * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
+ * time that slot is leased, so delayed completion or cleanup from an older run
+ * cannot mutate resources now owned by its successor. Generation zero is
+ * reserved for an invalid/uninitialised lease.
+ */
+typedef struct PipelineSlotLease {
+    uint32_t slot_id;
+    uint32_t reserved;
+    uint64_t generation;
+} PipelineSlotLease;
+
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
@@ -256,7 +270,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * Per-stage run timing is not returned — the platform emits it as `[STRACE]`
  * log markers (see docs/dfx/host-trace.md).
  *
- * `config` carries block_dim (0 = auto), aicpu_thread_num, the five diagnostic
+ * `config` carries aicpu_thread_num, the five diagnostic
  * enables + output_prefix, and the per-task ring sizing overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a
  * per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT entries; 0 = unset,
@@ -270,6 +284,33 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 );
+
+/** Select the per-run/exec-handle slot used by the next synchronous run. */
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, uint32_t slot_id);
+
+/** Select the HOST_PER_RUN arena bank used by the next synchronous run. */
+int select_arena_bank_ctx(DeviceContextHandle ctx, uint32_t bank_id);
+
+/**
+ * Committed GM heap base of one arena bank, or 0 when that bank has never been
+ * committed or the platform keeps a single shared arena set. Reports which
+ * device allocation a bank actually owns; changes nothing.
+ */
+uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id);
+
+/**
+ * Retained temporary-buffer address held for one pipeline slot, or 0 while that
+ * slot holds none. Reports which staging buffer a slot actually owns; changes
+ * nothing.
+ */
+uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id);
+
+/**
+ * Bind an optional host state word that the runner publishes after both device
+ * kernels have been enqueued. Onboard runtimes may export this symbol; callers
+ * must fall back to completion when it is absent.
+ */
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value);
 
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of
@@ -307,11 +348,10 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
 size_t get_host_dlopen_count(DeviceContextHandle ctx);
 
 /**
- * Number of run stream sets the runner bound to `ctx` has created. A set
- * belongs to a pipeline slot and is reused for every run on that slot, so a
- * runner that has served any number of runs on one slot reports 1. Returns 0
- * on platforms whose runs use the persistent bootstrap pair. Used by tests to
- * assert that repeated `simpler_run` calls do not rebuild the set per run.
+ * Number of AICore run streams the runner bound to `ctx` has created. AICPU
+ * streams belong to pipeline slots for the worker's lifetime; each run gets a
+ * freshly created AICore stream, so this advances once per run. Returns 0 on
+ * platforms whose runs use the persistent bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 

@@ -1,14 +1,20 @@
 # Python API reference
 
-The surface you write against, hand-maintained. There is no generated API
-reference in this repo, so treat the source as authoritative when the two
-disagree and fix this page in the same change.
+The surface you write against, hand-maintained: what `**config` keys `Worker`
+accepts, `CallConfig` defaults, and the argument-order footguns a generator
+cannot state. For the complete generated listing of every public symbol and
+signature, see the API pages on the
+[documentation site](https://hw-native-sys.github.io/simpler/user/reference/api/worker/).
+Treat the source as authoritative when the two disagree, and fix this page in the
+same change.
 
-Import paths matter: `simpler.__all__` currently exports only the logging
-helpers, so the runtime types are imported from their submodules.
+`Worker` is available from the package root; the remaining task and callable
+types live in `simpler.task_interface`. Both resolve on first access, so
+`import simpler` alone stays cheap and does not require the `_task_interface`
+extension.
 
 ```python
-from simpler.worker import Worker
+from simpler import Worker           # or: from simpler.worker import Worker
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
     CoreCallable, DataType, Tensor,
@@ -56,8 +62,8 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | ------ | ----- |
 | `malloc(size, worker_id=0) -> int` | Returns a device pointer as an integer |
 | `free(ptr, worker_id=0)` | |
-| `copy_to(dst, src, size, worker_id=0)` | H2D; `dst` is a device pointer, `src` a host address |
-| `copy_from(dst, src, size, worker_id=0)` | D2H; `dst` is the host address |
+| `copy_to(dst, src, size, worker_id=0)` | H2D; `dst` is a device pointer, `src` a host address. `dst` may be a `base + offset` interior address as long as `[dst, dst + size)` lies within one live allocation (partial update of a persistent buffer) |
+| `copy_from(dst, src, size, worker_id=0)` | D2H; `dst` is the host address. `src` may be an interior address whose `[src, src + size)` lies within one live device allocation |
 | `create_host_buffer(nbytes) -> HostBuffer` / `free_host_buffer(handle)` | Host-side buffer the device can reach |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 

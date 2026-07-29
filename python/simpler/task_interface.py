@@ -30,7 +30,13 @@ from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Annotation-only: `CallableHandle` is imported lazily at its use site, and
+    # PEP 563 keeps these annotations as strings, so nothing is imported at
+    # runtime.
+    from .callable_identity import CallableHandle
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -163,6 +169,13 @@ COMM_MAX_RANK_NUM = 64
 
 
 class RemoteAddressSpace(IntEnum):
+    """How a remote buffer's bytes are reached.
+
+    ``HOST_INLINE`` carries the payload in the message itself rather than
+    naming remote memory. ``REMOTE_WINDOW`` and ``UB_LDST`` are protocol
+    placeholders: the shipped transport is simulation-backed.
+    """
+
     HOST_INLINE = 1
     REMOTE_DEVICE = 2
     REMOTE_WINDOW = 3
@@ -177,6 +190,22 @@ _REMOTE_BUFFER_EXPORT_TOKEN = object()
 
 
 class RemoteBufferHandle:
+    """A reference to memory on a remote L3 worker.
+
+    Returned by ``Worker.remote_malloc`` (an *owner* handle) or by
+    ``Worker.remote_import`` (an *imported* handle, told apart by
+    ``is_imported``). The two are not interchangeable: owner handles are freed
+    with ``remote_free``, imported ones with ``remote_release_import``.
+
+    ``RemoteTensorRef.host_inline`` produces a third form, with
+    ``address_space`` of ``HOST_INLINE``: it carries its bytes in the message
+    and names no remote allocation, so neither release call applies —
+    ``remote_free`` rejects it outright and it is never ``is_imported``.
+
+    Construct only through ``Worker`` or ``RemoteTensorRef.host_inline``; the
+    constructor is token-guarded.
+    """
+
     __slots__ = (
         "_worker_id",
         "_owner_worker_id",
@@ -328,34 +357,42 @@ class RemoteBufferHandle:
 
     @property
     def worker_id(self) -> int:
+        """Worker holding this reference — the importer, for an imported handle."""
         return self._worker_id
 
     @property
     def owner_worker_id(self) -> int:
+        """Worker that owns the underlying allocation."""
         return self._owner_worker_id
 
     @property
     def import_id(self) -> int:
+        """Nonzero on an imported handle; ``0`` on an owner handle."""
         return self._import_id
 
     @property
     def address_space(self) -> RemoteAddressSpace:
+        """How these bytes are reached; see ``RemoteAddressSpace``."""
         return self._address_space
 
     @property
     def nbytes(self) -> int:
+        """Size of the allocation in bytes, or of the payload for ``HOST_INLINE``."""
         return self._nbytes
 
     @property
     def released(self) -> bool:
+        """Whether the handle has been freed or released."""
         return self._released
 
     @property
     def access_flags(self) -> int:
+        """Permitted access as a read/write bitmask; an export may only narrow it."""
         return self._access_flags
 
     @property
     def is_imported(self) -> bool:
+        """Whether this came from ``remote_import`` rather than ``remote_malloc``."""
         return self._import_id != 0
 
     def _mark_released(self) -> None:
@@ -524,26 +561,32 @@ class RemoteBufferExport:
 
     @property
     def owner_worker_id(self) -> int:
+        """Worker that owns the exported allocation."""
         return self._owner_worker_id
 
     @property
     def address_space(self) -> RemoteAddressSpace:
+        """How the exported bytes are reached."""
         return self._address_space
 
     @property
     def offset(self) -> int:
+        """Start of the exported range within the owner buffer."""
         return self._offset
 
     @property
     def nbytes(self) -> int:
+        """Length of the exported range in bytes."""
         return self._nbytes
 
     @property
     def access_flags(self) -> int:
+        """Access granted here; a subset of the owner handle's flags."""
         return self._access_flags
 
     @property
     def transport_profile(self) -> str:
+        """Transport this export was minted for."""
         return self._transport_profile
 
     def __repr__(self) -> str:
@@ -585,6 +628,8 @@ class _RemoteTaskArgsSidecar:
 
 @dataclass(frozen=True)
 class RemoteTensorRef:
+    """A tensor argument that lives on, or travels to, a remote worker."""
+
     handle: RemoteBufferHandle
     offset: int = 0
     shape: tuple[int, ...] = ()
@@ -620,6 +665,11 @@ class RemoteTensorRef:
 
     @classmethod
     def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> RemoteTensorRef:
+        """Build a reference whose payload travels inline, naming no remote memory.
+
+        ``payload`` length must equal the byte size implied by ``shape`` and
+        ``dtype``, and shape entries must be non-negative.
+        """
         data = bytes(payload)
         shape_tuple = tuple(int(x) for x in shape)
         if any(x < 0 for x in shape_tuple):
@@ -847,6 +897,10 @@ class CommBufferSpec:
 
 @dataclass
 class ChipDomainContext:
+    """Per-domain view handed to a chip worker: its rank within the domain and
+    the local slice of the symmetric window.
+    """
+
     name: str
     domain_rank: int
     domain_size: int
@@ -1011,7 +1065,18 @@ class ChipWorker:
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
 
-    def init(self, device_id, bins, log_level=None, log_info_v=None, prewarm_config=None, enable_sdma=False):
+    def init(
+        self,
+        device_id: int,
+        # Structurally typed: any object exposing the *_path attributes below.
+        # Not RuntimeBinaries — that lives in simpler_setup, which this package
+        # must not depend on.
+        bins: Any,
+        log_level: int | None = None,
+        log_info_v: int | None = None,
+        prewarm_config: CallConfig | None = None,
+        enable_sdma: bool = False,
+    ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
 
@@ -1205,7 +1270,13 @@ class ChipWorker:
                 raise
         return handle
 
-    def run(self, handle, args, config=None, **kwargs):
+    def run(
+        self,
+        handle: CallableHandle,
+        args: ChipStorageTaskArgs,
+        config: CallConfig | None = None,
+        **kwargs: Any,
+    ):
         """Launch a callable previously returned by ``register_callable``.
 
         Args:
@@ -1249,6 +1320,13 @@ class ChipWorker:
         # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
         self._impl.run(int(callable_id), args, config)
 
+    def _run_slot_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
+        if config is None:
+            config = CallConfig()
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
+
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
 
@@ -1264,8 +1342,29 @@ class ChipWorker:
 
     @property
     def run_stream_set_create_count(self):
-        """Number of run stream sets the bound runner has created."""
+        """Number of AICore run streams the bound runner has created."""
         return self._impl.run_stream_set_create_count
+
+    @property
+    def pipeline_depth(self):
+        return self._impl.pipeline_depth
+
+    @property
+    def runtime_slot_count(self):
+        return self._impl.runtime_slot_count
+
+    @property
+    def runtime_buffer_addrs(self):
+        """Address of each host Runtime staging buffer, in slot order."""
+        return list(self._impl.runtime_buffer_addrs)
+
+    def arena_bank_gm_heap_base(self, bank_id):
+        """Committed GM heap base of one arena bank, or 0 when uncommitted."""
+        return int(self._impl.arena_bank_gm_heap_base(int(bank_id)))
+
+    def retained_temp_addr(self, slot_id):
+        """Retained temporary-buffer address for one slot, or 0 when unheld."""
+        return int(self._impl.retained_temp_addr(int(slot_id)))
 
     def malloc(self, size):
         """Allocate memory. Returns a pointer (uint64)."""
@@ -1346,8 +1445,10 @@ class ChipWorker:
 
     @property
     def device_id(self):
+        """ACL device ordinal this worker is bound to."""
         return self._impl.device_id
 
     @property
     def initialized(self):
+        """Whether the underlying native worker has completed init."""
         return self._impl.initialized

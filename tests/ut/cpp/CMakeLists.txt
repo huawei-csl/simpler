@@ -119,6 +119,33 @@ function(add_a2a3_runtime_test name src)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
+function(add_a2a3_hbg_runtime_test name src)
+    add_executable(${name}
+        ${src}
+        ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/orchestration
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
 function(add_a2a3_orchestrator_runtime_test name src)
     add_executable(${name}
         ${src}
@@ -340,6 +367,19 @@ add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
+
+# Run-stream slot state machine: fresh AICore stream per run, and the handle a
+# failed destroy must keep. Header-only with injected create/destroy, so it
+# needs no runtime objects and no device.
+add_executable(test_run_stream_slots hierarchical/test_run_stream_slots.cpp)
+target_include_directories(test_run_stream_slots PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
+target_link_libraries(test_run_stream_slots PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_stream_slots COMMAND test_run_stream_slots)
+set_tests_properties(test_run_stream_slots PROPERTIES LABELS "no_hardware")
 
 # ---------------------------------------------------------------------------
 # Types / task_interface tests (src/common/task_interface/)
@@ -612,6 +652,7 @@ add_a2a3_test(test_task_timing_slots a2a3/test_task_timing_slots.cpp)
 
 # PTO2 runtime-linked tests
 add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_task_allocator.cpp)
 add_a2a3_runtime_test(test_dep_list_pool    a2a3/test_dep_list_pool.cpp)
 add_a2a3_runtime_test(test_scheduler_state  a2a3/test_scheduler_state.cpp)
 add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)

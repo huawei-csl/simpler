@@ -4,9 +4,18 @@ Index of every document under `docs/`, grouped by what you are trying to do.
 The top-level [README](../README.md) links only the handful of entry-point docs;
 this page is the complete map.
 
+These pages are also published as a searchable site at
+<https://hw-native-sys.github.io/simpler/>, which adds a generated API reference
+for `simpler.worker`, `simpler.task_interface` and `simpler.orchestrator`. The
+site is built by `.github/workflows/docs.yml`; `mkdocs.yml` owns its navigation,
+so a new page needs a `nav` entry there as well as a row here.
+
 New docs belong in one of the groups below, and in a subdirectory when the group
 already has one (`dfx/`, `hardware/`, `troubleshooting/`, `investigations/`).
 Add the row here in the same commit — an unlisted doc is invisible.
+
+**File names are kebab-case** (`chip-level-arch.md`), including when the doc is
+named after a code identifier that uses underscores.
 
 ## Start here
 
@@ -29,7 +38,7 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [Chip-Level Architecture (L2)](chip-level-arch.md) | Three-program model (host / AICPU / AICore), API layers, handshake |
-| [Hierarchical Level Runtime](hierarchical_level_runtime.md) | The L0–L6 level model and component composition |
+| [Hierarchical Level Runtime](hierarchical-level-runtime.md) | The L0–L6 level model and component composition |
 | [Task Flow](task-flow.md) | Callable / TaskArgs / CallConfig pass-through, `IWorker` |
 | [Orchestrator](orchestrator.md) | DAG submission: TensorMap, Scope, Ring, task state machine |
 | [Scheduler](scheduler.md) | DAG dispatch: wiring / ready / completion queues, dispatch loop |
@@ -83,7 +92,7 @@ changing simpler's own internals.
 | [CI Pipeline](ci.md) | Jobs, gating, and what each pipeline stage covers |
 | [Python Packaging](python-packaging.md) | Wheel layout, `simpler` vs `simpler_setup`, asset packaging |
 | [Compiler Sanitizers](sanitizers.md) | ASAN / UBSan / TSAN builds |
-| [Sim Multi-Device Isolation](sim_multi_device_isolation.md) | How the simulator isolates concurrent virtual devices |
+| [Sim Multi-Device Isolation](sim-multi-device-isolation.md) | How the simulator isolates concurrent virtual devices |
 
 ## When something is broken
 

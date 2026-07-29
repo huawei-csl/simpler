@@ -97,7 +97,7 @@ Building **on** simpler? Start at **[docs/user/](docs/user/README.md)** — how-
 | -------- | ----------- |
 | [Capability Survey](docs/capability-survey.md) | Status snapshot: what is shipped, gated, or design-only across topology (L2→L4), CANN launch, and comm engines |
 | [Chip-Level Architecture](docs/chip-level-arch.md) | L2 single-chip: three-program model (host/AICPU/AICore), API layers, handshake protocol |
-| [Hierarchical Level Runtime](docs/hierarchical_level_runtime.md) | L0–L6 level model, component composition (Orchestrator / Scheduler / Worker) |
+| [Hierarchical Level Runtime](docs/hierarchical-level-runtime.md) | L0–L6 level model, component composition (Orchestrator / Scheduler / Worker) |
 | [Task Flow](docs/task-flow.md) | End-to-end data flow: Callable / TaskArgs / CallConfig handles, IWorker interface |
 | [Orchestrator](docs/orchestrator.md) | DAG submission internals: submit flow, TensorMap, Scope, Ring, task state machine |
 | [Scheduler](docs/scheduler.md) | DAG dispatch internals: wiring/ready/completion queues, dispatch loop |
@@ -121,6 +121,6 @@ This project is licensed under the **CANN Open Software License Agreement Versio
 
 - [src/a2a3/platform/](src/a2a3/platform/) - Platform implementations
 - [src/a2a3/runtime/](src/a2a3/runtime/) - Runtime implementations
-- [examples/a2a3/](examples/a2a3/) - Examples organized by runtime
+- [examples/](examples/README.md) - Runnable examples, indexed: `workers/` for the raw `Worker` API, `a2a3/` and `a5/` for `@scene_test` kernels
 - [simpler_setup/](simpler_setup/) - SceneTestCase framework, runtime builder, kernel compiler
 - [python/](python/) - Python bindings and user-facing runtime API

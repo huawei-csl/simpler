@@ -10,7 +10,7 @@ rather than restating them:
 - Hardware substrate → [hardware/chip-architecture.md](hardware/chip-architecture.md),
   [hardware/mmio-performance.md](hardware/mmio-performance.md),
   [hardware/cache-coherency.md](hardware/cache-coherency.md)
-- Level model → [hierarchical_level_runtime.md](hierarchical_level_runtime.md)
+- Level model → [hierarchical-level-runtime.md](hierarchical-level-runtime.md)
 - Three-program model → [chip-level-arch.md](chip-level-arch.md)
 - AICPU launch mechanics → [aicpu-kernel-launch-mechanisms.md](aicpu-kernel-launch-mechanisms.md)
 - Comm domains / overlays → [comm-domain.md](comm-domain.md), [a5-sdma-overlay.md](a5-sdma-overlay.md)
@@ -33,7 +33,7 @@ be re-checked directly.
 ## Topology: L2 (host / AICPU / AICore) → L4 (host → remote host)
 
 The 7-level model (L6 Cluster … L0 Core) is declared in
-[hierarchical_level_runtime.md](hierarchical_level_runtime.md). Its own status
+[hierarchical-level-runtime.md](hierarchical-level-runtime.md). Its own status
 table is accurate: L3 implemented; L4 local implemented, remote simulation only;
 L5/L6 untested.
 
@@ -217,7 +217,7 @@ values yield `PTO2_ERROR_ASYNC_COMPLETION_INVALID`.
 
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
-| COUNTER (default) | registered | registered | **Shipped** — CI-run on both arches (`ci.yml:883`, `async_notify_demo` / `deferred_notify_demo`, no `skipif`) |
+| COUNTER (default) | registered | registered | **Shipped** — `async_notify_demo` runs onboard on both arches (`ci.yml:607`, `:884`); `deferred_notify_demo` runs in sim on both (`ci.yml:216`, `:310`). Routed by `@pytest.mark.platforms`, no `skipif` |
 | SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (dedicated CI step, `ci.yml:628-643`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |
