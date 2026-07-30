@@ -185,7 +185,7 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
 
 ### Step details
 
-**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring-slot--per-scope-heap-allocator). Blocks the Orch thread
+**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring-slot-and-per-scope-heap-allocator). Blocks the Orch thread
 if all slots are in-flight; this is the system's back-pressure mechanism.
 
 **Step 2 — store task data**: `TaskArgs` is moved (not copied). `config` is a
@@ -239,6 +239,10 @@ A group task is a single DAG node that executes in parallel on N workers.
 Each worker gets its own `TaskArgs`; the node only reaches COMPLETED when all
 N finish.
 
+Callers submit tasks that wait for same-level peers as one complete group.
+Submitting those members as independent singles can start one member before
+its peers are READY, leaving the running member unable to finish.
+
 ```cpp
 SubmitResult Orchestrator::submit_next_level_group(
     const CallableIdentity &callable, const std::vector<TaskArgs> &args_list,
@@ -259,10 +263,11 @@ routing.
 
 At dispatch time the Scheduler checks the group FIFO head and resolves every
 entry in `workers` to that exact stable worker ID. It dispatches only if the
-entire target set is idle; a blocked group reserves no partial worker set and
-does not cause a scan past the FIFO head. Each WorkerThread runs `worker->run`
-with its own `task_args_list[i]`. Completion remains aggregated at the group
-slot, so downstream consumers are released once after every member is terminal.
+entire target set is idle. A blocked group reserves all of its targets against
+new singles but does not cause a scan past the FIFO head. Each WorkerThread
+runs `worker->run` with its own `task_args_list[i]`. Completion remains
+aggregated at the group slot, so downstream consumers are released once after
+every member is terminal.
 
 ---
 
@@ -301,7 +306,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
 
 ---
 
-## 5. Ring (slot + per-scope heap allocator)
+## 5. Ring (slot and per-scope heap allocator)
 
 `Ring` owns three correlated per-task resources:
 

@@ -96,12 +96,16 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 TRB bind normally allocates one device buffer per ordinary non-child tensor
 during host-side argument staging, copies input bytes as needed, records
 copy-back metadata, and frees those temporary buffers during runtime
-validation. TRB replaces those per-run malloc/free pairs with a single
-runner-scoped retained buffer that is reused across runs. This is always on for
-TRB — an internal allocation optimization, not user-facing configuration.
+validation. TRB replaces those per-run malloc/free pairs with a retained buffer
+that its runs reuse. This is always on for TRB — an internal allocation
+optimization, not user-facing configuration.
+
+The buffer is owned per pipeline slot, not per runner: TRB's task args are
+`HOST_PER_RUN`, so two runs holding different slot leases stage through
+different buffers even though they share arena bank 0 for device scratch.
 
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
-`{addr, size}` slot across runs, exposed through two HostApi callbacks —
+`{addr, size}` slot per pipeline slot, exposed through two HostApi callbacks —
 `get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
 allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
 (`RetainedTempBump`).
@@ -334,7 +338,7 @@ This guarantees lookup only traverses valid entries — O(valid_entries_in_bucke
 
 Every time the orchestrator submits a task (Step 0 of `PTO2OrchestratorState::submit_task`), it calls `PTO2TensorMap::sync_tensormap`. When `last_task_alive` has advanced by more than `PTO2_TENSORMAP_CLEANUP_INTERVAL` (default 64) tasks since the last cleanup, `PTO2TensorMap::cleanup_retired` runs:
 
-This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`, allowing O(entries_per_task) cleanup without scanning the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
+This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`. A slot's chain can hold more than one task's entries: a task at `local_id + N * window` reuses the slot and prepends to the chain already there, and cleanup can lag that reuse. Cleanup therefore walks the chain and frees only the entries whose `producer_task_id` matches the retiring task, unlinking each and leaving the rest linked — O(entries_in_slot), with no scan of the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
@@ -585,7 +589,9 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
     sync_to_sm()  // release-store last_task_alive
 ```
 
-This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time.
+This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time. If a scheduler thread changes a ring head to `CONSUMED` but loses this try-lock, it sets the ring bit in `advance_pending_mask`. Scheduler no-progress iterations drain that mask: each pending ring retries the same in-order `advance_ring_pointers()` under `advance_lock`, leaves the bit set while the lock is still busy, and treats a successful watermark advance as scheduler progress.
+
+For ring-heap stall triage, a `CONSUMED` head whose ring bit is still set means no retry has acquired `advance_lock` and cleared the deferred request yet. If the bit clears and the published `last_task_alive` remains pinned, the stall is outside this deferred consumed-head advance path.
 
 ### 8.5 SchedulerContext
 

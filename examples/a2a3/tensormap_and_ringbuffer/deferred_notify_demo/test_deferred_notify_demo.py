@@ -7,13 +7,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L2 deferred completion + two-chip comm smoke test for a2a3sim."""
+"""L2 deferred completion + two-chip comm smoke test for a2a3, onboard and sim."""
 
 from __future__ import annotations
 
 import argparse
 import os
 
+import pytest
 import torch
 from simpler.task_interface import (
     ArgDirection,
@@ -171,8 +172,11 @@ def run(
         worker.close()
 
 
-def test_deferred_notify_demo() -> None:
-    assert run("a2a3sim", [0, 1]) == 0
+@pytest.mark.platforms(["a2a3", "a2a3sim"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(2)
+def test_deferred_notify_demo(st_device_ids, st_platform) -> None:
+    assert run(st_platform, [int(d) for d in st_device_ids]) == 0
 
 
 def main() -> int:
