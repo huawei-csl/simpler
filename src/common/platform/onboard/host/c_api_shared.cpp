@@ -319,9 +319,7 @@ int simpler_init(
     // seeded here by libsimpler_log.so's simpler_log_init() (runs earlier in
     // ChipWorker::init). Skipped when ASCEND_GLOBAL_LOG_LEVEL is externally
     // configured — CANN keeps that.
-    if (std::getenv("ASCEND_GLOBAL_LOG_LEVEL") == NULL) {
-        dlog_setlevel(-1, HostLogger::get_instance().level(), /*enableEvent*/ 0);
-    }
+    HostLogger::get_instance().configure_cann_log_level(dlog_setlevel);
 
     int rc;
     try {
@@ -656,6 +654,42 @@ int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state
         return static_cast<DeviceRunnerBase *>(ctx)->set_task_accepted_state(state, accepted_value);
     } catch (...) {
         return -1;
+    }
+}
+
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, uint32_t slot_id) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_pipeline_slot(slot_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int select_arena_bank_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_arena_bank(bank_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->arena_bank_gm_heap_base(bank_id);
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->retained_temp_addr(slot_id);
+    } catch (...) {
+        return 0;
     }
 }
 

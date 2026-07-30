@@ -368,6 +368,19 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
+# Run-stream slot state machine: fresh AICore stream per run, and the handle a
+# failed destroy must keep. Header-only with injected create/destroy, so it
+# needs no runtime objects and no device.
+add_executable(test_run_stream_slots hierarchical/test_run_stream_slots.cpp)
+target_include_directories(test_run_stream_slots PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/worker
+)
+target_link_libraries(test_run_stream_slots PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_stream_slots COMMAND test_run_stream_slots)
+set_tests_properties(test_run_stream_slots PROPERTIES LABELS "no_hardware")
+
 # ---------------------------------------------------------------------------
 # Types / task_interface tests (src/common/task_interface/)
 # ---------------------------------------------------------------------------
@@ -668,6 +681,12 @@ target_link_libraries(test_hbg_shared_memory PRIVATE
 )
 add_test(NAME test_hbg_shared_memory COMMAND test_hbg_shared_memory)
 set_tests_properties(test_hbg_shared_memory PROPERTIES LABELS "no_hardware")
+add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
+# PTO2TensorMap's out-of-line members (reserve_layout / init / valid_count) live
+# in this .cpp; no other add_a2a3_hbg_runtime_test target needs them.
+target_sources(test_hbg_tensormap PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/shared/pto_tensormap.cpp
+)
 add_a2a3_runtime_test(test_dep_list_pool    a2a3/test_dep_list_pool.cpp)
 add_a2a3_runtime_test(test_scheduler_state  a2a3/test_scheduler_state.cpp)
 add_a2a3_runtime_test(test_task_state       a2a3/test_task_state.cpp)
@@ -721,6 +740,28 @@ target_link_libraries(test_host_log_off PRIVATE
     pthread
 )
 add_test(NAME test_host_log_off COMMAND test_host_log_off)
+
+# Onboard uses CANN for DEBUG/INFO/WARN/ERROR but keeps TIMING on simpler's
+# finer threshold. The dlog stub makes the CANN levels available without SDK
+# headers or hardware.
+set(COMMON_PLATFORM_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/platform)
+add_executable(test_onboard_device_log_level
+    common/test_onboard_device_log_level.cpp
+    ${COMMON_PLATFORM_DIR}/onboard/aicpu/device_log.cpp
+)
+target_include_directories(test_onboard_device_log_level PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/stubs
+    ${COMMON_PLATFORM_DIR}/include
+    ${SIMPLER_LOG_DIR}/include
+)
+target_link_libraries(test_onboard_device_log_level PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_onboard_device_log_level COMMAND test_onboard_device_log_level)
+set_tests_properties(test_onboard_device_log_level PROPERTIES LABELS "no_hardware")
 
 # a2a3 host-side AICPU affinity selection (compute_allowed_cpus). Pure logic —
 # no CANN headers, no hardware: compile the probe .cpp alongside the test. The
