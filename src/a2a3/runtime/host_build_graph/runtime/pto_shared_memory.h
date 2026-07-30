@@ -215,12 +215,10 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
                     curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 curr_watermark = next;
-                cached_completed_watermark[thread_idx].val_ = next;
             } else {
                 // The acquire release semantics of the successful CAS guarantee that in the case of failure this thread
                 // also synchronises with the thread reporting the completion through the intermediary thread(s).
                 next = std::max(next, curr_watermark);
-                cached_completed_watermark[thread_idx].val_ = curr_watermark;
             }
         }
     }
