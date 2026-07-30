@@ -331,7 +331,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     // Initialize TraCR memory on the device
 #ifdef ENABLE_TRACR
-    // LOG_INFO_V9("[TraCR] thread[%d] DevAllocTraCR device_id_=%d", sched_getcpu(), device_id_);
+    // LOG_INFO("[TraCR] thread[%d] DevAllocTraCR device_id_=%d", sched_getcpu(), device_id_);
     rc = DevAllocTraCR(this, runtime);
     if (rc != 0) {
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
@@ -380,7 +380,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             dump += std::to_string(allowed[i]);
             if (i + 1 == allowed.size()) dump += "(last)";
         }
-        LOG_INFO_V0(
+        LOG_INFO(
             "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
             runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
         );
@@ -585,7 +585,7 @@ int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_
         }
     }
 
-    LOG_INFO_V0("=== launch_aicore_kernel ===");
+    LOG_INFO("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
     rc = launch_aicore_kernel(streams.aicore, kernel_args_.device_k_args_);
     if (rc != 0) {
@@ -594,7 +594,7 @@ int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_
         return rc;
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
+    LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
     rc = launch_aicpu_kernel(streams.aicpu, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {

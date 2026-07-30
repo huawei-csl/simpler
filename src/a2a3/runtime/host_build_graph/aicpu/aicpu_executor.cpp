@@ -173,7 +173,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     const bool is_leader = (tidx == 0);
 
     if (is_leader) {
-        LOG_INFO_V0("AicpuExecutor: Initializing");
+        LOG_INFO("AicpuExecutor: Initializing");
         // The 0 → 1 fixup already applied above.
         aicpu_thread_num_ = nthreads;
 
@@ -205,7 +205,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             return -1;
         }
         init_done_.store(true, std::memory_order_release);
-        LOG_INFO_V0("AicpuExecutor: Init complete");
+        LOG_INFO("AicpuExecutor: Init complete");
     } else {
         while (!init_done_.load(std::memory_order_acquire)) {
             if (init_failed_.load(std::memory_order_acquire)) return -1;
@@ -300,7 +300,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // only needs total_tasks and the scalar
             // orchestrator.inline_completed_tasks, both already valid.
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
-            LOG_INFO_V0("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
+            LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
         }
 
         // Publish "leader setup done" (SM attached, task count latched, queues
@@ -338,24 +338,30 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
             // 3S+1P: the last thread is the core-less resolution (P) thread; the
-            // rest are core-owning schedulers (S).
-            int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
-                                    sched_ctx_.run_resolution_thread(runtime, thread_idx) :
-                                    sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            // rest are core-owning schedulers (S). Each gets a distinct TraCR
+            // lane marker so the P thread's drain/reclaim work is separable from
+            // the S threads' dispatch in the trace.
+            int32_t completed;
+            if (thread_idx == sched_ctx_.p_thread_idx()) {
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Resolving, thread_idx);
+                completed = sched_ctx_.run_resolution_thread(runtime, thread_idx);
+            } else {
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
+                completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            }
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
             } else {
-                LOG_INFO_V0("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+                LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
             }
         }
     }
 
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
-    
+
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent.
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
@@ -363,7 +369,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         run_rc = shutdown_rc;
     }
 
-    LOG_INFO_V0("Thread %d: Completed", thread_idx);
+    LOG_INFO("Thread %d: Completed", thread_idx);
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
@@ -399,7 +405,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
 
-    LOG_INFO_V0("DeInit: Runtime execution state reset");
+    LOG_INFO("DeInit: Runtime execution state reset");
 
     init_done_.store(false, std::memory_order_release);
     init_failed_.store(false, std::memory_order_release);
@@ -411,7 +417,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     thread_idx_.store(0, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
 
-    LOG_INFO_V0("DeInit: AicpuExecutor reset complete");
+    LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
 
 // ===== Public Entry Point =====
@@ -440,7 +446,7 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
     (void)(runtime);
 
 #ifdef ENABLE_TRACR
-    LOG_INFO_V9(
+    LOG_INFO(
         "[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx,
         runtime->get_tracr_data()
     );
@@ -505,13 +511,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return -1;
     }
 
-    LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
+    LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
     // INIT TraCR all threads coming in
     TRACR_START();
-    LOG_INFO_V9(
-        "[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE
-    );
+    LOG_INFO("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE);
 
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
@@ -530,7 +534,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
+        LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
 
@@ -547,6 +551,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return rc;
     }
 
-    LOG_INFO_V0("%s", "aicpu_execute: Kernel execution completed successfully");
+    LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

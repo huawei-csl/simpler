@@ -267,7 +267,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
                 dump += std::to_string(allowed[i]);
                 if (i + 1 == allowed.size()) dump += "(orch)";
             }
-            LOG_INFO_V0(
+            LOG_INFO(
                 "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(), n_sched,
                 n_orch, launch_n, user_cpus.size()
             );
@@ -396,7 +396,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }
     }
 
-    LOG_INFO_V0("=== launch_aicore_kernel ===");
+    LOG_INFO("=== launch_aicore_kernel ===");
     rc = kernel_args_.init_device_kernel_args(mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_device_kernel_args failed: %d", rc);
@@ -409,7 +409,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         return rc;
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
+    LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     // launch_count = popcount(OCCUPY) from the topology probe — one thread
     // per user-schedulable cpu_id. The filter gate barriers exactly this
     // many threads (runtime.aicpu_launch_count is read on the device side
