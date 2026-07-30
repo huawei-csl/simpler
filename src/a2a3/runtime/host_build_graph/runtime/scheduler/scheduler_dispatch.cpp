@@ -941,11 +941,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
             int dummy_got;
             while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
                 for (int di = 0; di < dummy_got; di++) {
-#if SIMPLER_SCHED_PROFILING
                     (void)sched_->on_task_complete(*dummy_batch[di], thread_idx);
-#else
-                    (void)sched_->on_task_complete(*dummy_batch[di]);
-#endif
                     resolved_this_pass++;
                 }
             }
