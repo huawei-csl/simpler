@@ -191,6 +191,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         // the advance walk below. A completer that finishes out of order (local_id ahead of
         // the watermark) defers to whichever thread later completes the frontier task.
         if (curr_watermark != local_id) {
+            cached_completed_watermark[thread_idx].val_ = curr_watermark;
             return;
         }
 
@@ -206,12 +207,11 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
                     curr_watermark, next, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 // In case of failure, we hand off the update responsibility to the thread who succeeded
+                cached_completed_watermark[thread_idx].val_ = curr_watermark;
                 break;
             }
             // Thread fence required such that completed_watermark is written to GM before the next flag is read
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            cached_completed_watermark[thread_idx].val_ = next;
-
             if (not(next < submitted && is_completion_flag_set(thread_idx, next))) {
                 break;
             }
