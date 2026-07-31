@@ -62,7 +62,7 @@ jobs:
   # See docs/python-packaging.md and tools/verify_packaging.sh.
   packaging-matrix:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.examples_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -107,7 +107,7 @@ jobs:
   # ---------- Unit tests (no hardware, Python + C++) ----------
   ut:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -163,7 +163,7 @@ jobs:
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -257,7 +257,7 @@ jobs:
 
   st-sim-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true'
+    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -375,7 +375,7 @@ jobs:
   # corresponding profiling block — no cross-contamination from cmake cache.
   profiling-flags-smoke:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
+    if: (needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true') && needs.detect-changes.outputs.examples_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -473,7 +473,7 @@ jobs:
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
@@ -559,7 +559,7 @@ jobs:
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    if: needs.detect-changes.outputs.a2a3_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
     env:
@@ -597,32 +597,16 @@ jobs:
           # — which also runs the aicore_op_timeout fault-injection test — and run
           # them on their own dedicated device(s) in the SDMA step below, so an
           # SDMA fault's slow teardown can never mix with ordinary fault recovery.
-          SDMA_IGNORE="--ignore=examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo --ignore=examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
-          # qwen3_14b_decode runs all 40 Qwen3-14B decode layers against a 38 GiB
-          # fixture and takes ~5 min on its own — over half this sweep's 600 s
-          # session budget. It gets its own step below with its own budget, so the
-          # short timeout here keeps its job: catching a genuine hang.
-          HEAVY_IGNORE="--ignore=examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode"
+          #
+          # Selected by marker, not by path. `pytest --ignore=<moved path>` exits
+          # 0 and says nothing, so a rename used to drop the quarantine silently
+          # and land these back beside the fault-injection test. `-m` travels
+          # with the test instead.
           if [ "$(uname -m)" = "x86_64" ]; then
-            python -m pytest examples tests/st $SDMA_IGNORE $HEAVY_IGNORE --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+            python -m pytest examples tests/st -m "not sdma" --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
           else
             task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-              --run "python -m pytest examples tests/st $SDMA_IGNORE $HEAVY_IGNORE --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
-          fi
-
-      # qwen3_14b_decode is the full 40-layer Qwen3-14B decode — a 38 GiB fixture
-      # (x40-stacked weights + paged KV) and ~5 min wall. It runs here on its own
-      # device with its own session budget rather than eating the general sweep's.
-      - name: Qwen3-14B 40-layer decode (a2a3)
-        run: |
-          source /usr/local/Ascend/cann/set_env.sh
-          source .venv/bin/activate
-          QWEN_TEST="examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode"
-          if [ "$(uname -m)" = "x86_64" ]; then
-            python -m pytest $QWEN_TEST --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 1800
-          else
-            task-submit --timeout 3600 --max-time 3600 --device auto --device-num 1 \
-              --run "python -m pytest $QWEN_TEST --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1800"
+              --run "python -m pytest examples tests/st -m 'not sdma' --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
           fi
 
       # SDMA pytest — every SDMA test runs here on its own dedicated device(s),
@@ -635,7 +619,12 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          SDMA_TESTS="examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
+          # Selected by marker, so this step cannot drift from what the sweep
+          # deselects. Kept as a step of its own until #1425 is fixed: an
+          # AICore fault on a device that has provisioned SDMA still costs
+          # minutes, so these must not share a device with the fault-injection
+          # cases even though the in-session ordering already separates them.
+          SDMA_TESTS="examples tests/st -m sdma"
           if [ "$(uname -m)" = "x86_64" ]; then
             python -m pytest $SDMA_TESTS --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
           else
@@ -733,6 +722,9 @@ jobs:
       a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
       a5_changed: ${{ steps.check.outputs.a5_changed }}
       non_code_only: ${{ steps.check.outputs.non_code_only }}
+      st_affected: ${{ steps.check.outputs.st_affected }}
+      ut_affected: ${{ steps.check.outputs.ut_affected }}
+      examples_only: ${{ steps.check.outputs.examples_only }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -741,9 +733,19 @@ jobs:
       - name: Check file changes
         id: check
         run: |
-          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
+          # `run:` is `bash -e`, so a failing `git diff` would abort the step
+          # before the guard below and take every output with it — and a
+          # `detect-changes` failure leaves downstream `needs:` unsatisfied, which
+          # SKIPS the matrix rather than running it. Let only the exit status
+          # decide, and turn a failure into an empty list so the fail-open guard
+          # handles both cases identically.
+          if ! FILES=$(git diff --name-only \
+                ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}); then
+            echo "git diff failed (unresolved base/head SHA?); treating as unattributable"
+            FILES=""
+          fi
 
-          # Fail open, in ONE place. An empty diff means attribution is
+          # Fail open, in ONE place. No usable file list means attribution is
           # impossible — a PR with no files, or base/head SHAs that did not
           # resolve — so nothing below can be trusted and every flag must say
           # "affected". Deciding this per-flag is how the axes drifted apart:
@@ -751,10 +753,13 @@ jobs:
           # only, which left it false (UT and packaging ran) while both arch
           # flags independently came out false too (scene tests skipped).
           if [ -z "$FILES" ]; then
-            echo "Empty diff: cannot attribute changes, running everything"
+            echo "No usable file list: cannot attribute changes, running everything"
             echo "non_code_only=false" >> "$GITHUB_OUTPUT"
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+            echo "st_affected=true" >> "$GITHUB_OUTPUT"
+            echo "ut_affected=true" >> "$GITHUB_OUTPUT"
+            echo "examples_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -803,10 +808,54 @@ jobs:
             echo "All changes are a2a3-only or non-code; skipping a5"
           fi
 
+          # Test-category axis, same shape as the arch axis: a category is
+          # unaffected only when EVERY changed file belongs exclusively to the
+          # other one. Shared test infra (root conftest.py, pyproject.toml,
+          # simpler_setup/, tests/lint/) matches neither ST_ONLY nor UT_ONLY, so
+          # it correctly flips both. The two suites execute disjoint trees —
+          # `pytest examples tests/st` vs `pytest tests/ut` + the cpp ctest —
+          # and no unit test reads examples/ or tests/st/.
+          ST_ONLY='^(tests/st/|examples/)'
+          UT_ONLY='^tests/ut/'
+
+          # Scene tests are irrelevant only when every change is UT-exclusive.
+          ST_REMAINING=$(echo "$FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
+          if [ -n "$ST_REMAINING" ]; then
+            echo "st_affected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "st_affected=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are unit-test-only or non-code; skipping scene tests"
+          fi
+
+          # Unit tests are irrelevant only when every change is ST-exclusive.
+          UT_REMAINING=$(echo "$FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
+          if [ -n "$UT_REMAINING" ]; then
+            echo "ut_affected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ut_affected=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are scene-test/example-only or non-code; skipping unit tests"
+          fi
+
+          # `packaging-matrix` and `profiling-flags-smoke` build and install the
+          # product and then exercise it with a fixed, tiny payload. Nothing
+          # under examples/ reaches either: it is absent from both
+          # `wheel.packages` and the sdist `include`, and neither job reads the
+          # example corpus. Everything else stays in — `tests/` in particular,
+          # because `tools/verify_packaging.sh` runs one `tests/st/` file as an
+          # entry-point smoke and `tests/` is in the sdist include.
+          EXAMPLES_ONLY='^examples/'
+          NON_EXAMPLE=$(echo "$FILES" | grep -vE "$EXAMPLES_ONLY" | grep -vE "$NON_CODE" || true)
+          if [ -n "$NON_EXAMPLE" ]; then
+            echo "examples_only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "examples_only=true" >> "$GITHUB_OUTPUT"
+            echo "All changes are under examples/ or non-code; skipping packaging and the profiling-flag smoke"
+          fi
+
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.non_code_only != 'true'
+    if: needs.detect-changes.outputs.non_code_only != 'true' && needs.detect-changes.outputs.ut_affected == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
@@ -876,7 +925,7 @@ jobs:
 
   st-onboard-a5:
     needs: [detect-changes, pre-commit]
-    if: needs.detect-changes.outputs.a5_changed == 'true'
+    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
     env:
