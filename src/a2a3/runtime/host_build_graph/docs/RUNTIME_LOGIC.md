@@ -650,6 +650,15 @@ against that producer afterward can never find it `SENTINEL`-but-unflagged
 and register back onto it, which would otherwise spin forever (that producer
 will never run `on_mixed_task_complete` a second time to unstick it).
 
+**Early staging status.** Early producer propagation is currently disabled in
+HBG: `propagate_dispatch_fanin` is a stub, so the polling path does not populate
+`early_dispatch_queues` or `early_sync_start_queue`. The scheduler retains the
+early-staging machinery as a dormant mirror of the TMR runtime for a future
+consumer-pull publication path. If that path populates the queues, a
+`sync_start` cohort that fits one scheduler's idle and pending slots stages
+locally; larger cohorts use the generation-tagged global drain. This is not an
+active end-to-end HBG fast path today.
+
 **Phase 2 — Dispatch**:
 
 - At the top of the loop iteration: `retry_set_completion_flags(thread_idx)`

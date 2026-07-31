@@ -429,6 +429,19 @@ target_include_directories(test_buffer_pool_manager PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/log
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
+# MemoryAllocator byte-counter test: links the SIM impl (std::malloc/free,
+# no CANN) the same way test_buffer_pool_manager pulls unified_log.
+add_common_utils_test(test_memory_allocator common/test_memory_allocator.cpp)
+target_sources(test_memory_allocator PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/host/memory_allocator.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+)
+target_include_directories(test_memory_allocator PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+)
 add_common_utils_test(test_profiler_base common/test_profiler_base.cpp)
 target_sources(test_profiler_base PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
@@ -652,6 +665,7 @@ add_a2a3_test(test_task_timing_slots a2a3/test_task_timing_slots.cpp)
 
 # PTO2 runtime-linked tests
 add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
+add_a2a3_runtime_test(test_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_task_allocator.cpp)
 
 # host_build_graph's pto_shared_memory.cpp is not part of add_a2a3_hbg_runtime_test's
@@ -710,6 +724,7 @@ add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 # the unprefixed a2a3 runtime targets test_scheduler_state / test_ready_queue
 # / ...) already own those bare names.
 add_a5_runtime_test(test_a5_task_allocator   a5/test_task_allocator.cpp)
+add_a5_runtime_test(test_a5_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 add_a5_runtime_test(test_a5_dep_list_pool    a5/test_dep_list_pool.cpp)
 add_a5_runtime_test(test_a5_scheduler_state  a5/test_scheduler_state.cpp)
 add_a5_runtime_test(test_a5_task_state       a5/test_task_state.cpp)
