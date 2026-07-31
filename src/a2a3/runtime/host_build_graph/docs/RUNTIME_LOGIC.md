@@ -575,14 +575,22 @@ Each scheduler thread runs a tight loop with two main phases:
 - When `TASK_FIN_STATE` detected: call `on_subtask_complete`; when
   `completed_subtasks == total_required_subtasks`, call `on_mixed_task_complete`,
   which:
-  1. mirrors `task_state = COMPLETED` (host-visible) and sets the device
-     readiness truth `completion_flags[my_id] = my_id` (release);
-  2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
-     — reclassifying each waiter: a waiter whose remaining fanin is now all met
-     is pushed via `push_ready_routed`; otherwise it re-registers on its next
-     unmet producer. After the exchange the head is `SENTINEL`, so a consumer
-     registering concurrently re-checks the flags instead of being lost;
-  3. calls `update_completed_watermark(thread_idx, my_id)`, which CAS-advances
+  1. mirrors `task_state = COMPLETED` (host-visible);
+  2. calls `try_set_completion_flag` to set the device readiness truth
+     `completion_flags[my_id] = my_id` (release). On failure (the previous
+     occupant of `my_id`'s flag-slot isn't yet certified, see **Flag-slot
+     reuse** below) it pushes `my_id` onto
+     `failed_heap_of_set_completion_flag[thread_idx]` and returns immediately
+     — steps 3 and 4 below are skipped and become `my_id`'s one deferred
+     chance, taken later by `retry_set_completion_flags`;
+  3. on success, drains this task's intrusive **wake list** —
+     `wake_list_head.exchange(SENTINEL)` — via the shared `drain_wake_list`
+     helper, reclassifying each waiter: a waiter whose remaining fanin is now
+     all met is pushed via `push_ready_routed`; otherwise it re-registers on
+     its next unmet producer. After the exchange the head is `SENTINEL`, so a
+     consumer registering concurrently re-checks the flags instead of being
+     lost;
+  4. calls `update_completed_watermark(thread_idx, my_id)`, which CAS-advances
      `completed_watermark` over the contiguous completed prefix if — and only
      if — `my_id` is exactly the current watermark (§8.4).
 
@@ -617,11 +625,14 @@ calls `try_set_completion_flag`: it stores the flag and returns `true` when
 the previous occupant is already certified, or leaves the slot untouched and
 returns `false` otherwise. On `false` the thread pushes `task_id` onto
 `failed_heap_of_set_completion_flag[thread_idx]` (a per-thread min-heap)
-instead of spinning, and the dispatch loop retries the smallest pending id
-every iteration via `retry_set_completion_flags`, which calls
-`update_completed_watermark(thread_idx, min_task)` itself once a retried
-`try_set_completion_flag` succeeds (§8.4 — `on_mixed_task_complete` skips
-that call on the `false` path, so each id still gets exactly one
+instead of spinning, and returns without draining `task_id`'s wake list or
+touching the watermark — both stay `task_id`'s one deferred chance until
+the dispatch loop's per-iteration call to `retry_set_completion_flags`
+retries the smallest pending id. Once that retry succeeds for `min_task`,
+`retry_set_completion_flags` drains `min_task`'s wake list (the same
+`drain_wake_list` routing `on_mixed_task_complete` uses on its success path)
+and then calls `update_completed_watermark(thread_idx, min_task)` (§8.4 — so
+each id still gets exactly one wake-list drain and one
 `update_completed_watermark` call, made right after its flag is actually
 set, whether that happens inline or later via retry). This replaces the
 older requirement — task `t` must finish before task `t + task_window_size`
