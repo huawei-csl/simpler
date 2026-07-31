@@ -157,11 +157,18 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
 
     // local_id and local_id - task_window_size share a slot (flag_index wraps
     // modulo task_window_size). earlier_task is one past that slot's previous
-    // occupant, so the wait below blocks the store until completed_watermark
-    // certifies the previous occupant complete: task t must complete before
-    // task t + task_window_size may publish its own entry into the shared
-    // slot. This bounds how far a slot can be reused ahead of retirement, not
-    // how many tasks a run may submit in total.
+    // occupant, so task t must be watermark-certified before task t +
+    // task_window_size may publish its own entry into the shared slot. This
+    // bounds how far a slot can be reused ahead of retirement, not how many
+    // tasks a run may submit in total.
+    //
+    // Blocking: spin-waits for that certification. Used only for the
+    // host-side early-resolve publish in pto_orchestrator.cpp (thread_idx ==
+    // PLATFORM_MAX_AICPU_THREADS, the host-originated sentinel) — there is no
+    // scheduler loop on the host to defer a retry to, and no slot for it in
+    // PTO2SchedulerState::failed_heap_of_set_completion_flag, which is sized
+    // per AICPU thread only. Every other caller uses the non-blocking
+    // try_set_completion_flag below.
     void set_completion_flag(
         const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
     ) {
@@ -175,6 +182,19 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         completion_flags[flag_index(local_id)].store(local_id, order);
     }
 
+    // Non-blocking counterpart of set_completion_flag: when the slot's
+    // previous occupant is not yet watermark-certified, returns false without
+    // writing or waiting instead of spinning. The AICPU scheduler
+    // (pto_scheduler.h) queues a failed local_id onto its
+    // failed_heap_of_set_completion_flag and retries it once per
+    // scheduler-loop iteration via retry_set_completion_flags.
+    //
+    // This only needs: no task depends (via fanin) on a task whose id is >=
+    // its own id + task_window_size — otherwise that task's dispatch would
+    // wait on a producer whose completion can only become visible once the
+    // task itself is watermark-certified, deadlocking both. A
+    // topologically-submitted graph satisfies this for free, since every
+    // fanin producer's id is already less than its consumer's.
     bool try_set_completion_flag(
         const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
     ) {

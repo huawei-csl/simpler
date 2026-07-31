@@ -553,11 +553,13 @@ struct PTO2SchedulerState {
     }
 
     // Producer completion under polling: publish the host-visible task_state
-    // mirror + the device-visible completion_flags entry, drain the wake list
-    // (route/re-register each waiter), then CAS-advance the monotonic
-    // completed_watermark (load-bearing: the host wait_for_consumers gates on
-    // watermark > producer.last_consumer_local_id). Whole-graph-resident hbg
-    // has no device slot reclaim, so no advance_ring_pointers here.
+    // mirror, try to publish the device-visible completion_flags entry (see
+    // try_set_completion_flag — a losing attempt is queued for retry, not
+    // blocked on here), drain the wake list (route/re-register each waiter),
+    // then CAS-advance the monotonic completed_watermark (load-bearing: the
+    // host wait_for_consumers gates on watermark > producer.
+    // last_consumer_local_id). Whole-graph-resident hbg has no device slot
+    // reclaim, so no advance_ring_pointers here.
     void on_mixed_task_complete(int32_t thread_idx, PTO2TaskSlotState &slot_state) {
         const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
@@ -600,6 +602,12 @@ struct PTO2SchedulerState {
         ring.weak_update_completed_watermark(thread_idx, task_id + 1);
     }
 
+    // Retries deferred completion_flags stores in ascending task-id order.
+    // earlier_task (see try_set_completion_flag) grows with local_id, so the
+    // heap's minimum has the loosest watermark requirement of any pending
+    // entry: if it still can't write, no larger id in the heap can either,
+    // which is what makes stopping at the first failure correct rather than
+    // merely cheap.
     void retry_set_completion_flags(int32_t thread_idx) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         std::vector<int32_t> &heap = failed_heap_of_set_completion_flag[thread_idx];

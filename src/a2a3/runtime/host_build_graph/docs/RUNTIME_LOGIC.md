@@ -573,8 +573,11 @@ Each scheduler thread runs a tight loop with two main phases:
 - When `TASK_FIN_STATE` detected: call `on_subtask_complete`; when
   `completed_subtasks == total_required_subtasks`, call `on_mixed_task_complete`,
   which:
-  1. mirrors `task_state = COMPLETED` (host-visible) and sets the device
-     readiness truth `completion_flags[my_id] = my_id` (release);
+  1. mirrors `task_state = COMPLETED` (host-visible) and tries to set the
+     device readiness truth `completion_flags[my_id] = my_id` (release) via
+     `try_set_completion_flag`; on failure (see **Flag-slot reuse** below)
+     `my_id` is queued onto `failed_heap_of_set_completion_flag[thread_idx]`
+     instead of blocking here;
   2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
      — reclassifying each waiter: a waiter whose remaining fanin is now all met
      is pushed via `push_ready_routed`; otherwise it re-registers on its next
@@ -606,15 +609,38 @@ period is unchanged: the array does not grow with the number of tasks a run
 submits, and the slot written for `local_id` is later reused for `local_id +
 task_window_size`. The number of tasks a run may submit is therefore not
 bounded by the array's size — only the reuse of a given slot is ordered:
-`set_completion_flag` spin-waits until `completed_watermark` certifies task
-`t` complete before letting task `t + task_window_size` store into their
-shared slot. `is_completion_flag_set` stays correct across reuse by falling
-back to `completed_watermark`: once a task's id is behind the watermark it
-is reported complete regardless of what a later lap has since written into
-its slot.
+`try_set_completion_flag` only stores into the shared slot once
+`completed_watermark` certifies task `t` complete for slot `t +
+task_window_size`; otherwise it returns `false` without writing or waiting.
+A failed attempt is pushed onto the completing thread's
+`failed_heap_of_set_completion_flag` (a per-AICPU-thread min-heap) and
+retried at the Phase 1 → Phase 2 boundary by `retry_set_completion_flags`,
+which drains the heap in ascending task-id order and stops at the first
+still-blocked entry (the heap's minimum always has the loosest watermark
+requirement of any pending entry). `is_completion_flag_set` stays correct
+across reuse by falling back to `completed_watermark`: once a task's id is
+behind the watermark it is reported complete regardless of what a later lap
+has since written into its slot.
+
+Deferring the store instead of spin-waiting removes the forced pairwise
+ordering the blocking `set_completion_flag` would otherwise impose on every
+`(t, t + task_window_size)` pair even when the two tasks have no data
+dependency. The one ordering constraint that remains load-bearing: no task
+may depend (directly or transitively, via fanin) on a task whose id is `>=`
+its own id `+ task_window_size` — otherwise that task's dispatch would wait
+on a producer whose completion can only become visible once the task itself
+is watermark-certified, deadlocking both. A topologically-submitted graph
+satisfies this for free, since every fanin producer's id is already less
+than its consumer's. `set_completion_flag` remains in use, blocking, only for
+the host-side early-resolve publish (§7.2, a hidden-alloc producer that
+inline-completes on the host before any AICPU thread exists) — there is no
+scheduler loop on the host to retry from.
 
 **Phase 2 — Dispatch**:
 
+- At the top of the loop iteration: `retry_set_completion_flags(thread_idx)`
+  drains this thread's deferred completion_flags stores (see **Flag-slot
+  reuse** above).
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
