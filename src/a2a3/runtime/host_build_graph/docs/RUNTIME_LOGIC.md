@@ -577,11 +577,13 @@ Each scheduler thread runs a tight loop with two main phases:
      device readiness truth `completion_flags[my_id] = my_id` (release) via
      `try_set_completion_flag`; on failure (see **Flag-slot reuse** below)
      `my_id` is queued onto `failed_heap_of_set_completion_flag[thread_idx]`
-     instead of blocking here;
-  2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
-     — reclassifying each waiter: a waiter whose remaining fanin is now all met
-     is pushed via `push_ready_routed`; otherwise it re-registers on its next
-     unmet producer. After the exchange the head is `SENTINEL`, so a consumer
+     and the call returns immediately, **without** draining the wake list —
+     see below for why that has to wait;
+  2. on success, drains this task's intrusive **wake list** via
+     `drain_wake_list` — `wake_list_head.exchange(SENTINEL)` — reclassifying
+     each waiter: a waiter whose remaining fanin is now all met is pushed via
+     `push_ready_routed`; otherwise it re-registers on its next unmet
+     producer. After the exchange the head is `SENTINEL`, so a consumer
      registering concurrently re-checks the flags instead of being lost;
   3. CAS-advances `completed_watermark` over the contiguous completed prefix
      (§8.4).
@@ -636,11 +638,24 @@ the host-side early-resolve publish (§7.2, a hidden-alloc producer that
 inline-completes on the host before any AICPU thread exists) — there is no
 scheduler loop on the host to retry from.
 
+`drain_wake_list` (the wake-list drain in Phase 1 step 2 above) is only ever
+called once a producer's own `completion_flags` entry is durably set —
+inline from `on_mixed_task_complete` on immediate success, or from
+`retry_set_completion_flags` right after a deferred store succeeds (draining
+that task's wake list, then repeating its low-latency `completed_watermark`
+bump, is the last thing each successful retry does). A producer's
+`wake_list_head` therefore never becomes `SENTINEL` before
+`is_completion_flag_set` is already true for it — a waiter reclassified
+against that producer afterward can never find it `SENTINEL`-but-unflagged
+and register back onto it, which would otherwise spin forever (that producer
+will never run `on_mixed_task_complete` a second time to unstick it).
+
 **Phase 2 — Dispatch**:
 
 - At the top of the loop iteration: `retry_set_completion_flags(thread_idx)`
   drains this thread's deferred completion_flags stores (see **Flag-slot
-  reuse** above).
+  reuse** above); each success also drains that task's wake list and bumps
+  `completed_watermark`, mirroring `on_mixed_task_complete`'s own tail.
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
