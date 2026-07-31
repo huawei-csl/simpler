@@ -131,9 +131,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // requires.
     std::atomic<int32_t> *completion_flags;
 
-    // To have subsequent tasks on different cachelines one needs shuffle_lower_bits >= 4 (because 64 / sizeof(int32_t)
-    // = 2^4). Every 2^shuffle_lower_bits will typically be on the same cacheline which is good for
-    // update_completion_watermark
+    // To have subsequent tasks on different cachelines one needs shuffle_higher_bits >= 4 (because 64 / sizeof(int32_t)
+    // = 2^4) and shuffle_lower_bits >= 1. Every 2^shuffle_lower_bits will typically be on the same cacheline which is
+    // good for update_completion_watermark
     constexpr int32_t flag_index(const int32_t local_id) const {
         int32_t low_bits = local_id & ((static_cast<int32_t>(1) << shuffle_lower_bits) - static_cast<int32_t>(1));
         low_bits <<= shuffle_higher_bits;
@@ -173,6 +173,23 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
             SPIN_WAIT_HINT();
         }
         completion_flags[flag_index(local_id)].store(local_id, order);
+    }
+
+    bool try_set_completion_flag(
+        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
+    ) {
+        const int32_t earlier_task = local_id - task_window_mask;
+        int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
+        if ((cached_cw < earlier_task) &&
+            ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
+            weak_update_completed_watermark(thread_idx, earlier_task);
+            if ((cached_cw < earlier_task) &&
+                ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
+                return false;
+            }
+        }
+        completion_flags[flag_index(local_id)].store(local_id, order);
+        return true;
     }
 
     void weak_update_completed_watermark(
