@@ -1083,6 +1083,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
+        sched_->retry_set_completion_flags(thread_idx);
+
         bool try_pushed = false;
 
         // Phase 2 drain check

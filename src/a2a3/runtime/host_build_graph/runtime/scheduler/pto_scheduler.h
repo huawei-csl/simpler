@@ -31,6 +31,7 @@
 #pragma once
 
 #include <atomic>
+#include <vector>
 
 #include "common/core_type.h"
 #include "common/memory_barrier.h"
@@ -50,6 +51,10 @@
         acc += (_st1 - _st0);       \
         _st0 = _st1;                \
     } while (0)
+#endif
+
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
 // =============================================================================
@@ -463,6 +468,10 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
+    // Heap of tasks for which setting the completion flag failed. Should always
+    // be empty. This only exists as a failsafe.
+    std::vector<int32_t> failed_heap_of_set_completion_flag[PLATFORM_MAX_AICPU_THREADS];
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -554,7 +563,11 @@ struct PTO2SchedulerState {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
 
         slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
-        ring.set_completion_flag(thread_idx, task_id);
+        if (unlikely(not ring.try_set_completion_flag(thread_idx, task_id))) {
+            std::vector<int32_t> &heap = failed_heap_of_set_completion_flag[thread_idx];
+            heap.emplace_back(task_id);
+            std::push_heap(heap.begin(), heap.end(), std::greater<>{});
+        }
 
         PTO2TaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
@@ -584,6 +597,20 @@ struct PTO2SchedulerState {
         // stuck below the true prefix, hanging any wait_for_consumers whose
         // last_consumer sits in the gap.
         ring.update_completed_watermark(thread_idx, task_id);
+    }
+
+    void retry_set_completion_flags(int32_t thread_idx) {
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        std::vector<int32_t> &heap = failed_heap_of_set_completion_flag[thread_idx];
+
+        while (unlikely(not heap.empty())) {
+            int32_t min_task = heap[0];
+            if (not ring.try_set_completion_flag(thread_idx, min_task)) {
+                break;
+            }
+            std::pop_heap(heap.begin(), heap.end(), std::greater<>{});
+            heap.pop_back();
+        }
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
