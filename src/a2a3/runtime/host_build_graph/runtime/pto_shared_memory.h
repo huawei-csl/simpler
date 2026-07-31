@@ -200,11 +200,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
         if ((cached_cw < earlier_task) &&
             ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
-            weak_update_completed_watermark(thread_idx, earlier_task);
-            if ((cached_cw < earlier_task) &&
-                ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
-                return false;
-            }
+            return false;
         }
         completion_flags[flag_index(local_id)].store(local_id, order);
         return true;
