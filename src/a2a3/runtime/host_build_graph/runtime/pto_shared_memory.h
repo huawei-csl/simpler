@@ -85,9 +85,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // Lowest task_id not yet guaranteed complete: every task with id in
     // [0, completed_watermark) has its completion_flags entry set. Every completer
     // (device on_mixed_task_complete, or the host orchestrator for an inline-completed
-    // hidden-alloc task) calls update_completed_watermark right after setting its own
-    // flag; only the one landing exactly at the current watermark walks it forward over
-    // the contiguous completed prefix. The host consumer-wait gates on it: a producer
+    // hidden-alloc task) calls update_completed_watermark exactly once, right after its
+    // own flag is actually set — never before. When on_mixed_task_complete's
+    // try_set_completion_flag fails, the call moves to retry_set_completion_flags, which
+    // makes it once the retried try_set_completion_flag succeeds instead (docs/
+    // RUNTIME_LOGIC.md §8.4); only the one landing exactly at the current watermark walks
+    // it forward over the contiguous completed prefix. The host consumer-wait gates on it: a producer
     // slot P's consumers have all retired once completed_watermark >
     // P.last_consumer_local_id. On its own cache line (concurrent CAS-advance by
     // completing threads).
@@ -128,8 +131,8 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // (same task_window_size-entry period, different physical slot — see
     // flag_index), so the entry for local_id is reused by local_id +
     // task_window_size once the run submits more tasks than the array has
-    // slots for — see set_completion_flag for the ordering this reuse
-    // requires.
+    // slots for — see set_completion_flag / try_set_completion_flag for the
+    // ordering this reuse requires.
     std::atomic<int32_t> *completion_flags;
 
     // To have subsequent tasks on different cachelines one needs shuffle_higher_bits >= 4 (because 64 / sizeof(int32_t)
@@ -164,6 +167,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // slot. This bounds how far a slot can be reused ahead of retirement, not
     // how many tasks a run may submit in total.
     // Must be followed by a call to update_completed_watermark with same thread_idx and local_id (logical requirement)
+    // Only the host orchestrator's inline hidden-alloc completion path (submit_task,
+    // §7.2) still calls this blocking form; the device scheduler uses
+    // try_set_completion_flag below instead.
     void set_completion_flag(
         const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
     ) const {
@@ -176,6 +182,18 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         completion_flags[flag_index(local_id)].store(local_id, order);
     }
 
+    // Non-blocking counterpart to set_completion_flag: same slot-reuse condition
+    // (the previous occupant of local_id's aliased slot must be certified by
+    // completed_watermark first), but returns false instead of spinning when it
+    // is not yet certified, leaving completion_flags untouched. The device
+    // scheduler defers a false return to failed_heap_of_set_completion_flag and
+    // retries later rather than blocking the dispatch loop — see
+    // docs/RUNTIME_LOGIC.md "Flag-slot reuse" (§8.2) for the relaxed
+    // correctness argument this relies on. Must be followed by a call to
+    // update_completed_watermark with the same thread_idx and local_id only when
+    // this returns true — on false, the caller must defer that call to whichever
+    // retry finally succeeds (never call it against a local_id whose flag isn't
+    // set yet, §8.4).
     bool try_set_completion_flag(
         const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
     ) {

@@ -608,13 +608,34 @@ linearly. This is a bijection on `[0, task_window_size)`, so the reuse
 period is unchanged: the array does not grow with the number of tasks a run
 submits, and the slot written for `local_id` is later reused for `local_id +
 task_window_size`. The number of tasks a run may submit is therefore not
-bounded by the array's size — only the reuse of a given slot is ordered:
-`set_completion_flag` spin-waits until `completed_watermark` certifies task
-`t` complete before letting task `t + task_window_size` store into their
-shared slot. `is_completion_flag_set` stays correct across reuse by falling
-back to `completed_watermark`: once a task's id is behind the watermark it
-is reported complete regardless of what a later lap has since written into
-its slot.
+bounded by the array's size — only the reuse of a given slot is ordered: a
+write for `local_id` must not land before `completed_watermark` certifies
+`local_id - task_window_size` (the slot's previous occupant) complete.
+
+The device scheduler enforces this without blocking. `on_mixed_task_complete`
+calls `try_set_completion_flag`: it stores the flag and returns `true` when
+the previous occupant is already certified, or leaves the slot untouched and
+returns `false` otherwise. On `false` the thread pushes `task_id` onto
+`failed_heap_of_set_completion_flag[thread_idx]` (a per-thread min-heap)
+instead of spinning, and the dispatch loop retries the smallest pending id
+every iteration via `retry_set_completion_flags`, which calls
+`update_completed_watermark(thread_idx, min_task)` itself once a retried
+`try_set_completion_flag` succeeds (§8.4 — `on_mixed_task_complete` skips
+that call on the `false` path, so each id still gets exactly one
+`update_completed_watermark` call, made right after its flag is actually
+set, whether that happens inline or later via retry). This replaces the
+older requirement — task `t` must finish before task `t + task_window_size`
+— with a weaker one: task `t` must not depend on a task with id `>= t +
+task_window_size`. That holds automatically whenever task ids follow a
+topological order of the dependency graph (the normal case — a task's fanins
+always carry smaller ids than the task itself), so the heap is expected to
+drain on its very next retry and exists only as a failsafe.
+
+`is_completion_flag_set` stays correct across reuse — whether or not an
+entry is currently sitting unresolved in the failed-heap — by falling back
+to `completed_watermark`: once a task's id is behind the watermark it is
+reported complete regardless of what a later lap has since written into its
+slot.
 
 **Phase 2 — Dispatch**:
 
@@ -639,16 +660,30 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 `completed_watermark` is the lowest id not yet guaranteed complete: every task
 in `[0, completed_watermark)` has its `completion_flags` entry set.
 
-Every completer — device `on_mixed_task_complete`, and the host orchestrator
-for an inline-completed hidden-alloc task (§7.2) — calls
-`set_completion_flag(thread_idx, my_id)` followed by
-`update_completed_watermark(thread_idx, my_id)`, in that order: the watermark
-walk trusts `my_id`'s own `completion_flags` entry is already set rather than
-re-checking it, so calling out of order could advance the watermark past
-`my_id` before that write is visible.
+Every completer calls `update_completed_watermark(thread_idx, my_id)` exactly
+once, and only *after* `my_id`'s own `completion_flags` entry is actually
+set — never before. The host orchestrator's inline-completed hidden-alloc
+task (§7.2) gets this for free: it calls the blocking `set_completion_flag`,
+which cannot return before the store lands, immediately followed by
+`update_completed_watermark`. The device path (`on_mixed_task_complete`)
+calls `try_set_completion_flag` (**Flag-slot reuse**, §8.2); when that
+returns `true` it calls `update_completed_watermark` right after, same as
+the host path. When it returns `false` (deferred to
+`failed_heap_of_set_completion_flag`), `on_mixed_task_complete` skips the
+`update_completed_watermark` call entirely — `task_id`'s one chance moves to
+`retry_set_completion_flags`, which calls
+`update_completed_watermark(thread_idx, min_task)` right after the retried
+`try_set_completion_flag` finally succeeds. Either way, the call that
+"belongs" to an id is made exactly once, and only once that id's flag is
+genuinely visible — a task's `update_completed_watermark` call must never
+run before the store its own walk trusts as already-set, since the walk
+skips re-checking `my_id`'s own `completion_flags` entry, so calling too
+early could advance the watermark past `my_id` before that write is
+visible.
 
-The call is **eager but frontier-gated**: every completer makes it, but
-`update_completed_watermark` is a no-op unless `my_id` equals the watermark
+The call is **eager but frontier-gated**: every completer makes it (promptly
+on the host and the common device case, or after a deferred retry in the
+failed-heap case — §8.2), but `update_completed_watermark` is a no-op unless `my_id` equals the watermark
 it currently observes. Only the completer landing exactly at the frontier
 does the work, CAS-advancing over the **full contiguous completed prefix**
 (bounded by `current_task_index`, not by `my_id`) — capping at `my_id` would

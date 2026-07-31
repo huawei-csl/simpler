@@ -53,6 +53,9 @@
     } while (0)
 #endif
 
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
@@ -563,7 +566,8 @@ struct PTO2SchedulerState {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
 
         slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
-        if (unlikely(not ring.try_set_completion_flag(thread_idx, task_id))) {
+        const bool did_set_completion_flag = ring.try_set_completion_flag(thread_idx, task_id);
+        if (unlikely(not did_set_completion_flag)) {
             std::vector<int32_t> &heap = failed_heap_of_set_completion_flag[thread_idx];
             heap.emplace_back(task_id);
             std::push_heap(heap.begin(), heap.end(), std::greater<>{});
@@ -596,9 +600,24 @@ struct PTO2SchedulerState {
         // a low-id task completing after a higher one would leave the watermark
         // stuck below the true prefix, hanging any wait_for_consumers whose
         // last_consumer sits in the gap.
-        ring.update_completed_watermark(thread_idx, task_id);
+        //
+        // Gated on did_set_completion_flag: task_id gets exactly one
+        // update_completed_watermark call, and it must run after task_id's flag is
+        // actually visible. When try_set_completion_flag just failed, task_id's flag
+        // isn't set yet, so the call is skipped here and made later by
+        // retry_set_completion_flags once the retry succeeds -- calling it here
+        // unconditionally would burn task_id's only chance while its own
+        // completion_flags entry is still unset.
+        if (likely(did_set_completion_flag)) {
+            ring.update_completed_watermark(thread_idx, task_id);
+        }
     }
 
+    // min_task's update_completed_watermark call was skipped in on_mixed_task_complete
+    // (its try_set_completion_flag failed there), so this is that task's one and only
+    // remaining chance to make it -- must fire here, immediately after the retried
+    // try_set_completion_flag succeeds, or the watermark could stall on min_task forever
+    // if some other thread's walk reaches it first (see docs/RUNTIME_LOGIC.md §8.4).
     void retry_set_completion_flags(int32_t thread_idx) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         std::vector<int32_t> &heap = failed_heap_of_set_completion_flag[thread_idx];
@@ -610,6 +629,7 @@ struct PTO2SchedulerState {
             }
             std::pop_heap(heap.begin(), heap.end(), std::greater<>{});
             heap.pop_back();
+            ring.update_completed_watermark(thread_idx, min_task);
         }
     }
 
