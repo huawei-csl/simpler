@@ -183,23 +183,6 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
         if ((cached_cw < earlier_task) &&
             ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
-            weak_update_completed_watermark(thread_idx, earlier_task);
-            if ((cached_cw < earlier_task) &&
-                ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
-                return false;
-            }
-        }
-        completion_flags[flag_index(local_id)].store(local_id, order);
-        return true;
-    }
-
-    bool try_set_completion_flag(
-        const int32_t thread_idx, const int32_t local_id, std::memory_order order = std::memory_order_release
-    ) {
-        const int32_t earlier_task = local_id - task_window_mask;
-        int32_t &cached_cw = cached_completed_watermark[thread_idx].val_;
-        if ((cached_cw < earlier_task) &&
-            ((cached_cw = completed_watermark.load(std::memory_order_acquire)) < earlier_task)) {
             return false;
         }
         completion_flags[flag_index(local_id)].store(local_id, order);
