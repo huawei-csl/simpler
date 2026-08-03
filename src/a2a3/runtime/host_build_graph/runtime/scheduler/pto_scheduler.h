@@ -513,6 +513,45 @@ struct PTO2SchedulerState {
     // be empty. This only exists as a failsafe.
     FailedCompletionFlagHeap failed_heap_of_set_completion_flag[PLATFORM_MAX_AICPU_THREADS];
 
+    // Ids whose completion_flags entry is already set but whose
+    // update_completed_watermark trigger attempt is still owed, deferred here by
+    // on_mixed_task_complete's direct-success path so flush_pending_watermark_updates
+    // can batch them into one pass instead of one call per task. resolve_and_dispatch
+    // calls the flush right after each of the 3 phases that can push onto this array
+    // (check_running_cores_for_completion, the async-wait-list poll, the dummy-queue
+    // drain) rather than once per whole loop turn -- but that does NOT shrink the
+    // required capacity to a single phase's own burst: an id still ahead of the
+    // frontier survives its own phase's flush by design (never discarded, see
+    // flush_pending_watermark_updates), so it stacks with whatever the NEXT phase
+    // pushes in the same iteration. Confirmed the hard way -- sizing this at 144
+    // (2 * CoreTracker::MAX_CORE_PER_THREAD, the largest single phase's own push
+    // count) reproduced a real onboard SCHEDULER_TIMEOUT stall on
+    // tests/st/a2a3/host_build_graph/bgemm; the array must still bound the full
+    // cross-phase sum. Capacity is the same worst case as flushing once per turn:
+    // 2 * CoreTracker::MAX_CORE_PER_THREAD (144, from check_running_cores_for_completion
+    // -- a single register poll can complete both a core's running and pending slot)
+    // + DUMMY_DRAIN_BATCH (8) + MAX_ASYNC_WAITS (64) = 216, rounded up to 14
+    // cachelines. CoreTracker::MAX_CORE_PER_THREAD (not a runtime aicpu_thread_num
+    // split) is load-bearing here: a run can leave a single scheduler thread owning
+    // every core on the device (see CoreTracker::MAX_CLUSTERS's comment), so the
+    // worst case is not divided across threads. The per-phase flush still pays off
+    // in the common case (each phase's own burst usually resolves immediately,
+    // keeping the array small in practice) -- it just cannot shrink the capacity
+    // this array must be sized to for the worst case.
+    struct PendingWatermarkIds {
+        static constexpr int32_t kCapacity = 144;
+        int32_t entries[kCapacity];
+        int32_t count = 0;
+
+        void push(int32_t task_id) {
+            always_assert(count < kCapacity);
+            entries[count++] = task_id;
+        }
+
+        bool empty() const { return count == 0; }
+    };
+    PendingWatermarkIds pending_watermark_update[PLATFORM_MAX_AICPU_THREADS];
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -650,11 +689,34 @@ struct PTO2SchedulerState {
         // task_id gets exactly one update_completed_watermark call, made only
         // after task_id's own completion_flags entry is actually visible: the
         // early return above guarantees try_set_completion_flag succeeded, so
-        // the flag is already set by the time this line runs. When
-        // try_set_completion_flag fails instead, task_id's one chance to call
-        // update_completed_watermark moves to retry_set_completion_flags,
-        // made right after that retry succeeds.
-        ring.update_completed_watermark(thread_idx, task_id);
+        // the flag is already set by the time this line runs. That call is
+        // deferred here (enqueued rather than made inline) so the scheduler main
+        // loop can batch every id this thread completes in a turn into one
+        // ascending pass via flush_pending_watermark_updates, instead of one
+        // update_completed_watermark call per task. When try_set_completion_flag
+        // fails instead, task_id's one chance moves to retry_set_completion_flags,
+        // which is unaffected by this batching and still calls
+        // update_completed_watermark inline right after its own retry succeeds.
+        pending_watermark_update[thread_idx].push(task_id);
+    }
+
+    // Drains this thread's pending_watermark_update array, batching the
+    // update_completed_watermark calls deferred by on_mixed_task_complete's
+    // direct-success path into a single fence+load+scan (see the sorted-range
+    // overload of update_completed_watermark) instead of one call per id.
+    // Unresolved entries are never discarded -- an id still ahead of the
+    // frontier this call is left in the (compacted) array for the next flush,
+    // because it may be the one and only id whose exact-match call can ever
+    // unstick a future frontier landing on it (docs/RUNTIME_LOGIC.md §8.4).
+    void flush_pending_watermark_updates(int32_t thread_idx) {
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        PendingWatermarkIds &pending = pending_watermark_update[thread_idx];
+        if (pending.empty()) return;
+        int32_t *begin = pending.entries;
+        int32_t *end = pending.entries + pending.count;
+
+        ring.update_completed_watermark(thread_idx, begin, end);
+        pending.count = 0;
     }
 
     // min_task's update_completed_watermark call was skipped in on_mixed_task_complete

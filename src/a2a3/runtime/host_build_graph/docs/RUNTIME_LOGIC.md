@@ -590,9 +590,12 @@ Each scheduler thread runs a tight loop with two main phases:
      its next unmet producer. After the exchange the head is `SENTINEL`, so a
      consumer registering concurrently re-checks the flags instead of being
      lost;
-  4. calls `update_completed_watermark(thread_idx, my_id)`, which CAS-advances
-     `completed_watermark` over the contiguous completed prefix if — and only
-     if — `my_id` is exactly the current watermark (§8.4).
+  4. enqueues `my_id` onto `pending_watermark_update[thread_idx]`, deferring
+     the actual `update_completed_watermark(thread_idx, my_id)` call — which
+     CAS-advances `completed_watermark` over the contiguous completed prefix
+     if, and only if, `my_id` is exactly the current watermark — to the next
+     `flush_pending_watermark_updates` call, made right after this phase
+     finishes (§8.4).
 
 **Readiness / wake registration.** A task is ready iff every id in its
 `fanin_local_ids` has its `completion_flags` entry set to its own id
@@ -631,10 +634,12 @@ the dispatch loop's per-iteration call to `retry_set_completion_flags`
 retries the smallest pending id. Once that retry succeeds for `min_task`,
 `retry_set_completion_flags` drains `min_task`'s wake list (the same
 `drain_wake_list` routing `on_mixed_task_complete` uses on its success path)
-and then calls `update_completed_watermark(thread_idx, min_task)` (§8.4 — so
-each id still gets exactly one wake-list drain and one
-`update_completed_watermark` call, made right after its flag is actually
-set, whether that happens inline or later via retry). This replaces the
+and then calls `update_completed_watermark(thread_idx, min_task)` directly and
+immediately, unlike `on_mixed_task_complete`'s direct-success path, which
+defers this call to the batched per-turn flush (§8.4) — `retry_set_completion_flags`
+is the rare failsafe path and is not part of that batching. Either way each id
+still gets exactly one wake-list drain and one `update_completed_watermark`
+call, made only after its flag is actually visible. This replaces the
 older requirement — task `t` must finish before task `t + task_window_size`
 — with a weaker one: task `t` must not depend on a task with id `>= t +
 task_window_size`. That holds automatically whenever task ids follow a
@@ -680,41 +685,62 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 `completed_watermark` is the lowest id not yet guaranteed complete: every task
 in `[0, completed_watermark)` has its `completion_flags` entry set.
 
-Every completer calls `update_completed_watermark(thread_idx, my_id)` exactly
-once, and only *after* `my_id`'s own `completion_flags` entry is actually
-set — never before. The host orchestrator's inline-completed hidden-alloc
-task (§7.2) gets this for free: it calls the blocking `set_completion_flag`,
-which cannot return before the store lands, immediately followed by
-`update_completed_watermark`. The device path (`on_mixed_task_complete`)
-calls `try_set_completion_flag` (**Flag-slot reuse**, §8.2); when that
-returns `true` it calls `update_completed_watermark` right after, same as
-the host path. When it returns `false` (deferred to
-`failed_heap_of_set_completion_flag`), `on_mixed_task_complete` skips the
-`update_completed_watermark` call entirely — `task_id`'s one chance moves to
-`retry_set_completion_flags`, which calls
-`update_completed_watermark(thread_idx, min_task)` right after the retried
-`try_set_completion_flag` finally succeeds. Either way, the call that
-"belongs" to an id is made exactly once, and only once that id's flag is
-genuinely visible — a task's `update_completed_watermark` call must never
-run before the store its own walk trusts as already-set, since the walk
-skips re-checking `my_id`'s own `completion_flags` entry, so calling too
-early could advance the watermark past `my_id` before that write is
-visible.
+Every completer eventually causes exactly one `update_completed_watermark(thread_idx,
+my_id)` call, made only *after* `my_id`'s own `completion_flags` entry is
+actually set — never before. The host orchestrator's inline-completed
+hidden-alloc task (§7.2) gets this for free: it calls the blocking
+`set_completion_flag`, which cannot return before the store lands,
+immediately followed by `update_completed_watermark`. `retry_set_completion_flags`
+(the failsafe retry path, §8.2) also calls it directly and immediately, right
+after the retried `try_set_completion_flag` finally succeeds.
 
-The call is **eager but frontier-gated**: every completer makes it (promptly
-on the host and the common device case, or after a deferred retry in the
-failed-heap case — §8.2), but `update_completed_watermark` is a no-op unless `my_id` equals the watermark
-it currently observes. Only the completer landing exactly at the frontier
-does the work, CAS-advancing over the **full contiguous completed prefix**
-(bounded by `current_task_index`, not by `my_id`) — capping at `my_id` would
-make the final value completion-order-dependent and strand it below the true
-prefix. A completer that finishes out of order (its id ahead of the
-watermark) defers: it does not retry or block, it relies on whichever thread
-later completes the frontier task to walk forward through its already-set
-flag. This is why the call cannot be skipped or deferred for *any* completion
-path, including host-side ones — a task sitting at the frontier with no
-completer ever calling `update_completed_watermark` for it stalls the
-watermark permanently.
+`on_mixed_task_complete`'s direct-success path (`try_set_completion_flag`
+returning `true` on the first try — the common case) differs: instead of
+calling `update_completed_watermark` inline, it pushes `my_id` onto
+`pending_watermark_update[thread_idx]` (a fixed-capacity per-thread array in
+`PTO2SchedulerState`). `resolve_and_dispatch` drains it via
+`flush_pending_watermark_updates` right after each of the 3 phases that can
+push onto it in one iteration — `check_running_cores_for_completion`, the
+async-wait-list poll, and the dummy-queue drain — rather than once per whole
+loop turn, so the common case (each phase's own burst usually resolves
+immediately) keeps the array small in practice. This does **not** shrink the
+worst-case capacity requirement, though: an id still ahead of the frontier
+survives its own phase's flush by design (never discarded — see below), so it
+stacks with whatever the next phase pushes in the same iteration. The array
+is sized for the full cross-phase sum, same as flushing once per turn would
+require (see the field's comment in `pto_scheduler.h` for the exact
+arithmetic) — sizing it to only the largest single phase's own push count
+reproduced a real onboard `SCHEDULER_TIMEOUT` stall. `flush_pending_watermark_updates`
+`std::sort`s the array ascending, then calls the sorted-range overload of
+`update_completed_watermark` — one fence + one `completed_watermark` load for
+the whole array, scanning for the single entry that can possibly equal the
+frontier and triggering the walk (via the shared `do_update_completed_watermark`
+helper) at most once — and compacts away every entry now strictly below the
+resulting watermark (`std::lower_bound` over the same sorted range). This
+batches the common case (0 or 1 real trigger per flush) into one call, instead
+of one call per completed task.
+
+The call is **eager but frontier-gated**: it is made as soon as possible on
+every path (promptly on the host and the retry-heap case, once per phase in
+the batched direct-success case), but `update_completed_watermark` is a no-op
+unless `my_id` equals the watermark it currently observes. Only the call
+landing exactly at the frontier does the work, CAS-advancing over the **full
+contiguous completed prefix** (bounded by `current_task_index`, not by
+`my_id`) — capping at `my_id` would make the final value
+completion-order-dependent and strand it below the true prefix. A completer
+that finishes out of order (its id ahead of the watermark) defers: it does
+not retry or block, it relies on whichever thread later completes the
+frontier task to walk forward through its already-set flag.
+
+This is why the call can be **deferred but never discarded**, on *any*
+completion path including host-side ones — a task sitting at the frontier
+with no completer ever calling `update_completed_watermark` for it stalls the
+watermark permanently, since ids are unique and nothing else will ever call
+with that exact value again. `flush_pending_watermark_updates` honors this:
+an id it cannot resolve this call (the watermark is still behind it) is left
+in the array — never dropped — for the next flush to retry, so the "every id
+eventually gets its call" guarantee holds across flushes exactly as it holds
+inline on the other two paths.
 
 It is **load-bearing**: the host `wait_for_tensor_ready(..., wait_for_consumers)`
 gates on `completed_watermark > producer.last_consumer_local_id` to observe
