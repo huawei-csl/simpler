@@ -218,7 +218,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // exactly at the frontier. Advances over the full contiguous completed prefix
     // (bounded by current_task_index), returning the resulting watermark value —
     // either what this walk landed on, or what a racing thread's CAS beat it to.
-    int32_t do_update_completed_watermark(const int32_t thread_idx, int32_t curr_watermark) {
+    void do_update_completed_watermark(const int32_t thread_idx, int32_t curr_watermark) {
         const int32_t submitted = fc.current_task_index.load(std::memory_order_acquire);
 
         int32_t next = curr_watermark + 1;
@@ -232,12 +232,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
                 )) {
                 // In case of failure, we hand off the update responsibility to the thread who succeeded
                 cached_completed_watermark[thread_idx].val_ = curr_watermark;
-                return curr_watermark;
+                break;
             }
             // Thread fence required such that completed_watermark is written to GM before the next flag is read
             std::atomic_thread_fence(std::memory_order_seq_cst);
             if (not(next < submitted && is_completion_flag_set(thread_idx, next))) {
-                return next;
+                break;
             }
             curr_watermark = next++;
         }
@@ -253,7 +253,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // further internally); any other value is the watermark this call found instead,
     // letting a caller distinguish "already past" (returned > local_id) from "not
     // there yet" (returned < local_id) without a second load.
-    int32_t update_completed_watermark(const int32_t thread_idx, const int32_t local_id) {
+    void update_completed_watermark(const int32_t thread_idx, const int32_t local_id) {
         // Thread fence required such that setting the flag of task local_id is written to GM before completed_watermark
         // is read
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -265,9 +265,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         // the watermark) defers to whichever thread later completes the frontier task.
         if (curr_watermark != local_id) {
             cached_completed_watermark[thread_idx].val_ = curr_watermark;
-            return curr_watermark;
+            return;
         }
-        return do_update_completed_watermark(thread_idx, curr_watermark);
+        do_update_completed_watermark(thread_idx, curr_watermark);
     }
 
     // Batched counterpart of update_completed_watermark for a caller holding several
@@ -279,18 +279,18 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // could match either), and triggers the walk at most once. Returns the resulting
     // watermark either way — a caller can drop every id strictly below it (e.g. via
     // std::lower_bound over the same sorted range) without re-querying the watermark.
-    int32_t update_completed_watermark(const int32_t thread_idx, const int32_t *first, const int32_t *last) {
+    void update_completed_watermark(const int32_t thread_idx, const int32_t *first, const int32_t *last) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
 
         for (; first != last; ++first) {
             if (*first == curr_watermark) {
-                return do_update_completed_watermark(thread_idx, curr_watermark);
+                do_update_completed_watermark(thread_idx, curr_watermark);
+                return;
             }
         }
 
         cached_completed_watermark[thread_idx].val_ = curr_watermark;
-        return curr_watermark;
     }
 
     int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
