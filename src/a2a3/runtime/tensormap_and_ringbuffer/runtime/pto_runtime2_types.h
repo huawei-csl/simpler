@@ -283,8 +283,9 @@ struct PTO2TaskPayload {
     //
     // Bitmask of global core_ids this consumer is pre-staged (gated) on. Concurrent
     // stagers publish bits with atomic fetch_or. A regular consumer destructively
-    // splits them between release and late-stager owners; a sync_start drain keeps
-    // the completed mask stable for its single cohort launch owner.
+    // splits them between release and late-stager owners; a sync_start cohort keeps
+    // the completed mask stable for its single launch owner, whether staging is local
+    // or uses the global drain fallback.
     std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
     // seeded at wiring with producers already complete, then a flagged producer
@@ -460,10 +461,9 @@ static_assert(
 // (rather than folding scope + consumers into one count) lets a consumer reach
 // fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
 // is still unset -- i.e. "all consumers done but scope still open" stays
-// distinguishable from "fully consumed". The heap/task deadlock detector keys
-// off exactly that complement: that condition with state==COMPLETED means the
-// head can only be released by scope_end, which a blocked orchestrator can
-// never reach -> provable deadlock.
+// distinguishable from "fully consumed". Structural allocation deadlock is
+// detected separately by checking whether the blocking ring head is the oldest
+// task pinned by any open scope on that ring.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
 
 enum PTO2TaskLifecycleFlag : uint8_t {
