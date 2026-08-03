@@ -513,6 +513,8 @@ struct PTO2SchedulerState {
     // be empty. This only exists as a failsafe.
     FailedCompletionFlagHeap failed_heap_of_set_completion_flag[PLATFORM_MAX_AICPU_THREADS];
 
+    alignas(64) int32_t max_local_task_complete[PLATFORM_MAX_AICPU_THREADS * (64/sizeof(int32_t))];
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -647,16 +649,15 @@ struct PTO2SchedulerState {
 
         drain_wake_list(thread_idx, slot_state);
 
-        // completed_watermark = lowest id not yet guaranteed complete: every task
-        // in [0, watermark) has its completion_flags entry set. This bounded
-        // advance publishes at most task_id + 1 — low-latency unblocking for a
-        // wait_for_consumers whose last_consumer_local_id is exactly this task.
-        // The uncapped full-prefix walk that keeps the watermark order-independent
-        // (needed when a low-id task completes after a higher one already
-        // advanced it partway) is in resolve_and_dispatch (scheduler_dispatch.cpp),
-        // called once per scheduler loop iteration after that iteration's
-        // dispatch phase.
+        int32_t &max_id = max_local_task_complete[thread_idx * (64/sizeof(int32_t))];
+        max_id = std::max(max_id, task_id);
+    }
+
+    void weak_update_completed_watermark(int32_t thread_idx) {
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        int32_t &task_id = max_local_task_complete[thread_idx * (64/sizeof(int32_t))]; 
         ring.weak_update_completed_watermark(thread_idx, task_id + 1);
+        task_id = -1;
     }
 
     // Retries deferred completion_flags stores in ascending task-id order.

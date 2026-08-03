@@ -135,6 +135,10 @@ bool PTO2SchedulerState::init_data_from_layout(
         return false;
     }
 
+    for (int32_t t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        sched->max_local_task_complete[t * (64 / sizeof(int32_t))] = -1;
+    }
+
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
                 &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity

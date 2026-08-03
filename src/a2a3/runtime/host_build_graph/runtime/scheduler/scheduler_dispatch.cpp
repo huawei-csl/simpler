@@ -1037,6 +1037,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             );
         }
         if (completed_this_turn > 0) {
+            sched_->weak_update_completed_watermark(thread_idx);
 #if SIMPLER_SCHED_PROFILING
             sched_->tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
 #endif
@@ -1067,6 +1068,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 break;
             }
             if (poll_result.completed > 0) {
+                sched_->weak_update_completed_watermark(thread_idx);
 #if SIMPLER_SCHED_PROFILING
                 sched_->tasks_completed.fetch_add(poll_result.completed, std::memory_order_relaxed);
 #endif
@@ -1200,6 +1202,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 cur_thread_completed++;
             }
             if (dummy_got > 0) {
+                sched_->weak_update_completed_watermark(thread_idx);
                 made_progress = true;
             }
 #if SIMPLER_DFX
