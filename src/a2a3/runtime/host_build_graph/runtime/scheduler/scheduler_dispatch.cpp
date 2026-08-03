@@ -1037,6 +1037,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             );
         }
         if (completed_this_turn > 0) {
+            sched_->flush_pending_watermark_updates(thread_idx);
 #if SIMPLER_SCHED_PROFILING
             sched_->tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
 #endif
@@ -1053,12 +1054,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
             }
         }
-        // Flush right after this phase, not batched with the phases below: this
-        // thread's own core-completion burst is bounded (see
-        // PendingWatermarkIds's comment), and flushing here first gives that
-        // burst a chance to fully drain before the next phase's pushes share the
-        // same fixed-capacity array.
-        sched_->flush_pending_watermark_updates(thread_idx);
 
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
@@ -1073,6 +1068,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 break;
             }
             if (poll_result.completed > 0) {
+                sched_->flush_pending_watermark_updates(thread_idx);
 #if SIMPLER_SCHED_PROFILING
                 sched_->tasks_completed.fetch_add(poll_result.completed, std::memory_order_relaxed);
 #endif
@@ -1082,8 +1078,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 made_progress = true;
             }
         }
-        // Flush this phase's own completions too, same reasoning as above.
-        sched_->flush_pending_watermark_updates(thread_idx);
 
 #if SIMPLER_DFX
         if (!try_completed) {
@@ -1208,6 +1202,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 cur_thread_completed++;
             }
             if (dummy_got > 0) {
+                sched_->flush_pending_watermark_updates(thread_idx);
                 made_progress = true;
             }
 #if SIMPLER_DFX
@@ -1234,8 +1229,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // on the swimlane; the cycle accumulators are coarse aggregates.
             }
 #endif
-            // Flush this phase's own inline completions too, same reasoning as above.
-            sched_->flush_pending_watermark_updates(thread_idx);
         }
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
