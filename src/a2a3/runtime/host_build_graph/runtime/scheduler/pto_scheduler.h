@@ -538,7 +538,7 @@ struct PTO2SchedulerState {
     // in the common case (each phase's own burst usually resolves immediately,
     // keeping the array small in practice) -- it just cannot shrink the capacity
     // this array must be sized to for the worst case.
-    struct PendingWatermarkIds {
+    struct alignas(64) PendingWatermarkIds {
         static constexpr int32_t kCapacity = 144;
         int32_t entries[kCapacity];
         int32_t count = 0;
