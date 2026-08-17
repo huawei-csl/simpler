@@ -550,7 +550,12 @@ struct PTO2SchedulerState {
 
     // First-unmet classification. Returns -1 (all fanins met -> route to ready)
     // or the index of the first unmet fanin (register on that producer's wake
-    // list). The decision is terminal: tasks are never re-polled; a producer's
+    // list). fanin_local_ids is sorted descending by the orchestrator's builder,
+    // so that first unmet entry is the highest unmet producer local id — the
+    // latest-submitted producer, which is the likeliest to complete last and
+    // therefore the least likely to bounce the consumer onto a second wake list.
+    // The scan still stops at the first unmet id rather than reading the whole
+    // array. The decision is terminal: tasks are never re-polled; a producer's
     // completion re-scans its waiters via on_mixed_task_complete's wake drain.
     int classify_fanin_state(const PTO2TaskSlotState *s) const {
         const PTO2TaskPayload &p = *s->payload;

@@ -690,8 +690,12 @@ static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
 
 // Polling: fanin is a flat array of position-independent producer local ids on
 // the payload (no dep-pool spill, no producer pointers). The builder writes them
-// directly into payload->fanin_local_ids as producers are appended, deduping by
-// slot and hard-capping at PTO2_MAX_FANIN. self_local is this task's own local id
+// directly into payload->fanin_local_ids, keeping the array sorted descending by
+// local id, deduping by slot and hard-capping at PTO2_MAX_FANIN. Descending order
+// is what makes classify_fanin_state's first unmet entry the highest unmet
+// producer id — the latest-submitted producer, hence the one most likely to
+// complete last, so the consumer is least likely to be re-registered onto a
+// second wake list. self_local is this task's own local id
 // (the consumer), used to bump each producer's last_consumer_local_id (the
 // reclaim gate the host wait_for_consumers polls via completed_watermark).
 struct PTO2FaninBuilder {
@@ -740,7 +744,17 @@ static bool append_fanin_or_fail(
         orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
         return false;
     }
-    fanin_builder->payload->fanin_local_ids[fanin_builder->count++] = static_cast<int32_t>(producer_task_id.local());
+    // Insertion sort, descending. mark_seen already rejected duplicates, so no
+    // equal id reaches here and the shift stops at the first larger neighbour.
+    // Fanin degree is bounded by PTO2_MAX_FANIN and is small in practice, so the
+    // shift is cheaper than a separate ordering pass over the finished array.
+    int32_t *fanin_ids = fanin_builder->payload->fanin_local_ids;
+    const int32_t new_id = static_cast<int32_t>(producer_task_id.local());
+    int32_t pos = fanin_builder->count++;
+    for (; pos > 0 && fanin_ids[pos - 1] < new_id; pos--) {
+        fanin_ids[pos] = fanin_ids[pos - 1];
+    }
+    fanin_ids[pos] = new_id;
 
     // Reclaim gate: record this task as a consumer of the producer. The producer
     // slot retires once the per-ring completed_watermark reaches this consumer id.
