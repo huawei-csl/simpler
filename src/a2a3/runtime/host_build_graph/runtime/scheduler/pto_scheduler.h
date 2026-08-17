@@ -555,7 +555,7 @@ struct PTO2SchedulerState {
     int classify_fanin_state(const PTO2TaskSlotState *s) const {
         const PTO2TaskPayload &p = *s->payload;
         const PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
-        for (int32_t i = 0; i < p.fanin_count; i++) {
+        for (int32_t i = p.fanin_count - 1; i >= 0; i--) {
             if (!ring.is_completion_flag_set(p.fanin_local_ids[i])) return i;
         }
         return -1;
