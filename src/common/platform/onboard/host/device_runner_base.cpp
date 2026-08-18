@@ -41,6 +41,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
+#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
@@ -206,6 +207,40 @@ void *DeviceRunnerBase::acquire_graph_execution_buffer(
     return aligned_addr;
 }
 
+void *DeviceRunnerBase::acquire_graph_definition_buffer(
+    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
+) {
+    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return nullptr;
+    }
+    RetainedGraphExecutionBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
+    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
+        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
+        return buffer.aligned_addr;
+    }
+
+    const size_t allocation_bytes = bytes + alignment - 1;
+    void *allocation = mem_alloc_.alloc(allocation_bytes);
+    if (allocation == nullptr) return nullptr;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+    if (raw > UINTPTR_MAX - (alignment - 1)) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+    if (device_memset(aligned_addr, 0, bytes) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    buffer = RetainedGraphExecutionBuffer{allocation, aligned_addr, bytes};
+    return aligned_addr;
+}
+
 void DeviceRunnerBase::release_graph_execution_buffers() {
     for (GraphExecutionBufferMap &by_key : graph_execution_buffers_) {
         for (auto &entry : by_key) {
@@ -215,10 +250,19 @@ void DeviceRunnerBase::release_graph_execution_buffers() {
         }
         by_key.clear();
     }
+    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
+        for (auto &entry : by_key) {
+            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
+        }
+        by_key.clear();
+    }
 }
 
 void DeviceRunnerBase::abandon_graph_execution_buffers() {
     for (GraphExecutionBufferMap &by_key : graph_execution_buffers_) {
+        by_key.clear();
+    }
+    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
         by_key.clear();
     }
 }
@@ -1057,14 +1101,26 @@ void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_output_prefix(config.output_prefix);
 }
 
-void DeviceRunnerBase::begin_host_orchestrator_capture(uint64_t reserve_capacity) noexcept {
+HostPhaseRecordPool *DeviceRunnerBase::host_phase_pool_arm(bool producer_wants_records) noexcept {
     if (clock_correlation_provider_ != nullptr) {
         clock_correlation_provider_->release(false);
         clock_correlation_provider_.reset();
     }
-    chip_swimlane_collector_.begin_host_orchestrator_capture(static_cast<size_t>(reserve_capacity));
-    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES) return;
+    const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
+    chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
+    // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
+    // where an escaping exception is std::terminate. A pass that cannot get its
+    // storage collects no records and says so by handing back nullptr.
+    HostPhaseRecordPool *pool = nullptr;
+    try {
+        pool = host_phase_records_.arm(producer_wants_records || swimlane_wants_records);
+    } catch (...) {
+        LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
+    }
+    if (!swimlane_wants_records) return pool;
 
+    // Only the chip-swimlane reader places these records against device
+    // timestamps, so only it needs the two clocks anchored.
     try {
         clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
         chip_swimlane_collector_.begin_clock_correlation_session(
@@ -1085,6 +1141,16 @@ void DeviceRunnerBase::begin_host_orchestrator_capture(uint64_t reserve_capacity
             chip_swimlane_collector_.finish_clock_correlation_session();
         }
     }
+    return pool;
+}
+
+void DeviceRunnerBase::publish_host_phase_records_to_swimlane() {
+    if (!host_phase_records_.finished()) return;
+    chip_swimlane_collector_.set_host_phase_records(
+        host_phase_records_.submit_records(), host_phase_records_.device_upload_records(),
+        host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
+        host_phase_records_.dropped_records()
+    );
 }
 
 void DeviceRunnerBase::finish_clock_correlation_session(
@@ -1654,7 +1720,18 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
         chip_swimlane_collector_.stop();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
+        publish_host_phase_records_to_swimlane();
         chip_swimlane_collector_.export_swimlane_json();
+    }
+
+    // Per-event view of the prepare path. Written here rather than in the reap
+    // tail because a device error reaches this teardown but not that tail, and a
+    // failed run is when the prepare timing is worth having. Keyed on
+    // output_prefix_ because it is non-empty exactly when this run produces
+    // diagnostic artifacts, and on the store having finished a pass, which is what
+    // a host-orchestrating runtime leaves behind.
+    if (!output_prefix_.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
     }
 
     if (enable_dump_args_) {

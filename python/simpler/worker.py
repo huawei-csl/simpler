@@ -79,7 +79,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, cast
@@ -92,12 +92,12 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _emit_host_span,
-    _host_span_sink_available,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
     _mailbox_load_i32,
     _mailbox_store_i32,
     _read_control_copy_request,
+    _set_host_span_level_prefix,
     _worker_host_mapped_region_ack_cleanup_error,
     _worker_host_mapped_region_close,
     _worker_host_mapped_region_import_onboard,
@@ -143,6 +143,9 @@ from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
     HOST_CPU,
+    AdapterKind,
+    AdapterProfile,
+    AttachmentRole,
     BackendPlan,
     BackendResolver,
     DefaultRegionAccessService,
@@ -155,6 +158,7 @@ from .comm_endpoints import (
     _EndpointTopologySnapshot,
     _format_worker_path,
     _normalize_node_identity,
+    at,
     parse_endpoint_path,
 )
 from .comm_region import MaterializationContext, RegionInstance, materialize_region_instance
@@ -180,6 +184,7 @@ from .global_comm_domain import (
     LOCAL_PREPARE_REQUEST,
     LOCAL_RELEASE_REQUEST,
     GlobalCommInitCommand,
+    GlobalDomainAttachment,
     GlobalDomainBuffer,
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
@@ -225,7 +230,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
-    _initialize_simpler_log,
+    _initialize_host_log,
     _Worker,
 )
 from .worker_chip_orch_comm import (
@@ -246,6 +251,8 @@ from .worker_chip_orch_comm import (
     peek_region_create_reply_region_id,
     validate_region_create_reply,
 )
+from .worker_level import WorkerLevel
+from .worker_level import span_prefix as _span_prefix
 
 # Upper bound on how long the parent waits for every chip's bootstrap mailbox
 # to leave IDLE.  Well above a realistic HCCL init (seconds) but short enough
@@ -260,8 +267,8 @@ _WORKER_CHIP_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\
 
 
 def _host_spans_active() -> bool:
-    """Whether an emitted host span can currently reach the logger sink."""
-    return HOST_STRACE_ENABLED and _host_span_sink_available()
+    """Whether host-span emission was compiled into this extension."""
+    return HOST_STRACE_ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -4389,6 +4396,9 @@ class Worker:
         **config,
     ) -> None:
         self.level = level
+        # Rebound from the level in `init()`; the default matches the C++ table's
+        # so a span emitted before init names L3 rather than nothing.
+        self._host_span_prefix = _span_prefix(WorkerLevel.host)
         self._config = config
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
@@ -6368,6 +6378,14 @@ class Worker:
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
+        mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
+        for child_index in worker._mpi_worker_ids:
+            rank = worker._mpi_rank_by_worker_id[int(child_index)]
+            group = mpi_groups[rank.group_id]
+            mpi_node_identity = _normalize_node_identity(group.spec.hosts[rank.rank])
+            mpi_path = _format_worker_path(3, parent_path=path, index=int(child_index))
+            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
+            self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
 
     def _append_device_endpoint_topology(
         self,
@@ -7309,14 +7327,20 @@ class Worker:
             sys.stderr.flush()
 
     def _release_import_recursive(self, identity: CanonicalIdentity) -> None:
-        """Drop ``identity`` from this Worker's own same-process import cache, then forward one
+        """Drop ``identity`` from this Worker's own same-process caches, then forward one
         more hop down this Worker's own children — same shape as ``_unregister_child_digest``'s
         recursive forward for callable cleanup, since a NEXT_LEVEL child may itself have
         materialized ``identity`` further down its own tree (chip/SUB leaves, or its own
         NEXT_LEVEL children in turn).
+
+        Two caches name a released identity here, not one: the import cache holds a mapping of it,
+        and ``_reexport_by_source`` holds the forwarding handle built from it. A retained re-export
+        outlives its backing, and its ``to_descriptor()`` keeps answering — so a later forward of
+        the same identity would hand a child a descriptor for a name the owner has unlinked.
         """
         if self._chip_import_registry is not None:
             self._chip_import_registry.unregister(identity)
+        self._reexport_by_source.pop(identity, None)
         self._broadcast_import_release(identity)
 
     def add_worker(self, worker: Worker) -> int:
@@ -7751,12 +7775,19 @@ class Worker:
 
         # Seed this process's logger before the first fork: the spans its own
         # scheduler emits obey the Python logger level, and every child inherits
-        # the mapping. Every level needs this — `init()` rejects device_ids above
+        # the state. Every level needs this — `init()` rejects device_ids above
         # L3, so a pod process owns no chips yet still drives next-level Workers
-        # and emits their spans. A chip-owning Worker names the copy its children
-        # load; any other process seeds the copy the package already preloaded.
+        # and emits their spans. A chip child re-seeds its inherited state before
+        # binding the logger copies embedded in the runtime modules it loads.
         chip_log_level = _simpler_log.get_current_config()
-        _initialize_simpler_log(self._l3_bins if device_ids else None, chip_log_level)
+        _initialize_host_log(chip_log_level)
+
+        # Bind the level word this process's host-scheduler spans lead with. The
+        # C++ emit sites in Orchestrator / WorkerThread are level-agnostic — the
+        # same code drives next-level children at every level above the chip — so
+        # the word is a property of the process. Resolved once here and pushed, so
+        # there is a single derivation rather than one on each side.
+        self._host_span_prefix = _set_host_span_level_prefix(_span_prefix(self.level))
 
         self._startup_reaped_pids = set()
         self._startup_ready_pids = set()
@@ -9115,7 +9146,77 @@ class Worker:
             command.window_size,
             command.members,
             command.buffers,
+            command.attachments,
         )
+
+    def _global_domain_attachment_matrix(
+        self,
+        members: tuple[GlobalDomainMember, ...],
+        receiver_nodes: tuple[int, ...],
+        window_size: int,
+    ) -> tuple[GlobalDomainAttachment, ...]:
+        """Resolve one host-consumer row for every receiving L3 node.
+
+        The endpoint planner remains the authority for adapter selection.  A
+        relation that the current planner cannot serve is retained as a
+        host-consumer attachment with no adapter; the wire therefore preserves
+        the complete matrix without claiming that an unavailable remote path
+        is usable.  A later access primitive can fill that capability without
+        changing rank membership or row cardinality.
+        """
+
+        registry = self._get_endpoint_registry()
+        resolver = BackendResolver(registry, self._get_region_access_service())
+        root_path = _format_worker_path(int(self.level))
+        attachments: list[GlobalDomainAttachment] = []
+        for receiver_node_id in sorted({int(node) for node in receiver_nodes}):
+            receiver_path = _format_worker_path(
+                3,
+                parent_path=root_path,
+                index=receiver_node_id,
+            )
+            consumer_selector = at(receiver_path, HOST_CPU)
+            for member in members:
+                member_path = _format_worker_path(
+                    2,
+                    parent_path=receiver_path
+                    if int(member.node_worker_id) == receiver_node_id
+                    else _format_worker_path(
+                        3,
+                        parent_path=root_path,
+                        index=int(member.node_worker_id),
+                    ),
+                    index=int(member.local_worker_id),
+                )
+                provider_selector = at(member_path, DEVICE_AICORE)
+                resolved = registry.resolve_region_spec(
+                    (provider_selector, consumer_selector),
+                    SingleOwner(provider=provider_selector),
+                )
+                plan = resolver.plan(
+                    resolved,
+                    RegionLayoutSpec(payload_bytes=int(window_size), counter_bytes=0),
+                )
+                adapter_kind: AdapterKind | None = None
+                adapter_profile: AdapterProfile | None = None
+                if not isinstance(plan, UnsupportedRegionPlan):
+                    consumer = next(
+                        attachment
+                        for attachment in plan.payload.attachments
+                        if attachment.role is AttachmentRole.CONSUMER
+                    )
+                    adapter_kind = consumer.adapter_kind
+                    adapter_profile = consumer.adapter_profile
+                attachments.append(
+                    GlobalDomainAttachment(
+                        node_worker_id=receiver_node_id,
+                        address_space=AddressSpace.HOST,
+                        role=AttachmentRole.CONSUMER,
+                        adapter_kind=adapter_kind,
+                        adapter_profile=adapter_profile,
+                    )
+                )
+        return tuple(attachments)
 
     @staticmethod
     def _global_domain_provenance_id(domain_id: int) -> int:
@@ -9143,6 +9244,7 @@ class Worker:
     ) -> tuple[GlobalDomainDescriptor, ...]:
         if self.level != 3 or self._worker is None:
             raise RuntimeError("Global CommDomain node prepare requires a ready L3 Worker")
+        command.attachments_for_node(node_worker_id)
         prior = self._global_node_domains.get(command.domain_id)
         if prior is not None:
             if self._global_domain_command_identity(prior.command) != self._global_domain_command_identity(command):
@@ -9204,6 +9306,15 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
+        if command.attachments:
+            if command.attachments != state.command.attachments:
+                raise RuntimeError("Global CommDomain import attachments conflict with prepare")
+        elif state.command.attachments:
+            # Attachments are immutable domain topology. IMPORT carries no
+            # second copy; rehydrate the prepared row before comparing the
+            # command identity and publishing the node view.
+            command = replace(command, attachments=state.command.attachments)
+        node_attachments = command.attachments_for_node(node_worker_id)
         if self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command):
             raise RuntimeError("Global CommDomain import command conflicts with prepare")
         validate_descriptor_table(
@@ -9292,6 +9403,7 @@ class Worker:
                 domain_id=command.domain_id,
                 generation=command.generation,
                 mapping_size=command.descriptors[0].mapping_size,
+                attachments=node_attachments,
             )
         except BaseException:
             # A node may have imported one local rank before a later local rank
@@ -9307,6 +9419,11 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain commit requires a matching imported domain")
+        if command.attachments:
+            if command.attachments != state.command.attachments:
+                raise RuntimeError("Global CommDomain commit attachments conflict with prepare")
+        elif state.command.attachments:
+            command = replace(command, attachments=state.command.attachments)
         if state.phase is not GlobalDomainPhase.IMPORT or state.view is None:
             raise RuntimeError("Global CommDomain commit requires IMPORT completion")
         if (
@@ -9569,6 +9686,12 @@ class Worker:
         global_buffers = tuple(GlobalDomainBuffer(buffer.name, int(buffer.nbytes)) for buffer in buffers)
         domain_members_tuple = tuple(domain_members)
         involved_nodes = tuple(dict.fromkeys(member.node_worker_id for member in domain_members_tuple))
+        attachment_nodes = tuple(sorted(involved_nodes))
+        attachment_matrix = self._global_domain_attachment_matrix(
+            domain_members_tuple,
+            attachment_nodes,
+            int(window_size),
+        )
         for node_worker_id in involved_nodes:
             node = nodes[node_worker_id]
             resolve_global_comm_capability(
@@ -9605,6 +9728,7 @@ class Worker:
             window_size=int(window_size),
             members=domain_members_tuple,
             buffers=global_buffers,
+            attachments=attachment_matrix,
         )
 
         prepared_nodes: list[int] = []
@@ -9761,6 +9885,7 @@ class Worker:
             mapping_size=descriptors[0].mapping_size,
             retain_after_run=retain_after_run,
             _release_fn=lambda released, owner=resources: self._release_global_domain_handle(released, owner),
+            attachments=attachment_matrix,
         )
         self._live_global_domains[name] = handle
         resources.live_global_domains[name] = handle
@@ -10082,9 +10207,19 @@ class Worker:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
 
         A no-op when no run is being built (``_building_run_resources is None``) — tracking is
-        opportunistic, only meaningful inside ``submit_next_level``/``submit_next_level_group``'s
-        run context, per the ``current_resources = self._building_run_resources; if ... is not
-        None`` idiom used elsewhere for the same "attach to the open run, if any" shape.
+        opportunistic, only meaningful inside the run context of the four orchestrator dispatch
+        entry points that carry Tensor args to another process (``submit_next_level``,
+        ``submit_next_level_group``, ``submit_sub``, ``submit_sub_group``), per the
+        ``current_resources = self._building_run_resources; if ... is not None`` idiom used
+        elsewhere for the same "attach to the open run, if any" shape.
+
+        The set over-approximates in one direction on purpose: every caller records before
+        ``_admit_task_submission``, which can itself raise on a sticky ordered-cleanup failure, so an
+        identity can be recorded for a task that never went out. That costs a spurious
+        ``release_buffer`` refusal, recoverable through ``close()``, where recording after admission
+        would leave a dispatched task's identity unrecorded and let a release unlink under it. The
+        group entry points additionally validate every member before recording any, since a rejected
+        member dispatches nothing at all.
         """
         resources = self._building_run_resources
         if resources is None:
@@ -10497,23 +10632,42 @@ class Worker:
         drop its own cached import for the identity.
 
         Rejects outright if any currently in-flight L3+ run (not yet past ``_cleanup_published``)
-        sent this identity as a NEXT_LEVEL Tensor arg, or any in-flight L2 direct-chip run sent it —
-        a Buffer never goes away while a dispatched task still names it. The L3+ check takes
-        ``_submit_mu`` first: a handle is visible in ``_accepted_run_handles`` before its
-        orchestration callback (where ``touched_identities`` gets populated) has run, and that
-        callback is what ``_submit_mu`` already serializes graph construction against, so taking it
-        here means the check only ever runs between callbacks, never mid-callback with a
-        not-yet-complete touched set. The L2 check is independent (a separate run-id namespace with
-        no callback to serialize against — ``_chip_run_touched_identities`` is written atomically
-        alongside ``_chip_runs`` under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the
-        two checks run sequentially rather than under one shared lock. Neither is checked once
-        ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency. The entry
-        survives a failed close, so ``_release_all_buffers`` still reports the leak at close() rather
-        than losing it here — the import-cache broadcast only fires once close() has actually
-        succeeded, so a failed release never tells a descendant to drop a mapping the owner still
-        considers live. The slot is dropped only when it still holds *this* buffer: a buffer_id
-        minted elsewhere can collide with a registry key, and evicting the live entry it names would
-        strand that backing."""
+        sent this identity as a NEXT_LEVEL or SUB Tensor arg, or any in-flight L2 direct-chip run
+        sent it — a Buffer never goes away while a dispatched task still names it. All three
+        dispatch paths retain: a SUB task maps the identity into a sub-worker process just as a
+        NEXT_LEVEL task maps it into a child, so unlinking the backing under either one faults the
+        consumer on a segment that no longer has a name.
+
+        The L3+ check takes ``_submit_mu`` first: a handle is visible in ``_accepted_run_handles``
+        before its orchestration callback (where ``touched_identities`` gets populated) has run, and
+        that callback is what ``_submit_mu`` already serializes graph construction against, so taking
+        it here means the check only ever runs between callbacks, never mid-callback with a
+        not-yet-complete touched set. ``_abandoned_run_handles`` is scanned in the same block and
+        without the ``_cleanup_published`` test: ``_publish_abandoned_run`` sets that flag and drops
+        the handle from the accepted set while the run itself stays retained until native teardown
+        drains it, so an abandoned run is exactly the case where the flag stops describing whether
+        the device is done with the backing. Such a buffer therefore stops being releasable through
+        this API for the Worker's remaining life, which strands nothing: ``close()`` reclaims it via
+        ``_release_all_buffers`` calling ``Buffer.close()`` directly.
+
+        The L2 check is independent (a separate run-id namespace with no callback to serialize
+        against — ``_chip_run_touched_identities`` is written atomically alongside ``_chip_runs``
+        under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the two checks run
+        sequentially rather than under one shared lock. Neither is checked once ``buffer`` is already
+        closed, matching ``Buffer.close()``'s own idempotency.
+
+        The entry survives a failed close, so ``_release_all_buffers`` still reports the leak at
+        close() rather than losing it here — the import-cache broadcast only fires once close() has
+        actually succeeded, so a failed release never tells a descendant to drop a mapping the owner
+        still considers live. The converse does not hold, and is the one asymmetry here: a
+        ``Buffer.close()`` whose ``shm.close()`` raises has still unlinked the name (its ``finally``
+        runs the unlink), so the backing can be nameless while descendants keep mappings this call
+        never told them to drop. A descendant materializing that identity afterwards gets the named
+        ``FileNotFoundError`` from ``ImportRegistry.materialize``, not a silent bad mapping.
+
+        The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
+        collide with a registry key, and evicting the live entry it names would strand that
+        backing."""
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -10523,6 +10677,12 @@ class Worker:
                 for handle in self._accepted_run_handles:
                     if not handle._cleanup_published and buffer.identity in handle._resources.touched_identities:
                         raise RuntimeError(f"release_buffer: {buffer.identity} is still referenced by an in-flight run")
+                for handle in self._abandoned_run_handles:
+                    if buffer.identity in handle._resources.touched_identities:
+                        raise RuntimeError(
+                            f"release_buffer: {buffer.identity} is still referenced by an abandoned run "
+                            f"whose native teardown has not completed"
+                        )
             with self._registry_lock:
                 for touched in self._chip_run_touched_identities.values():
                     if buffer.identity in touched:
@@ -10878,7 +11038,7 @@ class Worker:
                     finally:
                         graph_end_ns = time.monotonic_ns()
                         _emit_host_span(
-                            "l3.graph_build",
+                            f"{self._host_span_prefix}.graph_build",
                             run_id,
                             0,
                             0,
@@ -11675,6 +11835,7 @@ class Worker:
             ("remote", "pending remote frees", self._flush_pending_remote_frees),
             ("buffer", "all owner Buffers", self._release_all_buffers),
             ("buffer", "fork-inherited tensor buffers", self._fork_tensor_handles.clear),
+            ("buffer", "re-exported forwarding handles", self._reexport_by_source.clear),
             ("buffer", "chip import registry", self._close_chip_import_registry),
         ):
             self._cleanup_journal.add_once(kind, identity, cleanup)

@@ -64,6 +64,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/host_phase_records.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -146,6 +147,8 @@ public:
     void *acquire_graph_execution_buffer(
         uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, std::size_t bytes, std::size_t alignment
     );
+    void *
+    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -675,13 +678,13 @@ public:
         enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
-    void begin_host_orchestrator_capture(uint64_t reserve_capacity) noexcept;
-    void record_host_orchestrator_phase(const ChipSwimlaneHostOrchPhaseRecord &record) noexcept {
-        chip_swimlane_collector_.record_host_orchestrator_phase(record);
+    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        host_phase_records_.finish(submitted_tasks, invocation_id);
     }
-    void finish_host_orchestrator_capture(uint64_t expected_records) noexcept {
-        chip_swimlane_collector_.finish_host_orchestrator_capture(expected_records);
-    }
+    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this pass's records to the swimlane reader, just before its export. */
+    void publish_host_phase_records_to_swimlane();
     void finish_clock_correlation_session(bool capture_device_complete, bool abandon_device_resources) noexcept;
     void set_dump_args_enabled(int level) {
         dump_args_level_ = static_cast<DumpArgsLevel>(level);
@@ -1080,6 +1083,12 @@ protected:
     };
     using GraphExecutionBufferMap = std::unordered_map<uint64_t, std::vector<RetainedGraphExecutionBuffer>>;
     std::array<GraphExecutionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_execution_buffers_{};
+    // Graph Definition storage, one retained block per (pipeline slot,
+    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
+    // content identity rather than occurrence: every submission of one run
+    // references the same device-resident Definition.
+    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphExecutionBuffer>;
+    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
@@ -1148,6 +1157,10 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     ChipSwimlaneCollector chip_swimlane_collector_;
+    // Not a collector: the pool the runtime's prepare path writes into, read by
+    // whichever per-event views the run enabled. Its two readers are gated
+    // independently, so it belongs to neither.
+    simpler::dfx::HostPhaseRecordStore host_phase_records_;
     std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;

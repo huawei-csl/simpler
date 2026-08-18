@@ -130,8 +130,6 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
 // Weak fallback for builds that don't link chip_swimlane_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
-__attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -149,30 +147,16 @@ uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 // Cycle accumulation is unconditional under SIMPLER_ORCH_PROFILING (that's what
 // the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
-// printed in the cold-path log.
-//
-// Per-submit ORCH_SUBMIT record is the only swim-lane emit on the orch
-// path — one record per submit_task() / alloc_tensors() call spanning
-// the entire [start, end] window. Per-sub-step phase records were dropped
-// in favour of the cumulatives + per-submit envelope; the dispatcher
-// already inserts one record at the end of each submit path via
-// CYCLE_COUNT_ORCH_SUBMIT_RECORD.
-#define CYCLE_COUNT_START()                                                            \
-    bool _prof_active = (orch->chip_swimlane_level >= ChipSwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                                           \
-    uint64_t _submit_start_ts = _t0
+// printed in the cold-path log. Per-event records are a separate channel on a
+// separate clock — see ORCH_PHASE_END below.
+#define CYCLE_COUNT_START()                  \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1; \
+    (void)_t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                         \
-    do {                                                                                            \
-        if (_prof_active) {                                                                         \
-            _t1 = get_sys_cnt_aicpu();                                                              \
-            chip_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                           \
     } while (0)
 #elif SIMPLER_DFX
 #include "aicpu/device_time.h"
@@ -189,28 +173,54 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
     return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
            static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
 }
-__attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
-// submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
+// submit_idx tags a record with its position in the pass's submit order.
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                            \
-    bool _prof_active = (orch->chip_swimlane_level >= ChipSwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                    \
-    uint64_t _submit_start_ts = _t0
-#define CYCLE_COUNT_LAP(acc) \
-    do {                     \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                         \
-    do {                                                                                            \
-        if (_prof_active) {                                                                         \
-            _t1 = get_sys_cnt_aicpu();                                                              \
-            chip_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                           \
-    } while (0)
+// The per-sub-step accumulators exist only in an ORCH_PROFILING build, so at this
+// level there is nothing to time.
+#define CYCLE_COUNT_START()
+#define CYCLE_COUNT_LAP(acc)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)
+#endif
+
+// Host phase record sink. The host build links a strong definition that folds the
+// record into its kind's counters and appends it to the platform's record pool;
+// every other build keeps this no-op. Kind values are HostPhaseKind, passed as a
+// plain integer because this file is also compiled for the AICPU, where the
+// platform's host headers are absent.
+__attribute__((weak, visibility("hidden"))) void host_phase_record(uint64_t, uint64_t, uint32_t, uint64_t, uint32_t) {}
+
+// Host monotonic clock shared with the `[STRACE]` span tree, so a record nests
+// under chip.run.bind.host_orch without any clock conversion. The host build
+// links the strong definition in host_phase_trace.cpp; this fallback keeps
+// non-host builds linking, where the recorder above is a no-op anyway.
+__attribute__((weak, visibility("hidden"))) uint64_t host_phase_now_ns() { return 0; }
+
+#if SIMPLER_DFX
+// Kinds this file records, spelled as the HostPhaseKind values the host side
+// reads. Only the host orchestrator reaches these sites, so the bind-stage kinds
+// that precede them in the enum are not named here.
+enum class HostOrchPhase : uint32_t {
+    Submit = 12,           // submit_task_common: one ordinary ring task
+    Prepare = 13,          // prepare_task: one alloc_tensors slot
+    RecordNode = 14,       // graph_record_submit_node: one recorded Graph node
+    GraphSubmit = 15,      // graph_submit_definition: one outer GRAPH task
+    BuildDefinition = 16,  // graph_build_definition: nodes compacted into the image
+};
+#define ORCH_PHASE_START() const uint64_t _orch_phase_t0 = host_phase_now_ns()
+#define ORCH_PHASE_END(phase, detail)                                                                         \
+    do {                                                                                                      \
+        host_phase_record(                                                                                    \
+            _orch_phase_t0, host_phase_now_ns(), static_cast<uint32_t>(phase), static_cast<uint64_t>(detail), \
+            g_orch_submit_idx                                                                                 \
+        );                                                                                                    \
+    } while (0)
+#else
+#define ORCH_PHASE_START()
+#define ORCH_PHASE_END(phase, detail) \
+    do {                              \
+    } while (0)
 #endif
 
 static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
@@ -676,6 +686,18 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
     return GraphHostUpload{upload.outer_slot, upload.image.data(), upload.image.size()};
 }
 
+GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
+    GraphHostDefinitionList list;
+    list.entries.reserve(state.definitions.size());
+    for (auto &[key, image] : state.definitions) {
+        const GraphDefinition *header = graph_definition(image);
+        if (header != nullptr && header->total_bytes == image.size()) {
+            list.entries.push_back(GraphHostDefinition{key, image.data(), image.size()});
+        }
+    }
+    return list;
+}
+
 static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     uint32_t next = orch->fanin_seen_current_epoch + 1;
     if (next == 0) {
@@ -1116,6 +1138,7 @@ static TaskOutputTensors submit_task_common(
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
+    ORCH_PHASE_START();
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
@@ -1289,16 +1312,19 @@ static TaskOutputTensors submit_task_common(
     // Polling + host-orch: append_fanin_or_fail already wrote each producer's
     // local id into payload.fanin_local_ids and bumped its last_consumer_local_id.
     // All that remains is to record how many. There is NO fanout adjacency, NO
-    // dep_pool, and NO ready routing here — the device boot scan classifies every
-    // task exactly once (fanin_satisfied -> push_ready_routed, else register_wake)
-    // before the scheduler dispatch loop starts. Because fanin is now a flat array
-    // of position-independent integers, none of this needs host->device pointer
-    // relocation.
+    // dep_pool, and NO ready routing here — the initial device boot scan classifies
+    // each task once. A -1 result from classify_fanin_state routes the task through
+    // push_ready_routed; otherwise the returned index selects the producer passed
+    // to register_wake. Wake retargeting in register_wake may reclassify a task
+    // when the selected producer is already complete.
+    // The initial scan happens before the scheduler dispatch loop starts. Because
+    // fanin is a flat array of position-independent integers, none of this needs
+    // host->device pointer relocation.
     payload.fanin_count = fanin_builder.count;
     (void)sched;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
+    ORCH_PHASE_END(HostOrchPhase::Submit, task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -1390,10 +1416,9 @@ bool graph_build_submission_image(
     const std::vector<std::byte> &definition_image, const CoreTaskArgs &args, std::vector<std::byte> *submission_image
 ) {
     if (submission_image == nullptr || graph_definition(definition_image) == nullptr) return false;
-    const size_t definition_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphDefinition));
-    const size_t tensors_offset = PTO2_ALIGN_UP(definition_offset + definition_image.size(), alignof(GraphTensor));
+    const size_t tensors_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphTensor));
     const size_t tensor_bytes = static_cast<size_t>(args.tensor_count()) * sizeof(GraphTensor);
-    if (definition_offset > UINT32_MAX || tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
+    if (tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
         return false;
     }
     const size_t tensors_end = tensors_offset + tensor_bytes;
@@ -1405,7 +1430,6 @@ bool graph_build_submission_image(
         return false;
     }
     submission_image->assign(total_bytes, std::byte{0});
-    std::memcpy(submission_image->data() + definition_offset, definition_image.data(), definition_image.size());
     auto *tensors = reinterpret_cast<GraphTensor *>(submission_image->data() + tensors_offset);
     for (int32_t i = 0; i < args.tensor_count(); ++i)
         tensors[i] = graph_tensor_pack(args.tensor(i).ref());
@@ -1419,8 +1443,8 @@ bool graph_build_submission_image(
     const GraphDefinition &definition = *graph_definition(definition_image);
     GraphSubmission submission{};
     submission.graph_key = definition.full_key;
+    submission.definition_hash = definition.content_hash;
     submission.total_bytes = static_cast<uint32_t>(submission_image->size());
-    submission.definition_offset = static_cast<uint32_t>(definition_offset);
     submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
     submission.tensor_count = static_cast<uint32_t>(args.tensor_count());
     submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
@@ -1433,7 +1457,6 @@ bool graph_submit_definition(
     PTO2OrchestratorState *orch, GraphHostState *state, const std::vector<std::byte> &definition_image,
     const CoreTaskArgs &args, PTO2TaskId *submitted_id
 ) {
-    CYCLE_COUNT_START();
     const GraphDefinition *definition = graph_definition(definition_image);
     if (definition == nullptr || !graph_boundary_matches(*definition, args) ||
         definition->required_heap > static_cast<uint64_t>(INT32_MAX)) {
@@ -1499,7 +1522,6 @@ bool graph_submit_definition(
     pending.outer_slot = &slot;
     state->pending_uploads.push_back(std::move(pending));
     if (submitted_id != nullptr) *submitted_id = task_id;
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
 #if SIMPLER_DFX
     orch->tasks_submitted++;
 #endif
@@ -1519,6 +1541,7 @@ TaskOutputTensors graph_record_submit_node(
     PTO2OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
+    ORCH_PHASE_START();
     TaskOutputTensors result;
     GraphRecording &recording = *graph_state_from(orch)->recording;
 
@@ -1652,6 +1675,7 @@ TaskOutputTensors graph_record_submit_node(
     }
 
     recording.nodes.push_back(std::move(node));
+    ORCH_PHASE_END(HostOrchPhase::RecordNode, task_id.raw);
     return result;
 }
 
@@ -1677,9 +1701,11 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
     auto definition_it = state->definitions.find(full_key);
     if (definition_it != state->definitions.end()) {
         PTO2TaskId submitted = PTO2TaskId::invalid();
+        ORCH_PHASE_START();
         if (graph_submit_definition(orch, state, definition_it->second, args, &submitted)) {
             result.execute_block = false;
             result.task_id = submitted;
+            ORCH_PHASE_END(HostOrchPhase::GraphSubmit, submitted.raw);
 #if SIMPLER_DFX
             g_orch_submit_idx++;
 #if SIMPLER_ORCH_PROFILING
@@ -1735,11 +1761,13 @@ bool PTO2OrchestratorState::graph_end() {
     this->ring.task_allocator.restore_heap_top(recording->heap_watermark);
 
     std::vector<std::byte> definition;
+    ORCH_PHASE_START();
     if (!graph_build_definition(*recording, &definition)) {
         debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
         LOG_WARN("%s", "[GraphExecution] unsupported construct observed; falling back to the ordinary path");
         return false;
     }
+    ORCH_PHASE_END(HostOrchPhase::BuildDefinition, recording->nodes.size());
     const GraphDefinition *header = graph_definition(definition);
     if (header == nullptr) return false;
     LOG_DEBUG(
@@ -1754,9 +1782,13 @@ bool PTO2OrchestratorState::graph_end() {
     // block instead of one per internal node. The Definition stays cached for
     // subsequent invocations even if this placement fails.
     PTO2TaskId submitted = PTO2TaskId::invalid();
-    if (recording->boundary_args == nullptr ||
-        !graph_submit_definition(this, state, cached, *recording->boundary_args, &submitted)) {
-        return false;
+    {
+        ORCH_PHASE_START();
+        if (recording->boundary_args == nullptr ||
+            !graph_submit_definition(this, state, cached, *recording->boundary_args, &submitted)) {
+            return false;
+        }
+        ORCH_PHASE_END(HostOrchPhase::GraphSubmit, submitted.raw);
     }
 #if SIMPLER_DFX
     g_orch_submit_idx++;
@@ -1923,6 +1955,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     }
 
     CYCLE_COUNT_START();
+    ORCH_PHASE_START();
 
     if (args.has_error) {
         report_fatal(
@@ -2009,7 +2042,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
+    ORCH_PHASE_END(HostOrchPhase::Prepare, prepared.task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
