@@ -30,10 +30,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
+#include <condition_variable>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <unordered_map>
@@ -69,6 +72,20 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_begin_task(
     uint64_t, bool, bool, const int32_t[3], int32_t, int32_t, const TensorRef *, const TensorArgType *
 ) {}
 __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_end_task() {}
+
+// Raises the two edge kinds compute_task_fanin can discover, for the capture
+// instantiation. Shared by the ordinary submit path and the outer GRAPH task so
+// both describe an edge the same way.
+struct DepGraphAnnotate {
+    void creator(int32_t arg_idx, const ChipTensor &consumer, PTO2TaskId producer) const {
+        dep_gen_host_graph_add_creator_edge(producer.raw, arg_idx, consumer);
+    }
+    void tensormap(
+        int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry, OverlapStatus overlap
+    ) const {
+        dep_gen_host_graph_add_tensormap_edge(entry.producer_task_id.raw, arg_idx, consumer, entry, overlap);
+    }
+};
 __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_add_explicit_edge(uint64_t) {}
 __attribute__((weak, visibility("hidden"))) void
 dep_gen_host_graph_add_creator_edge(uint64_t, int32_t, const ChipTensor &) {}
@@ -81,11 +98,6 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_add_tensorma
 // host builds fall back to this weak `false`. Gating here still skips the
 // cross-agent occupancy reads that feed the sample when scope_stats is disabled.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
-
-// Heap-ring wrap report, called from the allocator (pto_ring_buffer.h) on each
-// wrap. Strong definition lives in the AICPU collector; host builds fall back to
-// this weak no-op so the runtime translation unit stays self-contained.
-extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 
 // AICore register accessor (aicpu/platform_regs.h). The host orchestrator's
 // route_ready_once path transitively ODR-uses the early-dispatch doorbell inline
@@ -130,10 +142,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
 // Weak fallback for builds that don't link chip_swimlane_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
-__attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
-static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
 static uint64_t g_orch_args_cycle = 0;       // param copy
 static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
@@ -142,36 +151,21 @@ static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
-uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
-uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 // Cycle accumulation is unconditional under SIMPLER_ORCH_PROFILING (that's what
 // the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
-// printed in the cold-path log.
-//
-// Per-submit ORCH_SUBMIT record is the only swim-lane emit on the orch
-// path — one record per submit_task() / alloc_tensors() call spanning
-// the entire [start, end] window. Per-sub-step phase records were dropped
-// in favour of the cumulatives + per-submit envelope; the dispatcher
-// already inserts one record at the end of each submit path via
-// CYCLE_COUNT_ORCH_SUBMIT_RECORD.
-#define CYCLE_COUNT_START()                                                            \
-    bool _prof_active = (orch->chip_swimlane_level >= ChipSwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                                           \
-    uint64_t _submit_start_ts = _t0
+// printed in the cold-path log. Per-event records are a separate channel on a
+// separate clock — see ORCH_PHASE_END below.
+#define CYCLE_COUNT_START()                  \
+    uint64_t _t0 = get_sys_cnt_aicpu(), _t1; \
+    (void)_t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                         \
-    do {                                                                                            \
-        if (_prof_active) {                                                                         \
-            chip_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                           \
     } while (0)
 #elif SIMPLER_DFX
 #include "aicpu/device_time.h"
@@ -188,28 +182,54 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
     return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
            static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
 }
-__attribute__((weak, visibility("hidden"))) void
-chip_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
-// submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
+// submit_idx tags a record with its position in the pass's submit order.
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                            \
-    bool _prof_active = (orch->chip_swimlane_level >= ChipSwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                    \
-    uint64_t _submit_start_ts = _t0
-#define CYCLE_COUNT_LAP(acc) \
-    do {                     \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                         \
-    do {                                                                                            \
-        if (_prof_active) {                                                                         \
-            _t1 = get_sys_cnt_aicpu();                                                              \
-            chip_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                           \
-    } while (0)
+// The per-sub-step accumulators exist only in an ORCH_PROFILING build, so at this
+// level there is nothing to time.
+#define CYCLE_COUNT_START()
+#define CYCLE_COUNT_LAP(acc)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)
+#endif
+
+// Host phase record sink. The host build links a strong definition that folds the
+// record into its kind's counters and appends it to the platform's record pool;
+// every other build keeps this no-op. Kind values are HostPhaseKind, passed as a
+// plain integer because this file is also compiled for the AICPU, where the
+// platform's host headers are absent.
+__attribute__((weak, visibility("hidden"))) void host_phase_record(uint64_t, uint64_t, uint32_t, uint64_t, uint32_t) {}
+
+// Host monotonic clock shared with the `[STRACE]` span tree, so a record nests
+// under chip.run.bind.host_orch without any clock conversion. The host build
+// links the strong definition in host_phase_trace.cpp; this fallback keeps
+// non-host builds linking, where the recorder above is a no-op anyway.
+__attribute__((weak, visibility("hidden"))) uint64_t host_phase_now_ns() { return 0; }
+
+#if SIMPLER_DFX
+// Kinds this file records, spelled as the HostPhaseKind values the host side
+// reads. Only the host orchestrator reaches these sites, so the bind-stage kinds
+// that precede them in the enum are not named here.
+enum class HostOrchPhase : uint32_t {
+    Submit = 12,           // submit_task_common: one ordinary ring task
+    Prepare = 13,          // prepare_task: one alloc_tensors slot
+    RecordNode = 14,       // graph_record_submit_node: one recorded Graph node
+    GraphSubmit = 15,      // graph_submit_definition: one outer GRAPH task
+    BuildDefinition = 16,  // graph_build_definition: nodes compacted into the image
+};
+#define ORCH_PHASE_START() const uint64_t _orch_phase_t0 = host_phase_now_ns()
+#define ORCH_PHASE_END(phase, detail)                                                                         \
+    do {                                                                                                      \
+        host_phase_record(                                                                                    \
+            _orch_phase_t0, host_phase_now_ns(), static_cast<uint32_t>(phase), static_cast<uint64_t>(detail), \
+            g_orch_submit_idx                                                                                 \
+        );                                                                                                    \
+    } while (0)
+#else
+#define ORCH_PHASE_START()
+#define ORCH_PHASE_END(phase, detail) \
+    do {                              \
+    } while (0)
 #endif
 
 static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
@@ -289,6 +309,18 @@ struct GraphRecordedScalarSourceRef {
     size_t source_index{0};
 };
 
+// A node's dispatch predicate, held as the operand tensor plus the element index
+// within it rather than the absolute address submit would resolve. The tensor is
+// copied because the caller only lends it for the duration of the submit call.
+struct GraphRecordedPredicate {
+    ChipTensor operand;
+    GraphRecordedTensorSourceRef source;
+    uint64_t elem_offset{0};
+    int64_t target{0};
+    uint8_t elem_size{0};
+    PredicateOp op{PredicateOp::NONE};
+};
+
 struct GraphRecordedNode {
     std::array<int32_t, PTO2_SUBTASK_SLOT_COUNT> kernel_ids{};
     ActiveMask active_mask{};
@@ -297,47 +329,101 @@ struct GraphRecordedNode {
     int16_t total_required_subtasks{0};
     size_t total_output_size{0};
     uintptr_t record_packed_base{0};
+    // Element addresses are handed to the caller through TaskOutputTensors, so
+    // this one stays per node: its heap buffer has to outlive every later node's
+    // recording. The arrays whose addresses are never borrowed live flat on the
+    // recording instead — see GraphRecording.
     std::vector<ChipTensor> tensors;
-    std::vector<GraphRecordedTensorSourceRef> tensor_sources;
-    std::vector<uint64_t> scalars;
-    std::vector<GraphRecordedScalarSourceRef> scalar_sources;
-    std::vector<size_t> internal_fanins;
+    // Ranges into the recording's flat arrays. tensor_sources has one entry per
+    // tensor, so tensors.size() is its count.
+    uint32_t tensor_source_offset{0};
+    uint32_t scalar_offset{0};
+    uint32_t scalar_count{0};
+    uint32_t fanin_offset{0};
+    uint32_t fanin_count{0};
+    // Index into the recording's predicates, or -1 when the node carries none.
+    int32_t predicate_index{-1};
     ArgsDumpTaskMetadata dump_metadata;
+};
+
+// One recorded node's scratch output window. reserve_heap_scratch is a pure bump
+// and a node stores the aligned size it advanced by, so consecutive windows abut:
+// held in record order these are sorted and disjoint, which is what lets an
+// address lookup binary search instead of walking every producer. A node with no
+// output advances nothing and owns no entry.
+struct GraphRecordedOutputRange {
+    uintptr_t begin;
+    uintptr_t end;
+    uint32_t node_index;
 };
 
 struct GraphRecording {
     uint64_t full_key{0};
     int32_t start_local_task_id{0};
-    // Heap allocation pointer captured at graph_begin. Internal nodes reserve
-    // scratch output buffers past it during the recording pass; graph_end rolls
-    // the heap back here so the outer GRAPH task reclaims the same region.
-    uint64_t heap_watermark{0};
-    // The Graph boundary CoreTaskArgs, owned by the caller for the whole
-    // rt_submit_graph_impl call (recording pass + graph_end). graph_end replays
-    // it through graph_submit_definition to emit the outer GRAPH task with the
-    // current invocation's boundary tensor addresses.
-    const CoreTaskArgs *boundary_args{nullptr};
+    uint64_t next_virtual_offset{0};
+    // Worker-owned deep copy of the first Graph boundary. It stays valid from
+    // graph_prepare through graph_end and anchors boundary scalar sources while
+    // the main thread submits outer shells from later invocation arguments.
+    const GraphTaskArgs *boundary_args{nullptr};
+    int32_t boundary_scalar_count{0};
     bool unsupported{false};
     std::vector<ChipTensor> boundary_tensors;
     std::vector<TensorArgType> boundary_types;
     std::vector<GraphRecordedNode> nodes;
+    // Flat per-node arrays, indexed by the ranges on GraphRecordedNode. Held
+    // here rather than on each node so recording a graph pays a handful of
+    // amortized growths instead of one allocation per node per array.
+    std::vector<GraphRecordedTensorSourceRef> tensor_sources;
+    std::vector<uint64_t> scalars;
+    std::vector<GraphRecordedScalarSourceRef> scalar_sources;
+    std::vector<size_t> internal_fanins;
+    std::vector<GraphRecordedOutputRange> output_ranges;
+    // Indexed by GraphRecordedNode::predicate_index; only predicated nodes
+    // contribute an entry.
+    std::vector<GraphRecordedPredicate> predicates;
 };
 
 struct GraphPendingUpload {
     PTO2TaskSlotState *outer_slot{nullptr};
     std::vector<std::byte> image;
+    bool deferred_heap{false};
 };
+
+enum class GraphRecordingStatus : uint8_t { IDLE = 0, RECORDING = 1, READY = 2, FAILED = 3 };
 
 struct GraphHostState {
     std::unordered_map<uint64_t, std::vector<std::byte>> definitions;
     std::unique_ptr<GraphRecording> recording;
     std::vector<GraphPendingUpload> pending_uploads;
+    std::mutex recording_mutex;
+    std::condition_variable recording_cv;
+    // Atomic because graph_prepare reads it on the recording worker without
+    // taking recording_mutex, by design: acquiring the mutex there lets a
+    // main-thread burst of same-hash submissions starve the worker before it can
+    // bind its private recording state. Every other access holds the mutex.
+    std::atomic<GraphRecordingStatus> recording_status{GraphRecordingStatus::IDLE};
+    uint64_t recording_key{0};
+
+    GraphRecordingStatus status() const { return recording_status.load(std::memory_order_acquire); }
+    void set_status(GraphRecordingStatus next) { recording_status.store(next, std::memory_order_release); }
 };
 
 namespace {
 
 GraphHostState *graph_state_from(PTO2OrchestratorState *orch) {
     return orch == nullptr ? nullptr : static_cast<GraphHostState *>(orch->graph_host_state);
+}
+
+thread_local GraphRecording *g_active_graph_recording = nullptr;
+// The recording a thread holds belongs to one GraphHostState. Recording into it
+// from a different orchestrator would silently mix two graphs, so the owner is
+// part of the thread-local identity rather than implied by it.
+thread_local GraphHostState *g_active_graph_owner = nullptr;
+
+GraphRecording *active_graph_recording(PTO2OrchestratorState *orch) {
+    GraphHostState *state = graph_state_from(orch);
+    if (state == nullptr || state != g_active_graph_owner) return nullptr;
+    return g_active_graph_recording;
 }
 
 uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
@@ -381,10 +467,14 @@ bool graph_tensor_from_boundary(
     return false;
 }
 
+template <typename ArgT>
 GraphRecordedScalarSourceRef
-graph_classify_scalar(const GraphRecording &recording, const CoreTaskArgs &args, int32_t scalar_index) {
+graph_classify_scalar(const GraphRecording &recording, const ArgT &args, int32_t scalar_index) {
     if (recording.boundary_args == nullptr) return {};
-    if (&args == recording.boundary_args && scalar_index < recording.boundary_args->scalar_count()) {
+    // Identity, not type: an internal node's Arg and the boundary Arg have
+    // different capacities, so compare the addresses through void.
+    if (static_cast<const void *>(&args) == static_cast<const void *>(recording.boundary_args) &&
+        scalar_index < recording.boundary_args->scalar_count()) {
         return GraphRecordedScalarSourceRef{GraphRecordedScalarSource::BOUNDARY, static_cast<size_t>(scalar_index)};
     }
 
@@ -410,29 +500,35 @@ bool graph_classify_tensor(
     GraphRecordedTensorSourceRef *source
 ) {
     if (graph_tensor_from_boundary(recording, tensor, source)) return true;
-    const uint64_t tensor_addr = tensor.buffer.addr;
-    for (int32_t producer_index = task_index; producer_index >= 0; --producer_index) {
-        const GraphRecordedNode &producer =
-            producer_index == task_index ? current : recording.nodes[static_cast<size_t>(producer_index)];
-        if (producer.record_packed_base == 0 || producer.total_output_size == 0 ||
-            producer.total_output_size > UINTPTR_MAX - producer.record_packed_base) {
-            continue;
+    const uintptr_t tensor_addr = static_cast<uintptr_t>(tensor.buffer.addr);
+    // The node being recorded is not in output_ranges yet — its entry is appended
+    // once its own tensors are classified — so its window is tested here, and a
+    // hit is OWN_OUTPUT rather than a dependency.
+    if (current.record_packed_base != 0 && current.total_output_size != 0 &&
+        current.total_output_size <= UINTPTR_MAX - current.record_packed_base) {
+        const uintptr_t begin = current.record_packed_base;
+        if (tensor_addr >= begin && tensor_addr < begin + current.total_output_size) {
+            source->source = GraphRecordedTensorSource::OWN_OUTPUT;
+            source->source_index = static_cast<size_t>(task_index);
+            source->packed_offset = tensor_addr - begin;
+            return true;
         }
-        const uintptr_t begin = producer.record_packed_base;
-        const uintptr_t end = begin + producer.total_output_size;
-        if (tensor_addr < begin || tensor_addr >= end) continue;
-        source->source =
-            producer_index == task_index ? GraphRecordedTensorSource::OWN_OUTPUT : GraphRecordedTensorSource::INTERNAL;
-        source->source_index = static_cast<size_t>(producer_index);
-        source->packed_offset = tensor_addr - begin;
-        return true;
     }
-    return false;
-}
-
-void graph_record_mark_unsupported(PTO2OrchestratorState *orch) {
-    GraphHostState *state = graph_state_from(orch);
-    if (state != nullptr && state->recording != nullptr) state->recording->unsupported = true;
+    // Sorted and disjoint, so the only window that can hold the address is the
+    // last one starting at or below it.
+    const auto after = std::upper_bound(
+        recording.output_ranges.begin(), recording.output_ranges.end(), tensor_addr,
+        [](uintptr_t addr, const GraphRecordedOutputRange &range) {
+            return addr < range.begin;
+        }
+    );
+    if (after == recording.output_ranges.begin()) return false;
+    const GraphRecordedOutputRange &range = *(after - 1);
+    if (tensor_addr >= range.end) return false;
+    source->source = GraphRecordedTensorSource::INTERNAL;
+    source->source_index = range.node_index;
+    source->packed_offset = tensor_addr - range.begin;
+    return true;
 }
 
 GraphBoundarySignature graph_boundary_signature(const ChipTensor &tensor, TensorArgType type, uint16_t alias_rep) {
@@ -507,6 +603,16 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
         return false;
     }
 
+    // Every per-node array is grown by push_back below, and the recording
+    // already knows how many entries each node contributes, so size them once
+    // here. Left unreserved, packing 277 nodes' args reallocates each vector a
+    // dozen times and copies its whole contents each time.
+    size_t total_tensors = 0;
+    for (const GraphRecordedNode &source : recording.nodes) {
+        total_tensors += source.tensors.size();
+    }
+    const size_t total_scalars = recording.scalars.size();
+    const size_t total_fanins = recording.internal_fanins.size();
     std::vector<uint32_t> fanout_counts(recording.nodes.size(), 0);
     std::vector<uint32_t> fanin_offsets(recording.nodes.size() + 1, 0);
     std::vector<uint16_t> fanin_indices;
@@ -517,6 +623,14 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     std::vector<GraphTensorSourceRef> tensor_sources;
     std::vector<uint64_t> scalars;
     std::vector<GraphScalarSourceRef> scalar_sources;
+    std::vector<GraphPredicate> predicates;
+    predicates.reserve(recording.predicates.size());
+    fanin_indices.reserve(total_fanins);
+    roots.reserve(recording.nodes.size());
+    tensors.reserve(total_tensors);
+    tensor_sources.reserve(total_tensors);
+    scalars.reserve(total_scalars);
+    scalar_sources.reserve(total_scalars);
 
     uint64_t required_heap = 0;
     uint32_t edge_count = 0;
@@ -524,13 +638,11 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
         const GraphRecordedNode &source = recording.nodes[i];
         if (source.total_output_size > static_cast<size_t>(INT32_MAX) ||
             source.tensors.size() > static_cast<size_t>(INT32_MAX) ||
-            source.scalars.size() > static_cast<size_t>(INT32_MAX) || source.internal_fanins.size() > UINT16_MAX ||
-            source.tensors.size() != source.tensor_sources.size() ||
-            source.scalars.size() != source.scalar_sources.size() ||
+            source.scalar_count > static_cast<uint32_t>(INT32_MAX) || source.fanin_count > UINT16_MAX ||
             tensors.size() > UINT32_MAX - source.tensors.size() ||
-            tensor_sources.size() > UINT32_MAX - source.tensor_sources.size() ||
-            scalars.size() > UINT32_MAX - source.scalars.size() ||
-            scalar_sources.size() > UINT32_MAX - source.scalar_sources.size() ||
+            tensor_sources.size() > UINT32_MAX - source.tensors.size() ||
+            scalars.size() > UINT32_MAX - source.scalar_count ||
+            scalar_sources.size() > UINT32_MAX - source.scalar_count ||
             std::any_of(source.tensors.begin(), source.tensors.end(), [](const ChipTensor &tensor) {
                 return tensor.ndims > MAX_TENSOR_DIMS;
             })) {
@@ -541,9 +653,10 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
         if (required_heap > UINT64_MAX - output_bytes) return false;
         required_heap += output_bytes;
 
-        fanin_offsets[i + 1] = fanin_offsets[i] + static_cast<uint32_t>(source.internal_fanins.size());
-        if (source.internal_fanins.empty()) roots.push_back(static_cast<uint16_t>(i));
-        for (size_t producer : source.internal_fanins) {
+        fanin_offsets[i + 1] = fanin_offsets[i] + source.fanin_count;
+        if (source.fanin_count == 0) roots.push_back(static_cast<uint16_t>(i));
+        for (uint32_t f = 0; f < source.fanin_count; ++f) {
+            const size_t producer = recording.internal_fanins[source.fanin_offset + f];
             if (producer >= i) return false;
             fanout_counts[producer]++;
             fanin_indices.push_back(static_cast<uint16_t>(producer));
@@ -557,21 +670,41 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
         node.logical_block_num = source.logical_block_num;
         node.total_required_subtasks = source.total_required_subtasks;
         node.tensor_count = static_cast<int32_t>(source.tensors.size());
-        node.scalar_count = static_cast<int32_t>(source.scalars.size());
+        node.scalar_count = static_cast<int32_t>(source.scalar_count);
         node.total_output_size = static_cast<int32_t>(source.total_output_size);
         node.tensor_offset = static_cast<uint32_t>(tensors.size());
         node.scalar_offset = static_cast<uint32_t>(scalars.size());
         node.dump_metadata = source.dump_metadata;
+        node.predicate_slot = 0;
+        if (source.predicate_index >= 0) {
+            if (static_cast<size_t>(source.predicate_index) >= recording.predicates.size() ||
+                predicates.size() >= static_cast<size_t>(UINT16_MAX)) {
+                return false;
+            }
+            const GraphRecordedPredicate &recorded = recording.predicates[source.predicate_index];
+            std::optional<GraphTensorSourceRef> packed_source = graph_pack_tensor_source(recorded.source);
+            if (!packed_source.has_value() || recorded.operand.ndims > MAX_TENSOR_DIMS) return false;
+            GraphPredicate packed{};
+            packed.operand = graph_tensor_pack(recorded.operand);
+            packed.operand_source = *packed_source;
+            packed.elem_offset = recorded.elem_offset;
+            packed.target = recorded.target;
+            packed.elem_size = recorded.elem_size;
+            packed.op = static_cast<uint8_t>(recorded.op);
+            node.predicate_slot = static_cast<uint16_t>(predicates.size() + 1);
+            predicates.push_back(packed);
+        }
         for (const ChipTensor &tensor : source.tensors)
             tensors.push_back(graph_tensor_pack(tensor));
-        for (const GraphRecordedTensorSourceRef &tensor_source : source.tensor_sources) {
-            std::optional<GraphTensorSourceRef> packed_source = graph_pack_tensor_source(tensor_source);
+        for (size_t t = 0; t < source.tensors.size(); ++t) {
+            std::optional<GraphTensorSourceRef> packed_source =
+                graph_pack_tensor_source(recording.tensor_sources[source.tensor_source_offset + t]);
             if (!packed_source.has_value()) return false;
             tensor_sources.push_back(*packed_source);
         }
-        for (size_t scalar_index = 0; scalar_index < source.scalars.size(); ++scalar_index) {
+        for (size_t scalar_index = 0; scalar_index < source.scalar_count; ++scalar_index) {
             std::optional<GraphScalarSourceRef> packed_source =
-                graph_pack_scalar_source(source.scalar_sources[scalar_index]);
+                graph_pack_scalar_source(recording.scalar_sources[source.scalar_offset + scalar_index]);
             if (!packed_source.has_value() ||
                 (packed_source->source == static_cast<uint8_t>(GraphScalarSource::BOUNDARY) &&
                  packed_source->source_index >= recording.boundary_args->scalar_count())) {
@@ -581,7 +714,7 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
             scalars.push_back(
                 packed_source->source == static_cast<uint8_t>(GraphScalarSource::BOUNDARY) ?
                     0 :
-                    source.scalars[scalar_index]
+                    recording.scalars[source.scalar_offset + scalar_index]
             );
         }
     }
@@ -592,7 +725,9 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     std::vector<uint16_t> fanout_indices(edge_count);
     std::vector<uint32_t> cursors(fanout_offsets.begin(), fanout_offsets.end() - 1);
     for (size_t consumer = 0; consumer < recording.nodes.size(); ++consumer) {
-        for (size_t producer : recording.nodes[consumer].internal_fanins) {
+        const GraphRecordedNode &consumer_node = recording.nodes[consumer];
+        for (uint32_t f = 0; f < consumer_node.fanin_count; ++f) {
+            const size_t producer = recording.internal_fanins[consumer_node.fanin_offset + f];
             fanout_indices[cursors[producer]++] = static_cast<uint16_t>(consumer);
         }
     }
@@ -621,9 +756,37 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     definition.edge_count = edge_count;
     definition.root_count = static_cast<uint32_t>(roots.size());
     definition.boundary_count = static_cast<uint32_t>(signatures.size());
-    definition.boundary_scalar_count = static_cast<uint32_t>(recording.boundary_args->scalar_count());
+    definition.boundary_scalar_count = static_cast<uint32_t>(recording.boundary_scalar_count);
     definition.tensor_arg_count = static_cast<uint32_t>(tensors.size());
     definition.scalar_arg_count = static_cast<uint32_t>(scalars.size());
+    definition.predicate_count = static_cast<uint32_t>(predicates.size());
+    size_t execution_storage_bytes = 0;
+    if (!graph_execution_storage_bytes(static_cast<int32_t>(definition.task_count), &execution_storage_bytes) ||
+        execution_storage_bytes > UINT32_MAX) {
+        return false;
+    }
+    definition.execution_storage_bytes = static_cast<uint32_t>(execution_storage_bytes);
+    // Every section's byte count is known now, so the image grows once instead of
+    // resizing eleven times. Each append aligns its start, hence the per-section
+    // alignment slack.
+    auto section_bytes = [](size_t count, size_t elem_size, size_t align) {
+        return count == 0 ? size_t{0} : (align - 1) + count * elem_size;
+    };
+    image->reserve(
+        image->size() + section_bytes(fanout_offsets.size(), sizeof(uint32_t), alignof(uint32_t)) +
+        section_bytes(fanout_indices.size(), sizeof(uint16_t), alignof(uint16_t)) +
+        section_bytes(fanin_offsets.size(), sizeof(uint32_t), alignof(uint32_t)) +
+        section_bytes(fanin_indices.size(), sizeof(uint16_t), alignof(uint16_t)) +
+        section_bytes(roots.size(), sizeof(uint16_t), alignof(uint16_t)) +
+        section_bytes(node_offsets.size(), sizeof(uint64_t), alignof(uint64_t)) +
+        section_bytes(nodes.size(), sizeof(GraphNodeDefinition), alignof(GraphNodeDefinition)) +
+        section_bytes(tensors.size(), sizeof(GraphTensor), alignof(GraphTensor)) +
+        section_bytes(tensor_sources.size(), sizeof(GraphTensorSourceRef), alignof(GraphTensorSourceRef)) +
+        section_bytes(scalars.size(), sizeof(uint64_t), alignof(uint64_t)) +
+        section_bytes(scalar_sources.size(), sizeof(GraphScalarSourceRef), alignof(GraphScalarSourceRef)) +
+        section_bytes(signatures.size(), sizeof(GraphBoundarySignature), alignof(GraphBoundarySignature)) +
+        section_bytes(predicates.size(), sizeof(GraphPredicate), alignof(GraphPredicate))
+    );
     definition.off_fanout_offsets = graph_append_section(image, fanout_offsets);
     definition.off_fanout_indices = graph_append_section(image, fanout_indices);
     definition.off_fanin_offsets = graph_append_section(image, fanin_offsets);
@@ -636,6 +799,7 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
     definition.off_scalars = graph_append_section(image, scalars);
     definition.off_scalar_sources = graph_append_section(image, scalar_sources);
     definition.off_boundary_signatures = graph_append_section(image, signatures);
+    definition.off_predicates = graph_append_section(image, predicates);
     if (definition.off_fanout_offsets == 0 || definition.off_fanin_offsets == 0 || definition.off_node_offsets == 0 ||
         definition.off_nodes == 0 || definition.off_boundary_signatures == 0 ||
         (!tensors.empty() && definition.off_tensors == 0) ||
@@ -644,7 +808,8 @@ bool graph_build_definition(const GraphRecording &recording, std::vector<std::by
         (!scalar_sources.empty() && definition.off_scalar_sources == 0) ||
         (!fanout_indices.empty() && definition.off_fanout_indices == 0) ||
         (!fanin_indices.empty() && definition.off_fanin_indices == 0) ||
-        (!roots.empty() && definition.off_root_indices == 0)) {
+        (!roots.empty() && definition.off_root_indices == 0) ||
+        (!predicates.empty() && definition.off_predicates == 0)) {
         return false;
     }
     definition.total_bytes = static_cast<uint32_t>(image->size());
@@ -673,6 +838,18 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
     GraphPendingUpload &upload = state.pending_uploads[index];
     if (upload.outer_slot == nullptr || upload.image.empty()) return std::nullopt;
     return GraphHostUpload{upload.outer_slot, upload.image.data(), upload.image.size()};
+}
+
+GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
+    GraphHostDefinitionList list;
+    list.entries.reserve(state.definitions.size());
+    for (auto &[key, image] : state.definitions) {
+        const GraphDefinition *header = graph_definition(image);
+        if (header != nullptr && header->total_bytes == image.size()) {
+            list.entries.push_back(GraphHostDefinition{key, image.data(), image.size()});
+        }
+    }
+    return list;
 }
 
 static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
@@ -736,6 +913,16 @@ static bool append_fanin_or_fail(
         return true;
     }
     if (fanin_builder->count >= PTO2_MAX_FANIN) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Fanin Capacity Exhausted!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("HBG stores every producer dependency inline on the consumer task.");
+        LOG_ERROR("  Fanin:     used=%d/%d", fanin_builder->count, PTO2_MAX_FANIN);
+        LOG_ERROR("  Requested: at least %d distinct producer dependencies", fanin_builder->count + 1);
+        LOG_ERROR("Solution:");
+        LOG_ERROR("  Reduce the task fanin to at most PTO2_MAX_FANIN=%d.", PTO2_MAX_FANIN);
+        LOG_ERROR("  HBG has no dependency spill pool; PTO2_RING_DEP_POOL does not apply.");
+        LOG_ERROR("========================================");
         orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
         return false;
     }
@@ -773,43 +960,11 @@ static PTO2OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
     return layout;
 }
 
-static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator, uint8_t ring_id) {
-    always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
-
-    int32_t scope_task_count = orch->scope_tasks_size - orch->scope_begins[orch->scope_stack_top];
-    if (scope_task_count < allocator.window_size() - 1) {
-        return true;
-    }
-
-    int32_t active_count = allocator.active_count();
-
-    LOG_ERROR("========================================");
-    LOG_ERROR("FATAL: Scope Deadlock Detected! (ring %d)", ring_id);
-    LOG_ERROR("========================================");
-    LOG_ERROR("Tasks in current scope (%d) >= task_window_size (%d).", scope_task_count, allocator.window_size());
-    LOG_ERROR("  scope_depth:        %d", orch->scope_stack_top + 1);
-    LOG_ERROR("  ring_id:            %d", ring_id);
-    LOG_ERROR("  scope_task_count:   %d", scope_task_count);
-    LOG_ERROR("  active_tasks:       %d / %d", active_count, allocator.window_size());
-    LOG_ERROR("Root Cause:");
-    LOG_ERROR("  host_build_graph is whole-graph-resident: the host builds the entire");
-    LOG_ERROR("  scope before the device runs, so no slots reclaim during the build.");
-    LOG_ERROR("  When scope task count >= window_size the ring overflows.");
-    LOG_ERROR("Solution:");
-    LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
-    LOG_ERROR("  2. Increase task window (current: %d)", allocator.window_size());
-    LOG_ERROR("     Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-    LOG_ERROR("     Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2>");
-    LOG_ERROR("  3. Split work across multiple scopes");
-    LOG_ERROR("========================================");
-    orch_mark_fatal(orch, PTO2_ERROR_SCOPE_DEADLOCK);
-    return false;
-}
-
 static bool prepare_task(
     PTO2OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
     TaskAttrs task_attrs, PTO2PreparedTask *out
 ) {
+    always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
     uint8_t ring_id = 0;
     auto &allocator = orch->ring.task_allocator;
 
@@ -822,10 +977,6 @@ static bool prepare_task(
             "block_num=%d with %d active slots requires %d subtasks; expected block_num >= 1 and total <= %d",
             block_num, active_subtasks_per_block, total_required_subtasks, std::numeric_limits<int16_t>::max()
         );
-        return false;
-    }
-
-    if (!check_scope_can_accept_task(orch, allocator, ring_id)) {
         return false;
     }
 
@@ -919,7 +1070,7 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     // tasks. Recorded ordering is preserved by the nodes' explicit dependencies
     // and tensor-source classification, so a scope inside a Graph body is a no-op
     // during recording and must not touch the real scope stack.
-    if (GraphHostState *state = graph_state_from(orch); state != nullptr && state->recording != nullptr) {
+    if (active_graph_recording(orch) != nullptr) {
         return;
     }
     assert(orch->scope_stack_top < static_cast<int32_t>(orch->scope_stack_capacity - 1) && "Scope stack overflow");
@@ -944,8 +1095,9 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
         // Polling: no dep_pool to report (readiness is via completion_flags).
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
+        // Both rings are forward-only here, so their reclaim ends stay at 0.
         scope_stats_begin(
-            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
+            ring_id, /*task_start=*/0, alloc.task_head(), /*heap_start=*/0, alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
         );
     }
@@ -959,7 +1111,7 @@ void PTO2OrchestratorState::end_scope() {
     }
     // Matches begin_scope: a scope inside a Graph body is a no-op during the
     // shadow-record pass, so it must not touch the scope stack.
-    if (GraphHostState *state = graph_state_from(orch); state != nullptr && state->recording != nullptr) {
+    if (active_graph_recording(orch) != nullptr) {
         return;
     }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
@@ -976,8 +1128,9 @@ void PTO2OrchestratorState::end_scope() {
         // Polling: no dep_pool to report (readiness is via completion_flags).
         int32_t dep_pool_tail = 0;
         int32_t dep_pool_top = 0;
+        // Both rings are forward-only here, so their reclaim ends stay at 0.
         scope_stats_end(
-            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
+            ring_id, /*task_start=*/0, alloc.task_head(), /*heap_start=*/0, alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
         );
     }
@@ -1012,97 +1165,34 @@ void PTO2OrchestratorState::end_scope() {
 // =============================================================================
 
 // Ensure the tensormap entry pool has room for `needed` inserts before STEP 4
-// registers this task's outputs. The pool is watermark-reclaimed like the
-// task/heap/fanin pools — retired tasks' entries free once last_task_alive
-// advances — so an exhausted pool is back-pressure, not a hard error. Reclaim
-// against the single ring's watermark; if still short,
-// spin until reclaim actually frees entries, with the same 500 ms wall-clock
-// backstop as the task allocator and fanin spill pool. A pool that stays full
-// (no entry freed) is a genuine deadlock: latch PTO2_ERROR_TENSORMAP_OVERFLOW
-// and bail. Returns false on deadlock or on a fatal already latched by another
-// party. Cold path — the fast path returns immediately when the pool has room.
+// registers this task's outputs. Device completion never reclaims TensorMap
+// entries; only synchronous dependency computation can remove a covered
+// producer before this check. A pool that is still short here therefore cannot
+// become large enough while the host waits: latch
+// PTO2_ERROR_TENSORMAP_OVERFLOW and bail rather than letting new_entry()'s hard
+// assert fire mid-registration. Returns false when the pool is exhausted or a
+// fatal is already latched by another party.
 static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t needed) {
     PTO2TensorMap &tm = orch->tensor_map;
     if (tm.free_entries() >= needed) {
         return true;
     }
-
-    int32_t alive;
-    auto read_alive = [&]() {
-        // Relaxed: a self-correcting poll re-read every reclaim tick, so a stale
-        // watermark only defers reclaim one tick and never over-frees.
-        alive = orch->sm_header->ring.fc.last_task_alive.load(std::memory_order_relaxed);
-    };
-
-    read_alive();
-    int64_t cur_alive_sum = tm.reclaim_retired_all(alive);  // kept for the deadlock diagnostic
-    int32_t prev_free = tm.free_entries();
-    if (prev_free >= needed) {
-        return true;
+    if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+        return false;
     }
 
-    int spin_count = 0;
-    uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
-    bool block_timing = false;  // false until the first no-reclaim-progress tick
-    while (tm.free_entries() < needed) {
-        spin_count++;
-
-        // Reclaim (and the all-ring watermark reads it needs) is the costly part of
-        // this spin and the only path that frees entries; gate it to a periodic tick.
-        // Cold path, but the spin itself is tight.
-        if ((spin_count & 31) == 0) {
-            read_alive();
-            cur_alive_sum = tm.reclaim_retired_all(alive);
-            int32_t cur_free = tm.free_entries();
-            if (cur_free >= needed) {
-                return true;
-            }
-            // Progress is entries actually freed, NOT watermark movement: a ring can
-            // retire zero-output tasks (count_registrable_outputs == 0), advancing
-            // last_task_alive without freeing any entry. Gating the backstop on
-            // free_entries() keeps a wedged pool from dodging the timeout while some
-            // unrelated ring keeps draining.
-            if (cur_free > prev_free) {
-                spin_count = 0;
-                prev_free = cur_free;
-                block_timing = false;
-            }
-        }
-
-        if ((spin_count & 1023) == 0) {
-            // A fatal latched elsewhere breaks this otherwise-unbounded spin.
-            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                return false;
-            }
-            // Absolute-time backstop, matching the task allocator: stable across
-            // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
-            // is an MMIO read, so sample it only once per 1024 spins.
-            uint64_t now = get_sys_cnt_aicpu();
-            if (!block_timing) {
-                block_cycle0 = now;
-                block_timing = true;
-            } else if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
-                LOG_ERROR("========================================");
-                LOG_ERROR("FATAL: TensorMap Entry Pool Deadlock Detected!");
-                LOG_ERROR("========================================");
-                LOG_ERROR("TensorMap entry pool freed no entries for ~500 ms while a task waits.");
-                LOG_ERROR("  - Pool used:   %d / %d", tm.current_used(), tm.pool_capacity());
-                LOG_ERROR("  - Needed:      %d entries", needed);
-                LOG_ERROR("  - last_task_alive: %" PRId64, cur_alive_sum);
-                LOG_ERROR("Diagnosis:");
-                LOG_ERROR("  No retiring task is freeing tensormap entries (last_task_alive may");
-                LOG_ERROR("  still move on rings with no registered outputs). Check TaskRing");
-                LOG_ERROR("  diagnostics for the stalled producer.");
-                LOG_ERROR("Solution:");
-                LOG_ERROR("  Increase PTO2_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
-                LOG_ERROR("========================================");
-                orch_mark_fatal(orch, PTO2_ERROR_TENSORMAP_OVERFLOW);
-                return false;
-            }
-        }
-        SPIN_WAIT_HINT();
-    }
-    return true;
+    LOG_ERROR("========================================");
+    LOG_ERROR("FATAL: TensorMap Entry Pool Exhausted!");
+    LOG_ERROR("========================================");
+    LOG_ERROR("Device completion does not reclaim HBG TensorMap entries.");
+    LOG_ERROR("  - Pool used:   %d / %d", tm.current_used(), tm.pool_capacity());
+    LOG_ERROR("  - Free:        %d entries", tm.free_entries());
+    LOG_ERROR("  - Needed:      %d entries", needed);
+    LOG_ERROR("Solution:");
+    LOG_ERROR("  Increase PTO2_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
+    LOG_ERROR("========================================");
+    orch_mark_fatal(orch, PTO2_ERROR_TENSORMAP_OVERFLOW);
+    return false;
 }
 
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
@@ -1115,6 +1205,7 @@ static TaskOutputTensors submit_task_common(
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
+    ORCH_PHASE_START();
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
@@ -1122,7 +1213,6 @@ static TaskOutputTensors submit_task_common(
         return result;
     }
     PTO2SchedulerState *sched = orch->scheduler;
-    PTO2RingFlowControl &fc = orch->sm_header->ring.fc;
     PTO2TaskId task_id = prepared.task_id;
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
@@ -1157,14 +1247,6 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    // === STEP 2: Sync TensorMap validity and optional cleanup ===
-    // Read current last_task_alive from shared memory for this ring
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-
-    orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
-
-    CYCLE_COUNT_LAP(g_orch_sync_cycle);
-
     for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
@@ -1173,18 +1255,12 @@ static TaskOutputTensors submit_task_common(
             );
             return result;
         }
-        // Declared dependencies are graph edges even when the producer already
-        // retired below last_task_alive and needs no fanin wiring.
         if (capture_dep_graph) {
             dep_gen_host_graph_add_explicit_edge(dep_task_id.raw);
         }
         uint8_t dep_ring_id = dep_task_id.ring();
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->ring;
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
-        int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
-        if (dep_local_task_id < dep_last_task_alive) {
-            continue;
-        }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
         if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder)) {
@@ -1209,16 +1285,6 @@ static TaskOutputTensors submit_task_common(
     // The capture branch instantiates compute_task_fanin with a live Annotate;
     // the plain branch keeps the un-annotated instantiation the hot path had.
     if (capture_dep_graph) {
-        struct DepGraphAnnotate {
-            void creator(int32_t arg_idx, const ChipTensor &consumer, PTO2TaskId producer) const {
-                dep_gen_host_graph_add_creator_edge(producer.raw, arg_idx, consumer);
-            }
-            void tensormap(
-                int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry, OverlapStatus overlap
-            ) const {
-                dep_gen_host_graph_add_tensormap_edge(entry.producer_task_id.raw, arg_idx, consumer, entry, overlap);
-            }
-        };
         const bool ok =
             compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit, DepGraphAnnotate{});
         // STEP 3 is this task's last capture point, so the entry closes here
@@ -1236,10 +1302,9 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_lookup_cycle);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    // Reserve pool capacity for this task's inserts before registering. The pool
-    // is reclaimed as last_task_alive advances; an
-    // exhausted pool back-pressures here (and detects a wedged watermark) rather
-    // than tripping new_entry()'s hard assert mid-registration.
+    // Reserve pool capacity for this task's inserts before registering, so an
+    // exhausted pool reports here rather than tripping new_entry()'s hard assert
+    // mid-registration.
     int32_t tensormap_needed = count_registrable_outputs(dep_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) {
         return result;
@@ -1288,16 +1353,19 @@ static TaskOutputTensors submit_task_common(
     // Polling + host-orch: append_fanin_or_fail already wrote each producer's
     // local id into payload.fanin_local_ids and bumped its last_consumer_local_id.
     // All that remains is to record how many. There is NO fanout adjacency, NO
-    // dep_pool, and NO ready routing here — the device boot scan classifies every
-    // task exactly once (fanin_satisfied -> push_ready_routed, else register_wake)
-    // before the scheduler dispatch loop starts. Because fanin is now a flat array
-    // of position-independent integers, none of this needs host->device pointer
-    // relocation.
+    // dep_pool, and NO ready routing here — the initial device boot scan classifies
+    // each task once. A -1 result from classify_fanin_state routes the task through
+    // push_ready_routed; otherwise the returned index selects the producer passed
+    // to register_wake. Wake retargeting in register_wake may reclassify a task
+    // when the selected producer is already complete.
+    // The initial scan happens before the scheduler dispatch loop starts. Because
+    // fanin is a flat array of position-independent integers, none of this needs
+    // host->device pointer relocation.
     payload.fanin_count = fanin_builder.count;
     (void)sched;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
+    ORCH_PHASE_END(HostOrchPhase::Submit, task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -1311,7 +1379,7 @@ static TaskOutputTensors submit_task_common(
 
 namespace {
 
-bool graph_boundary_matches(const GraphDefinition &definition, const CoreTaskArgs &args) {
+bool graph_boundary_matches(const GraphDefinition &definition, const GraphTaskArgs &args) {
     if (args.scalar_count() != static_cast<int32_t>(definition.boundary_scalar_count) ||
         args.explicit_dep_count() != 0 || args.tensor_count() != static_cast<int32_t>(definition.boundary_count)) {
         LOG_WARN(
@@ -1369,6 +1437,49 @@ bool graph_boundary_matches(const GraphDefinition &definition, const CoreTaskArg
     return true;
 }
 
+bool graph_recording_boundary_matches(const GraphRecording &recording, const GraphTaskArgs &args) {
+    if (args.scalar_count() != recording.boundary_scalar_count || args.explicit_dep_count() != 0 ||
+        args.tensor_count() != static_cast<int32_t>(recording.boundary_tensors.size()) ||
+        recording.boundary_tensors.size() != recording.boundary_types.size()) {
+        return false;
+    }
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        const ChipTensor &expected = recording.boundary_tensors[static_cast<size_t>(i)];
+        const ChipTensor &actual = args.tensor(i).ref();
+        if (actual.ndims > MAX_TENSOR_DIMS || actual.buffer.size != expected.buffer.size ||
+            actual.ndims != expected.ndims || actual.dtype != expected.dtype ||
+            args.tag(i) != recording.boundary_types[static_cast<size_t>(i)] ||
+            actual.manual_dep != expected.manual_dep || actual.is_contiguous != expected.is_contiguous ||
+            !std::equal(
+                std::begin(actual.shapes), std::begin(actual.shapes) + actual.ndims, std::begin(expected.shapes)
+            ) ||
+            !std::equal(
+                std::begin(actual.strides), std::begin(actual.strides) + actual.ndims, std::begin(expected.strides)
+            )) {
+            return false;
+        }
+        uint16_t expected_alias = static_cast<uint16_t>(i);
+        uint16_t actual_alias = static_cast<uint16_t>(i);
+        for (int32_t j = 0; j < i; ++j) {
+            const ChipTensor &expected_other = recording.boundary_tensors[static_cast<size_t>(j)];
+            if (expected_other.buffer.addr == expected.buffer.addr &&
+                expected_other.buffer.size == expected.buffer.size) {
+                expected_alias = static_cast<uint16_t>(j);
+                break;
+            }
+        }
+        for (int32_t j = 0; j < i; ++j) {
+            const ChipTensor &actual_other = args.tensor(j).ref();
+            if (actual_other.buffer.addr == actual.buffer.addr && actual_other.buffer.size == actual.buffer.size) {
+                actual_alias = static_cast<uint16_t>(j);
+                break;
+            }
+        }
+        if (actual_alias != expected_alias) return false;
+    }
+    return true;
+}
+
 void graph_reset_outer_payload(PTO2TaskPayload &payload) {
     payload.tensor_count = 0;
     payload.scalar_count = 0;
@@ -1385,14 +1496,13 @@ void graph_reset_outer_payload(PTO2TaskPayload &payload) {
     payload.early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
 }
 
-bool graph_build_submission_image(
-    const std::vector<std::byte> &definition_image, const CoreTaskArgs &args, std::vector<std::byte> *submission_image
+bool graph_prepare_submission_image(
+    uint64_t full_key, const GraphTaskArgs &args, std::vector<std::byte> *submission_image
 ) {
-    if (submission_image == nullptr || graph_definition(definition_image) == nullptr) return false;
-    const size_t definition_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphDefinition));
-    const size_t tensors_offset = PTO2_ALIGN_UP(definition_offset + definition_image.size(), alignof(GraphTensor));
+    if (submission_image == nullptr) return false;
+    const size_t tensors_offset = PTO2_ALIGN_UP(sizeof(GraphSubmission), alignof(GraphTensor));
     const size_t tensor_bytes = static_cast<size_t>(args.tensor_count()) * sizeof(GraphTensor);
-    if (definition_offset > UINT32_MAX || tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
+    if (tensors_offset > UINT32_MAX || tensors_offset > UINT32_MAX - tensor_bytes) {
         return false;
     }
     const size_t tensors_end = tensors_offset + tensor_bytes;
@@ -1404,7 +1514,6 @@ bool graph_build_submission_image(
         return false;
     }
     submission_image->assign(total_bytes, std::byte{0});
-    std::memcpy(submission_image->data() + definition_offset, definition_image.data(), definition_image.size());
     auto *tensors = reinterpret_cast<GraphTensor *>(submission_image->data() + tensors_offset);
     for (int32_t i = 0; i < args.tensor_count(); ++i)
         tensors[i] = graph_tensor_pack(args.tensor(i).ref());
@@ -1415,11 +1524,9 @@ bool graph_build_submission_image(
         );
     }
 
-    const GraphDefinition &definition = *graph_definition(definition_image);
     GraphSubmission submission{};
-    submission.graph_key = definition.full_key;
+    submission.graph_key = full_key;
     submission.total_bytes = static_cast<uint32_t>(submission_image->size());
-    submission.definition_offset = static_cast<uint32_t>(definition_offset);
     submission.tensors_offset = static_cast<uint32_t>(tensors_offset);
     submission.tensor_count = static_cast<uint32_t>(args.tensor_count());
     submission.scalars_offset = static_cast<uint32_t>(scalars_offset);
@@ -1428,33 +1535,29 @@ bool graph_build_submission_image(
     return true;
 }
 
-bool graph_submit_definition(
-    PTO2OrchestratorState *orch, GraphHostState *state, const std::vector<std::byte> &definition_image,
-    const CoreTaskArgs &args, PTO2TaskId *submitted_id
+bool graph_submit_outer(
+    PTO2OrchestratorState *orch, GraphHostState *state, uint64_t full_key, uint64_t definition_hash, int32_t owned_heap,
+    bool defer_heap, const GraphTaskArgs &args, PTO2TaskId *submitted_id
 ) {
-    const GraphDefinition *definition = graph_definition(definition_image);
-    if (definition == nullptr || !graph_boundary_matches(*definition, args) ||
-        definition->required_heap > static_cast<uint64_t>(INT32_MAX)) {
-        return false;
-    }
+    always_assert(orch->scope_stack_top >= 0 && "Cannot submit Graph outside a scope");
     auto &allocator = orch->ring.task_allocator;
-    if (allocator.active_count() + 1 >= allocator.window_size() ||
-        definition->required_heap > allocator.heap_available()) {
+    if (allocator.active_count() >= allocator.window_size() ||
+        (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available())) {
         LOG_WARN("%s", "[GraphExecution] task-window/heap preflight failed; using ordinary path");
         return false;
     }
 
     GraphPendingUpload pending;
-    if (!graph_build_submission_image(definition_image, args, &pending.image)) return false;
+    if (!graph_prepare_submission_image(full_key, args, &pending.image)) return false;
+    reinterpret_cast<GraphSubmission *>(pending.image.data())->definition_hash = definition_hash;
+    pending.deferred_heap = defer_heap;
 
     DepInputs boundary_inputs{
         args.tensor_count(), args.tensor_data(), args.tag_data(), 0, nullptr,
     };
     const int32_t tensormap_needed = count_registrable_outputs(boundary_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) return false;
-    if (!check_scope_can_accept_task(orch, allocator, 0)) return false;
-
-    const PTO2TaskAllocResult allocation = allocator.alloc(static_cast<int32_t>(definition->required_heap));
+    const PTO2TaskAllocResult allocation = allocator.alloc(defer_heap ? 0 : owned_heap);
     if (allocation.failed()) {
         orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
@@ -1483,14 +1586,38 @@ bool graph_submit_definition(
     graph_reset_outer_payload(payload);
 
     PTO2FaninBuilder fanin_builder(orch, &payload, static_cast<int32_t>(task_id.local()), next_fanin_seen_epoch(orch));
-    orch->tensor_map.sync_tensormap(task_id, ring.fc.last_task_alive.load(std::memory_order_acquire));
     auto emit = [&](PTO2TaskId producer_id) -> bool {
         const int32_t producer_local = static_cast<int32_t>(producer_id.local());
         const int32_t producer_slot = ring.get_slot_by_task_id(producer_local);
         PTO2TaskSlotState *producer = &ring.get_slot_state_by_slot(producer_slot);
         return append_fanin_or_fail(orch, producer_id.ring(), producer_slot, producer, producer_id, &fanin_builder);
     };
-    if (!compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit)) return false;
+    // An outer GRAPH task is a ring task like any other, so the dependency graph
+    // has to carry it: without this the whole Graph — and every edge into it —
+    // is absent from deps.json, leaving a run of 40 replays described by only its
+    // handful of non-Graph tasks. It dispatches no kernel of its own and the
+    // sub-DAG it replays owns no ring slots, so what is captured is its boundary:
+    // the args it consumes and the edges those produce.
+    const bool capture_dep_graph = dep_gen_host_graph_enabled();
+    if (capture_dep_graph) {
+        const std::array<int32_t, PTO2_SUBTASK_SLOT_COUNT> kernel_ids_capture{
+            INVALID_KERNEL_ID,
+            INVALID_KERNEL_ID,
+            INVALID_KERNEL_ID,
+        };
+        dep_gen_host_graph_begin_task(
+            task_id.raw, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
+            slot.logical_block_num, args.tensor_count(), args.tensor_data(), args.tag_data()
+        );
+        const bool ok =
+            compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit, DepGraphAnnotate{});
+        // The task's last capture point, so the entry closes whether or not the
+        // fanin computation succeeded.
+        dep_gen_host_graph_end_task();
+        if (!ok) return false;
+    } else if (!compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit)) {
+        return false;
+    }
     register_task_outputs(boundary_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
     payload.fanin_count = fanin_builder.count;
 
@@ -1503,21 +1630,80 @@ bool graph_submit_definition(
     return true;
 }
 
+bool graph_submit_definition(
+    PTO2OrchestratorState *orch, GraphHostState *state, const std::vector<std::byte> &definition_image,
+    const GraphTaskArgs &args, PTO2TaskId *submitted_id
+) {
+    const GraphDefinition *definition = graph_definition(definition_image);
+    if (definition == nullptr || !graph_boundary_matches(*definition, args) ||
+        definition->execution_storage_bytes == 0 ||
+        definition->required_heap > UINT64_MAX - definition->execution_storage_bytes) {
+        return false;
+    }
+    const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
+    if (owned_heap > static_cast<uint64_t>(INT32_MAX)) return false;
+    return graph_submit_outer(
+        orch, state, definition->full_key, definition->content_hash, static_cast<int32_t>(owned_heap), false, args,
+        submitted_id
+    );
+}
+
+bool graph_submit_pending_definition(
+    PTO2OrchestratorState *orch, GraphHostState *state, uint64_t full_key, const GraphTaskArgs &args,
+    PTO2TaskId *submitted_id
+) {
+    return graph_submit_outer(orch, state, full_key, 0, 0, true, args, submitted_id);
+}
+
+bool graph_finalize_pending_submissions(
+    PTO2OrchestratorState *orch, GraphHostState *state, const GraphDefinition &definition
+) {
+    if (definition.execution_storage_bytes == 0 ||
+        definition.required_heap > UINT64_MAX - definition.execution_storage_bytes) {
+        return false;
+    }
+    const uint64_t owned_heap = definition.required_heap + definition.execution_storage_bytes;
+    if (owned_heap > static_cast<uint64_t>(INT32_MAX)) return false;
+    for (GraphPendingUpload &pending : state->pending_uploads) {
+        if (!pending.deferred_heap || pending.image.size() < sizeof(GraphSubmission)) continue;
+        auto *submission = reinterpret_cast<GraphSubmission *>(pending.image.data());
+        if (submission->graph_key != definition.full_key || pending.outer_slot == nullptr ||
+            pending.outer_slot->task == nullptr || pending.outer_slot->task_kind != TaskKind::GRAPH ||
+            !graph_submission_wire_size_valid(*submission, pending.image.size())) {
+            return false;
+        }
+        void *packed_base = nullptr;
+        void *packed_end = nullptr;
+        if (!orch->ring.task_allocator.reserve_deferred_heap(
+                static_cast<int32_t>(owned_heap), &packed_base, &packed_end
+            )) {
+            return false;
+        }
+        pending.outer_slot->task->packed_buffer_base = packed_base;
+        pending.outer_slot->task->packed_buffer_end = packed_end;
+        submission->definition_hash = definition.content_hash;
+        pending.deferred_heap = false;
+    }
+    return true;
+}
+
 // Record one internal Graph node during the recording pass without consuming a
 // ring task-window slot. Builds the node's metadata and materialized outputs
-// exactly as submit_task_common would, but reserves output buffers from heap
-// scratch (released in graph_end) and derives internal fanins from tensor-source
+// exactly as submit_task_common would, but assigns output buffers from the
+// bit-63 virtual address range and derives internal fanins from tensor-source
 // classification — so no ring slot, tensormap entry, fanin-pool entry, or upload
-// is produced for the node. The whole sub-DAG is later replayed by the single
-// outer GRAPH task graph_end emits. The returned TaskOutputTensors borrow the
-// node's own tensor storage; moving the node into recording.nodes keeps those
-// addresses valid because the inner buffer is transferred, not copied.
+// is produced for the node. The resulting Definition is later attached to the
+// outer GRAPH shells already submitted by the main thread. The returned
+// TaskOutputTensors borrow the node's own tensor storage; moving the node into
+// recording.nodes keeps those addresses valid because the inner buffer is
+// transferred, not copied.
 TaskOutputTensors graph_record_submit_node(
     PTO2OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
+    ORCH_PHASE_START();
     TaskOutputTensors result;
-    GraphRecording &recording = *graph_state_from(orch)->recording;
+    GraphRecording &recording = *active_graph_recording(orch);
 
     const size_t node_index = recording.nodes.size();
     // A recorded node's index equals its local task id minus the recording
@@ -1527,22 +1713,20 @@ TaskOutputTensors graph_record_submit_node(
         PTO2TaskId::make(0, static_cast<uint32_t>(recording.start_local_task_id) + static_cast<uint32_t>(node_index));
     result.set_task_id(task_id);
 
-    if (node_index >= GRAPH_MAX_NODES || args.has_error || args.predicate().op != PredicateOp::NONE) {
+    if (node_index >= GRAPH_MAX_NODES || args.has_error) {
         recording.unsupported = true;
     }
 
     const PTO2OutputLayout layout = calculate_output_layout(args);
-    void *packed_base = orch->ring.task_allocator.reserve_heap_scratch(layout.total_output_size);
-    if (layout.total_output_size > 0 && packed_base == nullptr) {
-        // No scratch storage for this node's outputs: the sub-DAG cannot be
-        // recorded, so graph_end falls back and the body runs on the ordinary
-        // path where the same heap pressure is reported through alloc().
-        recording.unsupported = true;
-        return result;
-    }
     const uint64_t aligned_output =
         layout.total_output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(layout.total_output_size), PTO2_ALIGN_SIZE) :
                                        0;
+    if (recording.next_virtual_offset > GRAPH_RECORD_VIRTUAL_BASE - aligned_output) {
+        recording.unsupported = true;
+        return result;
+    }
+    const uintptr_t packed_base_addr = GRAPH_RECORD_VIRTUAL_BASE + recording.next_virtual_offset;
+    recording.next_virtual_offset += aligned_output;
 
     GraphRecordedNode node;
     node.kernel_ids[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
@@ -1553,11 +1737,10 @@ TaskOutputTensors graph_record_submit_node(
     node.task_attrs.set_early_resolve(false);
     node.logical_block_num = args.launch_spec.block_num();
     // Mirror prepare_task's contract: block_num must be positive and the subtask
-    // count must fit int16_t. An out-of-contract value marks the recording
-    // unsupported so graph_end falls back to the ordinary path, which reports
-    // PTO2_ERROR_INVALID_ARGS, rather than baking a truncated or negative count
-    // into the cached Definition (which the device would expand into a node that
-    // never completes).
+    // count must fit int16_t. An out-of-contract value marks asynchronous
+    // recording unsupported and makes commit fail-fast, rather than baking a
+    // truncated or negative count into the cached Definition (which the device
+    // would expand into a node that never completes).
     const int32_t required_subtasks =
         static_cast<int32_t>(node.logical_block_num) * __builtin_popcount(active_mask.core_mask());
     if (node.logical_block_num <= 0 || required_subtasks > std::numeric_limits<int16_t>::max()) {
@@ -1566,7 +1749,7 @@ TaskOutputTensors graph_record_submit_node(
     } else {
         node.total_required_subtasks = static_cast<int16_t>(required_subtasks);
     }
-    node.record_packed_base = reinterpret_cast<uintptr_t>(packed_base);
+    node.record_packed_base = packed_base_addr;
     node.total_output_size = aligned_output;
 
     // Build the tensor list exactly as PTO2TaskPayload::init: inputs/inouts copy
@@ -1581,8 +1764,7 @@ TaskOutputTensors graph_record_submit_node(
         } else {
             init_tensor_from_create_info(
                 slot_tensor, args.tensor(i).create_info(),
-                reinterpret_cast<void *>(reinterpret_cast<char *>(packed_base) + layout.offsets[i]),
-                layout.buffer_sizes[i]
+                reinterpret_cast<void *>(packed_base_addr + layout.offsets[i]), layout.buffer_sizes[i]
             );
             slot_tensor.owner_task_id = task_id;
         }
@@ -1592,7 +1774,9 @@ TaskOutputTensors graph_record_submit_node(
     for (int32_t i = 0; i < tensor_count; ++i) {
         if (args.tag(i) == TensorArgType::OUTPUT) result.materialize_output(node.tensors[static_cast<size_t>(i)]);
     }
-    node.scalars.assign(args.scalars(), args.scalars() + args.scalar_count());
+    node.scalar_offset = static_cast<uint32_t>(recording.scalars.size());
+    node.scalar_count = static_cast<uint32_t>(args.scalar_count());
+    recording.scalars.insert(recording.scalars.end(), args.scalars(), args.scalars() + args.scalar_count());
 #if SIMPLER_DFX
     node.dump_metadata.dump_arg_mask = args.dump_arg_mask();
     node.dump_metadata.dump_arg_flags = args.dump_arg_index_ambiguous_mask();
@@ -1602,31 +1786,77 @@ TaskOutputTensors graph_record_submit_node(
     // Classify each scalar's source: a plain literal is static Definition data,
     // while a value copied from a boundary scalar is refreshed on replay. A
     // mutable tracked boundary scalar is not supported and falls back.
-    node.scalar_sources.resize(static_cast<size_t>(args.scalar_count()));
+    recording.scalar_sources.resize(static_cast<size_t>(node.scalar_offset) + node.scalar_count);
     for (int32_t i = 0; i < args.scalar_count(); ++i) {
         GraphRecordedScalarSourceRef source = graph_classify_scalar(recording, args, i);
         if (source.source == GraphRecordedScalarSource::INVALIDATED_BOUNDARY) recording.unsupported = true;
-        node.scalar_sources[static_cast<size_t>(i)] = source;
+        recording.scalar_sources[static_cast<size_t>(node.scalar_offset) + static_cast<size_t>(i)] = source;
     }
 
     // Classify each tensor's source, then derive internal fanins from the
     // INTERNAL classifications plus any explicit internal dependency.
-    node.tensor_sources.resize(static_cast<size_t>(tensor_count));
+    node.tensor_source_offset = static_cast<uint32_t>(recording.tensor_sources.size());
+    recording.tensor_sources.resize(static_cast<size_t>(node.tensor_source_offset) + tensor_count);
     for (int32_t i = 0; i < tensor_count; ++i) {
+        // The out-pointer is used only for the duration of the call, so pointing
+        // it into the flat array is safe even though a later node grows that array.
         if (!graph_classify_tensor(
                 recording, node, static_cast<int32_t>(node_index), node.tensors[static_cast<size_t>(i)],
-                &node.tensor_sources[static_cast<size_t>(i)]
+                &recording.tensor_sources[static_cast<size_t>(node.tensor_source_offset) + static_cast<size_t>(i)]
             )) {
             recording.unsupported = true;
         }
     }
-    auto add_fanin = [&node](size_t producer) {
-        if (std::find(node.internal_fanins.begin(), node.internal_fanins.end(), producer) ==
-            node.internal_fanins.end()) {
-            node.internal_fanins.push_back(producer);
+    // A dispatch predicate resolves to an absolute GM address at submit, which a
+    // Definition replayed against fresh buffers cannot carry. Record the operand
+    // the same way a tensor arg is recorded — classified source plus the element
+    // index within that tensor — and let materialize resolve the pair. The
+    // predicate creates no dependency here any more than it does on the ordinary
+    // path: the caller declares one, and the explicit-dep loop below records it.
+    //
+    // Gated on the recorded attribute, not on args: a kernel-less node never
+    // dispatches, so submit_dummy_task and alloc_tensors drop the predicate the
+    // caller set. Reading args here instead would record a predicate the node's
+    // own attribute denies, and materialize rejects a Definition whose two halves
+    // disagree.
+    if (node.task_attrs.has_predicate()) {
+        const CoreTaskPredicate &pred = args.predicate();
+        GraphRecordedPredicate recorded;
+        recorded.op = pred.op;
+        recorded.target = pred.target;
+        const ChipTensor *operand = pred.operand.tensor;
+        // OWN_OUTPUT would read the node's own output before the node runs, so it
+        // names no value the predicate could be evaluating. An index vector that
+        // leaves the operand's extent is caught here too: materialize would
+        // otherwise reject the baked offset on the device, where the failure is a
+        // Scheduler fatal rather than a named unsupported construct.
+        const uint64_t flat_offset =
+            operand == nullptr ? 0 : operand->compute_flat_offset(pred.operand.indices, pred.operand.ndims);
+        if (operand == nullptr || operand->ndims > MAX_TENSOR_DIMS || pred.operand.ndims > operand->ndims ||
+            flat_offset < operand->start_offset || flat_offset - operand->start_offset >= operand->extent_elem_cache ||
+            !graph_classify_tensor(recording, node, static_cast<int32_t>(node_index), *operand, &recorded.source) ||
+            recorded.source.source == GraphRecordedTensorSource::OWN_OUTPUT) {
+            recording.unsupported = true;
+        } else {
+            recorded.operand.copy(*operand);
+            recorded.elem_offset = flat_offset - operand->start_offset;
+            recorded.elem_size = static_cast<uint8_t>(get_element_size(operand->dtype));
+        }
+        node.predicate_index = static_cast<int32_t>(recording.predicates.size());
+        recording.predicates.push_back(recorded);
+    }
+
+    node.fanin_offset = static_cast<uint32_t>(recording.internal_fanins.size());
+    // Dedup within this node's own range: the flat array's earlier entries belong
+    // to earlier nodes.
+    auto add_fanin = [&recording, &node](size_t producer) {
+        const auto begin = recording.internal_fanins.begin() + node.fanin_offset;
+        if (std::find(begin, recording.internal_fanins.end(), producer) == recording.internal_fanins.end()) {
+            recording.internal_fanins.push_back(producer);
         }
     };
-    for (const GraphRecordedTensorSourceRef &source : node.tensor_sources) {
+    for (uint32_t i = 0; i < static_cast<uint32_t>(tensor_count); ++i) {
+        const GraphRecordedTensorSourceRef &source = recording.tensor_sources[node.tensor_source_offset + i];
         if (source.source == GraphRecordedTensorSource::INTERNAL) add_fanin(source.source_index);
     }
     for (uint32_t i = 0; i < args.explicit_dep_count(); ++i) {
@@ -1648,14 +1878,26 @@ TaskOutputTensors graph_record_submit_node(
         }
     }
 
+    node.fanin_count = static_cast<uint32_t>(recording.internal_fanins.size() - node.fanin_offset);
+    if (node.record_packed_base != 0 && node.total_output_size != 0 &&
+        node.total_output_size <= UINTPTR_MAX - node.record_packed_base) {
+        const uintptr_t begin = node.record_packed_base;
+        const uintptr_t end = begin + node.total_output_size;
+        // The sorted-and-disjoint property the lookup depends on, checked rather
+        // than assumed: a mid-recording heap rollback would break it, and today
+        // the only rollback is graph_end's, after every node is recorded.
+        always_assert(recording.output_ranges.empty() || recording.output_ranges.back().end <= begin);
+        recording.output_ranges.push_back({begin, end, static_cast<uint32_t>(node_index)});
+    }
     recording.nodes.push_back(std::move(node));
+    ORCH_PHASE_END(HostOrchPhase::RecordNode, task_id.raw);
     return result;
 }
 
 }  // namespace
 
 GraphScopeResult
-PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args, uint64_t callable_hash) {
+PTO2OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash) {
     auto *orch = this;
     GraphScopeResult result;
     GraphHostState *state = graph_state_from(orch);
@@ -1663,20 +1905,54 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
         debug_assert(args.explicit_dep_count() == 0 && "Graph boundary explicit dependencies are not supported");
         return result;
     }
-    if (state->recording != nullptr) {
-        state->recording->unsupported = true;
-        debug_assert(state->recording == nullptr && "Nested Graph recording is not supported");
+    if (GraphRecording *active = active_graph_recording(orch); active != nullptr) {
+        active->unsupported = true;
+        debug_assert(active == nullptr && "Nested Graph recording is not supported");
         LOG_WARN("%s", "[GraphExecution] nested Graph recording is not supported");
         return result;
     }
 
     const uint64_t full_key = graph_full_key(callable_hash, graph_key);
+    std::unique_lock<std::mutex> lock(state->recording_mutex);
+    if (state->status() != GraphRecordingStatus::IDLE) {
+        if (state->recording_key != full_key || state->status() == GraphRecordingStatus::FAILED) {
+            return result;
+        }
+        bool boundary_matches = false;
+        if (state->recording != nullptr) {
+            boundary_matches = graph_recording_boundary_matches(*state->recording, args);
+        } else {
+            auto definition_it = state->definitions.find(full_key);
+            boundary_matches = definition_it != state->definitions.end() &&
+                               graph_definition(definition_it->second) != nullptr &&
+                               graph_boundary_matches(*graph_definition(definition_it->second), args);
+        }
+        if (!boundary_matches) return result;
+
+        PTO2TaskId submitted = PTO2TaskId::invalid();
+        ORCH_PHASE_START();
+        if (graph_submit_pending_definition(orch, state, full_key, args, &submitted)) {
+            result.execute_block = false;
+            result.task_id = submitted;
+            ORCH_PHASE_END(HostOrchPhase::GraphSubmit, submitted.raw);
+#if SIMPLER_DFX
+            g_orch_submit_idx++;
+#if SIMPLER_ORCH_PROFILING
+            g_orch_submit_count++;
+#endif
+#endif
+        }
+        return result;
+    }
+
     auto definition_it = state->definitions.find(full_key);
     if (definition_it != state->definitions.end()) {
         PTO2TaskId submitted = PTO2TaskId::invalid();
+        ORCH_PHASE_START();
         if (graph_submit_definition(orch, state, definition_it->second, args, &submitted)) {
             result.execute_block = false;
             result.task_id = submitted;
+            ORCH_PHASE_END(HostOrchPhase::GraphSubmit, submitted.raw);
 #if SIMPLER_DFX
             g_orch_submit_idx++;
 #if SIMPLER_ORCH_PROFILING
@@ -1700,9 +1976,7 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
     auto recording = std::make_unique<GraphRecording>();
     recording->full_key = full_key;
     recording->start_local_task_id = orch->ring.task_allocator.active_count();
-    recording->heap_watermark = orch->ring.task_allocator.heap_top();
-    args.anchor_scalar_sources();
-    recording->boundary_args = &args;
+    recording->boundary_scalar_count = args.scalar_count();
     recording->boundary_tensors.reserve(static_cast<size_t>(args.tensor_count()));
     recording->boundary_types.reserve(static_cast<size_t>(args.tensor_count()));
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
@@ -1710,61 +1984,139 @@ PTO2OrchestratorState::graph_begin(uint64_t graph_key, const CoreTaskArgs &args,
         recording->boundary_types.push_back(args.tag(i));
     }
     state->recording = std::move(recording);
-    // The body runs through the shadow-record path, not the ring, so it does not
-    // execute as ordinary tasks.
-    result.execute_block = false;
-    result.recording = true;
+    state->recording_key = full_key;
+    state->set_status(GraphRecordingStatus::RECORDING);
+
+    PTO2TaskId submitted = PTO2TaskId::invalid();
+    ORCH_PHASE_START();
+    if (graph_submit_pending_definition(orch, state, full_key, args, &submitted)) {
+        result.execute_block = false;
+        result.recording = true;
+        result.task_id = submitted;
+        ORCH_PHASE_END(HostOrchPhase::GraphSubmit, submitted.raw);
+#if SIMPLER_DFX
+        g_orch_submit_idx++;
+#if SIMPLER_ORCH_PROFILING
+        g_orch_submit_count++;
+#endif
+#endif
+    } else {
+        state->recording.reset();
+        state->recording_key = 0;
+        state->set_status(GraphRecordingStatus::IDLE);
+    }
     return result;
 }
 
-// Finish the recording pass. Returns true when the sub-DAG was compacted into a
-// Definition and emitted as a single outer GRAPH task; false when the recording
-// hit an unsupported construct or the outer task could not be placed, in which
-// case the caller re-runs the body on the ordinary path so its work is still
-// submitted.
-bool PTO2OrchestratorState::graph_end() {
+bool PTO2OrchestratorState::graph_prepare(const GraphTaskArgs &args) {
     GraphHostState *state = graph_state_from(this);
-    if (state == nullptr || state->recording == nullptr) return false;
-    std::unique_ptr<GraphRecording> recording = std::move(state->recording);
-    // Release the scratch output buffers the internal nodes reserved; the outer
-    // GRAPH task reclaims the same heap region as one block below (or the
-    // ordinary fallback re-uses it per task).
-    this->ring.task_allocator.restore_heap_top(recording->heap_watermark);
-
-    std::vector<std::byte> definition;
-    if (!graph_build_definition(*recording, &definition)) {
-        debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
-        LOG_WARN("%s", "[GraphExecution] unsupported construct observed; falling back to the ordinary path");
+    if (state == nullptr || g_active_graph_recording != nullptr) return false;
+    // graph_begin publishes this unique recording before the private job is
+    // enqueued; the recording worker's queue acquire observes those writes.
+    // Until this worker calls graph_end/graph_abort, later graph_begin calls
+    // only read the boundary vectors under recording_mutex, and only this worker
+    // writes the fields it binds below. Taking that mutex here lets the main
+    // thread's same-hash submit burst starve prepare and collapse the intended
+    // overlap, so the status read goes through the atomic instead.
+    if (state->status() != GraphRecordingStatus::RECORDING || state->recording == nullptr ||
+        !graph_recording_boundary_matches(*state->recording, args)) {
         return false;
     }
-    const GraphDefinition *header = graph_definition(definition);
-    if (header == nullptr) return false;
+    args.anchor_scalar_sources();
+    state->recording->boundary_args = &args;
+    g_active_graph_recording = state->recording.get();
+    g_active_graph_owner = state;
+    return true;
+}
+
+void PTO2OrchestratorState::graph_abort() {
+    GraphHostState *state = graph_state_from(this);
+    if (state == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lock(state->recording_mutex);
+        state->recording.reset();
+        state->set_status(GraphRecordingStatus::FAILED);
+    }
+    g_active_graph_recording = nullptr;
+    g_active_graph_owner = nullptr;
+    state->recording_cv.notify_all();
+}
+
+// Finish the background recording pass and publish the Definition. The main
+// thread finalizes the already-submitted outer Graph tasks in graph_commit.
+bool PTO2OrchestratorState::graph_end() {
+    GraphHostState *state = graph_state_from(this);
+    GraphRecording *recording = active_graph_recording(this);
+    if (state == nullptr || recording == nullptr) return false;
+
+    std::vector<std::byte> definition;
+    ORCH_PHASE_START();
+    const bool built = graph_build_definition(*recording, &definition);
+    if (built) {
+        ORCH_PHASE_END(HostOrchPhase::BuildDefinition, recording->nodes.size());
+    }
+    const GraphDefinition *header = built ? graph_definition(definition) : nullptr;
+    if (header == nullptr) {
+        debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
+        LOG_WARN("%s", "[GraphExecution] asynchronous recording produced an unsupported Graph");
+        graph_abort();
+        return false;
+    }
     LOG_DEBUG(
         "[GraphExecution] define key=0x%llx nodes=%u bytes=%u", static_cast<unsigned long long>(header->full_key),
         header->task_count, header->total_bytes
     );
-    auto inserted = state->definitions.emplace(header->full_key, std::move(definition));
-    const std::vector<std::byte> &cached = inserted.first->second;
-
-    // Emit the single outer GRAPH task for this first invocation exactly as a
-    // cache hit would, so the recording run occupies one ring slot and one heap
-    // block instead of one per internal node. The Definition stays cached for
-    // subsequent invocations even if this placement fails.
-    PTO2TaskId submitted = PTO2TaskId::invalid();
-    if (recording->boundary_args == nullptr ||
-        !graph_submit_definition(this, state, cached, *recording->boundary_args, &submitted)) {
-        return false;
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lock(state->recording_mutex);
+        if (state->status() != GraphRecordingStatus::RECORDING || state->recording_key != header->full_key) {
+            state->set_status(GraphRecordingStatus::FAILED);
+        } else {
+            state->definitions.emplace(header->full_key, std::move(definition));
+            state->set_status(GraphRecordingStatus::READY);
+        }
+        ready = state->status() == GraphRecordingStatus::READY;
+        state->recording.reset();
     }
-#if SIMPLER_DFX
-    g_orch_submit_idx++;
-#if SIMPLER_ORCH_PROFILING
-    g_orch_submit_count++;
-#endif
-#endif
-    return true;
+    g_active_graph_recording = nullptr;
+    g_active_graph_owner = nullptr;
+    state->recording_cv.notify_all();
+    return ready;
 }
 
-void PTO2OrchestratorState::graph_commit() {}
+void PTO2OrchestratorState::graph_commit() {
+    if (active_graph_recording(this) != nullptr) return;
+    GraphHostState *state = graph_state_from(this);
+    if (state == nullptr) return;
+
+    uint64_t full_key = 0;
+    const GraphDefinition *definition = nullptr;
+    bool failed = false;
+    {
+        std::unique_lock<std::mutex> lock(state->recording_mutex);
+        if (state->status() == GraphRecordingStatus::IDLE) return;
+        state->recording_cv.wait(lock, [&]() {
+            return state->status() != GraphRecordingStatus::RECORDING;
+        });
+        full_key = state->recording_key;
+        failed = state->status() != GraphRecordingStatus::READY;
+        auto definition_it = state->definitions.find(full_key);
+        if (!failed && definition_it != state->definitions.end()) definition = graph_definition(definition_it->second);
+    }
+
+    if (definition == nullptr || !graph_finalize_pending_submissions(this, state, *definition)) failed = true;
+    {
+        std::lock_guard<std::mutex> lock(state->recording_mutex);
+        state->set_status(GraphRecordingStatus::IDLE);
+        state->recording_key = 0;
+    }
+    if (failed) {
+        report_fatal(
+            PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "failed to finalize asynchronous Graph key=%#llx",
+            static_cast<unsigned long long>(full_key)
+        );
+    }
+}
 
 TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
     auto *orch = this;
@@ -1840,7 +2192,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
         task_attrs.set_predicate();
     }
 
-    if (GraphHostState *state = graph_state_from(orch); state != nullptr && state->recording != nullptr) {
+    if (active_graph_recording(orch) != nullptr) {
         return graph_record_submit_node(
             orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
             normalized.aiv1_kernel_id
@@ -1883,7 +2235,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const CoreTaskArgs &a
     task_attrs.set_early_resolve(args.allow_early_resolve());
     task_attrs.set_timing_slot(args.task_timing_slot());
 
-    if (GraphHostState *state = graph_state_from(orch); state != nullptr && state->recording != nullptr) {
+    if (active_graph_recording(orch) != nullptr) {
         return graph_record_submit_node(
             orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
@@ -1920,6 +2272,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     }
 
     CYCLE_COUNT_START();
+    ORCH_PHASE_START();
 
     if (args.has_error) {
         report_fatal(
@@ -1929,16 +2282,14 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
         return TaskOutputTensors{};
     }
 
-    // Runtime-allocated outputs cannot be replayed by a Graph, so a Graph body
-    // that calls alloc_tensors is unsupported. Still materialize the outputs so
-    // the recording body chains correctly, then poison the recording; graph_end
-    // falls back and the body re-runs on the ordinary path.
-    if (GraphHostState *state = graph_state_from(orch); state != nullptr && state->recording != nullptr) {
-        TaskOutputTensors result = graph_record_submit_node(
+    // A Graph body may allocate. The allocation records as a kernel-less node —
+    // the same shape submit_dummy_task records — and replay reserves the
+    // intermediate heap for every internal node anyway, so the outputs land at
+    // addresses the replayed Definition derives for itself.
+    if (active_graph_recording(orch) != nullptr) {
+        return graph_record_submit_node(
             orch, args, ActiveMask{}, TaskAttrs{}, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
-        graph_record_mark_unsupported(orch);
-        return result;
     }
 
     PTO2OutputLayout layout = calculate_output_layout(args);
@@ -2006,7 +2357,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
+    ORCH_PHASE_END(HostOrchPhase::Prepare, prepared.task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
@@ -2043,7 +2394,6 @@ void PTO2OrchestratorState::mark_done() {
 #if SIMPLER_ORCH_PROFILING
 PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
-    d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
     d.args_cycle = g_orch_args_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
@@ -2051,21 +2401,17 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
-    d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
-    d.alloc_atomic_count = g_orch_alloc_atomic_count;
     d.args_atomic_count = g_orch_args_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
+    g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;
-    g_orch_alloc_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
-    g_orch_alloc_atomic_count = 0;
     g_orch_args_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;
     return d;

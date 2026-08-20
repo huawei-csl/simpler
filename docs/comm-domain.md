@@ -70,6 +70,15 @@ domain ranks. A remote node reads `comm_profile` and `global_device_ranks`
 from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
 configuration. All participating nodes must use the same profile.
 
+An MPI-launched group registered with `add_mpirun_worker_group` uses the same
+member contract. Rank 0 writes the group manifest before launch, every MPI rank
+must publish READY before the L4 parent exposes the returned worker ids, and
+the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+must include the complete returned group; their order still defines dense
+domain ranks. A full MPI group exchanges descriptors rank-side over an MPI
+collective, so the L4 import fanout is skipped; a partial group falls back to
+the L4 descriptor broker above.
+
 Global CommDomain capability follows the backend that the node actually
 loads: a platform ending in `sim` supports the `sim` profile, and a real
 `a2a3` platform supports `a3-fabric-v1`. Real A5 and any other
@@ -87,6 +96,35 @@ The control flow is:
 4. L4 returns that table to every L3, which forwards it to each L2 for import.
 5. L4 commits only after all imports succeed. Any earlier failure sends
    `ABORT` and releases every prepared local window.
+
+`GlobalDomainCommand` is the transaction wire for all four phases:
+`PREPARE_EXPORT`, `IMPORT`, `COMMIT`, and `ABORT`. Runtime data movement does
+not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
+`GlobalDomainCopyCommand`, and teardown uses `GlobalDomainReleaseCommand`.
+
+### Attachment axis
+
+`GlobalDomainMember` remains the rank table: one entry and one exported window
+per device rank. A host is not inserted into that table and never consumes an
+HCCL rank. The version-2 `GlobalDomainCommand` carries a flattened attachment
+matrix alongside `members`. Each receiving L3 node contributes one row, and
+each row has one entry for every member in dense rank order. Thus a domain with
+three ranks on two nodes carries six attachment records; a receiver selects
+the row whose `node_worker_id` is its own. MPI and non-MPI control paths use
+the same complete command bytes.
+
+The first wire form describes host consumers for the whole rank window (all
+named buffer slices); it does not create a host mapping or lease during
+`PREPARE`. Attachments are immutable for the domain lifetime and are serialized
+only on `PREPARE_EXPORT`; `IMPORT` and `COMMIT` carry the descriptor table but
+an empty attachment field, and the receiving L3 reuses the row saved by
+`PREPARE_EXPORT`. `ABORT` carries only the transaction identity needed for
+rollback. `address_space`, `role`, and the adapter fields reuse the endpoint
+planner's existing vocabulary. The planner supplies an adapter when the
+relation is currently supported; an unsupported relation remains an explicit
+host-consumer record with no adapter instead of being mistaken for a usable
+mapping. Host access still needs the separate host-window access primitive
+before a consumer can dereference a device window.
 
 The descriptor reports the backend's actual mapped size. A3 Fabric may align
 the requested size to its VMM granularity; buffer carving and bounds checks
@@ -107,13 +145,13 @@ final safety net.
 
 Repository CI exercises the complete transaction, rollback, and mixed
 local/remote paths with the `sim` backend. It also exercises the real
-`a3-fabric-v1` backend: the two-machine `st-pod-onboard-a2a3` job runs
+`a3-fabric-v1` backend: the two-machine `st-network1-onboard-a2a3` job runs
 `global_tload_mixed_l3` and `compute_then_tload_mixed_l3`, whose default
 profile is `a3-fabric-v1` on real A3 devices. Those two examples are the
 in-repository harness for the Fabric path; a run that needs to know whether
 Fabric was covered should read that job rather than infer it from the
 simulation checks. The job now drives their `test_*.py` wrappers through
-`pod-run-pytest` rather than calling `run_parent.sh` directly.
+`network1-run-pytest` rather than calling `run_parent.sh` directly.
 
 ---
 
@@ -198,6 +236,20 @@ the resident `KernelArgs`, and injects it into every run's kernel
 `GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
 SDMA streams and its kernels read a zero workspace address. The workspace is
 released at Worker finalize by ordinary stream/manager teardown.
+
+Provisioning also warms the SDMA control path once, in the same call: a
+vector-only AICore ELF (`sdma_warmup_kernel.o`, staged per arch under
+`build/lib/<arch>/sdma_warmup/`) walks every channel so the first
+`TPREFETCH_ASYNC` of a run does not pay the cold STARS submit-queue publication
+(~92 µs per channel, ~4.4 ms of init for all 48). Either way the Worker comes
+up; the two ways of not having the ELF differ only in what says so. An arch that
+carries no `sdma_warmup_kernel.cpp` builds none by design and reports nothing —
+a5 is that case, so its first `TPREFETCH_ASYNC` still pays the cold path. An arch
+that carries the source but staged no object is a build or staging regression,
+and is warned about twice: by the runtime builder and again at Worker init. A
+warmup whose device launch or sync *fails* is not in this category at all — it
+fails Worker init, because the card it faulted on must not reach the first run.
+
 Communication-domain allocation does not create SDMA streams or carry the
 workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
 streams sit in the device fault/sync domain, a fault on that Worker slows its

@@ -164,8 +164,8 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     // Consumer task with 2 fanins
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
 
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -201,8 +201,8 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -264,7 +264,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 3;
     for (int i = 0; i < 3; i++) {
-        payload.fanin_inline_slot_states[i] = &producers[i];
+        payload.fanin_inline_edges[i].set(&producers[i], DEP_WAIT | DEP_RETAIN);
     }
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -306,8 +306,8 @@ TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -334,7 +334,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
-    payload.fanin_inline_slot_states[0] = &producer;
+    payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -359,8 +359,8 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producers[0];
-    payload.fanin_inline_slot_states[1] = &producers[1];
+    payload.fanin_inline_edges[0].set(&producers[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producers[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -385,7 +385,7 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
-    payload.fanin_inline_slot_states[0] = &producer;
+    payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -406,6 +406,102 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
 }
 
+TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
+    alignas(64) PTO2TaskSlotState filler;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    PTO2TaskSlotState *items[1] = {&filler};
+    uint64_t tags[1] = {queue.capacity};
+    // A full queue must end the call, not spin waiting for a consumer. Reaching
+    // the next line at all is the assertion.
+    EXPECT_FALSE(queue.push_batch_tagged(items, tags, 1));
+    EXPECT_EQ(queue.size(), queue.capacity);
+
+    // A batch larger than the queue can never be satisfied and must not spin.
+    EXPECT_FALSE(queue.push_batch_tagged(items, tags, static_cast<int>(queue.capacity) + 1));
+}
+
+TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
+    alignas(64) PTO2TaskSlotState filler;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+    ASSERT_NE(queue.pop(), nullptr);
+    ASSERT_NE(queue.pop(), nullptr);
+
+    PTO2TaskSlotState *items[2] = {&filler, &filler};
+    uint64_t tags[2] = {7, 8};
+    EXPECT_TRUE(queue.push_batch_tagged(items, tags, 2));
+    EXPECT_EQ(queue.size(), queue.capacity);
+}
+
+TEST_F(WiringTest, EarlyDispatchQueueOverflowRollsBackStagingClaim) {
+    alignas(64) PTO2TaskSlotState filler, consumer;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
+
+    auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
+    auto &queue = sched.early_dispatch_queues[shape];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    sched.try_enqueue_early_dispatch_candidate(consumer);
+
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_NONE);
+    EXPECT_EQ(queue.size(), queue.capacity);
+}
+
+TEST_F(WiringTest, EarlyDispatchQueueOverflowFallsBackToNormalDispatch) {
+    alignas(64) PTO2TaskSlotState filler, consumer;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+
+    PTO2ResourceShape shape = consumer.active_mask.to_shape();
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(shape)];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    sched.try_enqueue_early_dispatch_candidate(consumer);
+    ASSERT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_NONE);
+
+    // The overflowed candidate carries no early-dispatch claim, so the producer
+    // release routes every block through the ordinary ready queue.
+    EXPECT_TRUE(sched.route_ready_once(consumer));
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(sched.ready_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+}
+
+TEST_F(WiringTest, EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue) {
+    alignas(64) PTO2TaskSlotState filler, consumer;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+    consumer.task_attrs.set_sync_start();
+    ASSERT_TRUE(consumer.task_attrs.requires_sync_start());
+
+    auto &queue = sched.early_sync_start_queue;
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    sched.try_enqueue_early_dispatch_candidate(consumer);
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_NONE);
+    EXPECT_EQ(queue.size(), queue.capacity);
+
+    // A sync_start cohort that never reached its drain falls back to the
+    // shape's sync ready queue, not the plain one.
+    PTO2ResourceShape shape = consumer.active_mask.to_shape();
+    EXPECT_TRUE(sched.route_ready_once(consumer));
+    EXPECT_EQ(sched.ready_sync_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+}
+
 TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
     alignas(64) PTO2TaskSlotState producer, consumer;
     alignas(64) PTO2TaskPayload consumer_payload;
@@ -420,7 +516,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
 
     init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
     consumer_payload.fanin_actual_count = 1;
-    consumer_payload.fanin_inline_slot_states[0] = &producer;
+    consumer_payload.fanin_inline_edges[0].set(&producer, DEP_WAIT | DEP_RETAIN);
     consumer.payload = &consumer_payload;
     consumer.task = &consumer_desc;
 
@@ -449,7 +545,7 @@ TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
     init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
     consumer_payload.fanin_actual_count = 3;
     for (int i = 0; i < 3; i++)
-        consumer_payload.fanin_inline_slot_states[i] = &producers[i];
+        consumer_payload.fanin_inline_edges[i].set(&producers[i], DEP_WAIT | DEP_RETAIN);
     consumer.payload = &consumer_payload;
     consumer.task = &consumer_desc;
 
@@ -913,8 +1009,8 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &p_flagged;
-    payload.fanin_inline_slot_states[1] = &q_unflagged;
+    payload.fanin_inline_edges[0].set(&p_flagged, DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&q_unflagged, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -974,8 +1070,8 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &creator;
-    payload.fanin_inline_slot_states[1] = &compute;
+    payload.fanin_inline_edges[0].set(&creator, DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&compute, DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -1055,8 +1151,8 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
 
     init_slot(task_slot, PTO2_TASK_COMPLETED, 3, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producers[0];
-    payload.fanin_inline_slot_states[1] = &producers[1];
+    payload.fanin_inline_edges[0].set(&producers[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producers[1], DEP_WAIT | DEP_RETAIN);
     // Need a valid fanin_spill_pool even though we don't spill
     PTO2FaninPool dummy_pool{};
     PTO2FaninSpillEntry dummy_entries[4];
@@ -1076,6 +1172,93 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
     // Producers with fanout_refcount == fanout_count AND COMPLETED -> CONSUMED
     EXPECT_EQ(producers[0].task_state.load(), PTO2_TASK_CONSUMED);
     EXPECT_EQ(producers[1].task_state.load(), PTO2_TASK_CONSUMED);
+}
+
+// =============================================================================
+// WAIT/RETAIN split (issue #1375): an ordering-only (DEP_WAIT) producer drops
+// its submit->wire pin at wiring; a retention (DEP_WAIT|DEP_RETAIN) producer
+// keeps it until on_task_release. Both are linked for completion notification.
+// =============================================================================
+
+TEST_F(WiringTest, OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState wait_producer;    // DEP_WAIT only (modifier)
+    alignas(64) PTO2TaskSlotState retain_producer;  // DEP_WAIT|DEP_RETAIN (creator)
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    // Both live (PENDING) with a single submit pin (fanout_count = 1).
+    init_slot(wait_producer, PTO2_TASK_PENDING, 1, 1);
+    init_slot(retain_producer, PTO2_TASK_PENDING, 1, 1);
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_edges[0].set(&wait_producer, DEP_WAIT);
+    payload.fanin_inline_edges[1].set(&retain_producer, DEP_WAIT | DEP_RETAIN);
+    PTO2FaninPool dummy_pool{};
+    PTO2FaninSpillEntry dummy_entries[4];
+    std::atomic<int32_t> dummy_error{PTO2_ERROR_NONE};
+    dummy_pool.init(dummy_entries, 4, &dummy_error);
+    payload.fanin_spill_pool = &dummy_pool;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    // Both WAIT edges gate readiness (wfanin = 2) and both link onto fanout_head.
+    wire_fanin(task_slot, 2);
+    EXPECT_NE(wait_producer.fanout_head, nullptr);
+    EXPECT_NE(retain_producer.fanout_head, nullptr);
+
+    // Ordering-only pin released at wiring; retention pin still held.
+    EXPECT_EQ(wait_producer.fanout_refcount.load(), 1);
+    EXPECT_EQ(retain_producer.fanout_refcount.load(), 0);
+
+    // Release: only the retention edge releases here; the ordering edge is not
+    // released a second time.
+    sched.on_task_release(task_slot);
+    EXPECT_EQ(wait_producer.fanout_refcount.load(), 1);
+    EXPECT_EQ(retain_producer.fanout_refcount.load(), 1);
+}
+
+// on_task_release must honor per-edge flags in the spill region too: a spilled
+// DEP_RETAIN edge is released; inline ordering-only edges are skipped.
+TEST_F(WiringTest, ReleaseHonorsRetainFlagInSpillRegion) {
+    alignas(64) PTO2TaskSlotState filler;        // 64 inline DEP_WAIT-only edges
+    alignas(64) PTO2TaskSlotState spill_retain;  // 1 spilled DEP_RETAIN edge
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    // filler carries a large fanout_count so releasing it can never consume it.
+    init_slot(filler, PTO2_TASK_COMPLETED, 1, 100);
+    init_slot(spill_retain, PTO2_TASK_COMPLETED, 1, 1);
+    init_slot(task_slot, PTO2_TASK_COMPLETED, 0, 1);
+
+    for (int i = 0; i < PTO2_FANIN_INLINE_CAP; i++) {
+        payload.fanin_inline_edges[i].set(&filler, DEP_WAIT);
+    }
+    PTO2FaninPool spill_pool{};
+    PTO2FaninSpillEntry spill_entries[4];
+    std::atomic<int32_t> err{PTO2_ERROR_NONE};
+    spill_pool.init(spill_entries, 4, &err);
+    auto *e = spill_pool.alloc();
+    int32_t spill_start = spill_pool.top - 1;
+    e->set(&spill_retain, DEP_WAIT | DEP_RETAIN);
+
+    payload.fanin_actual_count = PTO2_FANIN_INLINE_CAP + 1;
+    payload.fanin_spill_start = spill_start;
+    payload.fanin_spill_pool = &spill_pool;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    sched.on_task_release(task_slot);
+
+    // Ordering-only inline edges are skipped; filler is untouched.
+    EXPECT_EQ(filler.fanout_refcount.load(), 0);
+    // The spilled retention edge is released (and consumed: rc == fc, COMPLETED).
+    EXPECT_EQ(spill_retain.fanout_refcount.load(), 1);
+    EXPECT_EQ(spill_retain.task_state.load(), PTO2_TASK_CONSUMED);
 }
 
 // =============================================================================

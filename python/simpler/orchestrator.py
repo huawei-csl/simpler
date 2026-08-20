@@ -369,6 +369,10 @@ class Orchestrator:
 
         ``workers`` contains the exact stable NEXT_LEVEL worker id for each
         member. For L3 chip dispatch, these are the existing chip worker ids.
+        When ``workers`` is the complete worker-id set of one MPI L3 group,
+        ``args_list`` becomes one per-rank mailbox request: MPI rank
+        ``workers[i]`` executes only ``args_list[i]``. A single worker id remains
+        directed and is never silently widened to the whole group.
         """
         cfg = config if config is not None else CallConfig()
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
@@ -376,6 +380,21 @@ class Orchestrator:
             raise ValueError("workers length must match args_list length")
         if len(set(worker_ids)) != len(worker_ids):
             raise ValueError("workers must not contain duplicate NEXT_LEVEL worker ids")
+        if self._worker is not None:
+            # The mailbox transport batches a dispatch whose size equals its MPI
+            # world size, so a same-sized selection that is not exactly the
+            # group would strand the group members in the batch rendezvous.
+            for mpi_group in getattr(self._worker, "_mpi_l3_groups", ()):
+                group_workers = {rank.worker_id for rank in mpi_group.ranks}
+                if (
+                    group_workers.intersection(worker_ids)
+                    and len(worker_ids) == len(group_workers)
+                    and set(worker_ids) != group_workers
+                ):
+                    raise ValueError(
+                        "submit_next_level_group: workers mixes MPI group members with other workers at the "
+                        "group's world size; target exactly the full MPI group or a smaller directed subset"
+                    )
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -464,6 +483,8 @@ class Orchestrator:
         )
         _reject_remote_sidecar_args(args, kind="orch.submit_sub")
         _reject_device_args(args, kind="orch.submit_sub")
+        if self._worker is not None:
+            self._worker._record_touched_identities(args)
         _admit_task_submission(self._worker)
         self._o.submit_sub(digest, kind, target_namespace, args)
 
@@ -478,6 +499,12 @@ class Orchestrator:
         for args in args_list:
             _reject_remote_sidecar_args(args, kind="orch.submit_sub_group")
             _reject_device_args(args, kind="orch.submit_sub_group")
+        # Second pass, as in submit_next_level_group: a member rejected above means no member is
+        # dispatched, and identities recorded for a group that never went out would refuse a
+        # release of buffers no task ever received.
+        if self._worker is not None:
+            for args in args_list:
+                self._worker._record_touched_identities(args)
         _admit_task_submission(self._worker)
         self._o.submit_sub_group(digest, kind, target_namespace, args_list)
 

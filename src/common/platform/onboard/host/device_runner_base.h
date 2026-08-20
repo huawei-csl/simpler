@@ -64,6 +64,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/host_phase_records.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
@@ -143,9 +144,8 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
-    void *acquire_graph_execution_buffer(
-        uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, std::size_t bytes, std::size_t alignment
-    );
+    void *
+    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -401,9 +401,16 @@ public:
      * a platform/runtime without SDMA fails fast. The provider handle is released
      * by finalize_common().
      *
+     * `sdma_warmup_binary` / `sdma_warmup_size`, when non-empty, are handed to
+     * launch_sdma_warmup_kernel() once the workspace is live. An absent or
+     * unrunnable warmup does NOT fail provisioning; a warmup whose device launch or
+     * sync fails does, and leaves the runner marked unusable.
+     *
      * @return 0 on success, negative on unsupported/failed provisioning.
      */
-    int provision_dma_workspace(uint32_t required_mask);
+    int provision_dma_workspace(
+        uint32_t required_mask, const void *sdma_warmup_binary = nullptr, size_t sdma_warmup_size = 0
+    );
 
     /**
      * Content-derived stable identity for a registered callable: the
@@ -510,11 +517,23 @@ public:
 
     /**
      * Whether this runner may start another run without first being finalized.
-     * The shared c_api checks this before attaching the thread or provisioning
-     * optional resources, so a poisoned runner cannot create SDMA streams on
-     * its way to the arch-specific enqueue fail-fast guard.
+     * The shared c_api checks this at every run boundary (prepare / launch /
+     * finalize), so a poisoned runner fails admission ahead of the arch-specific
+     * enqueue fail-fast guard.
      */
     virtual bool can_accept_run() const = 0;
+
+    /**
+     * An AICore launch or stream sync failed outside the per-run path. The arch
+     * runner drains what it can and flips its device-unusable flag, so the next
+     * admission fails fast and finalize() takes its fatal teardown path instead of
+     * per-resource release on a faulted card. The base default is a no-op for
+     * runners that track no such state.
+     */
+    virtual void recover_device_or_mark_unusable(int /*aicore_rc*/) {}
+
+    /** Invalidate retained run streams after new AICore code is published. */
+    virtual void mark_run_streams_stale() {}
 
     /** Provision/abandon platform resources owned by one prepared native run. */
     virtual int provision_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
@@ -660,6 +679,36 @@ public:
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
+     * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
+     * of a run does not pay it. Called from provision_dma_workspace() once the
+     * workspace is live, on `stream_aicore_`, and synchronized before returning.
+     *
+     * `binary` is a vector-only ELF, registered separately from the executor
+     * (`RT_DEV_BINARY_MAGIC_ELF_AIVEC`, its own handle) because the executor is a
+     * resident loop launched per run with a `block_dim_` that is still 0 here.
+     *
+     * Unavailability is best-effort and returns 0: an absent binary, no channels,
+     * a failed registration or allocation, and a channel that declines to warm all
+     * cost only first-call latency. A failed launch or stream sync is not, because
+     * it means an AICore operation faulted on this card; that marks the runner
+     * unusable and returns the error so the caller does not hand a poisoned device
+     * to the first run.
+     *
+     * @return 0 when the warmup ran or was unavailable, the device error otherwise.
+     */
+    int launch_sdma_warmup_kernel(const void *binary, size_t size);
+
+    /**
+     * Read back the warmup kernel's per-channel status slots and report how many
+     * channels came up warm, splitting the remainder into channels that declined
+     * the warmup's preconditions and channels no core reached. Takes ownership of
+     * `status_dev` and frees it. `elapsed_ms` is the launch-to-sync wall time,
+     * reported alongside the count because it is the init-time cost being traded
+     * for first-run latency.
+     */
+    void report_sdma_warmup_status(void *status_dev, uint32_t channel_count, double elapsed_ms);
+
+    /**
      * Enablement setters for the four shared diagnostics sub-features.
      * Applied from the per-run CallConfig by `apply_call_config()` before prepare;
      * downstream execution paths read the corresponding `enable_*_`
@@ -671,6 +720,15 @@ public:
         chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
         enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
+    uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        host_phase_records_.finish(submitted_tasks, invocation_id);
+    }
+    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this pass's records to the swimlane reader, just before its export. */
+    void publish_host_phase_records_to_swimlane();
+    void finish_clock_correlation_session(bool capture_device_complete, bool abandon_device_resources) noexcept;
     void set_dump_args_enabled(int level) {
         dump_args_level_ = static_cast<DumpArgsLevel>(level);
         enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
@@ -874,7 +932,7 @@ protected:
      * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
      * inline their own teardown after calling this helper.
      */
-    void teardown_shared_collectors_after_run();
+    void teardown_shared_collectors_after_run(bool device_execution_complete);
 
     /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`
@@ -901,16 +959,16 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
-    void release_graph_execution_buffers();
+    void release_graph_definition_buffers();
 
     /**
-     * Drop the retained graph-execution buffers without freeing them.
+     * Drop the retained graph-definition buffers without freeing them.
      *
-     * The fatal counterpart of release_graph_execution_buffers(): a force reset
+     * The fatal counterpart of release_graph_definition_buffers(): a force reset
      * has already invalidated every allocation, so only the host-side map is
      * cleared.
      */
-    void abandon_graph_execution_buffers();
+    void abandon_graph_definition_buffers();
 
     /**
      * Clear host-side ownership after a fatal device failure without issuing
@@ -1042,6 +1100,11 @@ protected:
     // `nullptr` in `finalize()`; CANN releases the device-side state
     // implicitly when the device context tears down.
     void *aicore_bin_handle_{nullptr};
+    // SDMA warmup ELF handle from `rtRegisterAllKernel`, kept separate from
+    // `aicore_bin_handle_` because it is a different (vector-only) binary. Only
+    // ever registered once, during provisioning. Reset the same way in
+    // `finalize()`.
+    void *sdma_warmup_bin_handle_{nullptr};
     // Dispatcher SO bytes — populated once via `set_dispatcher_binary()`
     // during simpler_init. Consumed exclusively by
     // `BootstrapDispatcher` on the first run and released by
@@ -1061,13 +1124,19 @@ protected:
     // the grow/pack logic lives in trb bind.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    struct RetainedGraphExecutionBuffer {
+    // One retained device block: the raw allocation plus the aligned address
+    // handed out. Backs the Graph Definition cache below.
+    struct RetainedGraphBuffer {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};
         std::size_t capacity{0};
     };
-    using GraphExecutionBufferMap = std::unordered_map<uint64_t, std::vector<RetainedGraphExecutionBuffer>>;
-    std::array<GraphExecutionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_execution_buffers_{};
+    // Graph Definition storage, one retained block per (pipeline slot,
+    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
+    // content identity rather than occurrence: every submission of one run
+    // references the same device-resident Definition.
+    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
+    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
@@ -1136,6 +1205,11 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     ChipSwimlaneCollector chip_swimlane_collector_;
+    // Not a collector: the pool the runtime's prepare path writes into, read by
+    // whichever per-event views the run enabled. Its two readers are gated
+    // independently, so it belongs to neither.
+    simpler::dfx::HostPhaseRecordStore host_phase_records_;
+    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

@@ -19,6 +19,7 @@ import gc
 import inspect
 import multiprocessing.shared_memory as shared_memory_mod
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -65,6 +66,7 @@ from simpler.worker import (
     _mailbox_store_i32,
     _pack_py_callable_payload,
 )
+from simpler.worker_level import WorkerLevel
 
 from ._harness import chip_callable, fake_chip_l3, requires_sim_binaries
 
@@ -251,8 +253,8 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
     monkeypatch.setattr(worker_mod._simpler_log, "get_current_config", lambda: 60)
     monkeypatch.setattr(
         worker_mod,
-        "_initialize_simpler_log",
-        lambda bins, level: startup_events.append(("log", bins, level)),
+        "_initialize_host_log",
+        lambda level: startup_events.append(("log", level)),
         raising=False,
     )
     monkeypatch.setattr(worker, "_await_children_ready", fake_await_children_ready)
@@ -267,7 +269,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
     assert fake_parent.configured_depths == [1]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized
-    assert startup_events[0] == ("log", "bins", 60)
+    assert startup_events[0] == ("log", 60)
     assert startup_events[1:] == [("fork",), ("fork",)]
 
 
@@ -275,7 +277,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
     """A chipless hierarchical process still runs a scheduler that emits host spans.
 
     `init()` rejects `device_ids` above L3, so gating the seeding on them would
-    leave exactly the pod processes unseeded — and their `HostLogger` would keep
+    leave exactly the network1 processes unseeded — and their `HostLogger` would keep
     its constructor default however the `simpler` logger is configured.
     """
 
@@ -316,8 +318,8 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
     monkeypatch.setattr(worker_mod._simpler_log, "get_current_config", lambda: 60)
     monkeypatch.setattr(
         worker_mod,
-        "_initialize_simpler_log",
-        lambda bins, level: startup_events.append(("log", bins, level)),
+        "_initialize_host_log",
+        lambda level: startup_events.append(("log", level)),
         raising=False,
     )
     monkeypatch.setattr(worker, "_await_children_ready", lambda *args, **kwargs: None)
@@ -329,9 +331,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             shm.close()
             shm.unlink()
 
-    # bins is None: this process loads no chip binaries, so the copy the package
-    # already preloaded is the one to seed.
-    assert startup_events[0] == ("log", None, 60)
+    assert startup_events[0] == ("log", 60)
     assert startup_events[1:] == [("fork",)]
 
 
@@ -2757,7 +2757,8 @@ class TestRunHandle:
         with pytest.raises(ValueError, match="bad graph"):
             worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
 
-        assert emitted == [("l3.graph_build", 1, 0, 0, 100, 175, "run_id=1 role=facade")]
+        expected_name = f"{worker._host_span_prefix}.graph_build"
+        assert emitted == [(expected_name, 1, 0, 0, 100, 175, "run_id=1 role=facade")]
 
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):
         worker, events = self._submission_failure_worker(failures=2)
@@ -3994,13 +3995,22 @@ class TestRunHandle:
                 self.region_id = region_id
                 self._worker_id = 0
                 self.mapping_closed = False
-                self.expired = False
+                self._expired = False
+                self._released = False
+                self._chip_release_committed = False
+
+            @property
+            def expired(self):
+                return self._expired
 
             def _close_worker_host_mapping(self):
                 self.mapping_closed = True
 
+            def free(self):
+                self._released = True
+
             def _expire(self):
-                self.expired = True
+                self._expired = True
 
         class NativeWorker:
             def __init__(self):
@@ -4088,13 +4098,22 @@ class TestRunHandle:
             _worker_id = 0
 
             def __init__(self):
-                self.expired = False
+                self._expired = False
+                self._released = False
+                self._chip_release_committed = False
+
+            @property
+            def expired(self):
+                return self._expired
 
             def _close_worker_host_mapping(self):
                 raise mapping_error
 
+            def free(self):
+                self._released = True
+
             def _expire(self):
-                self.expired = True
+                self._expired = True
 
         class NativeWorker:
             def __init__(self):
@@ -4150,9 +4169,18 @@ class TestRunHandle:
                 self._worker_id = 0
                 self.mapping_closes = 0
                 self.expires = 0
+                self._released = False
+                self._chip_release_committed = False
+
+            @property
+            def expired(self):
+                return self.expires > 0
 
             def _close_worker_host_mapping(self):
                 self.mapping_closes += 1
+
+            def free(self):
+                self._released = True
 
             def _expire(self):
                 self.expires += 1
@@ -7630,3 +7658,25 @@ class TestChipMainLoopDigestRegister:
             shm.unlink()
             payload_shm.close()
             payload_shm.unlink()
+
+
+def test_the_cpp_pre_bind_level_word_is_the_ladder_word_for_l3():
+    """`host_span_names.h` hand-writes the L3 word a third time, as its pre-bind default.
+
+    `WorkerLevel` is the source of truth and `strace_timing.py`'s copy is pinned to
+    it by its own test, but the C++ default is pinned to nothing — so a level word
+    could be renamed in Python while C++ keeps emitting the old one until a Worker
+    binds the prefix. Every span emitted before that binding would carry the stale
+    word, and no test would notice.
+
+    Read in a child process on purpose: the prefix freezes on first bind, so any
+    test in this process that constructed a Worker would leave the *bound* word
+    here instead of the default. Passing an empty word binds nothing (the setter
+    returns early) while the binding still reports what is currently in effect.
+    """
+    source = "from _task_interface import _set_host_span_level_prefix as bind; print(bind(''), end='')"
+    completed = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, check=True, timeout=120)
+
+    assert completed.stdout == WorkerLevel.node.name, (
+        f"C++ pre-bind level word is {completed.stdout!r}, ladder says {WorkerLevel.node.name!r}"
+    )

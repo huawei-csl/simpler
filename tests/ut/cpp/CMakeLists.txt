@@ -122,6 +122,7 @@ endfunction()
 function(add_a2a3_hbg_runtime_test name src)
     add_executable(${name}
         ${src}
+        ${ARGN}
         ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
         ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     )
@@ -214,6 +215,10 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    # ChipWorker owns the process log state in production through the binding
+    # DSO. These tests link ChipWorker directly, so provide the same logger
+    # implementation while retaining their custom host-span capture adapter.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
     # Host-side assert_impl / get_stacktrace for the unified ChipTensor's
     # always_assert (init_external and the view ops). Mirrors the binding's CMake.
     # ODR invariant: assert_impl / get_stacktrace are ALSO defined in the runtime
@@ -231,7 +236,16 @@ target_include_directories(hierarchical_objs PUBLIC
 )
 
 function(add_hierarchical_test name src)
+    set(options CUSTOM_HOST_SPAN_ADAPTER)
+    cmake_parse_arguments(TEST "${options}" "" "" ${ARGN})
+    if(TEST_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "Unknown add_hierarchical_test arguments: ${TEST_UNPARSED_ARGUMENTS}")
+    endif()
     add_executable(${name} ${src})
+    if(NOT TEST_CUSTOM_HOST_SPAN_ADAPTER)
+        target_sources(${name} PRIVATE
+            ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp)
+    endif()
     target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
     target_link_libraries(${name} PRIVATE
         hierarchical_objs
@@ -392,24 +406,24 @@ add_hierarchical_test(test_tensormap  hierarchical/test_tensormap.cpp)
 add_hierarchical_test(test_ring  hierarchical/test_ring.cpp)
 add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
-add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
+add_hierarchical_test(test_scheduler hierarchical/test_scheduler.cpp CUSTOM_HOST_SPAN_ADAPTER)
 add_hierarchical_test(test_chip_run_lane hierarchical/test_chip_run_lane.cpp)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 add_hierarchical_test(test_pipeline_contract hierarchical/test_pipeline_contract.cpp)
 
-# Run-stream slot state machine: fresh AICore stream per run, and the handle a
-# failed destroy must keep. Header-only with injected create/destroy, so it
-# needs no runtime objects and no device.
-add_executable(test_run_stream_slots hierarchical/test_run_stream_slots.cpp)
-target_include_directories(test_run_stream_slots PRIVATE
+# Run-stream pair state machine: publication-aware AICore stream reuse,
+# submitter-gated retirement, and failed-destroy ownership. Header-only with
+# injected create/destroy, so it needs no runtime objects and no device.
+add_executable(test_run_stream_pair hierarchical/test_run_stream_pair.cpp)
+target_include_directories(test_run_stream_pair PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/worker
 )
-target_link_libraries(test_run_stream_slots PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
-add_test(NAME test_run_stream_slots COMMAND test_run_stream_slots)
-set_tests_properties(test_run_stream_slots PROPERTIES LABELS "no_hardware")
+target_link_libraries(test_run_stream_pair PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_run_stream_pair COMMAND test_run_stream_pair)
+set_tests_properties(test_run_stream_pair PROPERTIES LABELS "no_hardware")
 
 add_executable(test_native_run_execution common/test_native_run_execution.cpp)
 target_include_directories(test_native_run_execution PRIVATE
@@ -671,6 +685,26 @@ target_link_libraries(test_scope_stats_collector PRIVATE
 add_test(NAME test_scope_stats_collector COMMAND test_scope_stats_collector)
 set_tests_properties(test_scope_stats_collector PROPERTIES LABELS "no_hardware")
 
+add_executable(test_host_phase_records
+    common/test_host_phase_records.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/host_phase_records.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_host_phase_records PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_host_phase_records PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_host_phase_records COMMAND test_host_phase_records)
+set_tests_properties(test_host_phase_records PROPERTIES LABELS "no_hardware")
+
 add_executable(test_chip_swimlane_aicore
     common/test_chip_swimlane_aicore.cpp
 )
@@ -796,11 +830,31 @@ add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)
 add_a2a3_runtime_test(test_scope_deadlock_detection common/test_scope_deadlock_detection.cpp)
 set(HBG_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime)
 set(A5_HBG_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime)
-add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_task_allocator.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_task_allocator a2a3/test_hbg_task_allocator.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensormap a2a3/test_hbg_tensormap.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_dep_gen_host_graph a2a3/test_dep_gen_host_graph.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_tensor_access a2a3/test_hbg_tensor_access.cpp)
+
+# The func_id -> CoreCallable dispatch table holds exactly the active callable's
+# mappings. An entry that outlives the ChipCallable buffer it points into is
+# dereferenced by the scheduler and called by the AICore (issue #1489), so this
+# links the Runtime implementation to pin the contract without a device.
+add_a2a3_hbg_runtime_test(test_dispatch_table a2a3/test_dispatch_table.cpp
+    ${HBG_RUNTIME_DIR}/shared/runtime.cpp)
 add_a2a3_hbg_runtime_test(test_hbg_core_tracker common/test_hbg_core_tracker.cpp)
+# The seed test calls the real ready_queue_init_data_from_layout, so it links the
+# shared init TU (and the orchestrator/SM members that TU refers to).
+add_a2a3_hbg_runtime_test(test_hbg_ready_queue_seed common/test_hbg_ready_queue_seed.cpp)
+add_a2a3_hbg_runtime_test(test_hbg_mailbox_init common/test_hbg_mailbox_init.cpp)
+target_sources(test_hbg_ready_queue_seed PRIVATE
+    ${HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
+    ${HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${HBG_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
 # The submit-poison test drives the real orchestrator submit path, so it links the
 # orchestrator + shared runtime out-of-line members (mirrors a2a3_rt_objs for hbg).
 add_a2a3_hbg_runtime_test(test_hbg_submit_poison a2a3/test_hbg_submit_poison.cpp)
@@ -823,6 +877,7 @@ target_sources(test_hbg_graph_submit_failure PRIVATE
     ${HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+add_a2a3_hbg_runtime_test(test_hbg_graph_async_submit common/test_hbg_graph_async_submit.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_graph_submit_failure common/test_hbg_graph_submit_failure.cpp)
 target_sources(test_a5_hbg_graph_submit_failure PRIVATE
     ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
@@ -833,7 +888,19 @@ target_sources(test_a5_hbg_graph_submit_failure PRIVATE
     ${A5_HBG_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
+add_a5_hbg_runtime_test(test_a5_hbg_graph_async_submit common/test_hbg_graph_async_submit.cpp)
 add_a5_hbg_runtime_test(test_a5_hbg_core_tracker common/test_hbg_core_tracker.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_ready_queue_seed common/test_hbg_ready_queue_seed.cpp)
+add_a5_hbg_runtime_test(test_a5_hbg_mailbox_init common/test_hbg_mailbox_init.cpp)
+target_sources(test_a5_hbg_ready_queue_seed PRIVATE
+    ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_orchestrator.cpp
+    ${A5_HBG_RUNTIME_DIR}/orchestrator_core/pto_ring_buffer.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${A5_HBG_RUNTIME_DIR}/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
+)
 add_a5_hbg_runtime_test(test_a5_hbg_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 set(HBG_A5_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime)
 # The submit-poison test drives the real orchestrator submit path, so it links the
@@ -848,13 +915,29 @@ target_sources(test_a5_hbg_submit_poison PRIVATE
     ${HBG_A5_RUNTIME_DIR}/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/args_dump_aicpu.cpp
 )
-add_a2a3_hbg_runtime_test(test_graph_cache a2a3/test_graph_cache.cpp)
+add_a2a3_hbg_runtime_test(test_graph_cache common/test_hbg_graph_cache.cpp)
 target_sources(test_graph_cache PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/host_build_graph/runtime/scheduler/graph_execution.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/graph_execution.cpp
 )
-add_a5_hbg_runtime_test(test_a5_graph_cache a5/test_graph_cache.cpp)
+add_a5_hbg_runtime_test(test_a5_graph_cache common/test_hbg_graph_cache.cpp)
 target_sources(test_a5_graph_cache PRIVATE
-    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/scheduler/graph_execution.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/host_build_graph/graph_execution.cpp
+)
+# Incremental-activation tests init a real PTO2SchedulerState (ready queues), so
+# they link the scheduler + shared runtime out-of-line members.
+add_a2a3_hbg_runtime_test(test_graph_activation a2a3/test_graph_activation.cpp)
+target_sources(test_graph_activation PRIVATE
+    ${HBG_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_tensormap.cpp
+    ${HBG_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
+    ${HBG_RUNTIME_DIR}/shared/runtime.cpp
+)
+add_a5_hbg_runtime_test(test_a5_graph_activation a5/test_graph_activation.cpp)
+target_sources(test_a5_graph_activation PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/pto_shared_memory.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/pto_tensormap.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/pto_runtime2_init.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/host_build_graph/runtime/shared/runtime.cpp
 )
 # PTO2TensorMap's out-of-line members (reserve_layout / init / valid_count) live
 # in this .cpp; no other add_a2a3_hbg_runtime_test target needs them.
@@ -903,15 +986,17 @@ add_a5_orchestrator_runtime_test(test_a5_wiring a5/test_wiring.cpp)
 add_a5_orchestrator_runtime_test(test_a5_args_dump a5/test_args_dump.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
 
-# Host logger silent/off behavior — no runtime deps, just compile host_log.cpp
-# alongside the test (faster than dlopen'ing libsimpler_log.so for a unit test).
+# Host logger silent/off behavior — no runtime deps, just compile the same
+# self-contained host logger sources used by production consumers.
 set(SIMPLER_LOG_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/log)
 add_executable(test_host_log_off
     a5/test_host_log_off.cpp
     ${SIMPLER_LOG_DIR}/host_log.cpp
+    ${SIMPLER_LOG_DIR}/unified_log_host.cpp
 )
 target_include_directories(test_host_log_off PRIVATE
     ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${SIMPLER_LOG_DIR}
     ${SIMPLER_LOG_DIR}/include
 )
@@ -987,6 +1072,7 @@ add_executable(test_sim_device_log
 target_include_directories(test_sim_device_log PRIVATE
     ${GTEST_INCLUDE_DIRS}
     ${COMMON_PLATFORM_DIR}/include
+    ${SIMPLER_LOG_DIR}/include
 )
 target_link_libraries(test_sim_device_log PRIVATE
     ${GTEST_MAIN_LIB}
@@ -1072,14 +1158,6 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     set(HOST_RUNTIME_LIB
         "${PROJECT_ROOT}/build/lib/a2a3/onboard/tensormap_and_ringbuffer/libhost_runtime.so"
     )
-    # libsimpler_log.so must be loaded RTLD_GLOBAL before host_runtime dlopen
-    # so undefined HostLogger / unified_log_* symbols in host_runtime resolve.
-    # Mirrors what ChipWorker::init does in production. The library is
-    # process-global (one .so per host toolchain, not per arch/variant).
-    set(SIMPLER_LOG_LIB
-        "${PROJECT_ROOT}/build/lib/libsimpler_log.so"
-    )
-
     if(NOT DEFINED ENV{ASCEND_HOME_PATH})
         message(FATAL_ERROR
             "SIMPLER_ENABLE_HARDWARE_TESTS=ON requires ASCEND_HOME_PATH to be set "
@@ -1109,7 +1187,6 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
     )
     target_compile_definitions(test_comm_lifecycle PRIVATE
         PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}"
-        SIMPLER_LOG_LIB_PATH="${SIMPLER_LOG_LIB}"
     )
     target_link_libraries(test_comm_lifecycle PRIVATE
         ${GTEST_MAIN_LIB}

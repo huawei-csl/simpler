@@ -81,42 +81,105 @@ The host/device boundary is POD and position-independent. Fanins are integer
 producer IDs, not pointers. The only per-slot pointers are rebound to their final
 device addresses before H2D.
 
-### 3.1 Bounded H2D Upload
+### 3.1 What Ships: the Arena's Three Zones
+
+Three rules decide every byte of the runtime arena:
+
+1. **Whoever generates a value writes it.** Content the host generates is written
+   on the host and copied down. Content that is a function of the *layout* rather
+   than of the *run* is written by the side that reads it.
+2. **A copy carries per-run content, never an initialization pattern.** Shipping
+   bytes the device could derive from the layout spends link bandwidth
+   transporting a constant.
+3. **Initialize once.** A region whose content does not differ between runs is
+   established once, not re-established per bind.
+
+They partition the arena into three contiguous zones, and `runtime_reserve_layout`
+reserves them in this order:
+
+| Zone | Regions | Copied | Written by |
+| ---- | ------- | ------ | ---------- |
+| host-only | orchestrator block: `fanin_seen_epoch` / `scope_tasks` / TensorMap, ~8.5 MB | never | host, during graph construction |
+| copied | `[off_copied_begin, off_copied_end)`: the runtime header | whole zone, one copy | host |
+| device-only | `sm_handle`, `PTO2SchedulerState` and its thirteen queue slot arrays, the completion mailbox | never | AICPU at boot |
+
+Putting the copied zone **between** the two zones that are never copied is what
+makes `bind` a single contiguous `copy_to_device`. Both bounds are layout fields,
+so no consumer infers a boundary from which region happens to be reserved first —
+`bind_callable_to_runtime_impl` asserts only that they are ordered and in range.
+
+**Why the scheduler state is device-written.** `PTO2SchedulerState` holds no
+per-run content: `sm_header` and the ring pointer derive from a pooled SM base,
+queue capacities are compile-time constants, and hbg never advances
+`last_task_alive`. Its one host-side entry point, `on_scope_end`, is an empty stub
+here. So the host would only be writing an initialization pattern — 203,392 bytes
+of it, dominated by `AsyncWaitList::entries` — for the device to receive and never
+read. `PTO2Runtime` therefore holds a *pointer* to it, wired from
+`off_scheduler` on each side, and the AICPU calls `init_data_from_layout` at boot.
+
+**Why the queue slots are device-written.** `push` claims `slots[pos & mask]` only
+when that slot's `sequence` already equals `pos`, so an empty queue is a
+`0..capacity-1` ramp, not zeroed memory: on zeroed slots position 0 happens to
+match and every later position reads a lower sequence, which is the full-queue
+signal, so such a queue accepts one push and then reports full. The ramp is
+mandatory but it is a function of `capacity` alone, so
+`PTO2SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
+shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
+`total_tasks`: graph execution expands a GRAPH task into on-device nodes that push
+past the host task count, so every slot must carry a valid sequence.
+
+Both run before the boot thread publishes `runtime_init_ready_`, which is what
+releases the peer threads into the dispatch loop, so no push can observe an
+uninitialized queue.
+
+**Boot cost, not per-run cost.** The sequence invariant is lap-relative: a free
+slot's sequence tracks the position it serves, and `pop` releases a slot with
+exactly the value the next lap's `push` expects. A drained queue is therefore
+already an empty queue, which is why `tensormap_and_ringbuffer` can leave
+`PTO2ReadyQueue::reset_for_reuse()` empty and never touch the positions. hbg
+re-establishes both on every attach today because the queue *headers* are reset
+per bind; the combination to avoid is resetting the positions while leaving the
+sequences mid-lap, which makes `push` read a sequence above its position and spin
+as if a peer were mid-publish.
+
+**Why the mailbox is device-written, and why zeroing `seq` is not optional.**
+`try_pop` bounds its scan with `head` and gates publication on
+`entries[t].seq == t + 1`, while a producer bumps `head` *before* it stores `seq`.
+So between those two a consumer already sees `t < head` and reads that slot: a
+residual `seq` equal to `t + 1` would hand out a message the producer has not
+written. `init_empty()` therefore zeroes `head`, `tail` and every slot's `seq`; the
+remaining message fields are written before their `seq` and never read ahead of
+`head`, so they need nothing. This is the one region whose device-side
+initialization is *not* O(1), and only because the cursors restart at zero every
+bind — once they persist, positions never repeat, a residual `seq` is always below
+`t + 1`, and the whole thing collapses to `tail := head`, which also discards what
+an error-aborted run left undrained. `MonotonicSeqSurvivesCapacityWrapWithoutZeroing`
+pins the invariant that makes that safe.
+
+### 3.2 Bounded H2D Upload
 
 The shared-memory mirror is sized to ring capacity (task window) but a run only
 writes `[0, total_tasks)`, and the device boots scheduler-only and reads no SM slot
 past `total_tasks`. So the SM H2D shipped each run is bounded, not capacity-sized —
 the contract that keeps `bind` proportional to the workload.
 
-- **Shared memory** — the header is zeroed on the host; `descriptors`, `payloads`,
-  `slot_states` and `completion_flags` are each written per task at submit and
-  H2D-uploaded bounded to `[0, total_tasks)`. Per-slot reset is init-on-write in
-  `orch::prepare_task` as each slot is claimed — there is no window-wide reset.
-
-- **Runtime arena** — the **orchestrator block** (`fanin_seen_epoch` /
-  `scope_tasks` / TensorMap, ~8.5 MB) is **not shipped at all**: it is host-only
-  dep-computation scratch, and the AICPU scheduler holds zero references to it. (The
-  scalar `inline_completed_tasks` the scheduler does read lives in the runtime
-  header, inside the region that still ships whole.) Everything from the scheduler
-  block onward — the ready-queue slot pools, runtime header, and completion mailbox
-  — ships **whole**. The ready queues are *not* bounded to `total_tasks`: graph
-  execution replays a cached GRAPH task that the device Scheduler expands into
-  on-device nodes, and those nodes push into the ready queues past the host task
-  count, so the queue slots must all carry a valid Vyukov sequence on the device.
-
-`bind_callable_to_runtime_impl` `always_assert`s `orch_start <= orch_end` before
-uploading, so a future `runtime_reserve_layout` reorder that moved the scheduler
-block ahead of the orchestrator block faults instead of shipping a misaligned image.
+The header is zeroed on the host; `descriptors`, `payloads`, `slot_states` and
+`completion_flags` are each written per task at submit and H2D-uploaded bounded to
+`[0, total_tasks)`. Per-slot reset is init-on-write in `orch::prepare_task` as each
+slot is claimed — there is no window-wide reset. The four segments travel as four
+copies rather than one because ring-sized tails separate their live prefixes.
 
 ## 4. Whole-Graph Capacity
 
 The runtime uses one task ring, one graph heap, and one TensorMap pool. They are
 capacity-bounded storage, not streaming flow-control buffers:
 
-- `last_task_alive` does not advance during a run;
-- `heap_tail` does not retire task output buffers during a run;
+- the task ring and the graph heap are forward-only bump allocators;
 - task slots and heap bytes are never recycled mid-run; and
-- TensorMap entries are not reclaimed while host construction is active.
+- TensorMap entries are held for the whole run.
+
+There is no reclaim channel from the scheduler back to the allocator, so the
+allocators carry no reclaim pointer and no back-pressure wait.
 
 `completed_watermark` records the contiguous prefix of completed device tasks.
 It supports completion/consumer metadata only; it does not reclaim the task ring
@@ -129,16 +192,18 @@ image.
 ### 4.1 Allocation Failure
 
 The graph must fit the configured task window, heap, fanin capacity, and
-TensorMap pool. When an allocation cannot progress, a wall-clock backstop
-latches a fatal instead of waiting for a scheduler that has not started.
+TensorMap pool. Because nothing is reclaimed, a request that does not fit can
+never become satisfiable — the allocator names the exhausted resource and fails
+on the spot. There is no wait and no timeout.
 
 Representative allocator output is:
 
 ```text
-FATAL: Task Allocator Deadlock - Heap Exhausted!
-  Task ring:  current=..., last_alive=..., active=.../...
-  Heap ring:  top=..., tail=..., size=..., available=...
-  Requested:  ... bytes
+FATAL: Graph Heap Exhausted!
+The whole graph must fit the configured ring; nothing is reclaimed mid-run.
+  Task window: used=.../...
+  Graph heap:  used=.../..., available=...
+  Requested:   ... bytes + 1 task slot
 ```
 
 This is host-orchestration logging. The allocator records the corresponding

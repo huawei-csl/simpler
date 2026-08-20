@@ -33,10 +33,11 @@ workers/
   l3/                       # Multi-chip examples (host-level DAG)
     multi_chip_dispatch/    # Worker(level=3) + orchestration + SubWorker
     child_memory/           # orch.malloc + child_memory=True, weight reuse across tasks
-  l4/                       # Multi-machine examples (one L3 here, one over TCP)
+  l4/                       # Multi-machine examples (one L3 here, one over TCP or mpirun)
     vector_add_mixed_l3/    # Worker(level=4) + add_remote_worker, golden checked on both sides
     global_tload_mixed_l3/  # Global CommDomain build + cross-machine peer TLOAD on both ranks
     compute_then_tload_mixed_l3/  # compute round on both L2s, then peer TLOAD through the same domain
+    global_tload_mpirun_l3/ # one mpirun launches an L3 rank per machine; MPI descriptor exchange
 ```
 
 Why no `tensormap_and_ringbuffer/` layer? Because every example here hard-codes
@@ -60,6 +61,12 @@ The daemon is `python -m simpler.remote_l3_worker --host H --port P` — generic
 identical for every example, nothing to write. All an example ships is the
 parent side.
 
+`global_tload_mpirun_l3` is the one exception to the daemon shape: there the
+parent owns a single `mpirun` that launches an L3 rank on each machine
+(`add_mpirun_worker_group`), so no daemon runs on the peer — see that
+example's README for its extra prerequisites (`mpirun` + `mpi4py` on both
+machines).
+
 ### What a new L4 example needs
 
 ```text
@@ -68,7 +75,7 @@ l4/<your_example>/
   kernels/aiv/*.cpp
   kernels/orchestration/*.cpp
   main.py                   # entry point: argparse + main() delegating to run()
-  test_<your_example>.py    # @scene_level(SceneTestLevel.POD) wrapper collected by pod CI
+  test_<your_example>.py    # @scene_level(SceneTestLevel.NETWORK1) wrapper collected by network1 CI
   run_parent.sh             # maps environment variables onto main.py's flags
 ```
 
@@ -104,13 +111,13 @@ Anything else — platform, runtime — defaults inside `run_parent.sh`.
 
 ### Running it in CI
 
-The `st-pod-onboard-a2a3` job runs L4 examples across a pair of a2a3 machines.
+The `st-network1-onboard-a2a3` job runs L4 examples across a pair of a2a3 machines.
 The job runs one `pytest examples tests/st --level 4` sweep, so adding yours
 means adding a `test_*.py` wrapper carrying
-`@scene_level(SceneTestLevel.POD)`. Keep `pod_remote_device_count` when the peer
+`@scene_level(SceneTestLevel.NETWORK1)`. Keep `network1_remote_device_count` when the peer
 side needs more than one remote device; it declares remote resource demand,
-not selection. Do not edit `_st-pod.yml`. The wiring and the log artifact are described in
-[`docs/ci.md`](../../docs/ci.md#multi-machine-pod-jobs).
+not selection. Do not edit `_st-network1.yml`. The wiring and the log artifact are described in
+[`docs/ci.md`](../../docs/ci.md#multi-machine-network1-jobs).
 
 ## Prerequisites
 

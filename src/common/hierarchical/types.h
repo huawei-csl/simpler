@@ -157,6 +157,10 @@ struct RunState {
     bool submission_closed{false};
     bool submission_failed{false};
     bool lease_released{false};
+    // When this run reached a terminal phase. `node.post_fence_retirement`
+    // measures from here to the end of release_run, the only work this process
+    // does outside every other span.
+    int64_t trace_terminal_ns{0};
 };
 
 // =============================================================================

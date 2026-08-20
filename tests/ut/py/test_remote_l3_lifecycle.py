@@ -270,7 +270,7 @@ def test_run_session_bounds_command_accept_by_startup_deadline_not_session_timeo
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -345,7 +345,7 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
     monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
 
@@ -405,7 +405,7 @@ def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(mon
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -466,7 +466,7 @@ def test_run_session_builds_deadline_before_registry_install(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -526,7 +526,7 @@ def test_run_session_uses_daemon_absolute_deadline_verbatim(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
-    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
@@ -957,11 +957,13 @@ def _bare_l3_worker():
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
     w._accepted_run_handles = set()
+    w._abandoned_run_handles = []
     # Run admission is shared/exclusive now, not a plain Lock: production code calls
     # `.exclusive()` / `.shared()` on it, so the stand-in has to be the real type.
     w._submit_mu = _SharedExclusiveLock()
     w._chip_run_touched_identities = {}
     w._chip_import_registry = None
+    w._reexport_by_source = {}
     w._worker = None
     return w
 

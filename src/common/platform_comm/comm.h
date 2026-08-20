@@ -37,7 +37,7 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
-#define COMM_GLOBAL_DOMAIN_VERSION 1U
+#define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
 
@@ -82,6 +82,15 @@ static_assert(offsetof(CommGlobalDomainDescriptor, handle) == 32, "CommGlobalDom
 
 /** Bit mask of DmaWorkspaceKind values this platform can provision. */
 uint32_t dma_workspace_supported_mask(void);
+
+/**
+ * Number of SDMA channels the provisioned workspace describes, i.e. how many
+ * channels the control-path warmup must walk. Exposed through the comm seam
+ * because it comes from a PTO constant (kSdmaMaxChannelGroups, the count
+ * SdmaWorkspaceManager::Init actually creates streams for) and src/common must
+ * not include PTO headers.
+ */
+uint32_t dma_workspace_channel_count(void);
 
 /**
  * Provision the async-DMA workspaces named in required_mask for the current

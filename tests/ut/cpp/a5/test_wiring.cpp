@@ -61,6 +61,7 @@ protected:
         ASSERT_TRUE(sched.init_data_from_layout(layout, sched_arena, sm_handle->header));
         sched.wire_arena_pointers(layout, sched_arena);
         orch.set_scheduler(&sched);
+        sched.set_publication_batching_enabled(true);
     }
 
     void TearDown() override {
@@ -110,7 +111,26 @@ protected:
         }
         ASSERT_TRUE(ok);
     }
+
+    // Ask the scheduler for an exact publication on ring 0, the way a blocked
+    // reclaim consumer does once it has spun without progress.
+    void request_and_drain_publication(int32_t ring_id = 0) {
+        sched.publication_request_mask.store(ring_mask_bit(ring_id), std::memory_order_release);
+        ASSERT_TRUE(sched.drain_publication_requests());
+    }
 };
+
+TEST(ReclaimHeadMatchTest, ComparesExactRingAndLocalTaskId) {
+    PTO2TaskDescriptor descriptor{};
+    PTO2TaskSlotState slot{};
+    slot.task = &descriptor;
+    descriptor.task_id = PTO2TaskId::make(0, 16);
+
+    EXPECT_FALSE(reclaim_head_matches_open_task(0, 0, &slot));
+    EXPECT_TRUE(reclaim_head_matches_open_task(16, 0, &slot));
+    EXPECT_FALSE(reclaim_head_matches_open_task(16, 1, &slot));
+    EXPECT_FALSE(reclaim_head_matches_open_task(16, 0, nullptr));
+}
 
 // =============================================================================
 // Orch-side publish: no fanin (independent task)
@@ -160,8 +180,8 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     // Consumer task with 2 fanins
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
 
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -197,8 +217,8 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producer_slots[0];
-    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    payload.fanin_inline_edges[0].set(&producer_slots[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producer_slots[1], DEP_WAIT | DEP_RETAIN);
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
@@ -240,7 +260,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 3;
     for (int i = 0; i < 3; i++) {
-        payload.fanin_inline_slot_states[i] = &producers[i];
+        payload.fanin_inline_edges[i].set(&producers[i], DEP_WAIT | DEP_RETAIN);
     }
     task_slot.payload = &payload;
     task_slot.task = &desc;
@@ -450,8 +470,8 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
 
     init_slot(task_slot, PTO2_TASK_COMPLETED, 3, 1);
     payload.fanin_actual_count = 2;
-    payload.fanin_inline_slot_states[0] = &producers[0];
-    payload.fanin_inline_slot_states[1] = &producers[1];
+    payload.fanin_inline_edges[0].set(&producers[0], DEP_WAIT | DEP_RETAIN);
+    payload.fanin_inline_edges[1].set(&producers[1], DEP_WAIT | DEP_RETAIN);
     // Need a valid fanin_spill_pool even though we don't spill
     PTO2FaninPool dummy_pool{};
     PTO2FaninSpillEntry dummy_entries[4];
@@ -471,6 +491,93 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
     // Producers with fanout_refcount == fanout_count AND COMPLETED -> CONSUMED
     EXPECT_EQ(producers[0].task_state.load(), PTO2_TASK_CONSUMED);
     EXPECT_EQ(producers[1].task_state.load(), PTO2_TASK_CONSUMED);
+}
+
+// =============================================================================
+// WAIT/RETAIN split (issue #1375): an ordering-only (DEP_WAIT) producer drops
+// its submit->wire pin at wiring; a retention (DEP_WAIT|DEP_RETAIN) producer
+// keeps it until on_task_release. Both are linked for completion notification.
+// =============================================================================
+
+TEST_F(WiringTest, OrderingOnlyReleasedAtWiringRetentionHeldUntilRelease) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState wait_producer;    // DEP_WAIT only (modifier)
+    alignas(64) PTO2TaskSlotState retain_producer;  // DEP_WAIT|DEP_RETAIN (creator)
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    // Both live (PENDING) with a single submit pin (fanout_count = 1).
+    init_slot(wait_producer, PTO2_TASK_PENDING, 1, 1);
+    init_slot(retain_producer, PTO2_TASK_PENDING, 1, 1);
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_edges[0].set(&wait_producer, DEP_WAIT);
+    payload.fanin_inline_edges[1].set(&retain_producer, DEP_WAIT | DEP_RETAIN);
+    PTO2FaninPool dummy_pool{};
+    PTO2FaninSpillEntry dummy_entries[4];
+    std::atomic<int32_t> dummy_error{PTO2_ERROR_NONE};
+    dummy_pool.init(dummy_entries, 4, &dummy_error);
+    payload.fanin_spill_pool = &dummy_pool;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    // Both WAIT edges gate readiness (wfanin = 2) and both link onto fanout_head.
+    wire_fanin(task_slot, 2);
+    EXPECT_NE(wait_producer.fanout_head, nullptr);
+    EXPECT_NE(retain_producer.fanout_head, nullptr);
+
+    // Ordering-only pin released at wiring; retention pin still held.
+    EXPECT_EQ(wait_producer.fanout_refcount.load(), 1);
+    EXPECT_EQ(retain_producer.fanout_refcount.load(), 0);
+
+    // Release: only the retention edge releases here; the ordering edge is not
+    // released a second time.
+    sched.on_task_release(task_slot);
+    EXPECT_EQ(wait_producer.fanout_refcount.load(), 1);
+    EXPECT_EQ(retain_producer.fanout_refcount.load(), 1);
+}
+
+// on_task_release must honor per-edge flags in the spill region too: a spilled
+// DEP_RETAIN edge is released; inline ordering-only edges are skipped.
+TEST_F(WiringTest, ReleaseHonorsRetainFlagInSpillRegion) {
+    alignas(64) PTO2TaskSlotState filler;        // 64 inline DEP_WAIT-only edges
+    alignas(64) PTO2TaskSlotState spill_retain;  // 1 spilled DEP_RETAIN edge
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    // filler carries a large fanout_count so releasing it can never consume it.
+    init_slot(filler, PTO2_TASK_COMPLETED, 1, 100);
+    init_slot(spill_retain, PTO2_TASK_COMPLETED, 1, 1);
+    init_slot(task_slot, PTO2_TASK_COMPLETED, 0, 1);
+
+    for (int i = 0; i < PTO2_FANIN_INLINE_CAP; i++) {
+        payload.fanin_inline_edges[i].set(&filler, DEP_WAIT);
+    }
+    PTO2FaninPool spill_pool{};
+    PTO2FaninSpillEntry spill_entries[4];
+    std::atomic<int32_t> err{PTO2_ERROR_NONE};
+    spill_pool.init(spill_entries, 4, &err);
+    auto *e = spill_pool.alloc();
+    int32_t spill_start = spill_pool.top - 1;
+    e->set(&spill_retain, DEP_WAIT | DEP_RETAIN);
+
+    payload.fanin_actual_count = PTO2_FANIN_INLINE_CAP + 1;
+    payload.fanin_spill_start = spill_start;
+    payload.fanin_spill_pool = &spill_pool;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    sched.on_task_release(task_slot);
+
+    // Ordering-only inline edges are skipped; filler is untouched.
+    EXPECT_EQ(filler.fanout_refcount.load(), 0);
+    // The spilled retention edge is released (and consumed: rc == fc, COMPLETED).
+    EXPECT_EQ(spill_retain.fanout_refcount.load(), 1);
+    EXPECT_EQ(spill_retain.task_state.load(), PTO2_TASK_CONSUMED);
 }
 
 // =============================================================================
@@ -496,6 +603,299 @@ TEST_F(WiringTest, AdvanceRingPointersScansConsumed) {
 
     // Verify SM was synced
     EXPECT_EQ(ring->fc.last_task_alive.load(), 3);
+}
+
+TEST_F(WiringTest, AdvanceRingPointersBatchesSharedMemoryPublication) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    ring->fc.current_task_index.store(18, std::memory_order_release);
+    for (int i = 0; i < 17; i++) {
+        ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+    }
+
+    rss.advance_ring_pointers();
+    EXPECT_EQ(rss.last_task_alive, 17);
+    EXPECT_EQ(ring->fc.last_task_alive.load(), 17);
+
+    ring->fc.last_task_alive.store(0);
+    rss.last_task_alive = 0;
+    rss.last_published_to_sm = 0;
+    for (int advances : {1, 15, 16, 17}) {
+        for (int i = 0; i < advances; i++) {
+            ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+        }
+        ring->get_slot_state_by_task_id(advances).task_state.store(PTO2_TASK_COMPLETED);
+        rss.advance_ring_pointers();
+        EXPECT_EQ(ring->fc.last_task_alive.load(), advances >= 16 ? advances : 0);
+
+        ring->fc.last_task_alive.store(0);
+        rss.last_task_alive = 0;
+        rss.last_published_to_sm = 0;
+    }
+}
+
+TEST_F(WiringTest, AdvanceRingPointersPublishesDrainedTail) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    for (int advances : {1, 15, 16, 17}) {
+        ring->fc.current_task_index.store(advances, std::memory_order_release);
+        for (int i = 0; i < advances; i++) {
+            ring->get_slot_state_by_task_id(i).task_state.store(PTO2_TASK_CONSUMED);
+        }
+
+        rss.advance_ring_pointers();
+        EXPECT_EQ(rss.last_task_alive, advances);
+        EXPECT_EQ(ring->fc.last_task_alive.load(), advances);
+
+        ring->fc.last_task_alive.store(0);
+        rss.last_task_alive = 0;
+        rss.last_published_to_sm = 0;
+    }
+}
+
+// =============================================================================
+// Withheld reclaim progress: request -> publish -> reclaim
+//
+// Batched publication lets the shared watermark trail scheduler-local
+// reclamation by PUBLISH_INTERVAL_K - 1 tasks, so a reclaim consumer can run out
+// of space while the scheduler has already retired what it needs. The consumer
+// asks for an exact publication and resumes once it lands.
+//
+// What the tests below assert is that handshake's three steps, each in one
+// thread. They deliberately do not assert the step in between — that a spinning
+// consumer reaches its request after 10 ms of no reclaim progress. That step is
+// a duration, and the same spin carries a 500 ms deadlock backstop, so a test
+// that raced a servicing thread against it would be asserting that the servicing
+// thread gets scheduled in time. Under `ctest -j` on a small runner it does not,
+// and the production code then does exactly what it is specified to do — report
+// the stall and give up — which such a test reports as a failed assertion.
+// =============================================================================
+
+TEST(ReclaimPublicationRequestTest, AcknowledgmentIsScopedToTheOutstandingRequest) {
+    std::atomic<uint32_t> request_mask{0};
+    std::atomic<uint32_t> ack_mask{0};
+    ReclaimPublicationRequest request(&request_mask, &ack_mask, 1);
+    ASSERT_TRUE(request.enabled());
+
+    // An ack that predates the request describes an older watermark, so it is
+    // cleared by the request rather than consumed by it.
+    ack_mask.store(ring_mask_bit(1), std::memory_order_release);
+    EXPECT_FALSE(request.poll_acknowledged());
+
+    request.request();
+    EXPECT_EQ(request_mask.load(std::memory_order_acquire), ring_mask_bit(1));
+    EXPECT_EQ(ack_mask.load(std::memory_order_acquire) & ring_mask_bit(1), 0u);
+    EXPECT_FALSE(request.poll_acknowledged());
+
+    ack_mask.fetch_or(ring_mask_bit(1), std::memory_order_release);
+    EXPECT_TRUE(request.poll_acknowledged());
+    // One acknowledgment proves one publication: a later reclaim spin must
+    // request again rather than re-reading this one.
+    EXPECT_FALSE(request.poll_acknowledged());
+}
+
+TEST(ReclaimPublicationRequestTest, AnUnwiredRequestCountsAsSynchronized) {
+    ReclaimPublicationRequest request(nullptr, nullptr, 0);
+
+    EXPECT_FALSE(request.enabled());
+    // No publisher to ask means the shared watermark is already the only one
+    // there is, so the reclaim spin must not wait for an ack that cannot come.
+    EXPECT_TRUE(request.poll_acknowledged());
+}
+
+TEST_F(WiringTest, DrainPublicationRequestsPublishesWithheldProgress) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    ring->fc.current_task_index.store(129, std::memory_order_release);
+    ring->get_slot_state_by_task_id(128).task_state.store(PTO2_TASK_PENDING);
+    rss.last_task_alive = 128;
+    rss.last_published_to_sm = 113;
+    ring->fc.last_task_alive.store(113, std::memory_order_release);
+
+    // 15 retired tasks short of the publish interval: batching withholds them.
+    rss.sync_to_sm();
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 113);
+
+    sched.publication_request_mask.store(ring_mask_bit(0), std::memory_order_release);
+    EXPECT_TRUE(sched.drain_publication_requests());
+
+    EXPECT_EQ(ring->fc.last_task_alive.load(), 128);
+    EXPECT_EQ(rss.last_published_to_sm, 128);
+    EXPECT_EQ(sched.publication_ack_mask.load() & ring_mask_bit(0), ring_mask_bit(0));
+    EXPECT_EQ(sched.publication_request_mask.load() & ring_mask_bit(0), 0u);
+
+    // The return value reports whether the watermark moved, not whether the
+    // request was serviced: a request with nothing withheld is still acked.
+    sched.publication_request_mask.store(ring_mask_bit(0), std::memory_order_release);
+    EXPECT_FALSE(sched.drain_publication_requests());
+    EXPECT_EQ(sched.publication_ack_mask.load() & ring_mask_bit(0), ring_mask_bit(0));
+    EXPECT_EQ(sched.publication_request_mask.load() & ring_mask_bit(0), 0u);
+}
+
+TEST_F(WiringTest, TaskWindowOpensOnceWithheldProgressIsPublished) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    alignas(64) char heap[64] = {};
+    ring->fc.current_task_index.store(3, std::memory_order_release);
+    ring->get_task_by_task_id(0).packed_buffer_end = heap;
+    ring->get_slot_state_by_task_id(0).task_state.store(PTO2_TASK_CONSUMED);
+    ring->get_slot_state_by_task_id(1).task_state.store(PTO2_TASK_PENDING);
+    rss.advance_ring_pointers();
+
+    ASSERT_EQ(rss.last_task_alive, 1);
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 0);
+
+    PTO2TaskAllocator allocator;
+    auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_handle->sm_base);
+    allocator.init(
+        ring->task_descriptors, 4, &ring->fc.current_task_index, &ring->fc.last_task_alive, heap, sizeof(heap),
+        orch_err, ring->slot_states, 3, 0
+    );
+    allocator.set_reclaim_publication_request(&sched.publication_request_mask, &sched.publication_ack_mask);
+
+    // A window of 4 admits task 3 only once the watermark retires task 0, and
+    // the watermark the allocator can see still says every task is alive.
+    ASSERT_EQ(allocator.window_size(), 4);
+    ASSERT_EQ(allocator.task_head(), 3);
+    ASSERT_EQ(allocator.task_tail(), 0);
+    ASSERT_EQ(allocator.active_count(), allocator.window_size() - 1);
+
+    request_and_drain_publication();
+    ASSERT_EQ(allocator.task_tail(), 1);
+
+    PTO2TaskAllocResult result = allocator.alloc(0, &ring->get_slot_state_by_task_id(0));
+
+    EXPECT_FALSE(result.failed());
+    EXPECT_EQ(result.task_id, 3);
+    EXPECT_EQ(ring->fc.last_task_alive.load(), 1);
+}
+
+TEST_F(WiringTest, HeapReclaimsOnceWithheldProgressIsPublished) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    alignas(64) char heap[64] = {};
+    PTO2TaskAllocator allocator;
+    auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_handle->sm_base);
+    allocator.init(
+        ring->task_descriptors, 8, &ring->fc.current_task_index, &ring->fc.last_task_alive, heap, sizeof(heap),
+        orch_err, ring->slot_states, 0, 0
+    );
+    allocator.set_reclaim_publication_request(&sched.publication_request_mask, &sched.publication_ack_mask);
+
+    auto full_heap = allocator.alloc(sizeof(heap));
+    ASSERT_FALSE(full_heap.failed());
+    ring->get_task_by_task_id(full_heap.task_id).packed_buffer_end = full_heap.packed_end;
+    auto live_tail = allocator.alloc(0);
+    ASSERT_FALSE(live_tail.failed());
+    ring->get_task_by_task_id(live_tail.task_id).packed_buffer_end = live_tail.packed_end;
+
+    ring->get_slot_state_by_task_id(0).task_state.store(PTO2_TASK_CONSUMED);
+    ring->get_slot_state_by_task_id(1).task_state.store(PTO2_TASK_PENDING);
+    rss.advance_ring_pointers();
+
+    ASSERT_EQ(rss.last_task_alive, 1);
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 0);
+
+    // Every heap byte belongs to task 0, which the visible watermark still
+    // counts as alive, so the heap tail cannot move off it.
+    ASSERT_EQ(allocator.heap_available(), 0u);
+    ASSERT_EQ(allocator.heap_tail(), 0u);
+
+    request_and_drain_publication();
+    ASSERT_EQ(allocator.task_tail(), 1);
+
+    PTO2TaskAllocResult result = allocator.alloc(8);
+
+    EXPECT_FALSE(result.failed());
+    EXPECT_EQ(result.task_id, 2);
+    EXPECT_EQ(result.packed_base, heap);
+    EXPECT_EQ(ring->fc.last_task_alive.load(), 1);
+}
+
+TEST_F(WiringTest, DependencyPoolReclaimsOnceWithheldProgressIsPublished) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    ring->fc.current_task_index.store(129, std::memory_order_release);
+    ring->fc.last_task_alive.store(113, std::memory_order_release);
+    ring->get_slot_state_by_task_id(127).dep_pool_mark = 5;
+    ring->get_slot_state_by_task_id(128).task_state.store(PTO2_TASK_PENDING);
+    rss.last_task_alive = 128;
+    rss.last_published_to_sm = 113;
+    rss.dep_pool.capacity = 8;
+    rss.dep_pool.top = 9;
+    rss.dep_pool.tail = 1;
+    rss.dep_pool.last_reclaimed = 64;
+
+    // The pool is full, and the watermark it can see is not a reclaim point:
+    // cleanup runs every 64 retired tasks and 113 is under 64 + 64.
+    ASSERT_EQ(rss.dep_pool.available(), 0);
+    rss.dep_pool.reclaim(*ring, ring->fc.last_task_alive.load());
+    ASSERT_EQ(rss.dep_pool.tail, 1);
+
+    request_and_drain_publication();
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 128);
+
+    // 128 is a reclaim point, and task 127's mark says entries below 5 are dead.
+    EXPECT_TRUE(rss.dep_pool.ensure_space(*ring, 1));
+    EXPECT_EQ(rss.dep_pool.tail, 5);
+}
+
+TEST_F(WiringTest, FaninPoolReclaimsOnceWithheldProgressIsPublished) {
+    auto &rss = sched.ring_sched_states[0];
+    auto *ring = rss.ring;
+
+    ring->fc.current_task_index.store(2, std::memory_order_release);
+    ring->get_slot_state_by_task_id(0).task_state.store(PTO2_TASK_CONSUMED);
+    ring->get_slot_state_by_task_id(1).task_state.store(PTO2_TASK_PENDING);
+    rss.advance_ring_pointers();
+    ASSERT_EQ(rss.last_task_alive, 1);
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 0);
+
+    PTO2FaninSpillEntry entries[4]{};
+    PTO2FaninPool pool{};
+    auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_handle->sm_base);
+    pool.init(entries, 4, orch_err);
+    pool.set_reclaim_publication_request(&sched.publication_request_mask, &sched.publication_ack_mask, 0);
+    for (int i = 0; i < 4; i++) {
+        ASSERT_NE(pool.alloc(), nullptr);
+    }
+
+    auto &payload = ring->get_payload_by_task_id(0);
+    payload.fanin_actual_count = PTO2_FANIN_INLINE_CAP + 1;
+    payload.fanin_spill_start = 1;
+    payload.fanin_spill_pool = &pool;
+
+    // The pool is full and the only task holding spill entries is task 0, which
+    // the visible watermark has not retired.
+    ASSERT_EQ(pool.available(), 0);
+    pool.reclaim(*ring, ring->fc.last_task_alive.load());
+    ASSERT_EQ(pool.tail, 1);
+
+    request_and_drain_publication();
+    ASSERT_EQ(ring->fc.last_task_alive.load(), 1);
+
+    EXPECT_TRUE(pool.ensure_space(*ring, 1));
+    EXPECT_EQ(pool.tail, 2);
+}
+
+TEST_F(WiringTest, RingReuseResetsPublicationShadow) {
+    auto &rss = sched.ring_sched_states[0];
+    rss.last_task_alive = 17;
+    rss.last_published_to_sm = 16;
+
+    auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_handle->sm_base);
+    rss.reset_for_reuse(sm_handle->sm_base, 0, orch_err);
+
+    EXPECT_EQ(rss.last_task_alive, 0);
+    EXPECT_EQ(rss.last_published_to_sm, 0);
+    EXPECT_FALSE(rss.publication_batching_enabled);
+    EXPECT_EQ(rss.ring, pto2_sm_layout::ring_header_addr(sm_handle->sm_base, 0));
 }
 
 TEST_F(WiringTest, AdvanceRingPointersStopsAtNonConsumed) {
@@ -552,4 +952,83 @@ TEST_F(WiringTest, NoEdgePublishRecordsDepPoolMark) {
     int32_t before_top = rss.dep_pool.top;
     publish_no_fanin(task_slot);
     EXPECT_EQ(task_slot.dep_pool_mark, before_top);
+}
+
+TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
+    alignas(64) PTO2TaskSlotState filler;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    PTO2TaskSlotState *items[1] = {&filler};
+    uint64_t tags[1] = {queue.capacity};
+    // A full queue must end the call, not spin waiting for a consumer. Reaching
+    // the next line at all is the assertion.
+    EXPECT_FALSE(queue.push_batch_tagged(items, tags, 1));
+    EXPECT_EQ(queue.size(), queue.capacity);
+
+    // A batch larger than the queue can never be satisfied and must not spin.
+    EXPECT_FALSE(queue.push_batch_tagged(items, tags, static_cast<int>(queue.capacity) + 1));
+}
+
+TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
+    alignas(64) PTO2TaskSlotState filler;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(filler.active_mask.to_shape())];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+    ASSERT_NE(queue.pop(), nullptr);
+    ASSERT_NE(queue.pop(), nullptr);
+
+    PTO2TaskSlotState *items[2] = {&filler, &filler};
+    uint64_t tags[2] = {7, 8};
+    EXPECT_TRUE(queue.push_batch_tagged(items, tags, 2));
+    EXPECT_EQ(queue.size(), queue.capacity);
+}
+
+TEST_F(WiringTest, EarlyDispatchQueueOverflowFallsBackToNormalDispatch) {
+    alignas(64) PTO2TaskSlotState filler, consumer;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+
+    PTO2ResourceShape shape = consumer.active_mask.to_shape();
+    auto &queue = sched.early_dispatch_queues[static_cast<int32_t>(shape)];
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    sched.try_enqueue_early_dispatch_candidate(consumer);
+    ASSERT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_NONE);
+
+    // The overflowed candidate carries no early-dispatch claim, so the producer
+    // release routes every block through the ordinary ready queue.
+    EXPECT_TRUE(sched.route_ready_once(consumer));
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(sched.ready_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+}
+
+TEST_F(WiringTest, EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue) {
+    alignas(64) PTO2TaskSlotState filler, consumer;
+    init_slot(filler, PTO2_TASK_PENDING, 0, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+    consumer.task_attrs.set_sync_start();
+    ASSERT_TRUE(consumer.task_attrs.requires_sync_start());
+
+    auto &queue = sched.early_sync_start_queue;
+    for (uint64_t i = 0; i < queue.capacity; i++) {
+        ASSERT_TRUE(queue.push_tagged(&filler, i));
+    }
+
+    sched.try_enqueue_early_dispatch_candidate(consumer);
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_NONE);
+    EXPECT_EQ(queue.size(), queue.capacity);
+
+    // A sync_start cohort that never reached its drain falls back to the
+    // shape's sync ready queue, not the plain one.
+    PTO2ResourceShape shape = consumer.active_mask.to_shape();
+    EXPECT_TRUE(sched.route_ready_once(consumer));
+    EXPECT_EQ(sched.ready_sync_queues[static_cast<int32_t>(shape)].pop(), &consumer);
 }

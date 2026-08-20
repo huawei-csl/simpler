@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include "common/host_span_names.h"
 #include "common/host_span_scope.h"
 #include "worker_manager.h"
 
@@ -135,6 +136,7 @@ void Orchestrator::finish_run_if_ready(const std::shared_ptr<RunState> &run) {
             return;
         }
         bool failed = run->submission_failed || static_cast<bool>(run->first_error);
+        run->trace_terminal_ns = simpler::host_trace::now_ns();
         run->phase.store(failed ? RunPhase::FAILED : RunPhase::COMPLETED, std::memory_order_release);
         notify = true;
     }
@@ -356,6 +358,8 @@ void Orchestrator::compact_if_quiescent() {
 }
 
 void Orchestrator::release_run(RunId run_id) {
+    int64_t terminal_ns = 0;
+    PipelineSlotLease lease{};
     {
         std::lock_guard<std::mutex> lk(runs_mu_);
         auto it = runs_.find(run_id);
@@ -363,10 +367,21 @@ void Orchestrator::release_run(RunId run_id) {
         if (!is_terminal(it->second->phase.load(std::memory_order_acquire))) {
             throw std::logic_error("Orchestrator::release_run: run is not terminal");
         }
+        terminal_ns = it->second->trace_terminal_ns;
+        lease = it->second->lease;
         runs_.erase(it);
     }
 
     compact_if_quiescent();
+#if SIMPLER_HOST_STRACE
+    std::ostringstream retire_attrs;
+    retire_attrs << "run_id=" << run_id << " slot_id=" << lease.slot_id << " generation=" << lease.generation
+                 << " role=facade";
+    simpler::host_trace::emit(
+        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::PostFenceRetirement), run_id, 0, 0,
+        terminal_ns, simpler::host_trace::now_ns() - terminal_ns, retire_attrs.str().c_str()
+    );
+#endif
 }
 
 void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot) {
@@ -632,7 +647,9 @@ uint64_t Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype,
         // can erase; the reverse order can leak an unjournaled producer entry.
         s.output_keys.push_back(key);
         if (test_hook_) test_hook_(OrchestratorTestPoint::ALLOC_OUTPUT_KEY_PREPARED);
-        tensormap_->insert(run->id, key, ar.slot);
+        // The allocation covers its whole backing, which is what a default TensorFootprint
+        // spans — so every view a consumer later takes of it resolves back to this slot.
+        tensormap_->insert(run->id, key, TensorFootprint{}, ar.slot);
     }
 
     // Simulate the self try_consume that on_task_complete would normally
@@ -725,7 +742,10 @@ SubmitResult Orchestrator::submit_impl(
                     << " group_index=" << (args_list.size() == 1 ? 0 : -1) << " group_size=" << args_list.size();
         if (target_worker_ids.size() == 1) trace_attrs << " worker_id=" << target_worker_ids.front();
         trace_attrs << " role=facade";
-        submit_trace.emplace("l3.submit", run->id, trace_callable_hash, 0, trace_attrs.str());
+        submit_trace.emplace(
+            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Submit), run->id, trace_callable_hash, 0,
+            trace_attrs.str()
+        );
     }
 #endif
 
@@ -1161,6 +1181,17 @@ void Orchestrator::infer_deps(
         }
     };
 
+    // One key can resolve to several producers, one per live view under it that this arg's own
+    // view reaches. `overlapping` is scratch reused across args.
+    std::vector<TaskSlot> overlapping;
+    auto take_producers = [&](TensorKey key, const TensorFootprint &view) {
+        overlapping.clear();
+        tensormap_->lookup_overlapping(run_id, key, view, overlapping);
+        for (TaskSlot prod : overlapping) {
+            add_unique_producer(prod);
+        }
+    };
+
     // Tag-driven dependency inference — mirrors L2
     // (src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp
     //  steps B and 4):
@@ -1178,6 +1209,11 @@ void Orchestrator::infer_deps(
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             const Tensor &r = a.tensor(i);
             TensorKey key{};
+            // The bytes this arg touches inside the backing its key names. Two args under one
+            // key conflict only where their views intersect, which is what keeps two disjoint
+            // slices of one buffer — `x[0]` and `x[1]` of a rank-major tensor, or two column
+            // blocks whose bounding boxes interleave — independent.
+            TensorFootprint view{};
             bool has_key = false;
             if (!remote_sidecars.empty()) {
                 const auto &sidecar = remote_sidecars[g];
@@ -1187,6 +1223,9 @@ void Orchestrator::infer_deps(
                     TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
+                    // A remote key already carries the view's offset, so every entry under one
+                    // of them denotes the same origin and a footprint adds nothing; the default
+                    // whole-backing one keeps this path's behaviour exactly as it was.
                     key = TensorKey::remote_buffer(
                         kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
                     );
@@ -1195,39 +1234,35 @@ void Orchestrator::infer_deps(
             }
             if (!has_key) {
                 if (r.buffer.nbytes == 0) continue;  // placeholder / null ref — nothing to track
-                // Key a local Tensor by its canonical identity alone (buffer granularity) — the
-                // successor of the former buffer-address key now that Tensor carries identity, not
-                // an address. Any two refs to the same buffer collide (a candidate dependency); the
-                // byte_offset/footprint overlap that would refine this to only *conflicting* sub-views
-                // is a future precision pass, not part of the key (folding it in would split
-                // same-buffer refs into distinct keys and miss real dependencies).
+                // Key a local Tensor by its canonical identity alone, so every view of one backing
+                // lands on one key and no real dependency can hide behind a differing offset. The
+                // view geometry decides which of those candidates actually conflict.
                 CanonicalIdentityHash idh;
                 uint64_t k = idh(r.buffer.identity);
                 key = r.buffer.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) ?
                           TensorKey::local_child(k, worker_id) :
                           TensorKey::local_host(k);
+                view = tensor_footprint(r);
                 has_key = true;
             }
             TensorArgType tag = a.tag(i);
             switch (tag) {
             case TensorArgType::INPUT: {
-                TaskSlot prod = tensormap_->lookup(run_id, key);
-                if (prod != INVALID_SLOT) add_unique_producer(prod);
+                take_producers(key, view);
                 break;
             }
             case TensorArgType::INOUT: {
-                TaskSlot prod = tensormap_->lookup(run_id, key);
-                if (prod != INVALID_SLOT) add_unique_producer(prod);
+                take_producers(key, view);
                 output_keys.push_back(key);
                 if (test_hook_) test_hook_(OrchestratorTestPoint::SUBMIT_OUTPUT_KEY_PREPARED);
-                tensormap_->insert(run_id, key, slot);
+                tensormap_->insert(run_id, key, view, slot);
                 break;
             }
             case TensorArgType::OUTPUT:
             case TensorArgType::OUTPUT_EXISTING: {
                 output_keys.push_back(key);
                 if (test_hook_) test_hook_(OrchestratorTestPoint::SUBMIT_OUTPUT_KEY_PREPARED);
-                tensormap_->insert(run_id, key, slot);
+                tensormap_->insert(run_id, key, view, slot);
                 break;
             }
             case TensorArgType::NO_DEP:

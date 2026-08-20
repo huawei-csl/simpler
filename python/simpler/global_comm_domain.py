@@ -14,8 +14,23 @@ import enum
 import struct
 from dataclasses import dataclass
 
-GLOBAL_DOMAIN_VERSION = 1
+from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
+
+from .comm_endpoints import AdapterKind, AdapterProfile, AttachmentRole
+
+#: Descriptor layout. Paired with ``COMM_GLOBAL_DOMAIN_VERSION`` in
+#: ``src/common/platform_comm/comm.h``: the platform backend stamps this number into every
+#: descriptor it exports and ``_validate_descriptor`` checks it on decode, so advancing one
+#: without the other fails every allocation at PREPARE. The ``LOCAL_*`` L3->L2 mailbox structs
+#: in ``worker.py`` also carry it; producer and consumer there are the same build.
+GLOBAL_DOMAIN_VERSION = 2
+#: L4<->L3 control-command layout: COMM_INIT, ALLOC_DOMAIN, RELEASE and COPY. Python owns both
+#: ends, so this advances on its own -- a command-layout change needs no C++ rebuild.
+GLOBAL_DOMAIN_COMMAND_VERSION = 2
 GLOBAL_DOMAIN_MAX_RANKS = 64
+GLOBAL_DOMAIN_MAX_BUFFERS = 64
+GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS = GLOBAL_DOMAIN_MAX_RANKS
+GLOBAL_DOMAIN_MAX_ATTACHMENTS = GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS
 GLOBAL_DOMAIN_HANDLE_BYTES = 256
 GLOBAL_DOMAIN_DESCRIPTOR = struct.Struct("<IIIIQII256s")
 GLOBAL_DOMAIN_DESCRIPTOR_BYTES = GLOBAL_DOMAIN_DESCRIPTOR.size
@@ -57,6 +72,23 @@ class GlobalDomainMember:
     local_worker_id: int
     global_device_rank: int
     domain_rank: int
+
+
+@dataclass(frozen=True)
+class GlobalDomainAttachment:
+    """One host/device attachment to a rank window on a receiving node.
+
+    The target rank is the attachment's position within its command row.  The
+    row is grouped by ``node_worker_id`` and has one entry for every member;
+    keeping the target out of this record lets one rank's window be attached
+    by multiple receiving nodes without adding a second rank identity.
+    """
+
+    node_worker_id: int
+    address_space: AddressSpace
+    role: AttachmentRole
+    adapter_kind: AdapterKind | None
+    adapter_profile: AdapterProfile | None
 
 
 @dataclass(frozen=True)
@@ -159,6 +191,26 @@ class GlobalDomainCommand:
     members: tuple[GlobalDomainMember, ...]
     buffers: tuple[GlobalDomainBuffer, ...]
     descriptors: tuple[GlobalDomainDescriptor, ...] = ()
+    attachments: tuple[GlobalDomainAttachment, ...] = ()
+
+    def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
+        """Return the row addressed to one receiving L3 node.
+
+        A command sent through MPI is intentionally identical on every rank;
+        selecting the row at the receiver is therefore part of the command
+        contract rather than a transport-specific fanout rule.
+        """
+
+        validate_attachment_table(self.attachments, self.members)
+        node_worker_id = int(node_worker_id)
+        rank_count = len(self.members)
+        for start in range(0, len(self.attachments), rank_count):
+            row = self.attachments[start : start + rank_count]
+            if row and row[0].node_worker_id == node_worker_id:
+                return row
+        if self.attachments:
+            raise ValueError(f"Global CommDomain has no attachment row for node worker {node_worker_id}")
+        return ()
 
 
 @dataclass(frozen=True)
@@ -265,6 +317,147 @@ def validate_member_table(members: tuple[GlobalDomainMember, ...]) -> None:
         raise ValueError("global domain members require unique non-negative global device ranks")
 
 
+# Wire ids for the three ``comm_endpoints`` enums this command carries. They are string enums, so
+# the wire needs its own numbering, and these numbers are part of the version-2 command format: a
+# value's id is fixed for the life of the version, and 0 is reserved for "no adapter". Adding an
+# enumerator means adding an id here; renaming or renumbering one is a wire break. Encoding and
+# decoding both reject an id this table does not name, so an enumerator that is added upstream and
+# not mirrored here fails closed rather than travelling as a wrong value.
+_ATTACHMENT_ROLE_IDS = {
+    AttachmentRole.PROVIDER: 1,
+    AttachmentRole.CONSUMER: 2,
+}
+_ATTACHMENT_ROLE_BY_ID = {value: key for key, value in _ATTACHMENT_ROLE_IDS.items()}
+_ADAPTER_KIND_IDS = {
+    AdapterKind.DIRECT_MAP: 1,
+    AdapterKind.DEVICE_PEER: 2,
+    AdapterKind.OWNER_DELEGATED_COPY: 3,
+    AdapterKind.EXPLICIT_TRANSFER: 4,
+    AdapterKind.COLLECTIVE: 5,
+}
+_ADAPTER_KIND_BY_ID = {value: key for key, value in _ADAPTER_KIND_IDS.items()}
+_ADAPTER_PROFILE_IDS = {
+    AdapterProfile.HOST_SVM_MAP: 1,
+    AdapterProfile.HOST_VMM_COPY: 2,
+    AdapterProfile.DEVICE_VMM_PEER_IMPORT: 3,
+    AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT: 4,
+    AdapterProfile.HOST_SHM_MAP: 5,
+    AdapterProfile.REMOTE_COPY: 6,
+}
+_ADAPTER_PROFILE_BY_ID = {value: key for key, value in _ADAPTER_PROFILE_IDS.items()}
+
+
+def _attachment_role_id(role: AttachmentRole) -> int:
+    try:
+        return _ATTACHMENT_ROLE_IDS[AttachmentRole(role)]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"global domain attachment role is unknown: {role!r}") from exc
+
+
+def _attachment_role_from_id(value: int) -> AttachmentRole:
+    try:
+        return _ATTACHMENT_ROLE_BY_ID[int(value)]
+    except KeyError as exc:
+        raise ValueError(f"global domain attachment role id is unknown: {value}") from exc
+
+
+def _adapter_kind_id(kind: AdapterKind | None) -> int:
+    if kind is None:
+        return 0
+    try:
+        return _ADAPTER_KIND_IDS[AdapterKind(kind)]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"global domain attachment adapter_kind is unknown: {kind!r}") from exc
+
+
+def _adapter_kind_from_id(value: int) -> AdapterKind | None:
+    if value == 0:
+        return None
+    try:
+        return _ADAPTER_KIND_BY_ID[int(value)]
+    except KeyError as exc:
+        raise ValueError(f"global domain attachment adapter_kind id is unknown: {value}") from exc
+
+
+def _adapter_profile_id(profile: AdapterProfile | None) -> int:
+    if profile is None:
+        return 0
+    try:
+        return _ADAPTER_PROFILE_IDS[AdapterProfile(profile)]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"global domain attachment adapter_profile is unknown: {profile!r}") from exc
+
+
+def _adapter_profile_from_id(value: int) -> AdapterProfile | None:
+    if value == 0:
+        return None
+    try:
+        return _ADAPTER_PROFILE_BY_ID[int(value)]
+    except KeyError as exc:
+        raise ValueError(f"global domain attachment adapter_profile id is unknown: {value}") from exc
+
+
+def _normalize_attachment(attachment: GlobalDomainAttachment) -> GlobalDomainAttachment:
+    try:
+        address_space = AddressSpace(int(attachment.address_space))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"global domain attachment address_space is unknown: {attachment.address_space!r}") from exc
+    try:
+        role = AttachmentRole(attachment.role)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"global domain attachment role is unknown: {attachment.role!r}") from exc
+    try:
+        adapter_kind = None if attachment.adapter_kind is None else AdapterKind(attachment.adapter_kind)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"global domain attachment adapter_kind is unknown: {attachment.adapter_kind!r}") from exc
+    try:
+        adapter_profile = None if attachment.adapter_profile is None else AdapterProfile(attachment.adapter_profile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"global domain attachment adapter_profile is unknown: {attachment.adapter_profile!r}"
+        ) from exc
+    if (adapter_kind is None) != (adapter_profile is None):
+        raise ValueError("global domain attachment adapter_kind and adapter_profile must be paired")
+    if int(attachment.node_worker_id) < 0:
+        raise ValueError("global domain attachment node_worker_id must be non-negative")
+    return GlobalDomainAttachment(
+        node_worker_id=int(attachment.node_worker_id),
+        address_space=address_space,
+        role=role,
+        adapter_kind=adapter_kind,
+        adapter_profile=adapter_profile,
+    )
+
+
+def validate_attachment_table(
+    attachments: tuple[GlobalDomainAttachment, ...], members: tuple[GlobalDomainMember, ...]
+) -> None:
+    """Validate the flattened receiver-node by rank attachment matrix."""
+
+    if not attachments:
+        return
+    rank_count = len(members)
+    if rank_count <= 0:
+        raise ValueError("global domain attachment table requires members")
+    if len(attachments) > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
+        raise ValueError("global domain attachment table exceeds maximum")
+    if len(attachments) % rank_count:
+        raise ValueError("global domain attachment table must contain complete rank rows")
+    row_count = len(attachments) // rank_count
+    if row_count > GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS:
+        raise ValueError("global domain attachment row count exceeds maximum")
+    seen_nodes: set[int] = set()
+    for start in range(0, len(attachments), rank_count):
+        row = tuple(_normalize_attachment(item) for item in attachments[start : start + rank_count])
+        row_nodes = {item.node_worker_id for item in row}
+        if len(row_nodes) != 1:
+            raise ValueError("global domain attachment row must target one node worker")
+        node_worker_id = next(iter(row_nodes))
+        if node_worker_id in seen_nodes:
+            raise ValueError("global domain attachment table contains a duplicate node row")
+        seen_nodes.add(node_worker_id)
+
+
 def validate_descriptor_table(
     descriptors: tuple[GlobalDomainDescriptor, ...], *, rank_count: int, profile: str
 ) -> None:
@@ -311,6 +504,34 @@ def _read_member(reader: _Reader) -> GlobalDomainMember:
     )
 
 
+def _put_attachment(out: bytearray, attachment: GlobalDomainAttachment) -> None:
+    attachment = _normalize_attachment(attachment)
+    out.extend(
+        struct.pack(
+            "<iIIII",
+            attachment.node_worker_id,
+            int(attachment.address_space),
+            _attachment_role_id(attachment.role),
+            _adapter_kind_id(attachment.adapter_kind),
+            _adapter_profile_id(attachment.adapter_profile),
+        )
+    )
+
+
+def _read_attachment(reader: _Reader) -> GlobalDomainAttachment:
+    node_worker_id, address_space, role, adapter_kind, adapter_profile = struct.unpack(
+        "<iIIII", reader._take(struct.calcsize("<iIIII"), "attachment")
+    )
+    attachment = GlobalDomainAttachment(
+        node_worker_id=int(node_worker_id),
+        address_space=AddressSpace(int(address_space)),
+        role=_attachment_role_from_id(int(role)),
+        adapter_kind=_adapter_kind_from_id(int(adapter_kind)),
+        adapter_profile=_adapter_profile_from_id(int(adapter_profile)),
+    )
+    return _normalize_attachment(attachment)
+
+
 def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
     validate_member_table(command.members)
     if not command.cluster_id or not command.topology_hash:
@@ -319,7 +540,7 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
         raise ValueError(f"unsupported global domain profile {command.profile!r}")
     if command.node_rank < 0 or command.node_count <= 0 or command.node_rank >= command.node_count:
         raise ValueError("global comm init node identity is invalid")
-    out = bytearray(struct.pack("<III", GLOBAL_DOMAIN_VERSION, command.node_rank, command.node_count))
+    out = bytearray(struct.pack("<III", GLOBAL_DOMAIN_COMMAND_VERSION, command.node_rank, command.node_count))
     _put_string(out, command.cluster_id, "cluster_id")
     _put_string(out, command.topology_hash, "topology_hash")
     _put_string(out, command.profile, "profile")
@@ -332,7 +553,7 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
 def decode_comm_init(data: bytes) -> GlobalCommInitCommand:
     reader = _Reader(data)
     version = reader.u32()
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global comm init version mismatch")
     node_rank = reader.u32()
     node_count = reader.u32()
@@ -386,14 +607,19 @@ def decode_comm_init_result(data: bytes) -> GlobalCommInitResult:
     return result
 
 
-def encode_domain_command(command: GlobalDomainCommand) -> bytes:
+def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR0912 -- wire validation keeps phase rules adjacent to encoding
     validate_member_table(command.members)
+    validate_attachment_table(command.attachments, command.members)
+    if command.phase is not GlobalDomainPhase.PREPARE_EXPORT and command.attachments:
+        raise ValueError("global domain attachments are only carried by PREPARE_EXPORT")
     if command.domain_id == 0 or command.generation == 0 or command.window_size <= 0:
         raise ValueError("global domain command identity and window_size must be positive")
     if not command.name:
         raise ValueError("global domain command name must be non-empty")
     if command.profile not in GLOBAL_DOMAIN_PROFILE_IDS:
         raise ValueError(f"unsupported global domain profile {command.profile!r}")
+    if len(command.buffers) > GLOBAL_DOMAIN_MAX_BUFFERS:
+        raise ValueError("global domain command buffer count exceeds maximum")
     if len({buffer.name for buffer in command.buffers}) != len(command.buffers):
         raise ValueError("global domain command contains duplicate buffer names")
     if any(not buffer.name or buffer.nbytes <= 0 for buffer in command.buffers):
@@ -411,7 +637,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:
     out = bytearray(
         struct.pack(
             "<IIQQQ",
-            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_COMMAND_VERSION,
             int(command.phase),
             int(command.domain_id),
             int(command.generation),
@@ -423,6 +649,9 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:
     out.extend(struct.pack("<I", len(command.members)))
     for member in command.members:
         _put_member(out, member)
+    out.extend(struct.pack("<I", len(command.attachments)))
+    for attachment in command.attachments:
+        _put_attachment(out, attachment)
     out.extend(struct.pack("<I", len(command.buffers)))
     for buffer in command.buffers:
         _put_string(out, buffer.name, "buffer.name")
@@ -436,7 +665,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
     version = reader.u32()
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global domain command version mismatch")
     try:
         phase = GlobalDomainPhase(reader.u32())
@@ -451,8 +680,12 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     if member_count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain command member count exceeds maximum")
     members = tuple(_read_member(reader) for _ in range(member_count))
+    attachment_count = reader.u32()
+    if attachment_count > GLOBAL_DOMAIN_MAX_ATTACHMENTS:
+        raise ValueError("global domain command attachment count exceeds maximum")
+    attachments = tuple(_read_attachment(reader) for _ in range(attachment_count))
     buffer_count = reader.u32()
-    if buffer_count > GLOBAL_DOMAIN_MAX_RANKS:
+    if buffer_count > GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain command buffer count exceeds maximum")
     buffers = tuple(GlobalDomainBuffer(reader.string("buffer.name"), reader.u64()) for _ in range(buffer_count))
     descriptor_count = reader.u32()
@@ -473,6 +706,7 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         members=members,
         buffers=buffers,
         descriptors=descriptors,
+        attachments=attachments,
     )
     encode_domain_command(command)
     return command
@@ -499,14 +733,14 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:
     if command.domain_id == 0 or command.generation == 0:
         raise ValueError("global domain release identity must be positive")
-    return struct.pack("<IQQ", GLOBAL_DOMAIN_VERSION, int(command.domain_id), int(command.generation))
+    return struct.pack("<IQQ", GLOBAL_DOMAIN_COMMAND_VERSION, int(command.domain_id), int(command.generation))
 
 
 def decode_release_command(data: bytes) -> GlobalDomainReleaseCommand:
     if len(data) != struct.calcsize("<IQQ"):
         raise ValueError("global domain release size mismatch")
     version, domain_id, generation = struct.unpack("<IQQ", data)
-    if version != GLOBAL_DOMAIN_VERSION or domain_id == 0 or generation == 0:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION or domain_id == 0 or generation == 0:
         raise ValueError("global domain release identity or version is invalid")
     return GlobalDomainReleaseCommand(int(domain_id), int(generation))
 
@@ -528,7 +762,7 @@ def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool)
     out = bytearray(
         struct.pack(
             "<IQQIQQ",
-            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_COMMAND_VERSION,
             int(command.domain_id),
             int(command.generation),
             int(command.domain_rank),
@@ -555,7 +789,7 @@ def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyC
         nbytes=int(nbytes),
         data=bytes(payload),
     )
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global domain copy version mismatch")
     encode_copy_command(command, include_data=include_data)
     return command

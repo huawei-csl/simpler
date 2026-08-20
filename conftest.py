@@ -115,7 +115,7 @@ class DevicePool:
 _device_pool: DevicePool | None = None
 
 
-class PodPeer(typing.NamedTuple):
+class Network1Peer(typing.NamedTuple):
     endpoint: str
     remote_device_ids: tuple[int, ...]
     session_timeout_s: float
@@ -198,7 +198,7 @@ def pytest_addoption(parser):
         "--enable-dep-gen",
         action="store_true",
         default=False,
-        help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+        help="Enable dep_gen capture (disabled when --rounds > 1)",
     )
     parser.addoption(
         "--enable-pmu",
@@ -214,7 +214,8 @@ def pytest_addoption(parser):
         "--enable-scope-stats",
         action="store_true",
         default=False,
-        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
+        "(per-scope ring-fill peaks).",
     )
     parser.addoption(
         "--enable-swimlane-overhead",
@@ -460,6 +461,20 @@ def _configure_sanitizer(config):
         )
 
 
+def _validate_diagnostic_flags(config) -> None:
+    # Imported by full path: `simpler_setup.scene_test` as an attribute is the
+    # @scene_test decorator, not this module.
+    from simpler_setup.scene_test import _validate_diagnostic_flags as validate  # noqa: PLC0415
+
+    try:
+        validate(
+            chip_swimlane=config.getoption("--enable-chip-swimlane", default=0),
+            swimlane_overhead=config.getoption("--enable-swimlane-overhead", default=False),
+        )
+    except ValueError as e:
+        raise pytest.UsageError(str(e)) from e
+
+
 def _validate_level_filters(config) -> None:
     if config.getoption("--level", default=None) is not None and (
         config.getoption("--exclude-level", default=None) is not None
@@ -477,7 +492,7 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "pod_remote_device_count(n): number of remote NPU devices needed on the peer machine",
+        "network1_remote_device_count(n): number of remote NPU devices needed on the peer machine",
     )
     config.addinivalue_line(
         "markers",
@@ -501,6 +516,7 @@ def pytest_configure(config):
     )
 
     _validate_level_filters(config)
+    _validate_diagnostic_flags(config)
     _configure_sanitizer(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
@@ -710,11 +726,11 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     # that all write chip_swimlane_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
-    if config.getoption("--enable-chip-swimlane", default=0):
+    if config.getoption("--enable-chip-swimlane", default=0) and config.getoption("--rounds", default=1) <= 1:
         l3_items = [
             i
             for i in items
-            if _item_scene_level(i) == SceneTestLevel.HOST and not any(m.name == "skip" for m in i.iter_markers())
+            if _item_scene_level(i) == SceneTestLevel.NODE and not any(m.name == "skip" for m in i.iter_markers())
         ]
         if l3_items:
             sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
@@ -1127,7 +1143,7 @@ def pytest_runtestloop(session):
 
     Child mode (runtime-filtered runs, L2/L3 level-filtered runs, or
     --collect-only) skips the dispatcher and falls through to pytest's
-    default runtestloop. Level 4 pod selection is not child mode; it still
+    default runtestloop. Level 4 network1 selection is not child mode; it still
     uses the Resource dispatcher.
     """
     runtime_filter = session.config.getoption("--runtime")
@@ -1137,7 +1153,7 @@ def pytest_runtestloop(session):
     # levels the dispatcher itself uses for children, it wants direct control.
     if runtime_filter is not None:
         return
-    if _normalize_cli_scene_level(level_filter) in (SceneTestLevel.CHIP, SceneTestLevel.HOST):
+    if _normalize_cli_scene_level(level_filter) in (SceneTestLevel.CHIP, SceneTestLevel.NODE):
         return
 
     # User explicitly asked for collect-only / scoped-run — don't orchestrate.
@@ -1363,54 +1379,53 @@ def st_platform(request):
 
 
 @pytest.fixture(scope="session")
-def st_pod_peer():
-    """Pod endpoint and remote device pool from the pod runner environment."""
-    endpoint = os.environ.get("POD_REMOTE_ENDPOINT")
+def st_network1_peer():
+    """Network1 endpoint and remote device pool from the network1 runner environment."""
+    endpoint = os.environ.get("NETWORK1_REMOTE_ENDPOINT")
     if not endpoint:
-        pytest.skip("POD_REMOTE_ENDPOINT is required for pod tests")
-    remote_devices = os.environ.get("POD_REMOTE_DEVICES")
+        pytest.skip("NETWORK1_REMOTE_ENDPOINT is required for network1 tests")
+    remote_devices = os.environ.get("NETWORK1_REMOTE_DEVICES")
     if not remote_devices:
-        pytest.skip("POD_REMOTE_DEVICES is required for pod tests")
+        pytest.skip("NETWORK1_REMOTE_DEVICES is required for network1 tests")
     try:
-        session_timeout_s = float(os.environ.get("POD_L3_SESSION_TIMEOUT_S", "120"))
+        session_timeout_s = float(os.environ.get("NETWORK1_L3_SESSION_TIMEOUT_S", "120"))
     except ValueError as e:
-        pytest.fail(f"POD_L3_SESSION_TIMEOUT_S must be a float: {e}")
+        pytest.fail(f"NETWORK1_L3_SESSION_TIMEOUT_S must be a float: {e}")
     # The remote peer connects back to the parent session runner.
-    return PodPeer(
+    return Network1Peer(
         endpoint=endpoint,
         remote_device_ids=tuple(_parse_device_range(remote_devices)),
         session_timeout_s=session_timeout_s,
-        session_listen_host=os.environ.get("POD_L3_SESSION_LISTEN_HOST", "0.0.0.0"),  # noqa: S104
+        session_listen_host=os.environ.get("NETWORK1_L3_SESSION_LISTEN_HOST", "0.0.0.0"),  # noqa: S104
     )
 
 
 @pytest.fixture()
-def st_pod_remote_device_ids(request, st_pod_peer):
-    """Allocate remote device IDs from the pod peer's default device pool.
+def st_network1_remote_device_ids(request, st_network1_peer):
+    """Allocate remote device IDs from the network1 peer's default device pool.
 
-    Every pod test gets the same leading slice, so this is collision-free only
-    while the pod job serializes the sweep with ``--max-parallel 1``.
+    Every network1 test gets the same leading slice, so this is collision-free only
+    while the network1 job serializes the sweep with ``--max-parallel 1``.
     """
-    marker = request.node.get_closest_marker("pod_remote_device_count")
+    marker = request.node.get_closest_marker("network1_remote_device_count")
     n = marker.args[0] if marker else 1
-    if n > len(st_pod_peer.remote_device_ids):
-        pytest.fail(
-            f"need {n} remote devices but POD_REMOTE_DEVICES only has {len(st_pod_peer.remote_device_ids)} entries"
-        )
-    return list(st_pod_peer.remote_device_ids[:n])
+    if n > len(st_network1_peer.remote_device_ids):
+        available = len(st_network1_peer.remote_device_ids)
+        pytest.fail(f"need {n} remote devices but NETWORK1_REMOTE_DEVICES only has {available} entries")
+    return list(st_network1_peer.remote_device_ids[:n])
 
 
 @pytest.fixture()
-def st_pod_logs(request, monkeypatch):
-    """Per-test parent log directory for pod scene tests."""
-    if _item_scene_level(request.node) != SceneTestLevel.POD:
-        pytest.fail("st_pod_logs requires SceneTestLevel.POD")
+def st_network1_logs(request, monkeypatch):
+    """Per-test parent log directory for network1 scene tests."""
+    if _item_scene_level(request.node) != SceneTestLevel.NETWORK1:
+        pytest.fail("st_network1_logs requires SceneTestLevel.NETWORK1")
     run_dir = os.environ.get("RUN_DIR")
     if not run_dir:
-        if not os.environ.get("POD_REMOTE_ENDPOINT") or not os.environ.get("POD_REMOTE_DEVICES"):
-            pytest.skip("pod runner environment is required for pod tests")
-        pytest.fail("RUN_DIR is required for pod tests")
-    machine = os.environ.get("POD_MACHINE", "parent")
+        if not os.environ.get("NETWORK1_REMOTE_ENDPOINT") or not os.environ.get("NETWORK1_REMOTE_DEVICES"):
+            pytest.skip("network1 runner environment is required for network1 tests")
+        pytest.fail("RUN_DIR is required for network1 tests")
+    machine = os.environ.get("NETWORK1_MACHINE", "parent")
     nodeid = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.nodeid)
     log_path = os.path.join(run_dir, "pytest", f"parent-{machine}", "ascend", nodeid)
     os.makedirs(log_path, exist_ok=True)

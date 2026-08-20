@@ -22,8 +22,9 @@
  * 4. Two-stage mixed-task completion (subtask done bits -> mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU. host_build_graph is scheduler-only (the
- * orchestrator runs to completion on the host); there is no on-device slot
- * reclaim (whole-graph-resident), so last_task_alive is not advanced here.
+ * orchestrator runs to completion on the host) and whole-graph-resident, so no
+ * task slot or heap byte is reclaimed on device; the scheduler owns completion
+ * state only.
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -86,12 +87,38 @@ struct alignas(64) PTO2ReadyQueue {
     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
 
     std::atomic<uint64_t> dequeue_pos;
-    char _pad2[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+    // Occupancy high-water, for teardown reporting only. Atomic because pushes
+    // are concurrent; relaxed throughout, so it is ordered against nothing.
+    std::atomic<uint64_t> max_occupancy;
+    char _pad2[64 - 2 * sizeof(std::atomic<uint64_t>)];  // Own cache line
+
+    // Bring the slots[] array to its empty state: slot i's sequence must equal i
+    // for push_tagged's `diff == 0` claim test to accept the first pass, so an
+    // empty queue is a 0..capacity-1 ramp rather than zeroed memory. Runs on the
+    // device after wire_arena_pointers, before any push — the region is reserved
+    // past the uploaded range, so nothing seeds it on the host.
+    void seed_slots() {
+        for (uint64_t i = 0; i < capacity; i++) {
+            slots[i].sequence.store(static_cast<int64_t>(i), std::memory_order_relaxed);
+            slots[i].slot_state = nullptr;
+        }
+    }
 
     uint64_t size() {
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         return (e >= d) ? (e - d) : 0;
+    }
+
+    // Raise the high-water to the occupancy left by a push that published up to
+    // `published_pos`. Off the fast path it is a load and a compare; the CAS runs
+    // only on a new maximum, so a contended push never pays for it.
+    void note_occupancy(uint64_t published_pos) {
+        const uint64_t occ = published_pos - dequeue_pos.load(std::memory_order_relaxed);
+        uint64_t observed = max_occupancy.load(std::memory_order_relaxed);
+        while (occ > observed && !max_occupancy.compare_exchange_weak(
+                                     observed, occ, std::memory_order_relaxed, std::memory_order_relaxed
+                                 )) {}
     }
 
     bool push(PTO2TaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
@@ -118,15 +145,21 @@ struct alignas(64) PTO2ReadyQueue {
         slot->slot_state = slot_state;
         slot->task_id_snapshot = task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
+        note_occupancy(pos + 1);
         return true;
     }
 
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
-    void push_batch(PTO2TaskSlotState **items, int count) { push_batch_tagged(items, nullptr, count); }
+    // Returns false without publishing anything when the queue cannot take all
+    // `count` items. A target slot holding an older generation means full and
+    // ends the call; a slot a peer has reserved but not yet published is
+    // transient and retries, so this only spins while a peer is mid-publish.
+    bool push_batch(PTO2TaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
-    void push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
-        if (count == 0) return;
+    bool push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
+        if (count == 0) return true;
+        if (static_cast<uint64_t>(count) > capacity) return false;
 
         uint64_t pos;
         while (true) {
@@ -136,7 +169,10 @@ struct alignas(64) PTO2ReadyQueue {
                 PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
                 int64_t diff = seq - static_cast<int64_t>(pos + i);
-                if (diff != 0) {
+                if (diff < 0) {
+                    return false;  // Queue full
+                }
+                if (diff > 0) {
                     ready = false;
                     break;
                 }
@@ -157,6 +193,8 @@ struct alignas(64) PTO2ReadyQueue {
             slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
+        note_occupancy(pos + static_cast<uint64_t>(count));
+        return true;
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
@@ -386,16 +424,15 @@ struct alignas(64) PTO2ReadyQueue {
 // as non-member so PTO2ReadyQueue stays a POD-like struct with cache-line
 // alignment. Storage is owned by the caller-supplied arena.
 //   reserve_layout: declare the slots[] region on the arena (must precede commit)
-//   init_from_layout: bind slots pointer from arena.region_ptr(off) and
-//                     initialize sequence counters
+//   init_from_layout: initialize the queue header (capacity, mask, positions)
+//   seed_slots: establish the slot array's empty ramp, on the device only
 //   destroy: forget the slots pointer (arena owns the buffer)
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
-// Writes everything *except* the arena-internal `slots` pointer field
-// (sequences/positions on the slot array, capacity, mask). Uses
-// arena.region_ptr(slots_off) only to address the slot array for writes;
-// does NOT store the pointer in `queue->slots`. Call
-// `ready_queue_wire_arena_pointers` afterwards to set the field itself.
-bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
+// Writes the header fields only: capacity, mask, positions, occupancy counter.
+// The slot array is neither addressed nor written — it lives past the uploaded
+// range and PTO2ReadyQueue::seed_slots() fills it on the device. Call
+// `ready_queue_wire_arena_pointers` to set the `slots` pointer itself.
+void ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, uint64_t capacity);
 // Stores queue->slots = arena.region_ptr(slots_off). Idempotent.
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
@@ -441,7 +478,6 @@ struct PTO2SchedulerState {
     struct alignas(64) RingSchedState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
-        int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // Polling: no per-ring dep_pool. Readiness is derived from the SM ring's
@@ -538,15 +574,6 @@ struct PTO2SchedulerState {
     // Readiness: a task is ready iff every producer named in its inline fanin has
     // set its completion_flags byte. Single-ring: all producers are ring 0, so
     // there is no per-edge ring indirection.
-
-    bool fanin_satisfied(const PTO2TaskSlotState *s) const {
-        const PTO2TaskPayload &p = *s->payload;
-        const PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
-        for (int32_t i = 0; i < p.fanin_count; i++) {
-            if (!ring.is_completion_flag_set(p.fanin_local_ids[i])) return false;
-        }
-        return true;
-    }
 
     // First-unmet classification. Returns -1 (all fanins met -> route to ready)
     // or the index of the first unmet fanin (register on that producer's wake
@@ -923,6 +950,59 @@ struct PTO2SchedulerState {
         return consumers_rescanned;
     }
 
+    // Push every materialized-and-published root that has not been routed yet,
+    // once the outer Graph task's external dependency gate (0x2) has opened.
+    // route_cursor makes this idempotent, so it composes across the per-slice
+    // calls during materialization and the final call at the activation meet;
+    // each root reaches the ready queue exactly once. Non-roots are never pushed
+    // here — they reach the ready queue through their producers' wake list.
+    int32_t graph_route_ready_roots(GraphExecution &execution) {
+        if (execution.outer_slot == nullptr) return 0;
+        GraphSubmission *submission = graph_submission_from_slot(*execution.outer_slot);
+        if (submission == nullptr || (__atomic_load_n(&submission->activation_gate, __ATOMIC_ACQUIRE) & 0x2u) == 0) {
+            return 0;
+        }
+        const int32_t published = execution.published_nodes.load(std::memory_order_acquire);
+        int32_t routed = 0;
+        while (true) {
+            int32_t i = execution.route_cursor.load(std::memory_order_relaxed);
+            if (i >= published) break;
+            if (!execution.route_cursor.compare_exchange_weak(
+                    i, i + 1, std::memory_order_acq_rel, std::memory_order_relaxed
+                )) {
+                continue;
+            }
+            if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) {
+                push_ready_routed(&execution.node_storage[i].slot);
+                routed++;
+            }
+        }
+        return routed;
+    }
+
+    // Register each newly materialized node [first, last) on its first unmet
+    // producer (or route it immediately when every producer already completed),
+    // publish the range for routing, and route any roots the external gate now
+    // admits. Runs single-owner per graph via the prepare-queue slot, so the
+    // range never overlaps another thread's. register_graph_wake and
+    // graph_first_unmet_producer are safe against a producer completing
+    // concurrently, which is what lets a node dispatch before the whole graph is
+    // materialized.
+    void graph_incremental_publish(GraphExecution &execution, int32_t first, int32_t last) {
+        for (int32_t i = first; i < last; ++i) {
+            if (execution.fanin_offsets[i] == execution.fanin_offsets[i + 1]) continue;  // root
+            PTO2TaskSlotState &node = execution.node_storage[i].slot;
+            const int32_t unmet = graph_first_unmet_producer(execution, node);
+            if (unmet < 0) {
+                push_ready_routed(&node);
+            } else {
+                register_graph_wake(execution, &execution.nodes[unmet].slot, &node);
+            }
+        }
+        execution.published_nodes.store(last, std::memory_order_release);
+        graph_route_ready_roots(execution);
+    }
+
     int32_t activate_prepared_graph(GraphExecution &execution) {
         GraphExecutionState expected = GraphExecutionState::PREPARED;
         if (!execution.state.compare_exchange_strong(
@@ -930,20 +1010,7 @@ struct PTO2SchedulerState {
             )) {
             return 0;
         }
-        const GraphDefinition &definition = *execution.definition;
-        const uint16_t *roots =
-            graph_definition_array<uint16_t>(definition, definition.off_root_indices, definition.root_count);
-        if (roots == nullptr) return 0;
-        int32_t routed = 0;
-        for (uint32_t i = 0; i < definition.root_count; ++i) {
-            const uint16_t node_index = roots[i];
-            if (node_index >= static_cast<uint32_t>(execution.node_count)) continue;
-            // Roots have zero internal fanin and are routed only here. Every
-            // non-root is registered on one saved producer at a time.
-            push_ready_routed(&execution.nodes[node_index].slot);
-            routed++;
-        }
-        return routed;
+        return graph_route_ready_roots(execution);
     }
 
     GraphMaterializeResult prepare_graph_task(
@@ -957,8 +1024,12 @@ struct PTO2SchedulerState {
             return graph_submission_execution_initializing(*submission) ? GraphMaterializeResult::BUSY :
                                                                           GraphMaterializeResult::INVALID;
         }
+        const int32_t before = execution->materialized_nodes;
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer_slot, *execution, max_nodes, nodes_materialized);
+        if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::PREPARED) {
+            graph_incremental_publish(*execution, before, execution->materialized_nodes);
+        }
         if (result == GraphMaterializeResult::PREPARED && graph_submission_signal(*submission, 0x1)) {
             activate_prepared_graph(*execution);
         }
@@ -998,8 +1069,16 @@ struct PTO2SchedulerState {
         }
 
         GraphExecution *execution = graph_execution_from_slot(slot_state);
-        if (execution == nullptr || execution->definition == nullptr || execution->nodes == nullptr ||
-            execution->state.load(std::memory_order_acquire) != GraphExecutionState::ACTIVE) {
+        if (execution == nullptr || execution->definition == nullptr || execution->nodes == nullptr) {
+            outcome.error_code = PTO2_ERROR_INVALID_ARGS;
+            return outcome;
+        }
+        // Incremental activation routes a node before the graph reaches ACTIVE, so a
+        // node can legitimately complete while the graph is still MATERIALIZING or
+        // PREPARED. Only SUBMITTED (execution not yet localized) and COMPLETED
+        // (execution already retired) are invalid states for a node completion.
+        const GraphExecutionState graph_state = execution->state.load(std::memory_order_acquire);
+        if (graph_state < GraphExecutionState::MATERIALIZING || graph_state > GraphExecutionState::ACTIVE) {
             outcome.error_code = PTO2_ERROR_INVALID_ARGS;
             return outcome;
         }
@@ -1114,6 +1193,13 @@ struct PTO2SchedulerState {
     // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each
     // ring). Called on both host and device sides.
     void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
+
+    // Phase 3c, device only: bring every queue's slots[] to its empty ramp. The
+    // slot arrays sit past the uploaded range, so this is the only thing that
+    // establishes the sequence values push compares against. Runs once per arena
+    // after wire_arena_pointers and before any push; a drained queue needs no
+    // repeat, since a free slot's sequence tracks the position it serves.
+    void seed_queue_slots();
 
     // Forget per-region pointers; arena owns the backing memory.
     void destroy();

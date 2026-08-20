@@ -65,18 +65,22 @@ import enum
 import hashlib
 import importlib
 import json
+import logging
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, cast
@@ -89,12 +93,12 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _emit_host_span,
-    _host_span_sink_available,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
     _mailbox_load_i32,
     _mailbox_store_i32,
     _read_control_copy_request,
+    _set_host_span_level_prefix,
     _worker_host_mapped_region_ack_cleanup_error,
     _worker_host_mapped_region_close,
     _worker_host_mapped_region_import_onboard,
@@ -140,6 +144,9 @@ from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
     HOST_CPU,
+    AdapterKind,
+    AdapterProfile,
+    AttachmentRole,
     BackendPlan,
     BackendResolver,
     DefaultRegionAccessService,
@@ -152,6 +159,7 @@ from .comm_endpoints import (
     _EndpointTopologySnapshot,
     _format_worker_path,
     _normalize_node_identity,
+    at,
     parse_endpoint_path,
 )
 from .comm_region import MaterializationContext, RegionInstance, materialize_region_instance
@@ -165,6 +173,7 @@ from .global_comm_domain import (
     GLOBAL_DOMAIN_MAX_COPY_BYTES,
     GLOBAL_DOMAIN_MAX_RANKS,
     GLOBAL_DOMAIN_MAX_STRING_BYTES,
+    GLOBAL_DOMAIN_PROFILE_A3_FABRIC,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     LOCAL_COPY_REPLY,
@@ -176,6 +185,7 @@ from .global_comm_domain import (
     LOCAL_PREPARE_REQUEST,
     LOCAL_RELEASE_REQUEST,
     GlobalCommInitCommand,
+    GlobalDomainAttachment,
     GlobalDomainBuffer,
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
@@ -221,7 +231,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
-    _initialize_simpler_log,
+    _initialize_host_log,
     _Worker,
 )
 from .worker_chip_orch_comm import (
@@ -242,6 +252,8 @@ from .worker_chip_orch_comm import (
     peek_region_create_reply_region_id,
     validate_region_create_reply,
 )
+from .worker_level import WorkerLevel
+from .worker_level import span_prefix as _span_prefix
 
 # Upper bound on how long the parent waits for every chip's bootstrap mailbox
 # to leave IDLE.  Well above a realistic HCCL init (seconds) but short enough
@@ -256,8 +268,8 @@ _WORKER_CHIP_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\
 
 
 def _host_spans_active() -> bool:
-    """Whether an emitted host span can currently reach the logger sink."""
-    return HOST_STRACE_ENABLED and _host_span_sink_available()
+    """Whether host-span emission was compiled into this extension."""
+    return HOST_STRACE_ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +458,12 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+# A chip/sub child exiting after SHUTDOWN still has to release everything it
+# imported — on a large-scope run (dsv4 HBG: ~80 backings incl. a 2 GiB ring
+# heap) the per-mapping teardown alone runs ~10 s — so the close-path reap
+# gets its own, larger budget. Rollback stays at the tighter value above: its
+# wait guards an unlink-only graceful path that is stuck when it exceeds it.
+_CLOSE_CHILD_REAP_TIMEOUT_S = 60.0
 # Bounded re-check interval for a close() joiner waiting on an in-flight
 # _CloseAttempt. A joiner normally wakes immediately on the completing thread's
 # notify_all(); the timeout is a backstop so that if that notify is skipped (an
@@ -627,6 +645,31 @@ class RemoteCallable:
         return self.target.split(":", 1)[1]
 
 
+def _validate_global_comm_capability(label: str, platform: str, comm_profile: str) -> None:
+    """Reject a profile the platform's backend cannot implement.
+
+    ``a3-fabric-v1`` maps peer windows through ``aclrtMemFabricHandle``, which
+    exists only on real A3 silicon. Every spec that names a comm profile states
+    the rule from here, so a new L3 launch path cannot admit a combination the
+    others reject.
+    """
+    if comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
+        raise ValueError(f"{label}.comm_profile {comm_profile!r} is not supported")
+    if comm_profile == GLOBAL_DOMAIN_PROFILE_A3_FABRIC:
+        if not platform.startswith("a2a3"):
+            raise ValueError(f"{label}.comm_profile {GLOBAL_DOMAIN_PROFILE_A3_FABRIC!r} requires an a2a3 platform")
+        if platform.endswith("sim"):
+            raise ValueError(f"{label}.comm_profile {GLOBAL_DOMAIN_PROFILE_A3_FABRIC!r} requires real A3 devices")
+
+
+def _validate_global_device_ranks(label: str, global_device_ranks: tuple[int, ...], device_count: int) -> None:
+    """One rank per local device, unique and non-negative."""
+    if global_device_ranks and len(global_device_ranks) != device_count:
+        raise ValueError(f"{label} must match device_ids length")
+    if any(rank < 0 for rank in global_device_ranks) or len(set(global_device_ranks)) != len(global_device_ranks):
+        raise ValueError(f"{label} must be unique and non-negative")
+
+
 @dataclass(frozen=True)
 class RemoteWorkerSpec:
     """Describes a remote L3 worker to attach via ``Worker.add_remote_worker``.
@@ -676,18 +719,169 @@ class RemoteWorkerSpec:
             raise ValueError(
                 f"RemoteWorkerSpec.transport must be {HOST_TCP_TRANSPORT_PROFILE!r} for the TCP daemon control plane"
             )
-        if self.comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
-            raise ValueError(f"RemoteWorkerSpec.comm_profile {self.comm_profile!r} is not supported")
-        if self.comm_profile == "a3-fabric-v1" and not self.platform.startswith("a2a3"):
-            raise ValueError("RemoteWorkerSpec.comm_profile 'a3-fabric-v1' requires an a2a3 platform")
-        if self.comm_profile == "a3-fabric-v1" and self.platform.endswith("sim"):
-            raise ValueError("RemoteWorkerSpec.comm_profile 'a3-fabric-v1' requires real A3 devices")
-        if self.global_device_ranks and len(self.global_device_ranks) != len(self.device_ids):
-            raise ValueError("RemoteWorkerSpec.global_device_ranks must match device_ids length")
-        if any(rank < 0 for rank in self.global_device_ranks) or len(set(self.global_device_ranks)) != len(
-            self.global_device_ranks
-        ):
-            raise ValueError("RemoteWorkerSpec.global_device_ranks must be unique and non-negative")
+        _validate_global_comm_capability("RemoteWorkerSpec", self.platform, self.comm_profile)
+        _validate_global_device_ranks(
+            "RemoteWorkerSpec.global_device_ranks", self.global_device_ranks, len(self.device_ids)
+        )
+
+
+@dataclass(frozen=True)
+class MpiL3GroupSpec:
+    """Describes L3 workers launched by one parent-owned ``mpirun``.
+
+    ``command_port_base``, ``health_port_base``, ``session_listen_hosts``,
+    ``connect_hosts``, ``allow_wildcard_session_bind``, ``ready_host``, and
+    ``ready_port`` are accepted only for source compatibility with PR #1623.
+    MPI groups ignore them and use the local named mailbox plus MPI collectives.
+    Non-MPI ``RemoteWorkerSpec`` continues to use its TCP fields.
+    """
+
+    hosts: tuple[str, ...]
+    platform: str
+    device_ids_by_rank: tuple[tuple[int, ...], ...]
+    runtime: str = "tensormap_and_ringbuffer"
+    num_sub_workers_by_rank: tuple[int, ...] = ()
+    transport: str = HOST_TCP_TRANSPORT_PROFILE
+    comm_profile: str = "sim"
+    global_device_ranks_by_rank: tuple[tuple[int, ...], ...] = ()
+    command_port_base: int | None = None
+    health_port_base: int | None = None
+    session_listen_hosts: tuple[str, ...] = ()
+    connect_hosts: tuple[str, ...] = ()
+    allow_wildcard_session_bind: bool = False
+    ready_host: str = ""
+    ready_port: int = 0
+    mpirun_path: str = "mpirun"
+    mpirun_args: tuple[str, ...] = ()
+    python_executable: str = field(default_factory=lambda: sys.executable)
+
+    def __post_init__(self) -> None:  # noqa: PLR0912 -- one place validates the public mpirun rank contract
+        hosts = tuple(str(host) for host in self.hosts)
+        if not hosts:
+            raise ValueError("MpiL3GroupSpec.hosts must be non-empty")
+        if not self.platform:
+            raise ValueError("MpiL3GroupSpec.platform must be non-empty")
+        device_ids_by_rank = tuple(tuple(int(device_id) for device_id in rank) for rank in self.device_ids_by_rank)
+        if len(device_ids_by_rank) != len(hosts):
+            raise ValueError("MpiL3GroupSpec.device_ids_by_rank must match hosts length")
+        if any(not rank for rank in device_ids_by_rank):
+            raise ValueError("MpiL3GroupSpec.device_ids_by_rank entries must be non-empty")
+        num_sub_workers_by_rank = (
+            tuple(0 for _ in hosts)
+            if not self.num_sub_workers_by_rank
+            else tuple(int(count) for count in self.num_sub_workers_by_rank)
+        )
+        if len(num_sub_workers_by_rank) != len(hosts):
+            raise ValueError("MpiL3GroupSpec.num_sub_workers_by_rank must match hosts length")
+        if any(count < 0 for count in num_sub_workers_by_rank):
+            raise ValueError("MpiL3GroupSpec.num_sub_workers_by_rank entries must be non-negative")
+        global_device_ranks_by_rank = (
+            tuple(() for _ in hosts)
+            if not self.global_device_ranks_by_rank
+            else tuple(tuple(int(rank) for rank in ranks) for ranks in self.global_device_ranks_by_rank)
+        )
+        if len(global_device_ranks_by_rank) != len(hosts):
+            raise ValueError("MpiL3GroupSpec.global_device_ranks_by_rank must match hosts length")
+        rank_pairs = zip(global_device_ranks_by_rank, device_ids_by_rank)
+        for rank_index, rank_pair in enumerate(rank_pairs):
+            global_ranks, device_ids = rank_pair
+            _validate_global_device_ranks(
+                f"MpiL3GroupSpec.global_device_ranks_by_rank[{rank_index}]", global_ranks, len(device_ids)
+            )
+        # A global device rank names one device in the whole cluster, so the
+        # group's ranks must be disjoint across mpirun ranks as well as within
+        # one. validate_member_table enforces the same rule on the members a
+        # domain is built from; stating it here names the offending spec field
+        # instead of surfacing as an opaque allocation failure.
+        flat_global_ranks = [rank for ranks in global_device_ranks_by_rank for rank in ranks]
+        if len(set(flat_global_ranks)) != len(flat_global_ranks):
+            raise ValueError("MpiL3GroupSpec.global_device_ranks_by_rank must be unique across the whole group")
+        session_listen_hosts = tuple(str(host) for host in self.session_listen_hosts)
+        connect_hosts = tuple(str(host) for host in self.connect_hosts)
+        if session_listen_hosts and len(session_listen_hosts) != len(hosts):
+            raise ValueError("MpiL3GroupSpec.session_listen_hosts must match hosts length")
+        if connect_hosts and len(connect_hosts) != len(hosts):
+            raise ValueError("MpiL3GroupSpec.connect_hosts must match hosts length")
+        if any(not host for host in session_listen_hosts) or any(not host for host in connect_hosts):
+            raise ValueError("MpiL3GroupSpec host fields must be non-empty")
+        command_port_base = None if self.command_port_base is None else int(self.command_port_base)
+        health_port_base = None if self.health_port_base is None else int(self.health_port_base)
+        for name, value in (("command_port_base", command_port_base), ("health_port_base", health_port_base)):
+            if value is not None and (value <= 0 or value + len(hosts) - 1 > 65535):
+                raise ValueError(f"MpiL3GroupSpec.{name} deprecated port range must be within 1..65535")
+        ready_host = str(self.ready_host)
+        ready_port = int(self.ready_port)
+        if ready_port < 0 or ready_port > 65535:
+            raise ValueError("MpiL3GroupSpec.ready_port must be within 0..65535")
+        if self.transport != HOST_TCP_TRANSPORT_PROFILE:
+            raise ValueError(f"MpiL3GroupSpec.transport must be {HOST_TCP_TRANSPORT_PROFILE!r}")
+        _validate_global_comm_capability("MpiL3GroupSpec", self.platform, self.comm_profile)
+        if not self.mpirun_path:
+            raise ValueError("MpiL3GroupSpec.mpirun_path must be non-empty")
+        if not self.python_executable:
+            raise ValueError("MpiL3GroupSpec.python_executable must be non-empty")
+        object.__setattr__(self, "hosts", hosts)
+        object.__setattr__(self, "platform", str(self.platform))
+        object.__setattr__(self, "runtime", str(self.runtime))
+        object.__setattr__(self, "transport", str(self.transport))
+        object.__setattr__(self, "comm_profile", str(self.comm_profile))
+        object.__setattr__(self, "device_ids_by_rank", device_ids_by_rank)
+        object.__setattr__(self, "num_sub_workers_by_rank", num_sub_workers_by_rank)
+        object.__setattr__(self, "global_device_ranks_by_rank", global_device_ranks_by_rank)
+        object.__setattr__(self, "session_listen_hosts", session_listen_hosts)
+        object.__setattr__(self, "connect_hosts", connect_hosts)
+        object.__setattr__(self, "command_port_base", command_port_base)
+        object.__setattr__(self, "health_port_base", health_port_base)
+        object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
+        object.__setattr__(self, "ready_host", ready_host)
+        object.__setattr__(self, "ready_port", ready_port)
+        object.__setattr__(self, "mpirun_path", str(self.mpirun_path))
+        object.__setattr__(self, "mpirun_args", tuple(str(arg) for arg in self.mpirun_args))
+        object.__setattr__(self, "python_executable", str(self.python_executable))
+
+
+@dataclass(frozen=True)
+class _RemoteSession:
+    worker_id: int
+    session_id: int
+    command_host: str
+    command_port: int
+    health_host: str
+    health_port: int
+    pid: int
+
+
+@dataclass(frozen=True)
+class _MpiL3RankSpec:
+    platform: str
+    runtime: str
+    device_ids: tuple[int, ...]
+    num_sub_workers: int
+    transport: str
+    comm_profile: str
+    global_device_ranks: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _MpiL3RankRuntime:
+    group_id: str
+    rank: int
+    worker_id: int
+    session_id: int
+    spec: _MpiL3RankSpec
+
+
+@dataclass
+class _MpiL3GroupRuntime:
+    group_id: str
+    spec: MpiL3GroupSpec
+    ranks: tuple[_MpiL3RankRuntime, ...]
+    process: subprocess.Popen[Any] | None = None
+    manifest_path: str | None = None
+    ready_dir: str | None = None
+    mailbox: Any | None = None
+    monitor_thread: threading.Thread | None = None
+    closing: bool = False
 
 
 @dataclass(frozen=True)
@@ -1554,6 +1748,8 @@ def _chip_descriptor_context(worker: Worker) -> tuple[str, str]:
             contexts.append(child_context)
     for spec in getattr(worker, "_remote_worker_specs", []):
         contexts.append((str(spec.platform), str(spec.runtime)))
+    for rank in getattr(worker, "_mpi_rank_by_worker_id", {}).values():
+        contexts.append((str(rank.spec.platform), str(rank.spec.runtime)))
     if not contexts:
         return "", ""
     first = contexts[0]
@@ -4207,6 +4403,9 @@ class Worker:
         **config,
     ) -> None:
         self.level = level
+        # Rebound from the level in `init()`; the default matches the C++ table's
+        # so a span emitted before init names L3 rather than nothing.
+        self._host_span_prefix = _span_prefix(WorkerLevel.node)
         self._config = config
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
@@ -4371,6 +4570,9 @@ class Worker:
         self._remote_worker_specs: list[RemoteWorkerSpec] = []
         self._remote_worker_ids: list[int] = []
         self._remote_sessions: list[_RemoteSession] = []
+        self._mpi_l3_groups: list[_MpiL3GroupRuntime] = []
+        self._mpi_worker_ids: list[int] = []
+        self._mpi_rank_by_worker_id: dict[int, _MpiL3RankRuntime] = {}
         self._next_level_worker_id_count: int = 0
         # Fallback ownership for private helpers used outside Worker.submit.
         # Normal orchestration-owned refs live in RunHandle._resources.
@@ -4536,6 +4738,51 @@ class Worker:
             self._remote_worker_ids.append(worker_id)
             return worker_id
 
+    def add_mpirun_worker_group(self, spec: MpiL3GroupSpec) -> tuple[int, ...]:
+        """Register L3 workers that will be launched by one parent-owned ``mpirun``.
+
+        A single named mailbox is created for the group during ``init()``.
+        The returned ids remain exact NEXT_LEVEL targets, but all of them route
+        through that group mailbox and the MPI collective dispatcher.
+        """
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.NEW:
+                raise RuntimeError("Worker.add_mpirun_worker_group after init")
+            if self.level < 4:
+                raise TypeError("Worker.add_mpirun_worker_group: MPI L3 groups require a level >= 4 parent")
+            if not isinstance(spec, MpiL3GroupSpec):
+                raise TypeError("Worker.add_mpirun_worker_group expects a MpiL3GroupSpec")
+
+            group_id = uuid.uuid4().hex
+            ranks: list[_MpiL3RankRuntime] = []
+            for rank in range(len(spec.hosts)):
+                worker_id = self._allocate_next_level_worker_id()
+                rank_spec = _MpiL3RankSpec(
+                    platform=spec.platform,
+                    runtime=spec.runtime,
+                    device_ids=spec.device_ids_by_rank[rank],
+                    num_sub_workers=spec.num_sub_workers_by_rank[rank],
+                    transport=spec.transport,
+                    comm_profile=spec.comm_profile,
+                    global_device_ranks=spec.global_device_ranks_by_rank[rank],
+                )
+                runtime = _MpiL3RankRuntime(
+                    group_id=group_id,
+                    rank=rank,
+                    worker_id=worker_id,
+                    session_id=self._new_remote_session_id(),
+                    spec=rank_spec,
+                )
+                ranks.append(runtime)
+                self._mpi_worker_ids.append(worker_id)
+                self._mpi_rank_by_worker_id[worker_id] = runtime
+            group = _MpiL3GroupRuntime(group_id=group_id, spec=spec, ranks=tuple(ranks))
+            self._mpi_l3_groups.append(group)
+            return tuple(rank.worker_id for rank in ranks)
+
+    def _remote_like_worker_ids(self) -> set[int]:
+        return set(self._remote_worker_ids) | set(self._mpi_worker_ids)
+
     @staticmethod
     def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
         if endpoint.count(":") != 1:
@@ -4674,7 +4921,7 @@ class Worker:
             )
         return entries
 
-    def _inner_registry_entries_for_spec(self, spec: RemoteWorkerSpec) -> list[dict[str, Any]]:
+    def _inner_registry_entries_for_spec(self, spec: RemoteWorkerSpec | _MpiL3RankSpec) -> list[dict[str, Any]]:
         from .remote_l3_protocol import (  # noqa: PLC0415
             ChipCallableBlobLocation,
             RemoteChipCallablePayload,
@@ -4727,14 +4974,8 @@ class Worker:
         comm_profile: str,
         global_device_ranks: tuple[int, ...],
     ) -> None:
-        if comm_profile not in GLOBAL_DOMAIN_PROFILE_IDS:
-            raise ValueError(f"{label} comm_profile {comm_profile!r} is not supported")
-        if comm_profile == "a3-fabric-v1" and (not platform.startswith("a2a3") or platform.endswith("sim")):
-            raise ValueError(f"{label} comm_profile 'a3-fabric-v1' requires real A3 devices")
-        if global_device_ranks and len(global_device_ranks) != len(device_ids):
-            raise ValueError(f"{label} global_device_ranks must match device_ids length")
-        if any(rank < 0 for rank in global_device_ranks) or len(set(global_device_ranks)) != len(global_device_ranks):
-            raise ValueError(f"{label} global_device_ranks must be unique and non-negative")
+        _validate_global_comm_capability(label, platform, comm_profile)
+        _validate_global_device_ranks(f"{label}.global_device_ranks", global_device_ranks, len(device_ids))
 
     def _resolved_global_nodes(self) -> dict[int, _GlobalNodeRuntime]:
         configs: list[tuple[int, tuple[int, ...], str, str, tuple[int, ...], bool]] = []
@@ -4746,6 +4987,18 @@ class Worker:
                     spec.platform,
                     spec.comm_profile,
                     tuple(spec.global_device_ranks),
+                    True,
+                )
+            )
+        for worker_id in self._mpi_worker_ids:
+            rank = self._mpi_rank_by_worker_id[int(worker_id)]
+            configs.append(
+                (
+                    int(worker_id),
+                    tuple(rank.spec.device_ids),
+                    rank.spec.platform,
+                    rank.spec.comm_profile,
+                    tuple(rank.spec.global_device_ranks),
                     True,
                 )
             )
@@ -4828,7 +5081,7 @@ class Worker:
         listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
         if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
             raise ValueError("RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True")
-        if worker_id in self._remote_worker_ids:
+        if worker_id in self._remote_like_worker_ids():
             runtime = self._resolved_global_nodes()[int(worker_id)]
             node_rank = runtime.node_rank
             node_count = runtime.node_count
@@ -4863,6 +5116,37 @@ class Worker:
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
             "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
             "feature_flags": [],
+        }
+
+    def _build_mpi_rank_manifest(
+        self,
+        *,
+        rank: _MpiL3RankRuntime,
+        startup_remaining_s: float,
+    ) -> dict[str, Any]:
+        spec = rank.spec
+        runtime = self._resolved_global_nodes()[int(rank.worker_id)]
+        return {
+            "session_id": int(rank.session_id),
+            "parent_worker_level": int(self.level),
+            "remote_worker_level": 3,
+            "worker_id": int(rank.worker_id),
+            "platform": spec.platform,
+            "runtime": spec.runtime,
+            "device_ids": list(spec.device_ids),
+            "num_sub_workers": int(spec.num_sub_workers),
+            "heap_ring_size": self._config.get("remote_heap_ring_size", None),
+            "transport": spec.transport,
+            "comm_profile": spec.comm_profile,
+            "cluster_id": self._global_cluster_id,
+            "node_rank": runtime.node_rank,
+            "node_count": runtime.node_count,
+            "global_device_ranks": list(runtime.global_device_ranks),
+            "session_timeout_s": self._remote_session_timeout_s(),
+            "startup_remaining_s": float(startup_remaining_s),
+            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(rank.worker_id),
+            "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
+            "feature_flags": ["mpi-group-mailbox-v1"],
         }
 
     def _open_remote_session(
@@ -4917,6 +5201,193 @@ class Worker:
         self._close_remote_sessions(sessions)
         self._remote_sessions.clear()
 
+    @staticmethod
+    def _new_remote_session_id() -> int:
+        session_id = uuid.uuid4().int & ((1 << 63) - 1)
+        return session_id if session_id != 0 else 1
+
+    @staticmethod
+    def _mpirun_args_select_hosts(args: tuple[str, ...]) -> bool:
+        host_args = {"--host", "-host", "-H", "--hostfile", "-hostfile", "--machinefile", "-machinefile"}
+        return any(arg in host_args or arg.startswith("--host=") or arg.startswith("--hostfile=") for arg in args)
+
+    @staticmethod
+    def _close_mpirun_group(  # noqa: PLR0912 -- cleanup reports every independent process/resource failure
+        group: _MpiL3GroupRuntime,
+        *,
+        timeout_s: float,
+    ) -> list[str]:
+        failures: list[str] = []
+        group.closing = True
+        proc = group.process
+        if proc is not None:
+            try:
+                # The remote sessions received SHUTDOWN before this runs, so a
+                # healthy group exits by itself once its ranks close their
+                # inner workers. SIGTERM is the backstop, not the first move:
+                # a rank interrupted mid native teardown dies uncleanly and
+                # mpirun reports the whole job as a bad termination.
+                if proc.poll() is None:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=timeout_s)
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append(f"terminate: {exc}")
+                try:
+                    proc.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append(f"kill: {exc}")
+                    try:
+                        proc.wait(timeout=timeout_s)
+                    except BaseException as exc:  # noqa: BLE001
+                        failures.append(f"wait after kill: {exc}")
+                except BaseException as exc:  # noqa: BLE001
+                    failures.append(f"wait after terminate: {exc}")
+            finally:
+                group.process = None
+        if group.monitor_thread is not None:
+            group.monitor_thread.join(timeout=timeout_s)
+            group.monitor_thread = None
+        if group.mailbox is not None:
+            try:
+                group.mailbox.close(unlink=True)
+            except BaseException as exc:  # noqa: BLE001
+                failures.append(f"close mailbox: {exc}")
+            finally:
+                group.mailbox = None
+        try:
+            if group.ready_dir is not None:
+                shutil.rmtree(group.ready_dir)
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(f"remove ready directory: {exc}")
+        finally:
+            group.ready_dir = None
+            group.manifest_path = None
+        return [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
+
+    def _close_mpirun_groups(
+        self,
+        *,
+        timeout_s: float = _ROLLBACK_GRACEFUL_TIMEOUT_S,
+        suppress_errors: bool = False,
+    ) -> None:
+        failures: list[str] = []
+        for group in reversed(self._mpi_l3_groups):
+            failures.extend(self._close_mpirun_group(group, timeout_s=timeout_s))
+        if failures:
+            sys.stderr.write("\n".join(f"[worker pid={os.getpid()}] WARN: {failure}" for failure in failures) + "\n")
+            sys.stderr.flush()
+            if not suppress_errors:
+                raise RuntimeError(failures[0])
+
+    @staticmethod
+    def _monitor_mpirun_group(group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any]) -> None:
+        returncode = proc.wait()
+        if group.closing or group.mailbox is None:
+            return
+        with contextlib.suppress(BaseException):
+            group.mailbox.mark_terminal(f"mpirun exited unexpectedly with status {returncode}")
+
+    @staticmethod
+    def _mark_mpirun_groups_closing(groups: list[_MpiL3GroupRuntime]) -> None:
+        for group in groups:
+            group.closing = True
+
+    def _activate_mpirun_worker_groups(self, deadline: float) -> None:
+        if not self._mpi_l3_groups:
+            return
+        from .mpi_group_mailbox import MAILBOX_SIZE as MPI_MAILBOX_SIZE  # noqa: PLC0415
+        from .mpi_group_mailbox import MailboxGroupState, MpiGroupMailbox  # noqa: PLC0415
+
+        session_timeout = self._remote_session_timeout_s()
+        assert self._worker is not None
+        for group in self._mpi_l3_groups:
+            ready_dir = tempfile.mkdtemp(prefix="simpler-mpirun-manifest-")
+            manifest_path = os.path.join(ready_dir, "group.json")
+            group.ready_dir = ready_dir
+            group.manifest_path = manifest_path
+            mailbox = MpiGroupMailbox.create(world_size=len(group.ranks))
+            group.mailbox = mailbox
+            rank_manifests: list[dict[str, Any]] = []
+            startup_remaining_s = self._remaining_until(deadline, "MPI L3 group manifest")
+            for rank in group.ranks:
+                manifest = self._build_mpi_rank_manifest(
+                    rank=rank,
+                    startup_remaining_s=startup_remaining_s,
+                )
+                manifest.update(
+                    {
+                        "mpi_group_id": group.group_id,
+                        "mpi_rank": rank.rank,
+                        "mpi_world_size": len(group.ranks),
+                        "mpi_group_worker_ids": [item.worker_id for item in group.ranks],
+                        "mpi_global_domain_exchange": True,
+                    }
+                )
+                rank_manifests.append(manifest)
+            group_manifest = {
+                "group_id": group.group_id,
+                "world_size": len(group.ranks),
+                "worker_ids": [rank.worker_id for rank in group.ranks],
+                "mailbox": mailbox.manifest(),
+                "rank_manifests": rank_manifests,
+            }
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(group_manifest, f, sort_keys=True)
+                f.write("\n")
+
+            cmd = [group.spec.mpirun_path, "-np", str(len(group.ranks))]
+            if not self._mpirun_args_select_hosts(group.spec.mpirun_args):
+                cmd.extend(["--host", ",".join(group.spec.hosts)])
+            cmd.extend(group.spec.mpirun_args)
+            cmd.extend(
+                [
+                    group.spec.python_executable,
+                    "-m",
+                    "simpler.mpi_l3_session",
+                    "--group-manifest",
+                    manifest_path,
+                ]
+            )
+            group.process = subprocess.Popen(cmd, start_new_session=True)
+            while mailbox.group_state is MailboxGroupState.INITIALIZING:
+                if group.process.poll() is not None:
+                    raise RuntimeError(
+                        f"MPI L3 group {group.group_id} exited before READY (status {group.process.returncode})"
+                    )
+                self._remaining_until(deadline, "MPI L3 mailbox READY")
+                time.sleep(_STARTUP_POLL_INTERVAL_S)
+            if mailbox.group_state is not MailboxGroupState.READY:
+                raise RuntimeError(f"MPI L3 group {group.group_id} failed before READY: {mailbox.terminal_reason()}")
+            self._worker.add_mpi_group_mailbox(
+                [rank.worker_id for rank in group.ranks],
+                [rank.session_id for rank in group.ranks],
+                mailbox.address,
+                MPI_MAILBOX_SIZE,
+                group.process.pid,
+                session_timeout,
+            )
+            group.monitor_thread = threading.Thread(
+                target=self._monitor_mpirun_group,
+                args=(group, group.process),
+                daemon=True,
+                name=f"simpler-mpirun-monitor-{group.group_id[:8]}",
+            )
+            group.monitor_thread.start()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("MPI L3 activation: startup deadline exceeded after attach")
+
     def _require_remote_worker_started(self, worker_id: int) -> None:
         """Argument + resource gate for the public remote-memory APIs. Admission
         (READY) is decided by the ``_operation_lease`` these APIs already hold —
@@ -4926,8 +5397,10 @@ class Worker:
         instead of spuriously failing."""
         if self.level < 4:
             raise TypeError("remote memory APIs require a level >= 4 parent Worker")
-        if int(worker_id) not in set(self._remote_worker_ids):
-            raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
+        if int(worker_id) not in self._remote_like_worker_ids():
+            raise ValueError(
+                "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
+            )
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
 
@@ -4939,8 +5412,10 @@ class Worker:
         public lifecycle, so teardown keeps its capability without re-opening
         public admission. Public entrypoints validate READY separately via
         ``_require_remote_worker_started``."""
-        if int(worker_id) not in set(self._remote_worker_ids):
-            raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
+        if int(worker_id) not in self._remote_like_worker_ids():
+            raise ValueError(
+                "remote memory APIs require a remote worker id returned by add_remote_worker or add_mpirun_worker_group"
+            )
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
 
@@ -5910,6 +6385,14 @@ class Worker:
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
+        mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
+        for child_index in worker._mpi_worker_ids:
+            rank = worker._mpi_rank_by_worker_id[int(child_index)]
+            group = mpi_groups[rank.group_id]
+            mpi_node_identity = _normalize_node_identity(group.spec.hosts[rank.rank])
+            mpi_path = _format_worker_path(3, parent_path=path, index=int(child_index))
+            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
+            self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
 
     def _append_device_endpoint_topology(
         self,
@@ -6011,14 +6494,14 @@ class Worker:
             raise TypeError("Worker.register: level 2 only supports ChipCallable targets")
         reg = _build_callable_registration(self, target, workers=workers)
         if isinstance(target, RemoteCallable):
-            if not self._remote_worker_specs:
+            if not self._remote_worker_specs and not self._mpi_l3_groups:
                 raise RuntimeError("Worker.register(RemoteCallable): add at least one remote worker first")
-            remote_worker_ids = set(self._remote_worker_ids)
+            remote_worker_ids = self._remote_like_worker_ids()
             for worker_id in reg.eligible_worker_ids:
                 if worker_id not in remote_worker_ids:
                     raise ValueError(
                         "Worker.register(RemoteCallable): workers must name remote worker ids returned by "
-                        "add_remote_worker"
+                        "add_remote_worker or add_mpirun_worker_group"
                     )
             # Linearize against the startup epoch exactly like the local path: a
             # register that races an in-progress init() waits for it, then a
@@ -6851,14 +7334,20 @@ class Worker:
             sys.stderr.flush()
 
     def _release_import_recursive(self, identity: CanonicalIdentity) -> None:
-        """Drop ``identity`` from this Worker's own same-process import cache, then forward one
+        """Drop ``identity`` from this Worker's own same-process caches, then forward one
         more hop down this Worker's own children — same shape as ``_unregister_child_digest``'s
         recursive forward for callable cleanup, since a NEXT_LEVEL child may itself have
         materialized ``identity`` further down its own tree (chip/SUB leaves, or its own
         NEXT_LEVEL children in turn).
+
+        Two caches name a released identity here, not one: the import cache holds a mapping of it,
+        and ``_reexport_by_source`` holds the forwarding handle built from it. A retained re-export
+        outlives its backing, and its ``to_descriptor()`` keeps answering — so a later forward of
+        the same identity would hand a child a descriptor for a name the owner has unlinked.
         """
         if self._chip_import_registry is not None:
             self._chip_import_registry.unregister(identity)
+        self._reexport_by_source.pop(identity, None)
         self._broadcast_import_release(identity)
 
     def add_worker(self, worker: Worker) -> int:
@@ -6947,13 +7436,15 @@ class Worker:
                     return True
                 if any(spec.device_ids for spec in worker._remote_worker_specs):
                     return True
+                if any(rank.spec.device_ids for rank in worker._mpi_rank_by_worker_id.values()):
+                    return True
                 return any(has_chip_target(child) for child in worker._next_level_workers)
 
             return None if has_chip_target(self) else "a chip device (device_ids)"
         if namespace == "REMOTE_TASK_DISPATCHER":
-            has_remote_workers = set(self._remote_worker_ids)
+            has_remote_workers = self._remote_like_worker_ids()
             ok = bool(has_remote_workers) and set(eligible_worker_ids) <= has_remote_workers
-            return None if ok else "its named remote worker(s) (add_remote_worker)"
+            return None if ok else "its named remote worker(s) (add_remote_worker/add_mpirun_worker_group)"
         return None
 
     def _validate_eligible_targets(self) -> None:
@@ -7144,7 +7635,7 @@ class Worker:
         # startup resource (mailbox shm, pre-fork _Worker mmap, child fork,
         # daemon socket) exists, so an invalid value fails without a
         # partially-built subtree to roll back.
-        if self._remote_worker_specs:
+        if self._remote_worker_specs or self._mpi_l3_groups:
             self._remote_session_timeout_s()
 
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
@@ -7291,12 +7782,33 @@ class Worker:
 
         # Seed this process's logger before the first fork: the spans its own
         # scheduler emits obey the Python logger level, and every child inherits
-        # the mapping. Every level needs this — `init()` rejects device_ids above
-        # L3, so a pod process owns no chips yet still drives next-level Workers
-        # and emits their spans. A chip-owning Worker names the copy its children
-        # load; any other process seeds the copy the package already preloaded.
+        # the state. Every level needs this — `init()` rejects device_ids above
+        # L3, so a network1 process owns no chips yet still drives next-level Workers
+        # and emits their spans. A chip child re-seeds its inherited state before
+        # binding the logger copies embedded in the runtime modules it loads.
         chip_log_level = _simpler_log.get_current_config()
-        _initialize_simpler_log(self._l3_bins if device_ids else None, chip_log_level)
+        _initialize_host_log(chip_log_level)
+
+        # Bind the level word this process's host-scheduler spans lead with. The
+        # C++ emit sites in Orchestrator / WorkerThread are level-agnostic — the
+        # same code drives next-level children at every level above the chip — so
+        # the word is a property of the process. Resolved once here and pushed, so
+        # there is a single derivation rather than one on each side.
+        #
+        # The first binding in a process wins, because a SpanScope holds the name
+        # pointer it was given. So a process that inits Workers at two levels keeps
+        # the first level's word, and self._host_span_prefix is whatever is really
+        # bound — never what this Worker asked for. Say so instead of letting the
+        # mismatch show up as mislabelled spans much later.
+        requested = _span_prefix(self.level)
+        self._host_span_prefix = _set_host_span_level_prefix(requested)
+        if self._host_span_prefix != requested:
+            logging.getLogger("simpler").warning(
+                "host-scheduler spans in this process are labelled %r, not %r: one process carries one "
+                "span vocabulary and an earlier Worker bound it first",
+                self._host_span_prefix,
+                requested,
+            )
 
         self._startup_reaped_pids = set()
         self._startup_ready_pids = set()
@@ -7465,6 +7977,7 @@ class Worker:
         # L3 sessions: opening starts the remote subtree and registering spawns
         # the RemoteL3Endpoint health thread, so both must follow every local
         # fork. Each remote consumes this process's remaining startup budget.
+        self._activate_mpirun_worker_groups(deadline)
         self._activate_remote_sessions(deadline)
 
         # _Worker was constructed in _init_hierarchical (pre-fork) so children
@@ -8050,18 +8563,17 @@ class Worker:
                 tail = extra
             return primary
 
-        expired = bool(getattr(region, "expired", getattr(region, "_expired", False)))
+        expired = bool(region.expired)
         if not expired:
             try:
                 region._close_worker_host_mapping()
             except BaseException as exc:  # noqa: BLE001
                 region_errors.append(exc)
             try:
-                if self._worker is not None:
+                if self._worker is not None and not region._chip_release_committed:
                     self._worker.control_worker_chip_region_release(region._worker_id, region.region_id)
-                    free = getattr(region, "free", None)
-                    if callable(free):
-                        free()
+                    region._chip_release_committed = True
+                    region.free()
             except BaseException as exc:  # noqa: BLE001
                 release_error = exc
                 region_errors.append(exc)
@@ -8655,7 +9167,77 @@ class Worker:
             command.window_size,
             command.members,
             command.buffers,
+            command.attachments,
         )
+
+    def _global_domain_attachment_matrix(
+        self,
+        members: tuple[GlobalDomainMember, ...],
+        receiver_nodes: tuple[int, ...],
+        window_size: int,
+    ) -> tuple[GlobalDomainAttachment, ...]:
+        """Resolve one host-consumer row for every receiving L3 node.
+
+        The endpoint planner remains the authority for adapter selection.  A
+        relation that the current planner cannot serve is retained as a
+        host-consumer attachment with no adapter; the wire therefore preserves
+        the complete matrix without claiming that an unavailable remote path
+        is usable.  A later access primitive can fill that capability without
+        changing rank membership or row cardinality.
+        """
+
+        registry = self._get_endpoint_registry()
+        resolver = BackendResolver(registry, self._get_region_access_service())
+        root_path = _format_worker_path(int(self.level))
+        attachments: list[GlobalDomainAttachment] = []
+        for receiver_node_id in sorted({int(node) for node in receiver_nodes}):
+            receiver_path = _format_worker_path(
+                3,
+                parent_path=root_path,
+                index=receiver_node_id,
+            )
+            consumer_selector = at(receiver_path, HOST_CPU)
+            for member in members:
+                member_path = _format_worker_path(
+                    2,
+                    parent_path=receiver_path
+                    if int(member.node_worker_id) == receiver_node_id
+                    else _format_worker_path(
+                        3,
+                        parent_path=root_path,
+                        index=int(member.node_worker_id),
+                    ),
+                    index=int(member.local_worker_id),
+                )
+                provider_selector = at(member_path, DEVICE_AICORE)
+                resolved = registry.resolve_region_spec(
+                    (provider_selector, consumer_selector),
+                    SingleOwner(provider=provider_selector),
+                )
+                plan = resolver.plan(
+                    resolved,
+                    RegionLayoutSpec(payload_bytes=int(window_size), counter_bytes=0),
+                )
+                adapter_kind: AdapterKind | None = None
+                adapter_profile: AdapterProfile | None = None
+                if not isinstance(plan, UnsupportedRegionPlan):
+                    consumer = next(
+                        attachment
+                        for attachment in plan.payload.attachments
+                        if attachment.role is AttachmentRole.CONSUMER
+                    )
+                    adapter_kind = consumer.adapter_kind
+                    adapter_profile = consumer.adapter_profile
+                attachments.append(
+                    GlobalDomainAttachment(
+                        node_worker_id=receiver_node_id,
+                        address_space=AddressSpace.HOST,
+                        role=AttachmentRole.CONSUMER,
+                        adapter_kind=adapter_kind,
+                        adapter_profile=adapter_profile,
+                    )
+                )
+        return tuple(attachments)
 
     @staticmethod
     def _global_domain_provenance_id(domain_id: int) -> int:
@@ -8683,6 +9265,9 @@ class Worker:
     ) -> tuple[GlobalDomainDescriptor, ...]:
         if self.level != 3 or self._worker is None:
             raise RuntimeError("Global CommDomain node prepare requires a ready L3 Worker")
+        # PREPARE_EXPORT is where the row is stored for IMPORT and COMMIT to reuse, so a table this
+        # node has no row in is rejected here rather than at the first phase that reads one.
+        _ = command.attachments_for_node(node_worker_id)
         prior = self._global_node_domains.get(command.domain_id)
         if prior is not None:
             if self._global_domain_command_identity(prior.command) != self._global_domain_command_identity(command):
@@ -8744,6 +9329,15 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain import requires a matching prepared domain")
+        if command.attachments:
+            if command.attachments != state.command.attachments:
+                raise RuntimeError("Global CommDomain import attachments conflict with prepare")
+        elif state.command.attachments:
+            # Attachments are immutable domain topology. IMPORT carries no
+            # second copy; rehydrate the prepared row before comparing the
+            # command identity and publishing the node view.
+            command = replace(command, attachments=state.command.attachments)
+        node_attachments = command.attachments_for_node(node_worker_id)
         if self._global_domain_command_identity(state.command) != self._global_domain_command_identity(command):
             raise RuntimeError("Global CommDomain import command conflicts with prepare")
         validate_descriptor_table(
@@ -8832,6 +9426,7 @@ class Worker:
                 domain_id=command.domain_id,
                 generation=command.generation,
                 mapping_size=command.descriptors[0].mapping_size,
+                attachments=node_attachments,
             )
         except BaseException:
             # A node may have imported one local rank before a later local rank
@@ -8847,6 +9442,11 @@ class Worker:
         state = self._global_node_domains.get(command.domain_id)
         if state is None or state.command.generation != command.generation:
             raise RuntimeError("Global CommDomain commit requires a matching imported domain")
+        if command.attachments:
+            if command.attachments != state.command.attachments:
+                raise RuntimeError("Global CommDomain commit attachments conflict with prepare")
+        elif state.command.attachments:
+            command = replace(command, attachments=state.command.attachments)
         if state.phase is not GlobalDomainPhase.IMPORT or state.view is None:
             raise RuntimeError("Global CommDomain commit requires IMPORT completion")
         if (
@@ -9014,14 +9614,40 @@ class Worker:
             raise RuntimeError("local Global CommDomain control reply is invalid")
         return reply[start : start + response_size]
 
-    def _global_domain_control(self, worker_id: int, control_name: int, payload: bytes) -> bytes:
+    def _global_domain_control(
+        self, worker_id: int, control_name: int, payload: bytes, *, group: bool = False
+    ) -> bytes:
         if self._worker is None:
             raise RuntimeError("Global CommDomain control requires a ready hierarchical Worker")
-        if worker_id in self._remote_worker_ids:
-            return bytes(self._worker.remote_domain_control(int(worker_id), int(control_name), bytes(payload)))
+        if worker_id in self._remote_like_worker_ids():
+            return bytes(
+                self._worker.remote_domain_control(
+                    int(worker_id), int(control_name), bytes(payload), group_target=bool(group)
+                )
+            )
         if worker_id in self._next_level_worker_ids:
             return self._local_global_domain_control(worker_id, control_name, payload)
         raise ValueError(f"Global CommDomain worker {worker_id} is not a registered L3 worker")
+
+    def _mpi_group_for_involved_nodes(self, involved_nodes: tuple[int, ...]) -> _MpiL3GroupRuntime | None:
+        involved = set(int(worker_id) for worker_id in involved_nodes)
+        for group in self._mpi_l3_groups:
+            group_workers = {rank.worker_id for rank in group.ranks}
+            if involved == group_workers:
+                return group
+        return None
+
+    def _mpi_group_control(
+        self,
+        group: _MpiL3GroupRuntime,
+        control_name: int,
+        payload: bytes,
+    ) -> bytes:
+        if not group.ranks:
+            raise RuntimeError(f"MPI L3 group {group.group_id} has no ranks")
+        # One L4 request enters the rank-0 mailbox with the group-target frame
+        # flag set, so every MPI rank receives the same envelope.
+        return self._global_domain_control(group.ranks[0].worker_id, control_name, payload, group=True)
 
     def _allocate_global_domain(  # noqa: PLR0912 -- transaction validation and prepare/import/commit rollback stay ordered
         self,
@@ -9083,6 +9709,12 @@ class Worker:
         global_buffers = tuple(GlobalDomainBuffer(buffer.name, int(buffer.nbytes)) for buffer in buffers)
         domain_members_tuple = tuple(domain_members)
         involved_nodes = tuple(dict.fromkeys(member.node_worker_id for member in domain_members_tuple))
+        attachment_nodes = tuple(sorted(involved_nodes))
+        attachment_matrix = self._global_domain_attachment_matrix(
+            domain_members_tuple,
+            attachment_nodes,
+            int(window_size),
+        )
         for node_worker_id in involved_nodes:
             node = nodes[node_worker_id]
             resolve_global_comm_capability(
@@ -9119,9 +9751,11 @@ class Worker:
             window_size=int(window_size),
             members=domain_members_tuple,
             buffers=global_buffers,
+            attachments=attachment_matrix,
         )
 
         prepared_nodes: list[int] = []
+        mpi_group: _MpiL3GroupRuntime | None = None
         try:
             for node_worker_id in involved_nodes:
                 node = nodes[node_worker_id]
@@ -9144,40 +9778,36 @@ class Worker:
                 ):
                     raise RuntimeError(f"Global CommDomain COMM_INIT capability mismatch on node {node_worker_id}")
 
-            descriptor_by_rank: dict[int, GlobalDomainDescriptor] = {}
-            for node_worker_id in involved_nodes:
-                prepared_nodes.append(node_worker_id)
-                reply = self._global_domain_control(
-                    node_worker_id,
+            mpi_group = self._mpi_group_for_involved_nodes(involved_nodes)
+            if mpi_group is not None:
+                # A full MPI group exchanges descriptors rank-side (the session
+                # runner's collective), so one ALLOC_DOMAIN fanout both prepares
+                # and imports; the reply already carries the complete table.
+                prepared_nodes.extend(involved_nodes)
+                reply = self._mpi_group_control(
+                    mpi_group,
                     ControlName.ALLOC_DOMAIN,
                     encode_domain_command(base_command),
                 )
-                for descriptor in decode_descriptor_table(reply):
-                    if descriptor.domain_rank in descriptor_by_rank:
-                        raise RuntimeError("Global CommDomain prepare returned a duplicate rank")
-                    descriptor_by_rank[descriptor.domain_rank] = descriptor
-            descriptors = tuple(descriptor_by_rank[rank] for rank in range(len(domain_members_tuple)))
+                descriptors = decode_descriptor_table(reply)
+            else:
+                descriptor_by_rank: dict[int, GlobalDomainDescriptor] = {}
+                for node_worker_id in involved_nodes:
+                    prepared_nodes.append(node_worker_id)
+                    reply = self._global_domain_control(
+                        node_worker_id,
+                        ControlName.ALLOC_DOMAIN,
+                        encode_domain_command(base_command),
+                    )
+                    for descriptor in decode_descriptor_table(reply):
+                        if descriptor.domain_rank in descriptor_by_rank:
+                            raise RuntimeError("Global CommDomain prepare returned a duplicate rank")
+                        descriptor_by_rank[descriptor.domain_rank] = descriptor
+                descriptors = tuple(descriptor_by_rank[rank] for rank in range(len(domain_members_tuple)))
             validate_descriptor_table(descriptors, rank_count=len(domain_members_tuple), profile=profile)
             if descriptors[0].mapping_size < window_size:
                 raise RuntimeError("Global CommDomain backend mapped less than the requested window size")
 
-            import_command = GlobalDomainCommand(
-                phase=GlobalDomainPhase.IMPORT,
-                domain_id=domain_id,
-                generation=generation,
-                name=name,
-                profile=profile,
-                window_size=int(window_size),
-                members=domain_members_tuple,
-                buffers=global_buffers,
-                descriptors=descriptors,
-            )
-            for node_worker_id in involved_nodes:
-                self._global_domain_control(
-                    node_worker_id,
-                    ControlName.ALLOC_DOMAIN,
-                    encode_domain_command(import_command),
-                )
             commit_command = GlobalDomainCommand(
                 phase=GlobalDomainPhase.COMMIT,
                 domain_id=domain_id,
@@ -9189,12 +9819,36 @@ class Worker:
                 buffers=global_buffers,
                 descriptors=descriptors,
             )
-            for node_worker_id in involved_nodes:
-                self._global_domain_control(
-                    node_worker_id,
+            if mpi_group is not None:
+                self._mpi_group_control(
+                    mpi_group,
                     ControlName.ALLOC_DOMAIN,
                     encode_domain_command(commit_command),
                 )
+            else:
+                import_command = GlobalDomainCommand(
+                    phase=GlobalDomainPhase.IMPORT,
+                    domain_id=domain_id,
+                    generation=generation,
+                    name=name,
+                    profile=profile,
+                    window_size=int(window_size),
+                    members=domain_members_tuple,
+                    buffers=global_buffers,
+                    descriptors=descriptors,
+                )
+                for node_worker_id in involved_nodes:
+                    self._global_domain_control(
+                        node_worker_id,
+                        ControlName.ALLOC_DOMAIN,
+                        encode_domain_command(import_command),
+                    )
+                for node_worker_id in involved_nodes:
+                    self._global_domain_control(
+                        node_worker_id,
+                        ControlName.ALLOC_DOMAIN,
+                        encode_domain_command(commit_command),
+                    )
         except BaseException:
             abort_command = GlobalDomainCommand(
                 phase=GlobalDomainPhase.ABORT,
@@ -9206,10 +9860,10 @@ class Worker:
                 members=domain_members_tuple,
                 buffers=global_buffers,
             )
-            for node_worker_id in prepared_nodes:
+            if mpi_group is not None and prepared_nodes:
                 try:
-                    self._global_domain_control(
-                        node_worker_id,
+                    self._mpi_group_control(
+                        mpi_group,
                         ControlName.ALLOC_DOMAIN,
                         encode_domain_command(abort_command),
                     )
@@ -9220,10 +9874,29 @@ class Worker:
                     # that keeps a later run from being admitted as if the
                     # teardown had succeeded.
                     self._record_unreclaimable(
-                        f"Global CommDomain {name!r} ABORT cleanup failed for node worker "
-                        f"{node_worker_id}; backend windows may remain mapped",
+                        f"Global CommDomain {name!r} ABORT cleanup failed for MPI group "
+                        f"{mpi_group.group_id!r}; backend windows may remain mapped",
                         abort_error,
                     )
+            else:
+                for node_worker_id in prepared_nodes:
+                    try:
+                        self._global_domain_control(
+                            node_worker_id,
+                            ControlName.ALLOC_DOMAIN,
+                            encode_domain_command(abort_command),
+                        )
+                    except BaseException as abort_error:  # noqa: BLE001
+                        # The domain is not registered on this path, so no run fence
+                        # and no close() sweep can reach whatever the failed ABORT
+                        # leaves mapped. Refusing further work is the only boundary
+                        # that keeps a later run from being admitted as if the
+                        # teardown had succeeded.
+                        self._record_unreclaimable(
+                            f"Global CommDomain {name!r} ABORT cleanup failed for node worker "
+                            f"{node_worker_id}; backend windows may remain mapped",
+                            abort_error,
+                        )
             raise
 
         handle = GlobalCommDomainHandle(
@@ -9235,6 +9908,7 @@ class Worker:
             mapping_size=descriptors[0].mapping_size,
             retain_after_run=retain_after_run,
             _release_fn=lambda released, owner=resources: self._release_global_domain_handle(released, owner),
+            attachments=attachment_matrix,
         )
         self._live_global_domains[name] = handle
         resources.live_global_domains[name] = handle
@@ -9300,11 +9974,19 @@ class Worker:
 
         command = encode_release_command(GlobalDomainReleaseCommand(handle.domain_id, handle.generation))
         errors: list[BaseException] = []
-        for node_worker_id in dict.fromkeys(member.node_worker_id for member in handle.members):
+        involved_nodes = tuple(dict.fromkeys(member.node_worker_id for member in handle.members))
+        mpi_group = self._mpi_group_for_involved_nodes(involved_nodes)
+        if mpi_group is not None:
             try:
-                self._global_domain_control(node_worker_id, ControlName.RELEASE_DOMAIN, command)
+                self._mpi_group_control(mpi_group, ControlName.RELEASE_DOMAIN, command)
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
+        else:
+            for node_worker_id in involved_nodes:
+                try:
+                    self._global_domain_control(node_worker_id, ControlName.RELEASE_DOMAIN, command)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
         if errors:
             raise RuntimeError(f"Global CommDomain release failed: {errors[0]}") from errors[0]
         if self._live_global_domains.get(handle.name) is handle:
@@ -9548,9 +10230,19 @@ class Worker:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
 
         A no-op when no run is being built (``_building_run_resources is None``) — tracking is
-        opportunistic, only meaningful inside ``submit_next_level``/``submit_next_level_group``'s
-        run context, per the ``current_resources = self._building_run_resources; if ... is not
-        None`` idiom used elsewhere for the same "attach to the open run, if any" shape.
+        opportunistic, only meaningful inside the run context of the four orchestrator dispatch
+        entry points that carry Tensor args to another process (``submit_next_level``,
+        ``submit_next_level_group``, ``submit_sub``, ``submit_sub_group``), per the
+        ``current_resources = self._building_run_resources; if ... is not None`` idiom used
+        elsewhere for the same "attach to the open run, if any" shape.
+
+        The set over-approximates in one direction on purpose: every caller records before
+        ``_admit_task_submission``, which can itself raise on a sticky ordered-cleanup failure, so an
+        identity can be recorded for a task that never went out. That costs a spurious
+        ``release_buffer`` refusal, recoverable through ``close()``, where recording after admission
+        would leave a dispatched task's identity unrecorded and let a release unlink under it. The
+        group entry points additionally validate every member before recording any, since a rejected
+        member dispatches nothing at all.
         """
         resources = self._building_run_resources
         if resources is None:
@@ -9579,7 +10271,7 @@ class Worker:
         C++ target check only rejects unregistered ids, so a registered remote
         worker slips through — this guards that hole.
         """
-        if worker_id in set(self._remote_worker_ids):
+        if worker_id in self._remote_like_worker_ids():
             raise ValueError(
                 f"orch.{api}: worker {worker_id} is a remote NEXT_LEVEL worker; a local callable "
                 f"must target a local child (remote workers only run RemoteCallable dispatches)"
@@ -9867,7 +10559,8 @@ class Worker:
         tensor is MAP_SHARED — read-write across the fork, so usable as an OUTPUT the parent reads back;
         a plain tensor is COW read-only (input only). The handle is memoized by the tensor's storage
         base, so every ref over the same storage shares one canonical identity and dependencies key on
-        it. At L2 (no fork) any host tensor works. ``dtype`` is the ``DataType`` int value.
+        it; the ``byte_offset`` this computes is what then separates two views that do not intersect.
+        At L2 (no fork) any host tensor works. ``dtype`` is the ``DataType`` int value.
         """
         untyped_storage = getattr(tensor, "untyped_storage", None)
         if callable(untyped_storage):
@@ -9878,7 +10571,9 @@ class Worker:
             base, nbytes = host_ptr_nbytes(tensor)
             byte_offset = 0
         # Memoized per storage base so every view of one storage shares an identity and their
-        # dependencies key together. The allocator reuses addresses, though, so a hit whose size no
+        # dependencies key together — a real dependency between two views cannot then hide behind a
+        # differing offset, and the byte ranges tell the intersecting pairs from the disjoint ones
+        # under that one key. The allocator reuses addresses, though, so a hit whose size no
         # longer matches is a *different* storage that happens to sit where the last one did: it must
         # get a fresh identity, or the two would fuse into one node in the dependency graph.
         handle = self._fork_tensor_handles.get(base)
@@ -9963,23 +10658,42 @@ class Worker:
         drop its own cached import for the identity.
 
         Rejects outright if any currently in-flight L3+ run (not yet past ``_cleanup_published``)
-        sent this identity as a NEXT_LEVEL Tensor arg, or any in-flight L2 direct-chip run sent it —
-        a Buffer never goes away while a dispatched task still names it. The L3+ check takes
-        ``_submit_mu`` first: a handle is visible in ``_accepted_run_handles`` before its
-        orchestration callback (where ``touched_identities`` gets populated) has run, and that
-        callback is what ``_submit_mu`` already serializes graph construction against, so taking it
-        here means the check only ever runs between callbacks, never mid-callback with a
-        not-yet-complete touched set. The L2 check is independent (a separate run-id namespace with
-        no callback to serialize against — ``_chip_run_touched_identities`` is written atomically
-        alongside ``_chip_runs`` under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the
-        two checks run sequentially rather than under one shared lock. Neither is checked once
-        ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency. The entry
-        survives a failed close, so ``_release_all_buffers`` still reports the leak at close() rather
-        than losing it here — the import-cache broadcast only fires once close() has actually
-        succeeded, so a failed release never tells a descendant to drop a mapping the owner still
-        considers live. The slot is dropped only when it still holds *this* buffer: a buffer_id
-        minted elsewhere can collide with a registry key, and evicting the live entry it names would
-        strand that backing."""
+        sent this identity as a NEXT_LEVEL or SUB Tensor arg, or any in-flight L2 direct-chip run
+        sent it — a Buffer never goes away while a dispatched task still names it. All three
+        dispatch paths retain: a SUB task maps the identity into a sub-worker process just as a
+        NEXT_LEVEL task maps it into a child, so unlinking the backing under either one faults the
+        consumer on a segment that no longer has a name.
+
+        The L3+ check takes ``_submit_mu`` first: a handle is visible in ``_accepted_run_handles``
+        before its orchestration callback (where ``touched_identities`` gets populated) has run, and
+        that callback is what ``_submit_mu`` already serializes graph construction against, so taking
+        it here means the check only ever runs between callbacks, never mid-callback with a
+        not-yet-complete touched set. ``_abandoned_run_handles`` is scanned in the same block and
+        without the ``_cleanup_published`` test: ``_publish_abandoned_run`` sets that flag and drops
+        the handle from the accepted set while the run itself stays retained until native teardown
+        drains it, so an abandoned run is exactly the case where the flag stops describing whether
+        the device is done with the backing. Such a buffer therefore stops being releasable through
+        this API for the Worker's remaining life, which strands nothing: ``close()`` reclaims it via
+        ``_release_all_buffers`` calling ``Buffer.close()`` directly.
+
+        The L2 check is independent (a separate run-id namespace with no callback to serialize
+        against — ``_chip_run_touched_identities`` is written atomically alongside ``_chip_runs``
+        under ``_registry_lock`` instead, see ``_submit_l2_locked``), so the two checks run
+        sequentially rather than under one shared lock. Neither is checked once ``buffer`` is already
+        closed, matching ``Buffer.close()``'s own idempotency.
+
+        The entry survives a failed close, so ``_release_all_buffers`` still reports the leak at
+        close() rather than losing it here — the import-cache broadcast only fires once close() has
+        actually succeeded, so a failed release never tells a descendant to drop a mapping the owner
+        still considers live. The converse does not hold, and is the one asymmetry here: a
+        ``Buffer.close()`` whose ``shm.close()`` raises has still unlinked the name (its ``finally``
+        runs the unlink), so the backing can be nameless while descendants keep mappings this call
+        never told them to drop. A descendant materializing that identity afterwards gets the named
+        ``FileNotFoundError`` from ``ImportRegistry.materialize``, not a silent bad mapping.
+
+        The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
+        collide with a registry key, and evicting the live entry it names would strand that
+        backing."""
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -9989,6 +10703,12 @@ class Worker:
                 for handle in self._accepted_run_handles:
                     if not handle._cleanup_published and buffer.identity in handle._resources.touched_identities:
                         raise RuntimeError(f"release_buffer: {buffer.identity} is still referenced by an in-flight run")
+                for handle in self._abandoned_run_handles:
+                    if buffer.identity in handle._resources.touched_identities:
+                        raise RuntimeError(
+                            f"release_buffer: {buffer.identity} is still referenced by an abandoned run "
+                            f"whose native teardown has not completed"
+                        )
             with self._registry_lock:
                 for touched in self._chip_run_touched_identities.values():
                     if buffer.identity in touched:
@@ -10344,7 +11064,7 @@ class Worker:
                     finally:
                         graph_end_ns = time.monotonic_ns()
                         _emit_host_span(
-                            "l3.graph_build",
+                            f"{self._host_span_prefix}.graph_build",
                             run_id,
                             0,
                             0,
@@ -10597,10 +11317,13 @@ class Worker:
     def run_stream_set_create_count(self) -> int:
         """L2 only: number of AICore run streams the runner has created.
 
-        AICPU streams belong to pipeline slots for the worker's lifetime, while
-        each run creates and retires its own AICore stream, so this advances
-        once per run. Returns 0 on non-L2 workers and on platforms whose runs
-        use the persistent bootstrap stream pair (simulation, a5).
+        One AICPU + AICore pair serves every run for the runner's lifetime. The
+        AICPU stream persists; the AICore stream is recreated when a new code
+        upload makes it stale, and destroyed when an unproven completion retires
+        it, so this advances per publication or unproven retirement rather than
+        once per run or per pipeline slot. Returns 0 on non-L2 workers and on
+        platforms whose runs use the persistent bootstrap stream pair
+        (simulation, a5).
         """
         if self.level != 2 or self._chip_worker is None:
             return 0
@@ -10622,6 +11345,7 @@ class Worker:
             self._has_native_tree()
             or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
             or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
+            or any(group.process is not None or group.ready_dir is not None for group in self._mpi_l3_groups)
             or bool(self._live_worker_chip_regions)
             or bool(self._live_domains)
             or bool(self._live_global_domains or self._failed_global_domain_releases)
@@ -10643,6 +11367,9 @@ class Worker:
         n_shms = len(self._sub_shms) + len(self._chip_shms) + len(self._next_level_shms)
         if n_shms:
             parts.append(f"{n_shms} child shm(s)")
+        n_mpi = sum(1 for group in self._mpi_l3_groups if group.process is not None or group.ready_dir is not None)
+        if n_mpi:
+            parts.append(f"{n_mpi} mpirun group(s)")
         if self._live_worker_chip_regions:
             parts.append(f"{len(self._live_worker_chip_regions)} L3-L2 region(s)")
         if self._live_domains:
@@ -11134,6 +11861,7 @@ class Worker:
             ("remote", "pending remote frees", self._flush_pending_remote_frees),
             ("buffer", "all owner Buffers", self._release_all_buffers),
             ("buffer", "fork-inherited tensor buffers", self._fork_tensor_handles.clear),
+            ("buffer", "re-exported forwarding handles", self._reexport_by_source.clear),
             ("buffer", "chip import registry", self._close_chip_import_registry),
         ):
             self._cleanup_journal.add_once(kind, identity, cleanup)
@@ -11191,6 +11919,7 @@ class Worker:
 
             def _close_worker() -> None:
                 if self._worker:
+                    self._mark_mpirun_groups_closing(self._mpi_l3_groups)
                     self._worker.close()
                     self._worker = None
                     self._orch = None
@@ -11199,8 +11928,14 @@ class Worker:
             journal_err = self._cleanup_journal.drive({("native", "hierarchical Worker")})
             if journal_err is not None:
                 errors.append(journal_err)
-                if not startup_abort:
-                    raise errors[0]
+            # A failed native close must not strand the mpirun children: their
+            # reaping and mailbox unlink run before the error propagates.
+            self._cleanup_journal.add_once("child", "MPI L3 groups", self._close_mpirun_groups)
+            journal_err = self._cleanup_journal.drive({("child", "MPI L3 groups")})
+            if journal_err is not None:
+                errors.append(journal_err)
+            if errors and not startup_abort:
+                raise errors[0]
             self._cleanup_journal.add_once(
                 "shm", "Worker-Chip orchestration mappings", self._close_worker_chip_orch_comm
             )
@@ -11233,7 +11968,7 @@ class Worker:
             # teardown entry — so the (blocking) pre-child cleanup above cannot
             # eat it. Reap transfers a surviving pid/shm pair into the journal;
             # a later close() can retry without freeing a live mailbox.
-            reap_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_deadline = time.monotonic() + _CLOSE_CHILD_REAP_TIMEOUT_S
             _step(lambda: self._reclaim_child_groups(reap_deadline))
             # A prior attempt may already have transferred a surviving child
             # and its mailbox into the journal. Retry those entries only after
