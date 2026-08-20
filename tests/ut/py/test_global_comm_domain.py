@@ -10,15 +10,20 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import pytest
+import simpler.global_comm_domain as domain_mod
 from simpler.buffer import AddressSpace
 from simpler.comm_endpoints import AdapterKind, AdapterProfile, AttachmentRole
 from simpler.global_comm_domain import (
@@ -36,17 +41,22 @@ from simpler.global_comm_domain import (
     GlobalDomainAttachment,
     GlobalDomainBuffer,
     GlobalDomainCommand,
+    GlobalDomainCopyCommand,
     GlobalDomainDescriptor,
     GlobalDomainMember,
     GlobalDomainPhase,
     GlobalDomainReleaseCommand,
     decode_comm_init,
+    decode_copy_command,
     decode_descriptor_table,
     decode_domain_command,
+    decode_release_command,
     encode_comm_init,
     encode_comm_init_result,
+    encode_copy_command,
     encode_descriptor_table,
     encode_domain_command,
+    encode_release_command,
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
@@ -104,6 +114,24 @@ def _descriptors() -> tuple[GlobalDomainDescriptor, ...]:
         )
         for rank in range(2)
     )
+
+
+def test_global_domain_version_matches_the_native_header():
+    # The version is spelled twice -- GLOBAL_DOMAIN_VERSION here and COMM_GLOBAL_DOMAIN_VERSION in
+    # the platform header -- and every decoder compares it for strict equality with no negotiation.
+    # Bumping one alone is rejected by comm_hccl.cpp / comm_sim.cpp as a descriptor-version
+    # mismatch, which names the descriptor rather than the edit that caused it. This pins the
+    # pairing at the edit.
+    header = Path(__file__).resolve().parents[3] / "src" / "common" / "platform_comm" / "comm.h"
+    if not header.is_file():
+        pytest.skip("platform_comm sources are not present in this installation")
+    match = re.search(
+        r"^#define\s+COMM_GLOBAL_DOMAIN_VERSION\s+(\d+)U?\s*$",
+        header.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match is not None, f"COMM_GLOBAL_DOMAIN_VERSION not found in {header}"
+    assert int(match.group(1)) == GLOBAL_DOMAIN_VERSION
 
 
 @pytest.mark.parametrize(
@@ -255,6 +283,81 @@ def test_global_domain_attachment_table_requires_complete_unique_receiver_rows()
     assert GLOBAL_DOMAIN_MAX_ATTACHMENTS == 64 * 64
 
 
+def test_global_domain_attachment_names_every_unknown_enum_field():
+    # Each of the four enum-typed fields reports which field was wrong. `address_space` and `role`
+    # were already wrapped; `adapter_kind` and `adapter_profile` used to surface the raw enum
+    # ValueError, which names the value but not the field it came from.
+    def make_command(attachment: GlobalDomainAttachment) -> GlobalDomainCommand:
+        row = (attachment, replace(attachment, adapter_kind=None, adapter_profile=None))
+        return GlobalDomainCommand(
+            phase=GlobalDomainPhase.PREPARE_EXPORT,
+            domain_id=12,
+            generation=1,
+            name="attachment-enums",
+            profile="sim",
+            window_size=2048,
+            members=_members(),
+            buffers=(),
+            attachments=row,
+        )
+
+    good = _attachments()[0]
+    for field, bad_value in (
+        ("address_space", 9),
+        ("role", "NOT_A_ROLE"),
+        ("adapter_kind", "NOT_A_KIND"),
+        ("adapter_profile", "NOT_A_PROFILE"),
+    ):
+        with pytest.raises(ValueError, match=f"attachment {field} is unknown"):
+            encode_domain_command(make_command(replace(good, **{field: bad_value})))
+
+    # A None pair stays legal; only a half-set pair is rejected, and by its own message.
+    with pytest.raises(ValueError, match="must be paired"):
+        encode_domain_command(make_command(replace(good, adapter_profile=None)))
+
+
+def test_l4_l3_commands_version_independently_of_the_descriptor(monkeypatch):
+    """Python owns both ends of the L4<->L3 commands, so their layout versions separately from the
+    backend-stamped descriptor. Both constants hold the same number today, which would let a codec
+    that still read `GLOBAL_DOMAIN_VERSION` pass unnoticed -- so drive the command version to a
+    distinct value first. Under that override a descriptor-versioned encoder stamps the wrong
+    header, and a descriptor-versioned decoder rejects a payload it should accept.
+    """
+    members = _members()
+    command_version = GLOBAL_DOMAIN_VERSION + 1
+    monkeypatch.setattr(domain_mod, "GLOBAL_DOMAIN_COMMAND_VERSION", command_version)
+    encoded = {
+        "comm_init": encode_comm_init(GlobalCommInitCommand("cluster", "topology", "sim", 0, 2, members)),
+        "domain": encode_domain_command(
+            GlobalDomainCommand(
+                phase=GlobalDomainPhase.PREPARE_EXPORT,
+                domain_id=11,
+                generation=1,
+                name="tp",
+                profile="sim",
+                window_size=2048,
+                members=members,
+                buffers=(GlobalDomainBuffer("payload", 128),),
+            )
+        ),
+        "release": encode_release_command(GlobalDomainReleaseCommand(11, 1)),
+        "copy": encode_copy_command(GlobalDomainCopyCommand(11, 1, 0, 0, 4, b"abcd"), include_data=True),
+    }
+    decoders = {
+        "comm_init": decode_comm_init,
+        "domain": decode_domain_command,
+        "release": decode_release_command,
+        "copy": lambda data: decode_copy_command(data, include_data=True),
+    }
+
+    for name, blob in encoded.items():
+        assert struct.unpack_from("<I", blob)[0] == command_version, name
+        decoders[name](blob)
+        foreign = struct.pack("<I", command_version + 1) + blob[4:]
+        with pytest.raises(ValueError, match="version"):
+            decoders[name](foreign)
+
+
 def test_global_domain_encode_rejects_too_many_buffers():
     command = GlobalDomainCommand(
         phase=GlobalDomainPhase.PREPARE_EXPORT,
@@ -271,21 +374,28 @@ def test_global_domain_encode_rejects_too_many_buffers():
         encode_domain_command(command)
 
 
-def _failure_injection_worker(*, platform: str = "a2a3sim", profile: str = "sim"):
+def _failure_injection_worker(*, platform: str = "a2a3sim", profile: str = "sim", hosts=None):
+    """Two remote L3 nodes under one L4.
+
+    ``hosts`` defaults to both nodes on one host, which is what the failure-injection tests want
+    (they exercise phase rollback, not topology). Endpoint capability is decided per node identity,
+    so a test that cares whether two nodes are on the *same* machine passes distinct hosts.
+    """
     from simpler.worker import RemoteWorkerSpec, Worker, _RunResources  # noqa: PLC0415
 
+    hosts = ("127.0.0.1", "127.0.0.1") if hosts is None else tuple(hosts)
     worker = Worker(level=4, num_sub_workers=0)
     node_ids = tuple(
         worker.add_remote_worker(
             RemoteWorkerSpec(
-                endpoint=f"127.0.0.1:{19073 + index}",
+                endpoint=f"{host}:{19073 + index}",
                 platform=platform,
                 device_ids=(0,),
                 comm_profile=profile,
                 global_device_ranks=(index,),
             )
         )
-        for index in range(2)
+        for index, host in enumerate(hosts)
     )
     resources = _RunResources()
     worker._worker = object()
@@ -462,6 +572,73 @@ def test_allocate_global_domain_builds_one_attachment_row_per_receiver_node(monk
         assert calls
     finally:
         _close_failure_injection_worker(worker, resources)
+
+
+def _attachment_matrix_for_hosts(monkeypatch, hosts):
+    """Allocate one two-rank domain across ``hosts`` and return (node_ids, handle.attachments)."""
+    from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+
+    worker, resources, node_ids = _failure_injection_worker(hosts=hosts)
+    _install_global_domain_failure_injector(monkeypatch, worker, fail_phase=None, fail_node=-1)
+    try:
+        handle = worker._allocate_global_domain(
+            name="attachment-adapters",
+            members=((node_ids[0], 0), (node_ids[1], 0)),
+            window_size=4096,
+            buffers=[CommBufferSpec("payload", "uint8", 4096, 4096)],
+            retain_after_run=False,
+        )
+        return node_ids, handle.attachments
+    finally:
+        _close_failure_injection_worker(worker, resources)
+
+
+def test_attachment_adapters_come_from_the_endpoint_planner_per_pair(monkeypatch):
+    # The matrix is per (receiver node, rank) because the answer differs per pair, which is the
+    # whole reason a row cannot collapse to one entry per host. Two nodes on one machine reach
+    # every rank window the same way; two nodes on different machines reach only their own.
+    same_ids, same_host = _attachment_matrix_for_hosts(monkeypatch, ("127.0.0.1", "127.0.0.1"))
+    cross_ids, cross_host = _attachment_matrix_for_hosts(monkeypatch, ("10.0.0.1", "10.0.0.2"))
+
+    assert len(same_host) == 4
+    assert all(attachment.adapter_kind is AdapterKind.OWNER_DELEGATED_COPY for attachment in same_host)
+    assert all(attachment.adapter_profile is AdapterProfile.HOST_VMM_COPY for attachment in same_host)
+
+    # Cross-machine: the diagonal (a node reaching the rank it owns) resolves; the off-diagonal
+    # does not, and is carried as an adapter-less host consumer rather than as a usable mapping.
+    assert len(cross_host) == 4
+    resolved = {index for index, attachment in enumerate(cross_host) if attachment.adapter_kind is not None}
+    assert resolved == {0, 3}, cross_host
+    for index in (1, 2):
+        assert cross_host[index].adapter_kind is None
+        assert cross_host[index].adapter_profile is None
+    # An adapter-less row is still a complete, HOST-consumer record on both topologies.
+    for row in (same_host, cross_host):
+        assert all(attachment.address_space is AddressSpace.HOST for attachment in row)
+        assert all(attachment.role is AttachmentRole.CONSUMER for attachment in row)
+    assert same_ids == cross_ids
+
+
+def test_attachment_adapter_pair_survives_a_wire_round_trip_with_and_without_an_adapter(monkeypatch):
+    # The None adapter has to survive encode/decode as None, not as a zero-valued enumerator:
+    # the wire reserves id 0 for "no adapter", and only a round trip proves the two directions
+    # agree on that.
+    _node_ids, cross_host = _attachment_matrix_for_hosts(monkeypatch, ("10.0.0.1", "10.0.0.2"))
+    assert any(attachment.adapter_kind is None for attachment in cross_host)
+    assert any(attachment.adapter_kind is not None for attachment in cross_host)
+
+    command = GlobalDomainCommand(
+        phase=GlobalDomainPhase.PREPARE_EXPORT,
+        domain_id=7,
+        generation=1,
+        name="round-trip",
+        profile="sim",
+        window_size=4096,
+        members=_members(),
+        buffers=(GlobalDomainBuffer("payload", 4096),),
+        attachments=cross_host,
+    )
+    assert decode_domain_command(encode_domain_command(command)).attachments == cross_host
 
 
 def test_global_domain_abort_failure_preserves_primary_error_and_poisons_admission(monkeypatch):

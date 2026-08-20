@@ -32,14 +32,26 @@ The runtime uses a 7-level hierarchy mirroring the physical topology of Ascend
 NPU clusters:
 
 ```text
-L6  CLOS2 / Cluster    ── full cluster (N6 super-nodes)
-L5  CLOS1 / SuperNode  ── super-node (N5 pods)
-L4  POD   / Pod        ── pod (4 hosts)
-L3  HOST  / Node       ── single host machine (16 chips + M SubWorkers)
-L2  CHIP  / Processor  ── one NPU chip (shared device memory)
-L1  DIE   / L2Cache    ── chip die (hardware-managed)
-L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
+L6  network3  / CLOS2 / Cluster    ── full cluster (N6 super-nodes)
+L5  network2  / CLOS1 / SuperNode  ── super-node (N5 pods)
+L4  network1  / POD   / Pod        ── pod (4 hosts)
+L3  node      / HOST  / Node       ── single host machine (16 chips + M SubWorkers)
+L2  chip      / CHIP  / Processor  ── one NPU chip (shared device memory)
+L1  —         / DIE   / L2Cache    ── chip die (hardware-managed)
+L0  core      / CORE  / AIV, AIC   ── individual compute core (hardware-managed)
 ```
+
+The first column is the level word **this code** uses — `WorkerLevel` in
+[`python/simpler/worker_level.py`](../python/simpler/worker_level.py), the
+`[STRACE]` span prefix, and `SceneTestLevel`. L1 has no word because no Worker
+sits there. The second column is the **Ascend architecture documentation's** code
+for the same level, and the third is the physical entity it denotes.
+
+L3 is where the three disagree, and that is worth reading closely: we call it
+`node`, the architecture docs call it `HOST`, and the entity is a Node. `host` is
+the *processor* name in this repository — `HostLogger`, the `host_span` ABI,
+`host_runtime.so` — so reusing it as a level word made one word mean both "which
+processor" and "which level".
 
 **L2 is the boundary** between two worlds:
 
@@ -57,10 +69,29 @@ L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
 
 | Level | Workers it contains | Status |
 | ----- | ------------------- | ------ |
-| L3 (Host) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
-| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Local implemented; remote sim implemented; HCOMM profiles pending |
-| L5 (SuperNode) | `Worker(level=4)` ×N | Local L4 code path, untested; remote proposed |
-| L6 (Cluster) | `Worker(level=5)` ×N | Local L4 code path, untested; remote proposed |
+| L3 (`node`) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
+| L4 (`network1`) | `Worker(level=3)` ×N + `SubWorker` ×M | Local implemented; remote sim implemented; HCOMM profiles pending |
+| L5 (`network2`) | `Worker(level=4)` ×N | Local L4 code path, untested; remote proposed |
+| L6 (`network3`) | `Worker(level=5)` ×N | Local L4 code path, untested; remote proposed |
+
+**This table is the one place the level words are mapped to physical entities.**
+Every word names a **topology position**, never a processor and never a
+deployment fact. A level above `node` is named for how many network hops separate
+it from the node, not for the hardware that implements it: `network1` is the layer
+commonly deployed as a **pod**, `network2` as a **supernode**, `network3` as a
+**cluster**. The words count hops because that correspondence is not fixed —
+sometimes a node sits under a pod, sometimes directly under a supernode — and
+naming a level after an interconnect does not work either, since it is mostly SU
+and sometimes RoCE. Note the digit counts hops rather than the level number:
+`network1` is L4.
+
+L3 is `node` for the same reason, and **not** `host`: `host` names the *processor*
+that `HostLogger`, the `host_span` ABI and `host_runtime.so` belong to, and L3
+merely happens to run there. So does L4, and so does part of the chip runtime —
+a level word taken from a deployment location cannot be exclusive. The ladder is
+defined once, in
+[`python/simpler/worker_level.py`](../python/simpler/worker_level.py); everything
+else in the tree uses the level word alone.
 
 `Worker` is a single C++ class that handles every level from L3 upward — the
 `level` parameter is a diagnostic label; behavior does not branch on it. The

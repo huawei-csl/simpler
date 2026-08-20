@@ -6,7 +6,7 @@ How you select what runs, turn diagnostics on, and read the artifacts back.
 
 ```bash
 pytest examples tests/st --platform a2a3sim            # simulation, no device
-pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4 --device 4-7  # hardware (SDMA/pod quarantined; pod runs in the two-machine job)
+pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4 --device 4-7  # hardware (SDMA/network1 quarantined; network1 runs in the two-machine job)
 python examples/my_example/test_my_example.py -p a2a3sim   # standalone, no pytest
 ```
 
@@ -17,7 +17,7 @@ python examples/my_example/test_my_example.py -p a2a3sim   # standalone, no pyte
 | `--platform` | Target platform: `a2a3sim`, `a2a3`, `a5sim`, `a5`. Required |
 | `--device` | Device id or range, e.g. `0` or `4-7`. Default `0` |
 | `--runtime` | Restrict to one runtime (`tensormap_and_ringbuffer`, `host_build_graph`) |
-| `--level` | Restrict to one level, e.g. `--level 2`; pod wrappers use `--level 4` |
+| `--level` | Restrict to one level, e.g. `--level 2`; network1 wrappers use `--level 4` |
 | `--exclude-level` | Exclude tests explicitly carrying one level, e.g. ordinary onboard lanes use `--exclude-level 4` |
 | `--case` | Case selector, repeatable: `Foo`, `ClassA::Foo`, or `ClassA::` for a whole class |
 | `--manual` | Manual-test handling for scene cases and standalone pytest tests: `exclude` (default), `include`, `only` |
@@ -36,14 +36,17 @@ cases use `"manual": True` or a platform list such as
 All off by default. Each also exists as a `CallConfig` field for direct-`Worker`
 programs — see the [Python API reference](python-api.md).
 
+**Every flag in this table is disabled when `--rounds > 1`**, so benchmark
+rounds stay uninstrumented. The harness warns for each one it switches off.
+
 | Flag | Meaning |
 | ---- | ------- |
 | `--enable-chip-swimlane` | Per-task timing. Bare flag = level 4 (full); `1` AICore timing, `2` + dispatch/fanout, `3` + scheduler phases, `4` + orchestration. **L2 only** |
 | `--enable-swimlane-overhead` | Adds the 8 Overhead Analysis counter tracks. Requires `--enable-chip-swimlane` **and** a `deps.json` — add `--enable-dep-gen` if absent |
 | `--enable-pmu` | AICore hardware counters. Bare flag = `PIPE_UTILIZATION` (2); pass an event type to override, e.g. `--enable-pmu 4` |
 | `--dump-args` | Capture per-task arguments. `0` off; `1` partial; `2` full; `3` hybrid (all metadata plus payload selected via `Arg::dump(...)`) |
-| `--enable-dep-gen` | Capture the dependency graph (first round only) |
-| `--enable-scope-stats` | Per-scope peaks to `<output_prefix>/scope_stats.jsonl` |
+| `--enable-dep-gen` | Capture the dependency graph |
+| `--enable-scope-stats` | Per-scope peaks to `<output_prefix>/scope_stats/scope_stats.jsonl` |
 
 Which flag answers which question is tabulated in
 [How-to: profile a kernel](../how-to/profile-a-kernel.md).

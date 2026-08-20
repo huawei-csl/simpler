@@ -24,6 +24,7 @@
 #include "platform_comm/comm_context.h"
 #include "pto_runtime_c_api.h"
 
+#include "common/acl_hal_device.h"
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
@@ -269,10 +270,14 @@ static aclError reserve_and_map_vmm_window(
         return status;
     }
 
+    // aclrtMemAccessDesc::location.id is consumed in the driver-visible space, unlike
+    // aclrtPhysicalMemProp::location.id in its caller create_local_vmm_window, which takes the ACL-logical
+    // id. Under ASCEND_RT_VISIBLE_DEVICES the logical id here names the wrong card and aclrtMemSetAccess
+    // fails with 507899 (ACL_ERROR_RT_DRV_INTERNAL_ERROR). See common/acl_hal_device.h.
     aclrtMemAccessDesc access_desc{};
     access_desc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
     access_desc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    access_desc.location.id = static_cast<uint32_t>(device_id);
+    access_desc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(device_id));
     status = aclrtMemSetAccess(base, size, &access_desc, 1);
     if (status != ACL_SUCCESS) {
         aclrtUnmapMem(base);
@@ -1082,6 +1087,18 @@ using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
 extern "C" uint32_t dma_workspace_supported_mask(void) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     return uint32_t{1} << DMA_WORKSPACE_SDMA;
+#else
+    return 0;
+#endif
+}
+
+extern "C" uint32_t dma_workspace_channel_count(void) {
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    // kSdmaMaxChannelGroups, not the device-side kSdmaMaxChannel: the two are the
+    // same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups) but
+    // only this one comes in through the host-safe workspace-manager header, and
+    // it is what SdmaWorkspaceManager::Init actually creates streams for.
+    return pto::comm::sdma::kSdmaMaxChannelGroups;
 #else
     return 0;
 #endif

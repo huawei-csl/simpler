@@ -56,14 +56,12 @@ host_tensor_write(HostTensorAccessor *, uint64_t dev_addr, const void *src, uint
 // Host fallback for the host-orchestration path. The AICPU cycle counter is a
 // device register unavailable on the host, so return a monotonic wall-clock
 // scaled to that counter's cycle units (PLATFORM_PROF_SYS_CNT_FREQ). The
-// cycle-denominated deadlock/timeout backstops that run during host orchestration
-// (PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES in the ring/heap/fanin allocators,
-// PTO2_TENSOR_DATA_TIMEOUT_CYCLES in wait_for_tensor_ready) then fire at their
-// intended wall-clock. A constant 0 made those backstops no-ops, so a
-// ring/heap/fanin-pool overflow spun forever instead of failing cleanly (host-orch
-// holds the whole graph and cannot reclaim mid-build). The AICPU build links the
-// strong device counter from device_time.cpp; hidden visibility keeps this off
-// the global dynamic symbol table.
+// cycle-denominated timeouts that run during host orchestration
+// (PTO2_TENSOR_DATA_TIMEOUT_CYCLES in wait_for_tensor_ready, the fanin spill
+// pool's backstop) then fire at their intended wall-clock; a constant 0 would
+// make them no-ops and spin forever. The AICPU build links the strong device
+// counter from device_time.cpp; hidden visibility keeps this off the global
+// dynamic symbol table.
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -98,9 +96,17 @@ static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const CoreTaskA
     return rt->orchestrator.submit_dummy_task(args);
 }
 
-static GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, const CoreTaskArgs &args) {
+static GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, const GraphTaskArgs &args) {
     if (rt == nullptr) return GraphScopeResult{};
     return rt->orchestrator.graph_begin(graph_key, args, rt->active_callable_hash);
+}
+
+static bool graph_prepare_impl(PTO2Runtime *rt, const GraphTaskArgs &args) {
+    return rt != nullptr && rt->orchestrator.graph_prepare(args);
+}
+
+static void graph_abort_impl(PTO2Runtime *rt) {
+    if (rt != nullptr) rt->orchestrator.graph_abort();
 }
 
 static bool graph_end_impl(PTO2Runtime *rt) { return rt != nullptr && rt->orchestrator.graph_end(); }
@@ -117,7 +123,14 @@ void rt_scope_begin(PTO2Runtime *rt) {
 
 void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
-void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
+void rt_orchestration_done(PTO2Runtime *rt) {
+    // Host orchestration calls this runtime entry directly rather than the
+    // orchestration-SO wrapper. Commit here as well so an all-Graph entry has a
+    // final synchronization point for its asynchronous recording and deferred
+    // outer shells even when no later non-Graph task forced an earlier commit.
+    rt->orchestrator.graph_commit();
+    rt->orchestrator.mark_done();
+}
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
@@ -381,6 +394,8 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .available_cluster_count = available_cluster_count_impl,
     .available_aiv_count = available_aiv_count_impl,
     .graph_begin = graph_begin_impl,
+    .graph_prepare = graph_prepare_impl,
+    .graph_abort = graph_abort_impl,
     .graph_end = graph_end_impl,
     .graph_commit = graph_commit_impl,
 #if SIMPLER_DFX

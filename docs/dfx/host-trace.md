@@ -46,8 +46,9 @@ The visible Perfetto axis remains monotonic; each mapped host event exposes the
 exact decimal `wall_ts_ns` and a UTC `wall_time` in its arguments, while the JSON
 top level retains the source mappings in `clockAnchors`. Nanosecond epoch values
 are strings because JSON consumers commonly use IEEE-754 numbers, which cannot
-represent current epoch nanoseconds exactly. Old logs without an anchor retain
-their existing output, and `clk=dev` records never receive host wall time.
+represent current epoch nanoseconds exactly. A log with no anchor for a pid gets
+no wall time for that pid's events and is otherwise unaffected, and `clk=dev`
+records never receive host wall time.
 
 One line per span, emitted on scope exit
 (`src/common/log/include/common/strace.h`):
@@ -117,36 +118,43 @@ including time the caller spends polling or doing other host work; blocking
 | 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, `chip.run.runner_run.device_wall` |
 | 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
-## L3/L4 host scheduler spans
+## Host scheduler spans
 
 Every hierarchical worker that drives next-level children emits these spans
-through the logger compiled into `_task_interface` — an L3 with chips and an
-L4 pod alike, since the orchestrator and scheduler code they run is the same:
+through the logger compiled into `_task_interface`, since the orchestrator and
+scheduler code they run is the same at every level above the chip. **The leading
+word names the level that emitted them**, so `<level>` below is one of `node`
+(L3), `network1` (L4), `network2` (L5) or `network3` (L6) — see
+[`python/simpler/worker_level.py`](../../python/simpler/worker_level.py) for the
+ladder. It is never `host`: that names the *processor* this span ABI belongs to,
+which every one of those levels runs on:
 
-| Span | Host decision point |
-| ---- | ------------------- |
-| `host.graph_build` | serialized Python graph callback |
-| `host.submit` | next-level task publication after slot allocation |
-| `host.dispatch` | scheduler handoff to a worker thread |
-| `host.frame_submit` | local child mailbox-frame publication |
-| `host.activate` | prepared-frame activation |
-| `host.complete` | terminal child progress handling |
-| `host.post_fence_retirement` | run erase + quiescent compaction, after the completion fence |
+| Span | Decision point |
+| ---- | -------------- |
+| `<level>.graph_build` | serialized Python graph callback |
+| `<level>.submit` | next-level task publication after slot allocation |
+| `<level>.dispatch` | scheduler handoff to a worker thread |
+| `<level>.frame_submit` | local child mailbox-frame publication |
+| `<level>.activate` | prepared-frame activation |
+| `<level>.complete` | terminal child progress handling |
+| `<level>.post_fence_retirement` | run erase + quiescent compaction, after the completion fence |
 
 Their attributes carry the available `run_id`, `task_slot`, `group_index`,
 `worker_id`, `dispatch_id`, endpoint kind, and the dispatch's pipeline lease
 (`slot_id` / `generation`).
 
-Because the names do not encode which level emitted them, a pod run puts the L4
-process and each of its L3 processes on lanes that differ only by pid. The
-per-level vocabulary that resolves this is tracked in
-[#1793](https://github.com/hw-native-sys/simpler/issues/1793).
+The word is resolved once per process, from its Worker's level, and the **first
+binding wins**: a `SpanScope` keeps the name pointer it was handed, so a process
+that inits Workers at two levels keeps the first one's word and logs a warning
+rather than relabelling spans that are still open. One process therefore carries
+one vocabulary — which is what makes an L4 run readable, since its own spans say
+`network1.` while each of its L3 children says `host.`.
 
 One process contributes at most two host lanes, because the scheduler runs on
-one thread: the facade thread emits `host.graph_build` and `host.submit`, and the
-scheduler thread emits the other four. `role=worker` on `host.frame_submit`,
-`host.activate` and `host.complete` names the worker a dispatch targets, not the
-thread that ran it.
+one thread: the facade thread emits `<level>.graph_build` and `<level>.submit`,
+and the scheduler thread emits the other four. `role=worker` on
+`<level>.frame_submit`, `<level>.activate` and `<level>.complete` names the
+worker a dispatch targets, not the thread that ran it.
 
 The spans reach the logger over the fixed POD `SimplerHostSpan` ABI in
 `common/host_span.h`. `_task_interface` compiles the host logger directly, so
@@ -158,6 +166,35 @@ that state before `fork()`; a chip child re-seeds its inherited copy and passes
 the same pointer to every runtime module it loads. The threshold and one-anchor
 coordination are therefore shared within each process without relying on
 `RTLD_GLOBAL` logger symbols.
+
+## `ext.` — spans from outside simpler
+
+Every level word above belongs to simpler, so a span from any other producer
+leads with the reserved word `ext.` and names itself:
+
+```text
+ext.<producer>.<span>          e.g. ext.pypto.decode_layer
+```
+
+All three segments are required. `ext.foo` names no span of its own and
+`ext..foo` names no producer, so neither attributes to anyone — such a span is
+still recognized as external (it can never be mistaken for ours) but renders in
+an unattributed lane. A producer segment may itself be one of our level words:
+`ext.host.foo` attributes to a producer called `host` and remains external.
+
+What the namespace guarantees, in both directions:
+
+| Guarantee | What holds |
+| --------- | ---------- |
+| **Visible in** | `--swimlane`, on the emitting pid/tid. This is the only view that renders external spans. |
+| **Excluded from** | the TPOT, rounds and `--tree` tables and `--trace-out`, all of which key on `(pid, inv)`. `inv` is our native run epoch and no public surface exposes it, so admitting external spans would collapse every one of them into a single forged invocation. |
+| **Cannot affect** | lane naming, lane splitting, or dispatch-flow pairing. Our views infer those only from our own spans, so `role`, `slot_id`, `run_id` and `depth` on an external span carry whatever meaning its producer wants. |
+| **Process label** | a process that emitted only external spans is labelled `external producer <name> (pid=N)`, with no `simpler` prefix. A producer emitting into one of our processes — the common case for a caller of the public API — leaves that process labelled as ours. |
+
+The contract is executable: `tests/ut/py/test_strace_timing.py` asserts each row
+above under the `ext.` heading near the end of the file. A repository adapting to
+this namespace can read those tests as the specification and mirror them against
+its own emitter.
 
 ## Reading the markers — `strace_timing.py`
 
@@ -232,7 +269,7 @@ tree, and the root span already carries the identity that tells two runs apart.
 
 Only `claim_release` was added for this: it wraps `release_native_run` inside
 finalize, the point a successor's launch becomes admissible, and no other span
-marks that boundary. `host.post_fence_retirement` covers the L3 orchestrator's
+marks that boundary. `node.post_fence_retirement` covers the L3 orchestrator's
 `release_run` tail for the same reason.
 
 The identity is `run_id / dispatch_id / run_epoch / slot_id / generation`. Each

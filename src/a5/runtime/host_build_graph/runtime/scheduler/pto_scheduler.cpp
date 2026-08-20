@@ -24,7 +24,6 @@
 #if SIMPLER_DFX
 // Weak fallbacks for host/UT builds that don't link the scope_stats collector.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
-extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 #endif
 
 // =============================================================================
@@ -72,31 +71,46 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 // =============================================================================
 
 void PTO2SchedulerState::print_stats() {
-    PTO2SchedulerState *sched = this;
     LOG_DEBUG("=== Scheduler Statistics ===");
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (sched->ring_sched_state.last_task_alive > 0) {
-            LOG_DEBUG("Ring %d:", r);
-            LOG_DEBUG("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
-        }
-    }
 #if SIMPLER_SCHED_PROFILING
-    LOG_DEBUG("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
-    LOG_DEBUG("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
+    LOG_DEBUG("tasks_completed:   %lld", (long long)tasks_completed.load(std::memory_order_relaxed));
+    LOG_DEBUG("tasks_consumed:    %lld", (long long)tasks_consumed.load(std::memory_order_relaxed));
 #endif
     LOG_DEBUG("============================");
 }
 
 void PTO2SchedulerState::print_queues() {
     PTO2SchedulerState *sched = this;
-    LOG_DEBUG("=== Ready Queues ===");
-
     const char *shape_names[] = {"AIC", "AIV", "MIX"};
-
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        LOG_DEBUG("  %s: count=%" PRIu64, shape_names[i], sched->ready_queues[i].size());
+        LOG_TIMING(
+            "QPROBE rq[%s] pushes=%llu maxocc=%llu cap=%llu", shape_names[i],
+            (unsigned long long)sched->ready_queues[i].enqueue_pos.load(std::memory_order_relaxed),
+            (unsigned long long)sched->ready_queues[i].max_occupancy.load(std::memory_order_relaxed),
+            (unsigned long long)sched->ready_queues[i].capacity
+        );
+        LOG_TIMING(
+            "QPROBE rsq[%s] pushes=%llu maxocc=%llu", shape_names[i],
+            (unsigned long long)sched->ready_sync_queues[i].enqueue_pos.load(std::memory_order_relaxed),
+            (unsigned long long)sched->ready_sync_queues[i].max_occupancy.load(std::memory_order_relaxed)
+        );
+        LOG_TIMING(
+            "QPROBE edq[%s] pushes=%llu maxocc=%llu cap=%llu", shape_names[i],
+            (unsigned long long)sched->early_dispatch_queues[i].enqueue_pos.load(std::memory_order_relaxed),
+            (unsigned long long)sched->early_dispatch_queues[i].max_occupancy.load(std::memory_order_relaxed),
+            (unsigned long long)sched->early_dispatch_queues[i].capacity
+        );
     }
-    LOG_DEBUG("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
-
-    LOG_DEBUG("====================");
+    LOG_TIMING(
+        "QPROBE dummy pushes=%llu maxocc=%llu | graph_rq pushes=%llu maxocc=%llu | graph_pq pushes=%llu maxocc=%llu | "
+        "ess pushes=%llu maxocc=%llu",
+        (unsigned long long)sched->dummy_ready_queue.enqueue_pos.load(std::memory_order_relaxed),
+        (unsigned long long)sched->dummy_ready_queue.max_occupancy.load(std::memory_order_relaxed),
+        (unsigned long long)sched->graph_ready_queue.enqueue_pos.load(std::memory_order_relaxed),
+        (unsigned long long)sched->graph_ready_queue.max_occupancy.load(std::memory_order_relaxed),
+        (unsigned long long)sched->graph_prepare_queue.enqueue_pos.load(std::memory_order_relaxed),
+        (unsigned long long)sched->graph_prepare_queue.max_occupancy.load(std::memory_order_relaxed),
+        (unsigned long long)sched->early_sync_start_queue.enqueue_pos.load(std::memory_order_relaxed),
+        (unsigned long long)sched->early_sync_start_queue.max_occupancy.load(std::memory_order_relaxed)
+    );
 }

@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #include "common/core_type.h"
 #include "common/host_api.h"
 #include "common/platform_config.h"
+#include "common/sdma_warmup_layout.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 #include "host/host_phase_records_artifact.h"
@@ -171,42 +173,6 @@ void DeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *ad
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *DeviceRunnerBase::acquire_graph_execution_buffer(
-    uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment
-) {
-    if (pipeline_slot >= graph_execution_buffers_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return nullptr;
-    }
-    std::vector<RetainedGraphExecutionBuffer> &buffers = graph_execution_buffers_[pipeline_slot][graph_key];
-    if (occurrence >= buffers.size()) buffers.resize(static_cast<size_t>(occurrence) + 1);
-    RetainedGraphExecutionBuffer &buffer = buffers[occurrence];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
-    }
-
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphExecutionBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
-}
-
 void *DeviceRunnerBase::acquire_graph_definition_buffer(
     uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
 ) {
@@ -214,7 +180,7 @@ void *DeviceRunnerBase::acquire_graph_definition_buffer(
         (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
         return nullptr;
     }
-    RetainedGraphExecutionBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
+    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
     if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
         reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
         return buffer.aligned_addr;
@@ -237,19 +203,11 @@ void *DeviceRunnerBase::acquire_graph_definition_buffer(
         mem_alloc_.free(allocation);
         return nullptr;
     }
-    buffer = RetainedGraphExecutionBuffer{allocation, aligned_addr, bytes};
+    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
     return aligned_addr;
 }
 
-void DeviceRunnerBase::release_graph_execution_buffers() {
-    for (GraphExecutionBufferMap &by_key : graph_execution_buffers_) {
-        for (auto &entry : by_key) {
-            for (RetainedGraphExecutionBuffer &buffer : entry.second) {
-                if (buffer.allocation != nullptr) mem_alloc_.free(buffer.allocation);
-            }
-        }
-        by_key.clear();
-    }
+void DeviceRunnerBase::release_graph_definition_buffers() {
     for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
         for (auto &entry : by_key) {
             if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
@@ -258,10 +216,7 @@ void DeviceRunnerBase::release_graph_execution_buffers() {
     }
 }
 
-void DeviceRunnerBase::abandon_graph_execution_buffers() {
-    for (GraphExecutionBufferMap &by_key : graph_execution_buffers_) {
-        by_key.clear();
-    }
+void DeviceRunnerBase::abandon_graph_definition_buffers() {
     for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
         by_key.clear();
     }
@@ -974,7 +929,9 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-int DeviceRunnerBase::provision_dma_workspace(uint32_t required_mask) {
+int DeviceRunnerBase::provision_dma_workspace(
+    uint32_t required_mask, const void *sdma_warmup_binary, size_t sdma_warmup_size
+) {
     const uint32_t supported = dma_workspace_supported_mask();
     if ((required_mask & ~supported) != 0) {
         LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
@@ -1013,7 +970,151 @@ int DeviceRunnerBase::provision_dma_workspace(uint32_t required_mask) {
             dma_workspace_addr_[kind] = 0;
         return rc;
     }
+
+    // Deliberately after the re-latch: warming needs the live workspace. An
+    // unavailable warmup leaves provisioning successful, because the only cost is
+    // first-call latency. A device error does not: the card the warmup just faulted
+    // on would otherwise reach the first run. No dma_workspace_release() on that
+    // path — launch_sdma_warmup_kernel() has marked the runner unusable, and
+    // per-resource release on a faulted card is exactly what finalize()'s fatal
+    // path exists to avoid. The workspace handle stays set so that path still sees
+    // an SDMA generation and applies its handoff delay.
+    rc = launch_sdma_warmup_kernel(sdma_warmup_binary, sdma_warmup_size);
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: sdma warmup left the device unusable: %d", rc);
+        return rc;
+    }
     return 0;
+}
+
+int DeviceRunnerBase::launch_sdma_warmup_kernel(const void *binary, size_t size) {
+    // Reaching here means the workspace was provisioned, so this platform does
+    // support SDMA and a missing ELF is a build/staging regression rather than
+    // the expected state — worth a warning even though it is not fatal.
+    if (binary == nullptr || size == 0) {
+        LOG_WARN("sdma warmup: no warmup ELF supplied; the first TPREFETCH_ASYNC will pay the cold control path");
+        return 0;
+    }
+    const uint32_t channel_count = dma_workspace_channel_count();
+    const uint64_t workspace = dma_workspace_addr_[DMA_WORKSPACE_SDMA];
+    if (channel_count == 0 || workspace == 0) {
+        LOG_INFO("sdma warmup: no channels or no workspace address; skipping");
+        return 0;
+    }
+
+    if (sdma_warmup_bin_handle_ == nullptr) {
+        rtDevBinary_t warmup_binary;
+        std::memset(&warmup_binary, 0, sizeof(warmup_binary));
+        // AIVEC, not the executor's ELF magic: this binary has no cube half.
+        warmup_binary.magic = RT_DEV_BINARY_MAGIC_ELF_AIVEC;
+        warmup_binary.version = 0;
+        warmup_binary.data = binary;
+        warmup_binary.length = size;
+        int reg_rc = rtRegisterAllKernel(&warmup_binary, &sdma_warmup_bin_handle_);
+        if (reg_rc != 0 || sdma_warmup_bin_handle_ == nullptr) {
+            LOG_WARN("sdma warmup: rtRegisterAllKernel failed: %d; skipping warmup", reg_rc);
+            sdma_warmup_bin_handle_ = nullptr;
+            return 0;
+        }
+    }
+
+    // One cache line per channel, see sdma_warmup_layout.h. Transient: the launch
+    // is synchronized here, so nothing outlives this call.
+    const size_t status_bytes = static_cast<size_t>(channel_count) * kSdmaWarmupStatusStrideBytes;
+    void *status_dev = allocate_tensor(status_bytes);
+    if (status_dev == nullptr) {
+        LOG_WARN("sdma warmup: could not allocate %zu status bytes; skipping warmup", status_bytes);
+        return 0;
+    }
+    // Zero means "no core reached this channel", so the buffer must start clean
+    // for the readback below to be meaningful.
+    int rc = device_memset(status_dev, 0, status_bytes);
+    if (rc != 0) {
+        LOG_WARN("sdma warmup: status zero-fill failed: %d; skipping warmup", rc);
+        free_tensor(status_dev);
+        return 0;
+    }
+
+    struct Args {
+        uint64_t workspace;
+        uint64_t status;
+        uint64_t channel_count;
+    };
+    Args args = {workspace, reinterpret_cast<uint64_t>(status_dev), channel_count};
+    rtArgsEx_t rt_args;
+    std::memset(&rt_args, 0, sizeof(rt_args));
+    rt_args.args = &args;
+    rt_args.argsSize = sizeof(args);
+
+    rtTaskCfgInfo_t cfg = {};
+    cfg.schemMode = RT_SCHEM_MODE_BATCH;
+
+    // block_dim is kSdmaWarmupBlockDim, NOT channel_count: the cold cost is
+    // per-channel and serializes in the engine regardless of how many cores push
+    // on it, so extra blocks buy nothing (measured) and tying block_dim to the
+    // channel count would break on any chip with fewer AIVs than channels. The
+    // kernel walks channels grid-stride to cover all of them from 8 blocks.
+    const auto started = std::chrono::steady_clock::now();
+    rc = rtKernelLaunchWithHandleV2(
+        sdma_warmup_bin_handle_, 0, kSdmaWarmupBlockDim, &rt_args, nullptr, stream_aicore_, &cfg
+    );
+    if (rc == 0) {
+        rc = rtStreamSynchronize(stream_aicore_);
+    }
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (rc != 0) {
+        LOG_ERROR("sdma warmup: launch/sync failed: %d; the card is left poisoned", rc);
+        // No free_tensor(status_dev): rtFree on a card that just failed an AICore
+        // operation can block in DEV_RUNNING_DOWN. The allocation stays tracked by
+        // mem_alloc_ and is forgotten wholesale by the fatal teardown the mark
+        // below routes finalize() into.
+        recover_device_or_mark_unusable(rc);
+        return rc;
+    }
+
+    report_sdma_warmup_status(status_dev, channel_count, elapsed_ms);
+    return 0;
+}
+
+void DeviceRunnerBase::report_sdma_warmup_status(void *status_dev, uint32_t channel_count, double elapsed_ms) {
+    const size_t status_bytes = static_cast<size_t>(channel_count) * kSdmaWarmupStatusStrideBytes;
+    std::vector<uint8_t> status_host(status_bytes, 0);
+    const int rc = copy_from_device(status_host.data(), status_dev, status_bytes);
+    free_tensor(status_dev);
+    if (rc != 0) {
+        LOG_WARN("sdma warmup: status D2H failed: %d; warmup ran but is unverified", rc);
+        return;
+    }
+
+    uint32_t warmed = 0;
+    uint32_t declined = 0;
+    for (uint32_t channel = 0; channel < channel_count; ++channel) {
+        uint32_t slot = 0;
+        std::memcpy(
+            &slot, status_host.data() + static_cast<size_t>(channel) * kSdmaWarmupStatusStrideBytes, sizeof(slot)
+        );
+        if (slot == kSdmaWarmupStatusOk) {
+            ++warmed;
+        } else if (slot == kSdmaWarmupStatusFailed) {
+            ++declined;
+        }
+    }
+    // TIMING, not INFO: this is a one-off multi-millisecond init cost paid to
+    // remove the same cost from the first run, so it belongs with the other
+    // performance markers that stay visible at the default threshold.
+    if (warmed == channel_count) {
+        LOG_TIMING("sdma warmup: %u/%u channels warmed in %.2f ms", warmed, channel_count, elapsed_ms);
+    } else {
+        // The two shortfalls have different causes: a declined channel was reached
+        // but failed the warmup's preconditions (unpopulated SQ, non-empty queue),
+        // while an unreached one means the walk itself did not cover the channel.
+        LOG_WARN(
+            "sdma warmup: only %u/%u channels warmed in %.2f ms (%u declined, %u unreached); "
+            "the rest keep their cold-start cost",
+            warmed, channel_count, elapsed_ms, declined, channel_count - warmed - declined
+        );
+    }
 }
 
 uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
@@ -1107,13 +1208,14 @@ HostPhaseRecordPool *DeviceRunnerBase::host_phase_pool_arm(bool producer_wants_r
         clock_correlation_provider_.reset();
     }
     const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
+    const bool artifact_wants_records = producer_wants_records && !output_prefix_.empty();
     chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
     // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
     // where an escaping exception is std::terminate. A pass that cannot get its
     // storage collects no records and says so by handing back nullptr.
     HostPhaseRecordPool *pool = nullptr;
     try {
-        pool = host_phase_records_.arm(producer_wants_records || swimlane_wants_records);
+        pool = host_phase_records_.arm(artifact_wants_records || swimlane_wants_records);
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
@@ -1277,8 +1379,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
 
     // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
-    // releases its device-side state when the device context tears down.
+    // releases its device-side state when the device context tears down. Same for
+    // the SDMA warmup ELF's separate handle.
     aicore_bin_handle_ = nullptr;
+    sdma_warmup_bin_handle_ = nullptr;
     binaries_loaded_ = false;
     // The inner AICPU SO is unloaded with the binaries above, so its latched
     // globals are gone too — clear the one-shot guard so a reused runner
@@ -1334,11 +1438,11 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     prebuilt_runtime_arena_cache_image_.clear();
 
     if (abandon_device_resources) {
-        abandon_graph_execution_buffers();
+        abandon_graph_definition_buffers();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
     } else {
-        release_graph_execution_buffers();
+        release_graph_definition_buffers();
         clear_temporary_buffer();
     }
 

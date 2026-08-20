@@ -56,11 +56,13 @@ inline constexpr std::array<const char *, static_cast<size_t>(HostSpan::kCount)>
     ".graph_build", ".submit", ".dispatch", ".frame_submit", ".activate", ".complete", ".post_fence_retirement",
 };
 
-/// The bound level word. Defaults to `host`: L3 is the only level that has ever
+/// The bound level word. Defaults to `node`: L3 is the only level that has ever
 /// driven this code in a shipped configuration, so an unset prefix names the
-/// truth rather than an arbitrary placeholder.
+/// truth rather than an arbitrary placeholder. The word names a topology
+/// position, so it is never the processor name `host` — that belongs to the
+/// `host_span` ABI this file implements, which every level above the chip uses.
 inline std::string &level_word() {
-    static std::string word = "host";
+    static std::string word = "node";
     return word;
 }
 
@@ -77,22 +79,42 @@ inline std::array<std::string, static_cast<size_t>(HostSpan::kCount)> &host_span
     return table;
 }
 
+/// Whether the word has been bound. A second binding is refused rather than
+/// applied — see `set_level_prefix`.
+inline bool &prefix_bound() {
+    static bool bound = false;
+    return bound;
+}
+
 }  // namespace detail
 
 /**
- * Bind this process's level word, e.g. `"host"` or `"network1"`.
+ * Bind this process's level word, e.g. `"node"` or `"network1"`.
  *
- * Called once during Worker init, before any worker thread starts and before
- * the first span — the table is then read-only, which is why it needs no lock.
- * A null or empty word leaves the default in place.
+ * **The first non-empty word wins; every later one is refused.** Two reasons,
+ * and neither is enforceable by documentation alone:
+ *
+ *  - `SpanScope` stores the `const char *` it was handed and dereferences it in
+ *    its destructor. Rebinding reassigns these strings, which may reallocate, so
+ *    a scope open across a rebind would emit through a dangling pointer.
+ *  - A process that constructs Workers at two levels would otherwise relabel the
+ *    first Worker's spans while it is still running.
+ *
+ * A null or empty word leaves the current binding in place. `level_prefix()`
+ * always reports what is actually bound, so a caller that asked for something
+ * else can see that it did not get it — Python compares the two and warns,
+ * because one process has one vocabulary and that is worth saying out loud
+ * rather than discovering in a trace.
  */
 inline void set_level_prefix(const char *word) {
     if (word == nullptr || *word == '\0') return;
+    if (detail::prefix_bound()) return;
     detail::level_word() = word;
     auto &table = detail::host_span_table();
     for (size_t i = 0; i < table.size(); ++i) {
         table[i] = detail::level_word() + detail::kHostSpanSuffixes[i];
     }
+    detail::prefix_bound() = true;
 }
 
 /// The level word currently bound, for a caller that must agree with it.

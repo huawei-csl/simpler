@@ -18,7 +18,15 @@ from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports
 
 from .comm_endpoints import AdapterKind, AdapterProfile, AttachmentRole
 
+#: Descriptor layout. Paired with ``COMM_GLOBAL_DOMAIN_VERSION`` in
+#: ``src/common/platform_comm/comm.h``: the platform backend stamps this number into every
+#: descriptor it exports and ``_validate_descriptor`` checks it on decode, so advancing one
+#: without the other fails every allocation at PREPARE. The ``LOCAL_*`` L3->L2 mailbox structs
+#: in ``worker.py`` also carry it; producer and consumer there are the same build.
 GLOBAL_DOMAIN_VERSION = 2
+#: L4<->L3 control-command layout: COMM_INIT, ALLOC_DOMAIN, RELEASE and COPY. Python owns both
+#: ends, so this advances on its own -- a command-layout change needs no C++ rebuild.
+GLOBAL_DOMAIN_COMMAND_VERSION = 2
 GLOBAL_DOMAIN_MAX_RANKS = 64
 GLOBAL_DOMAIN_MAX_BUFFERS = 64
 GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS = GLOBAL_DOMAIN_MAX_RANKS
@@ -309,6 +317,12 @@ def validate_member_table(members: tuple[GlobalDomainMember, ...]) -> None:
         raise ValueError("global domain members require unique non-negative global device ranks")
 
 
+# Wire ids for the three ``comm_endpoints`` enums this command carries. They are string enums, so
+# the wire needs its own numbering, and these numbers are part of the version-2 command format: a
+# value's id is fixed for the life of the version, and 0 is reserved for "no adapter". Adding an
+# enumerator means adding an id here; renaming or renumbering one is a wire break. Encoding and
+# decoding both reject an id this table does not name, so an enumerator that is added upstream and
+# not mirrored here fails closed rather than travelling as a wrong value.
 _ATTACHMENT_ROLE_IDS = {
     AttachmentRole.PROVIDER: 1,
     AttachmentRole.CONSUMER: 2,
@@ -392,8 +406,16 @@ def _normalize_attachment(attachment: GlobalDomainAttachment) -> GlobalDomainAtt
         role = AttachmentRole(attachment.role)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"global domain attachment role is unknown: {attachment.role!r}") from exc
-    adapter_kind = None if attachment.adapter_kind is None else AdapterKind(attachment.adapter_kind)
-    adapter_profile = None if attachment.adapter_profile is None else AdapterProfile(attachment.adapter_profile)
+    try:
+        adapter_kind = None if attachment.adapter_kind is None else AdapterKind(attachment.adapter_kind)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"global domain attachment adapter_kind is unknown: {attachment.adapter_kind!r}") from exc
+    try:
+        adapter_profile = None if attachment.adapter_profile is None else AdapterProfile(attachment.adapter_profile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"global domain attachment adapter_profile is unknown: {attachment.adapter_profile!r}"
+        ) from exc
     if (adapter_kind is None) != (adapter_profile is None):
         raise ValueError("global domain attachment adapter_kind and adapter_profile must be paired")
     if int(attachment.node_worker_id) < 0:
@@ -518,7 +540,7 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
         raise ValueError(f"unsupported global domain profile {command.profile!r}")
     if command.node_rank < 0 or command.node_count <= 0 or command.node_rank >= command.node_count:
         raise ValueError("global comm init node identity is invalid")
-    out = bytearray(struct.pack("<III", GLOBAL_DOMAIN_VERSION, command.node_rank, command.node_count))
+    out = bytearray(struct.pack("<III", GLOBAL_DOMAIN_COMMAND_VERSION, command.node_rank, command.node_count))
     _put_string(out, command.cluster_id, "cluster_id")
     _put_string(out, command.topology_hash, "topology_hash")
     _put_string(out, command.profile, "profile")
@@ -531,7 +553,7 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
 def decode_comm_init(data: bytes) -> GlobalCommInitCommand:
     reader = _Reader(data)
     version = reader.u32()
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global comm init version mismatch")
     node_rank = reader.u32()
     node_count = reader.u32()
@@ -615,7 +637,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     out = bytearray(
         struct.pack(
             "<IIQQQ",
-            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_COMMAND_VERSION,
             int(command.phase),
             int(command.domain_id),
             int(command.generation),
@@ -643,7 +665,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
     version = reader.u32()
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global domain command version mismatch")
     try:
         phase = GlobalDomainPhase(reader.u32())
@@ -711,14 +733,14 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:
     if command.domain_id == 0 or command.generation == 0:
         raise ValueError("global domain release identity must be positive")
-    return struct.pack("<IQQ", GLOBAL_DOMAIN_VERSION, int(command.domain_id), int(command.generation))
+    return struct.pack("<IQQ", GLOBAL_DOMAIN_COMMAND_VERSION, int(command.domain_id), int(command.generation))
 
 
 def decode_release_command(data: bytes) -> GlobalDomainReleaseCommand:
     if len(data) != struct.calcsize("<IQQ"):
         raise ValueError("global domain release size mismatch")
     version, domain_id, generation = struct.unpack("<IQQ", data)
-    if version != GLOBAL_DOMAIN_VERSION or domain_id == 0 or generation == 0:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION or domain_id == 0 or generation == 0:
         raise ValueError("global domain release identity or version is invalid")
     return GlobalDomainReleaseCommand(int(domain_id), int(generation))
 
@@ -740,7 +762,7 @@ def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool)
     out = bytearray(
         struct.pack(
             "<IQQIQQ",
-            GLOBAL_DOMAIN_VERSION,
+            GLOBAL_DOMAIN_COMMAND_VERSION,
             int(command.domain_id),
             int(command.generation),
             int(command.domain_rank),
@@ -767,7 +789,7 @@ def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyC
         nbytes=int(nbytes),
         data=bytes(payload),
     )
-    if version != GLOBAL_DOMAIN_VERSION:
+    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
         raise ValueError("global domain copy version mismatch")
     encode_copy_command(command, include_data=include_data)
     return command

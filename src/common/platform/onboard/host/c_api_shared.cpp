@@ -156,18 +156,6 @@ static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, v
     } catch (...) {}
 }
 
-static void *acquire_graph_execution_buffer(
-    void *runner_ctx, uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment
-) {
-    if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<DeviceRunnerBase *>(runner_ctx)
-            ->acquire_graph_execution_buffer(pipeline_slot, graph_key, occurrence, bytes, alignment);
-    } catch (...) {
-        return nullptr;
-    }
-}
-
 static void *acquire_graph_definition_buffer(
     void *runner_ctx, uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
 ) {
@@ -293,7 +281,6 @@ static const HostApiOps g_host_api_ops = {
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
-    .acquire_graph_execution_buffer = acquire_graph_execution_buffer,
     .acquire_graph_definition_buffer = acquire_graph_definition_buffer,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
@@ -818,6 +805,18 @@ int simpler_prepare_run(
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared) return -1;
+    // TEMPORARY (host_build_graph dsv4 bring-up): stop after prepare so the host
+    // side — orchestration, graph construction, image relocation and H2D — can be
+    // measured while the device execution of that graph still stalls. Sitting in
+    // launch (not simpler_run) covers the split prepare/launch/wait entry points
+    // the chip subprocess uses, which never call simpler_run. Outputs are never
+    // produced, so any run under this variable is a timing harness, not a test.
+    // Delete this together with the variable once the stall is diagnosed.
+    if (std::getenv("SIMPLER_SKIP_DEVICE_RUN") != nullptr) {
+        state->completion_rc = 0;
+        state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+        return 0;
+    }
     if (!state->runner->can_accept_run() || !state->runner_reserved) return -1;
     if (state->prepared_execution == nullptr ||
         !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
@@ -1095,10 +1094,14 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
     }
 }
 
-int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+int simpler_provision_dma_workspace(
+    DeviceContextHandle ctx, uint32_t required_mask, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
+) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunnerBase *>(ctx)->provision_dma_workspace(required_mask);
+        return static_cast<DeviceRunnerBase *>(ctx)->provision_dma_workspace(
+            required_mask, sdma_warmup_binary, static_cast<size_t>(sdma_warmup_size)
+        );
     } catch (...) {
         return -1;
     }

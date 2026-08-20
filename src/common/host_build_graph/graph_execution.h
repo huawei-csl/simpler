@@ -136,6 +136,13 @@ struct GraphDefinition {
     uint32_t boundary_scalar_count;
     uint32_t tensor_arg_count;
     uint32_t scalar_arg_count;
+    // Bytes an execution of this Definition needs for its GraphExecution header,
+    // node storage and patch arrays. Derived from task_count / tensor_arg_count /
+    // scalar_arg_count, so host and device read one value instead of each
+    // computing it. The outer GRAPH task's heap allocation covers
+    // required_heap + this, and the execution lives at
+    // packed_buffer_base + required_heap.
+    uint32_t execution_storage_bytes;
     uint32_t off_fanout_offsets;
     uint32_t off_fanout_indices;
     uint32_t off_fanin_offsets;
@@ -150,10 +157,13 @@ struct GraphDefinition {
     uint32_t off_boundary_signatures;
 };
 
+// One submission of a Graph. The static Definition is a shared device object
+// this references by address; the execution storage is not referenced at all —
+// it sits at outer_slot.task->packed_buffer_base + definition->required_heap,
+// so both sides derive it from the Definition rather than carrying it on the
+// wire.
 struct GraphSubmission {
     uint64_t graph_key;
-    uint64_t execution_storage;
-    uint64_t execution_storage_bytes;
     uint64_t local_execution;
     // Device GM address of the shared Definition object this replay references
     // (an integer-typed absolute address per the wire rules) plus the content
@@ -307,48 +317,15 @@ enum class GraphMaterializeResult : uint8_t {
     PREPARED = 3,
 };
 
-enum class GraphTensorAddressSource : uint8_t {
-    BOUNDARY = 0,
-    INTERNAL = 1,
-};
-
-// Precomputed on the first materialization and retained next to the node
-// storage. Affine replay walks this compact POD instead of re-reading and
-// classifying GraphTensorSourceRef entries from the Definition.
-struct GraphTensorAddressPatch {
-    uint64_t address_offset;
-    uint16_t source_index;
-    uint8_t source;
-    uint8_t reserved[5];
-};
-
-static_assert(std::is_trivially_copyable_v<GraphTensorAddressPatch>);
-static_assert(std::is_standard_layout_v<GraphTensorAddressPatch>);
-static_assert(sizeof(GraphTensorAddressPatch) == 16);
-
-struct GraphScalarPatch {
-    uint16_t node_index;
-    uint8_t node_scalar_index;
-    uint8_t boundary_scalar_index;
-};
-
-static_assert(std::is_trivially_copyable_v<GraphScalarPatch>);
-static_assert(std::is_standard_layout_v<GraphScalarPatch>);
-static_assert(sizeof(GraphScalarPatch) == 4);
-static_assert(GRAPH_MAX_NODES <= UINT16_MAX);
-static_assert(MAX_SCALAR_ARGS <= UINT8_MAX);
-
 struct alignas(64) GraphNodeStorage {
     PTO2TaskDescriptor task;
     PTO2TaskPayload payload;
     PTO2TaskSlotState slot;
 };
 
-inline constexpr uint64_t GRAPH_EXECUTION_STORAGE_MAGIC = 0x4752415048455845ULL;
 inline constexpr uint64_t GRAPH_EXECUTION_INITIALIZING = 1;
 
 struct GraphExecution {
-    uint64_t storage_magic{0};
     std::atomic<GraphExecutionState> state{GraphExecutionState::SUBMITTED};
     std::atomic<uint8_t> materialize_busy{0};
     std::atomic<int32_t> remaining_nodes{0};
@@ -361,28 +338,12 @@ struct GraphExecution {
     std::atomic<int32_t> published_nodes{0};
     std::atomic<int32_t> route_cursor{0};
     int32_t node_count{0};
-    int32_t node_capacity{0};
     int32_t materialized_nodes{0};
-    int32_t materialized_node_count{0};
     int32_t constructed_nodes{0};
-    uint32_t tensor_patch_capacity{0};
-    uint32_t materialized_tensor_patches{0};
-    uint32_t materialized_tensor_patch_count{0};
-    uint32_t scalar_patch_capacity{0};
-    uint32_t materialized_scalar_patches{0};
-    uint32_t materialized_scalar_patch_count{0};
-    size_t allocation_bytes{0};
-    uint64_t graph_key{0};
-    uint64_t definition_hash{0};
-    uint64_t materialized_graph_key{0};
-    uint64_t materialized_definition_hash{0};
-    uintptr_t materialized_outer_base{0};
-    bool definition_affine_reuse{false};
+    uint32_t consumed_tensor_args{0};
     PTO2TaskSlotState *outer_slot{nullptr};
     GraphNodeStorage *nodes{nullptr};
     GraphNodeStorage *node_storage{nullptr};
-    GraphTensorAddressPatch *tensor_patches{nullptr};
-    GraphScalarPatch *scalar_patches{nullptr};
     const GraphDefinition *definition{nullptr};
     const uint32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
@@ -392,53 +353,25 @@ struct GraphExecution {
     uint32_t boundary_scalar_count{0};
 };
 
-static_assert(offsetof(GraphExecution, storage_magic) == 0);
-static_assert(sizeof(GraphExecution::storage_magic) == sizeof(uint64_t));
 static_assert(std::is_trivially_destructible_v<GraphNodeStorage>);
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
 
-inline bool graph_execution_storage_layout(
-    int32_t node_capacity, uint32_t tensor_patch_capacity, uint32_t scalar_patch_capacity, size_t *nodes_offset,
-    size_t *tensor_patches_offset, size_t *scalar_patches_offset, size_t *storage_bytes
-) {
-    if (nodes_offset == nullptr || tensor_patches_offset == nullptr || scalar_patches_offset == nullptr ||
-        storage_bytes == nullptr || node_capacity <= 0 ||
-        static_cast<size_t>(node_capacity) > SIZE_MAX / sizeof(GraphNodeStorage) ||
-        tensor_patch_capacity > GRAPH_MAX_NODES * MAX_TENSOR_ARGS ||
-        scalar_patch_capacity > GRAPH_MAX_NODES * MAX_SCALAR_ARGS) {
+// The execution occupies [GraphExecution][GraphNodeStorage x node_count] at the
+// tail of the outer GRAPH task's heap allocation.
+inline bool graph_execution_storage_layout(int32_t node_count, size_t *nodes_offset, size_t *storage_bytes) {
+    if (nodes_offset == nullptr || storage_bytes == nullptr || node_count <= 0 ||
+        node_count > static_cast<int32_t>(GRAPH_MAX_NODES)) {
         return false;
     }
-    auto checked_align_up = [](size_t value, size_t alignment, size_t *result) {
-        if (alignment == 0 || value > SIZE_MAX - (alignment - 1)) return false;
-        *result = (value + alignment - 1) & ~(alignment - 1);
-        return true;
-    };
-    const size_t nodes_bytes = static_cast<size_t>(node_capacity) * sizeof(GraphNodeStorage);
-    const size_t tensor_patches_bytes = static_cast<size_t>(tensor_patch_capacity) * sizeof(GraphTensorAddressPatch);
-    const size_t scalar_patches_bytes = static_cast<size_t>(scalar_patch_capacity) * sizeof(GraphScalarPatch);
-    if (!checked_align_up(sizeof(GraphExecution), alignof(GraphNodeStorage), nodes_offset) ||
-        *nodes_offset > SIZE_MAX - nodes_bytes ||
-        !checked_align_up(*nodes_offset + nodes_bytes, alignof(GraphTensorAddressPatch), tensor_patches_offset) ||
-        *tensor_patches_offset > SIZE_MAX - tensor_patches_bytes ||
-        !checked_align_up(
-            *tensor_patches_offset + tensor_patches_bytes, alignof(GraphScalarPatch), scalar_patches_offset
-        ) ||
-        *scalar_patches_offset > SIZE_MAX - scalar_patches_bytes) {
-        return false;
-    }
-    return checked_align_up(*scalar_patches_offset + scalar_patches_bytes, alignof(GraphNodeStorage), storage_bytes);
+    constexpr size_t ALIGNMENT = alignof(GraphNodeStorage);
+    *nodes_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    *storage_bytes = *nodes_offset + static_cast<size_t>(node_count) * sizeof(GraphNodeStorage);
+    return true;
 }
 
-inline bool graph_execution_storage_bytes(
-    int32_t node_capacity, uint32_t tensor_patch_capacity, uint32_t scalar_patch_capacity, size_t *storage_bytes
-) {
+inline bool graph_execution_storage_bytes(int32_t node_count, size_t *storage_bytes) {
     size_t nodes_offset = 0;
-    size_t tensor_patches_offset = 0;
-    size_t scalar_patches_offset = 0;
-    return graph_execution_storage_layout(
-        node_capacity, tensor_patch_capacity, scalar_patch_capacity, &nodes_offset, &tensor_patches_offset,
-        &scalar_patches_offset, storage_bytes
-    );
+    return graph_execution_storage_layout(node_count, &nodes_offset, storage_bytes);
 }
 
 GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot);

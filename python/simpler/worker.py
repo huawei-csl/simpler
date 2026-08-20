@@ -65,6 +65,7 @@ import enum
 import hashlib
 import importlib
 import json
+import logging
 import math
 import os
 import re
@@ -457,6 +458,12 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+# A chip/sub child exiting after SHUTDOWN still has to release everything it
+# imported — on a large-scope run (dsv4 HBG: ~80 backings incl. a 2 GiB ring
+# heap) the per-mapping teardown alone runs ~10 s — so the close-path reap
+# gets its own, larger budget. Rollback stays at the tighter value above: its
+# wait guards an unlink-only graceful path that is stuck when it exceeds it.
+_CLOSE_CHILD_REAP_TIMEOUT_S = 60.0
 # Bounded re-check interval for a close() joiner waiting on an in-flight
 # _CloseAttempt. A joiner normally wakes immediately on the completing thread's
 # notify_all(); the timeout is a backstop so that if that notify is skipped (an
@@ -4398,7 +4405,7 @@ class Worker:
         self.level = level
         # Rebound from the level in `init()`; the default matches the C++ table's
         # so a span emitted before init names L3 rather than nothing.
-        self._host_span_prefix = _span_prefix(WorkerLevel.host)
+        self._host_span_prefix = _span_prefix(WorkerLevel.node)
         self._config = config
         self._callable_registry: dict[int, Any] = {}
         self._identity_registry: dict[bytes, _CallableIdentityState] = {}
@@ -7776,7 +7783,7 @@ class Worker:
         # Seed this process's logger before the first fork: the spans its own
         # scheduler emits obey the Python logger level, and every child inherits
         # the state. Every level needs this — `init()` rejects device_ids above
-        # L3, so a pod process owns no chips yet still drives next-level Workers
+        # L3, so a network1 process owns no chips yet still drives next-level Workers
         # and emits their spans. A chip child re-seeds its inherited state before
         # binding the logger copies embedded in the runtime modules it loads.
         chip_log_level = _simpler_log.get_current_config()
@@ -7787,7 +7794,21 @@ class Worker:
         # same code drives next-level children at every level above the chip — so
         # the word is a property of the process. Resolved once here and pushed, so
         # there is a single derivation rather than one on each side.
-        self._host_span_prefix = _set_host_span_level_prefix(_span_prefix(self.level))
+        #
+        # The first binding in a process wins, because a SpanScope holds the name
+        # pointer it was given. So a process that inits Workers at two levels keeps
+        # the first level's word, and self._host_span_prefix is whatever is really
+        # bound — never what this Worker asked for. Say so instead of letting the
+        # mismatch show up as mislabelled spans much later.
+        requested = _span_prefix(self.level)
+        self._host_span_prefix = _set_host_span_level_prefix(requested)
+        if self._host_span_prefix != requested:
+            logging.getLogger("simpler").warning(
+                "host-scheduler spans in this process are labelled %r, not %r: one process carries one "
+                "span vocabulary and an earlier Worker bound it first",
+                self._host_span_prefix,
+                requested,
+            )
 
         self._startup_reaped_pids = set()
         self._startup_ready_pids = set()
@@ -9244,7 +9265,9 @@ class Worker:
     ) -> tuple[GlobalDomainDescriptor, ...]:
         if self.level != 3 or self._worker is None:
             raise RuntimeError("Global CommDomain node prepare requires a ready L3 Worker")
-        command.attachments_for_node(node_worker_id)
+        # PREPARE_EXPORT is where the row is stored for IMPORT and COMMIT to reuse, so a table this
+        # node has no row in is rejected here rather than at the first phase that reads one.
+        _ = command.attachments_for_node(node_worker_id)
         prior = self._global_node_domains.get(command.domain_id)
         if prior is not None:
             if self._global_domain_command_identity(prior.command) != self._global_domain_command_identity(command):
@@ -10536,7 +10559,8 @@ class Worker:
         tensor is MAP_SHARED — read-write across the fork, so usable as an OUTPUT the parent reads back;
         a plain tensor is COW read-only (input only). The handle is memoized by the tensor's storage
         base, so every ref over the same storage shares one canonical identity and dependencies key on
-        it. At L2 (no fork) any host tensor works. ``dtype`` is the ``DataType`` int value.
+        it; the ``byte_offset`` this computes is what then separates two views that do not intersect.
+        At L2 (no fork) any host tensor works. ``dtype`` is the ``DataType`` int value.
         """
         untyped_storage = getattr(tensor, "untyped_storage", None)
         if callable(untyped_storage):
@@ -10547,7 +10571,9 @@ class Worker:
             base, nbytes = host_ptr_nbytes(tensor)
             byte_offset = 0
         # Memoized per storage base so every view of one storage shares an identity and their
-        # dependencies key together. The allocator reuses addresses, though, so a hit whose size no
+        # dependencies key together — a real dependency between two views cannot then hide behind a
+        # differing offset, and the byte ranges tell the intersecting pairs from the disjoint ones
+        # under that one key. The allocator reuses addresses, though, so a hit whose size no
         # longer matches is a *different* storage that happens to sit where the last one did: it must
         # get a fresh identity, or the two would fuse into one node in the dependency graph.
         handle = self._fork_tensor_handles.get(base)
@@ -11942,7 +11968,7 @@ class Worker:
             # teardown entry — so the (blocking) pre-child cleanup above cannot
             # eat it. Reap transfers a surviving pid/shm pair into the journal;
             # a later close() can retry without freeing a live mailbox.
-            reap_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_deadline = time.monotonic() + _CLOSE_CHILD_REAP_TIMEOUT_S
             _step(lambda: self._reclaim_child_groups(reap_deadline))
             # A prior attempt may already have transferred a surviving child
             # and its mailbox into the journal. Retry those entries only after

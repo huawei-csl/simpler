@@ -76,7 +76,7 @@ Implemented:
   each remote session manifest and installed on that L3's L2 children.
 - The repository contains simulation coverage for the no-`mpirun` Global
   CommDomain transaction and mixed local/remote L3 topology.
-- The two-machine `st-pod-onboard-a2a3` job covers the real `a3-fabric-v1`
+- The two-machine `st-network1-onboard-a2a3` job covers the real `a3-fabric-v1`
   backend through `global_tload_mixed_l3` (L4-brokered peer `TLOAD`) and
   `compute_then_tload_mixed_l3` (one L2 compute round followed by
   cross-machine communication through the same domain).
@@ -506,14 +506,20 @@ Parent-side slots therefore store existing `TaskArgs`, an optional
 `RemoteTaskArgsView`, eligible worker ids, and captured remote-buffer refs.
 
 `Orchestrator::infer_deps()` builds `TensorKey` from remote handle metadata
-when a sidecar exists. The first implementation intentionally preserves the
-current exact-start TensorMap semantics: local fork/shm keys use
-`(ptr, worker_id)`, while remote keys use
-`(address_kind, owner_worker_id, buffer_id, generation, offset)`. The tensor
-byte length is bounds-checked by the descriptor but does not participate in
-dependency lookup. This means two remote tensors that reference overlapping
-byte ranges with different offsets are not automatically ordered, matching the
-current local pointer-key behavior.
+when a sidecar exists. Remote keys keep the exact-start semantics the first
+implementation chose — `(address_kind, owner_worker_id, buffer_id, generation,
+offset)` — so the tensor byte length is bounds-checked by the descriptor but
+does not participate in dependency lookup. Two remote tensors over overlapping
+byte ranges with different offsets are therefore not automatically ordered.
+
+The local path no longer works this way. A local key names the backing alone,
+and the view's geometry decides which same-key args conflict, so overlap there
+is caught and disjointness there is respected. Bringing the remote path onto
+the same model means dropping `offset` from the key and giving each entry
+`[offset, offset + nbytes)` as its footprint — `RemoteTensorDesc` already
+carries both. `HOST_INLINE` is the case that needs care: it pins `buffer_id` and
+`generation` to zero, so `offset` is the only thing separating two inline
+payloads today.
 
 ## Failure Semantics
 

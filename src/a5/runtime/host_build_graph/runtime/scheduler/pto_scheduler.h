@@ -22,8 +22,9 @@
  * 4. Two-stage mixed-task completion (subtask done bits -> mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU. host_build_graph is scheduler-only (the
- * orchestrator runs to completion on the host); there is no on-device slot
- * reclaim (whole-graph-resident), so last_task_alive is not advanced here.
+ * orchestrator runs to completion on the host) and whole-graph-resident, so no
+ * task slot or heap byte is reclaimed on device; the scheduler owns completion
+ * state only.
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -86,12 +87,38 @@ struct alignas(64) PTO2ReadyQueue {
     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
 
     std::atomic<uint64_t> dequeue_pos;
-    char _pad2[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
+    // Occupancy high-water, for teardown reporting only. Atomic because pushes
+    // are concurrent; relaxed throughout, so it is ordered against nothing.
+    std::atomic<uint64_t> max_occupancy;
+    char _pad2[64 - 2 * sizeof(std::atomic<uint64_t>)];  // Own cache line
+
+    // Bring the slots[] array to its empty state: slot i's sequence must equal i
+    // for push_tagged's `diff == 0` claim test to accept the first pass, so an
+    // empty queue is a 0..capacity-1 ramp rather than zeroed memory. Runs on the
+    // device after wire_arena_pointers, before any push — the region is reserved
+    // past the uploaded range, so nothing seeds it on the host.
+    void seed_slots() {
+        for (uint64_t i = 0; i < capacity; i++) {
+            slots[i].sequence.store(static_cast<int64_t>(i), std::memory_order_relaxed);
+            slots[i].slot_state = nullptr;
+        }
+    }
 
     uint64_t size() {
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         return (e >= d) ? (e - d) : 0;
+    }
+
+    // Raise the high-water to the occupancy left by a push that published up to
+    // `published_pos`. Off the fast path it is a load and a compare; the CAS runs
+    // only on a new maximum, so a contended push never pays for it.
+    void note_occupancy(uint64_t published_pos) {
+        const uint64_t occ = published_pos - dequeue_pos.load(std::memory_order_relaxed);
+        uint64_t observed = max_occupancy.load(std::memory_order_relaxed);
+        while (occ > observed && !max_occupancy.compare_exchange_weak(
+                                     observed, occ, std::memory_order_relaxed, std::memory_order_relaxed
+                                 )) {}
     }
 
     bool push(PTO2TaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
@@ -118,6 +145,7 @@ struct alignas(64) PTO2ReadyQueue {
         slot->slot_state = slot_state;
         slot->task_id_snapshot = task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
+        note_occupancy(pos + 1);
         return true;
     }
 
@@ -165,6 +193,7 @@ struct alignas(64) PTO2ReadyQueue {
             slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
+        note_occupancy(pos + static_cast<uint64_t>(count));
         return true;
     }
 
@@ -395,16 +424,15 @@ struct alignas(64) PTO2ReadyQueue {
 // as non-member so PTO2ReadyQueue stays a POD-like struct with cache-line
 // alignment. Storage is owned by the caller-supplied arena.
 //   reserve_layout: declare the slots[] region on the arena (must precede commit)
-//   init_from_layout: bind slots pointer from arena.region_ptr(off) and
-//                     initialize sequence counters
+//   init_from_layout: initialize the queue header (capacity, mask, positions)
+//   seed_slots: establish the slot array's empty ramp, on the device only
 //   destroy: forget the slots pointer (arena owns the buffer)
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
-// Writes everything *except* the arena-internal `slots` pointer field
-// (sequences/positions on the slot array, capacity, mask). Uses
-// arena.region_ptr(slots_off) only to address the slot array for writes;
-// does NOT store the pointer in `queue->slots`. Call
-// `ready_queue_wire_arena_pointers` afterwards to set the field itself.
-bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity);
+// Writes the header fields only: capacity, mask, positions, occupancy counter.
+// The slot array is neither addressed nor written — it lives past the uploaded
+// range and PTO2ReadyQueue::seed_slots() fills it on the device. Call
+// `ready_queue_wire_arena_pointers` to set the `slots` pointer itself.
+void ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, uint64_t capacity);
 // Stores queue->slots = arena.region_ptr(slots_off). Idempotent.
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
@@ -450,7 +478,6 @@ struct PTO2SchedulerState {
     struct alignas(64) RingSchedState {
         // --- Cache Line 0: ring pointer (read-only) + hot path (read-write) ---
         PTO2SharedMemoryRingHeader *ring;
-        int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
         // Polling: no per-ring dep_pool. Readiness is derived from the SM ring's
@@ -1171,6 +1198,13 @@ struct PTO2SchedulerState {
     // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each
     // ring). Called on both host and device sides.
     void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
+
+    // Phase 3c, device only: bring every queue's slots[] to its empty ramp. The
+    // slot arrays sit past the uploaded range, so this is the only thing that
+    // establishes the sequence values push compares against. Runs once per arena
+    // after wire_arena_pointers and before any push; a drained queue needs no
+    // repeat, since a free slot's sequence tracks the position it serves.
+    void seed_queue_slots();
 
     // Forget per-region pointers; arena owns the backing memory.
     void destroy();
