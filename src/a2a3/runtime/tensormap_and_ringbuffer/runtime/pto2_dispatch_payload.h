@@ -21,9 +21,10 @@
  * initialized during scheduler cold start from core topology and the resident
  * per-device config, then remains stable for that scheduler instance.
  *
- * LocalContext (block_idx, block_num) and args[] are rebuilt by build_payload()
- * before each dispatch.  Both context struct pointers are written into the
- * args[] suffix on every dispatch (since args[] is rebuilt entirely each time).
+ * The scheduler prefills the AsyncCtx slab pointers and capacity, along with
+ * both context pointers in the args[] suffix, during cold initialization.
+ * build_payload() updates only the task-varying LocalContext fields and
+ * args[0..num_args) before each dispatch.
  *
  * AICore caches a pointer to its per-core slot at startup and reads from
  * it on each dispatch.  The struct is cache-line aligned to avoid false
@@ -70,7 +71,7 @@ constexpr uint32_t PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
 // Cache line 9 (byte 576) holds the AICPU-only DispatchPredicate; tensors follow it.
 constexpr uint32_t PTO2_TASKPAYLOAD_TENSORS_OFFSET = 640;
 constexpr uint32_t PTO2_TASKPAYLOAD_SCALARS_OFFSET = 4736;
-constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(Tensor)
+constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(ChipTensor)
 
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.

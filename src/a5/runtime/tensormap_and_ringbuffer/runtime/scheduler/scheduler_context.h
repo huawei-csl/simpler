@@ -13,7 +13,7 @@
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -25,7 +25,7 @@
 // (it pulls in Handshake which we only forward-declare).  Mirror the
 // authoritative values so the class layout compiles standalone.
 #ifndef RUNTIME_MAX_WORKER
-#define RUNTIME_MAX_WORKER 108
+#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #endif
 #ifndef RUNTIME_MAX_FUNC_ID
 #define RUNTIME_MAX_FUNC_ID 1024
@@ -166,10 +166,10 @@ private:
     std::atomic<uint64_t> drain_ack_tokens_[MAX_AICPU_THREADS]{};
 
 #if SIMPLER_DFX
-    SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_swimlane_level(), AFTER
-    // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
-    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
+    SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_chip_swimlane_level(), AFTER
+    // chip_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
@@ -246,7 +246,9 @@ private:
         return "?";
     }
 
-    int pop_ready_tasks_batch(PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count);
+    int pop_ready_tasks_batch(
+        PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
+    );
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
@@ -260,7 +262,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;
@@ -283,7 +285,7 @@ private:
         }
         // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
         // task, folded as min. Untagged tasks pay only this cache-hot compare and
-        // never read the sys counter. Independent of L2 swimlane level.
+        // never read the sys counter. Independent of chip swimlane level.
         if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
             aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
         }
@@ -298,7 +300,7 @@ private:
     );
 
     void dispatch_shape(
-        Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
+        int32_t thread_idx, PTO2ReadyQueue *disp_queues, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
@@ -315,9 +317,18 @@ private:
     // not unbounded — once mix completes on at least one cluster, the next
     // pass either drains the residual or admits AIC/AIV.
     void dispatch_ready_tasks(
-        Runtime *runtime, int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress,
-        bool &try_pushed
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
     );
+
+    // Shared staging order for both dispatch sources (normal ready + speculative early):
+    // MIX strict priority, IDLE stage before PENDING stage, cross-thread idle gating
+    // (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). `stage(shape, phase)` stages that
+    // shape+phase bucket for the source and returns true to STOP the pass (normal returns
+    // true when it enters drain mode; early always returns false). `residual_mix()` reports
+    // whether MIX work remains queued for the source (normal reads ready_queues[MIX], early
+    // reads early_dispatch_queues[MIX]). IDLE runs under PMU; PENDING is withheld under PMU.
+    template <typename StageFn, typename ResidualMixFn>
+    void run_staging_order(int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix);
 
     // Phase 4b: early-dispatch onto spare cores after normal dispatch.
     int32_t try_early_dispatch(
@@ -342,6 +353,13 @@ private:
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
+
+    // Tier-0 analog of has_residual_mix for the ready sync_start lane: true if MIX
+    // sync_start cohorts remain queued, so the Tier-0 pass keeps MIX strict priority
+    // over its own AIC/AIV sync work. Same relaxed-size snapshot caveat.
+    bool has_residual_sync_mix() const {
+        return sched_->ready_sync_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
     bool has_residual_early_mix() const {
@@ -383,7 +401,9 @@ private:
     SyncStartStageResult stage_sync_start_cores(
         PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated, bool record_drain_phases
     );
-    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
+    void handle_drain_mode(
+        int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr, int32_t *out_staged_blocks = nullptr
+    );
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
@@ -453,7 +473,7 @@ private:
     );
 
 #if SIMPLER_DFX
-    __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_chip_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================

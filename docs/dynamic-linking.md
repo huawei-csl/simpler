@@ -249,8 +249,8 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | SO | Caching | Lifecycle |
 | -- | ------- | --------- |
 | Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
-| AICPU | `DeviceRunner::aicpu_so_handle_` | Per-run: loaded in `ensure_binaries_loaded()`, closed in `unload_executor_binaries()` at end of `run()` |
-| AICore | `DeviceRunner::aicore_so_handle_` | Same as AICPU |
+| AICPU | `DeviceRunner::aicpu_so_handle_` | Per-init: loaded lazily by the first `prepare_execution()`, retained across runs, closed by `finalize()` |
+| AICore | `DeviceRunner::aicore_so_handle_` | Per-run: reloaded for the run's kernel binary, closed after a successful `drain_execution()` (or by final cleanup) |
 | Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `validate_runtime_impl()` |
 | Orchestration | `AicpuExecutor::orch_so_handle_` | Per-run: loaded by orchestrator thread, closed by last thread in `deinit()` |
 
@@ -271,9 +271,10 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 Onboard caches more aggressively. The `DeviceRunner` persists across tasks
 within a runtime group, the runtime AICPU SO is preinstalled once through the
 dispatcher bootstrap, and per-task launches reuse cached `rtFuncHandle`s.
-Simulation re-loads AICPU/AICore SOs every `run()` call because the SO's
-internal static state (`g_aicpu_executor`) must be fresh for each task when
-different tasks have different configurations.
+Simulation also retains the AICPU SO across runs so `g_aicpu_executor` can
+reuse its orchestration-SO cache; `AicpuExecutor::deinit()` resets its per-run
+state. The AICore SO is reloaded for each run because its kernel binary varies
+per callable.
 
 Onboard per-task launches pass the front-less `KernelArgs` payload directly to
 `rtsLaunchCpuKernel` with no CANN launch front: runtime state flows through
@@ -291,10 +292,17 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
   ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)      # sim only, once per process
   _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)   # C++
     dlopen(host_runtime.so, RTLD_LOCAL)
-    dlsym: create_device_context, destroy_device_context, simpler_init,
-           get_runtime_size, register_callable, simpler_run, unregister_callable,
+    dlsym every required export declared in pto_runtime_c_api.h, including:
+           create_device_context, destroy_device_context, simpler_init,
+           get_runtime_size, get_runtime_alignment, simpler_register_callable,
+           simpler_prepare_run, simpler_launch_run, simpler_poll_run,
+           simpler_wait_run, simpler_finalize_run, simpler_run,
+           simpler_unregister_callable, get_pipeline_contract,
+           supports_concurrent_native_prepare_ctx,
+           get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
            finalize_device
     create_device_context() → DeviceContextHandle
+    allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
       DeviceRunner::attach_current_thread(device_id)
         pto_cpu_sim_bind_device(device_id)
@@ -302,20 +310,28 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 
 ChipWorker.run(handle, args, config)                   # public wrapper path
-  simpler_run(ctx, buf, internal callable entry, args, config)
-    new (buf) Runtime()
-    DeviceRunner::bind_callable_to_runtime(r, cid, api, args, rings)  # replay + per-run bind
-    DeviceRunner::run(r, config)                        # applies config; width already resolved pre-bind
-      clear_cpu_sim_shared_storage()
-      ensure_binaries_loaded()               dlopen aicpu/aicore SOs once
-      launch AICPU + AICore threads
-      join all threads
-      unload_executor_binaries()             dlclose aicpu/aicore SOs
-    validate_runtime_impl(r)                 copy results, remove kernels
-    r->~Runtime()
+  simpler_run(ctx, buf, cid, args, config, &descriptor)
+    simpler_prepare_run(..., &descriptor)
+      new (buf) NativeRunContext(..., descriptor, host_api)   owns Runtime + progress state
+      DeviceRunner::bind_callable_to_runtime(r, cid, &host_api, args, rings)
+      DeviceRunner::prepare_execution(r, config, slot, identity)
+    simpler_launch_run(...)
+      child progress path: DeviceRunner::launch_execution(prepared, permit)
+        clear_cpu_sim_shared_storage()
+        ensure_binaries_loaded()             lazily dlopen AICPU; reload AICore for this run
+        launch AICPU + AICore threads
+        publish acceptance from the completed launch receipt
+    simpler_poll_run(...)                    nonblocking child progress query
+      DeviceRunner::poll_execution(active)    nonblocking completion query
+    simpler_wait_run(...)
+      DeviceRunner::drain_execution(active)   join threads; close AICore SO
+    simpler_finalize_run(...)
+      validate_runtime_impl(r)               copy results, remove kernels
+      state->~NativeRunContext()               destroys Runtime
 
 ChipWorker.finalize()
   finalize_device(ctx)
+    unload_executor_binaries()               dlclose AICPU and any residual AICore SO
   destroy_device_context(ctx)
   dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
 ```
@@ -351,20 +367,27 @@ device_worker_main(device_id)
 
     for each callable:
         ChipWorker.register_callable(callable)   # returns opaque handle
-          register_callable(ctx, internal callable entry, callable)
+          simpler_register_callable(ctx, internal callable entry, callable)
             upload child kernels, copy orch SO to device buffer
         for each launch with that handle:
           ChipWorker.run(handle, args, config)
-            simpler_run(ctx, buf, internal callable entry, args, config)
-              new (buf) Runtime()
-              bind_callable_to_runtime()       replay + rtMalloc, rtMemcpy to device
-              DeviceRunner::run()
-                ensure_binaries_loaded()       already done by init
-                launch_aicore_kernel()         cached rtRegisterAllKernel handle
-                                               + rtKernelLaunchWithHandleV2
-                launch_aicpu_kernel(Run)       rtsLaunchCpuKernel, cached rtFuncHandle
-                aclrtSynchronizeStreamWithTimeout()   wait on both streams
-              validate_runtime_impl()          rtMemcpy results back to host
+            simpler_run(ctx, buf, cid, args, config, &descriptor)
+              simpler_prepare_run(..., &descriptor)
+                new (buf) NativeRunContext(..., descriptor, host_api)   owns Runtime + progress state
+                bind_callable_to_runtime()     replay + rtMalloc, rtMemcpy to device
+                DeviceRunner::prepare_execution(..., slot, identity)
+              simpler_launch_run(...)
+                child progress path: DeviceRunner::launch_execution(prepared, permit)
+                  ensure_binaries_loaded()     already done by init
+                  launch_aicore_kernel()       cached rtRegisterAllKernel handle
+                                                 + rtKernelLaunchWithHandleV2
+                  launch_aicpu_kernel(Run)     rtsLaunchCpuKernel, cached rtFuncHandle
+                  publish acceptance from the completed launch receipt
+              simpler_poll_run(...)            nonblocking child progress query
+                DeviceRunner::poll_execution(active) nonblocking stream query
+              simpler_wait_run(...)
+                DeviceRunner::drain_execution(active) wait on both streams
+              simpler_finalize_run(...)        rtMemcpy results back; destroy state
 
     ChipWorker.finalize()
       finalize_device(ctx)                     rtDeviceReset()

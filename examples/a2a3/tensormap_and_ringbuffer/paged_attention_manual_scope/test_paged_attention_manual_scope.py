@@ -12,7 +12,7 @@
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
 
@@ -68,7 +68,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
             # MANUAL scope; the default per-ring task window (16384) can fill
             # before the oldest task retires and wedge the orchestrator
             # (FLOW_CONTROL_DEADLOCK / code 3). Double the window for headroom.
-            "config": {"aicpu_thread_num": 4, "runtime_env": {"ring_task_window": 32768}},
+            "config": {"runtime_env": {"ring_task_window": 32768}},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -83,7 +83,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -99,7 +98,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "Case3",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -115,7 +113,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseSmall1",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -130,7 +127,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseSmall2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 1,
@@ -146,7 +142,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseVarSeq2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 2,
@@ -163,7 +158,6 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseVarSeq4",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 4,
@@ -184,16 +178,16 @@ class TestPagedAttentionManualScope(SceneTestCase):
         specs = []
         for name, value in result:
             if isinstance(value, torch.Tensor):
-                specs.append(Tensor(name, value))
+                specs.append(TensorArg(name, value))
             else:
                 specs.append(Scalar(name, value))
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):
-        tensors = {s.name: s.value for s in args.specs if isinstance(s, Tensor)}
+        tensors = {s.name: s.value for s in args.specs if isinstance(s, TensorArg)}
         _pa_compute_golden(tensors, params)
         for s in args.specs:
-            if isinstance(s, Tensor) and s.name in tensors:
+            if isinstance(s, TensorArg) and s.name in tensors:
                 getattr(args, s.name)[:] = tensors[s.name]
 
 

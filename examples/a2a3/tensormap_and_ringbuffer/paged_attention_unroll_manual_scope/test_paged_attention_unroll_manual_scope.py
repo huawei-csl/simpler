@@ -12,7 +12,7 @@
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
 
@@ -34,7 +34,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
                 "name": "QK",
                 "source": "kernels/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
@@ -48,7 +48,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
                 "name": "PV",
                 "source": "kernels/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
@@ -64,7 +64,6 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -79,7 +78,6 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -95,7 +93,6 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case3",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -115,16 +112,16 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         specs = []
         for name, val in inputs:
             if isinstance(val, torch.Tensor):
-                specs.append(Tensor(name, val))
+                specs.append(TensorArg(name, val))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):
-        tensors = {s.name: s.value for s in args.specs if isinstance(s, Tensor)}
+        tensors = {s.name: s.value for s in args.specs if isinstance(s, TensorArg)}
         _pa_compute_golden(tensors, params)
         for s in args.specs:
-            if isinstance(s, Tensor) and s.name in tensors:
+            if isinstance(s, TensorArg) and s.name in tensors:
                 getattr(args, s.name)[:] = tensors[s.name]
 
 

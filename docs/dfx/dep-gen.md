@@ -9,7 +9,7 @@ the record entirely. The device hot path no longer carries fanout;
 `deps.json` is now the sole source of truth for swimlane edges.
 
 When it existed, each producer task carried its own
-`L2SwimlaneAicpuTaskRecord.fanout[]`, populated by the AICPU scheduler at the
+`ChipSwimlaneAicpuTaskRecord.fanout[]`, populated by the AICPU scheduler at the
 moment it wired a downstream consumer. If a producer had already finished and
 transitioned to `PTO2_TASK_COMPLETED` by the time a later submit wanted to
 register a dependency on it, the consumer's edge had nowhere to go — the
@@ -90,37 +90,38 @@ nothing to capture-then-reconstruct.
   shared-memory ring, and the drain thread are all skipped
   (`dep_gen_host_graph_active()` tells the runner). Nothing is dropped under
   back-pressure because nothing is streamed.
-- **Output.** The same `deps.json`, written at run teardown from the graph that
-  run's orchestration built.
+- **Output.** The same `deps.json`, written during the device-runner drain.
+  The graph is thread-local, and prepare's host orchestration and the drain that
+  emits it both run on the child progress loop's single thread.
 
 ---
 
 ## 3. How to Enable
 
 `dep_gen` is gated by `CallConfig.enable_dep_gen` (alongside
-`enable_l2_swimlane`, `enable_dump_args`, `enable_pmu`). The CLI flag
+`enable_chip_swimlane`, `enable_dump_args`, `enable_pmu`). The CLI flag
 is `--enable-dep-gen`:
 
 ```bash
 # Standalone
-python test_my_case.py --platform <a2a3|a5> --enable-dep-gen --enable-l2-swimlane
+python test_my_case.py --platform <a2a3|a5> --enable-dep-gen --enable-chip-swimlane
 
 # Pytest
-pytest tests/st/... --platform <a2a3|a5> --enable-dep-gen --enable-l2-swimlane
+pytest tests/st/... --platform <a2a3|a5> --enable-dep-gen --enable-chip-swimlane
 ```
 
-The `--enable-l2-swimlane` flag is independent but recommended in pair
+The `--enable-chip-swimlane` flag is independent but recommended in pair
 because:
 
 - `deps.json` is the dep_gen artifact.
-- `l2_swimlane_records.json` (from swimlane) is the timing artifact;
+- `chip_swimlane_records.json` (from swimlane) is the timing artifact;
   `merged_swimlane.json` (the Perfetto trace) uses `deps.json` for
   dependency arrows when both files exist (without it, the trace has no
   dependency arrows — the record no longer carries `fanout[]`).
 
 For perf-sensitive runs where you'd rather measure each profiler in
 isolation, see the **split workflow** described in
-[l2-swimlane-profiling §3.5](l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)
+[chip-swimlane-profiling §3.5](chip-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)
 — one dep_gen capture per topology, then any number of swimlane
 runs that the converter joins back to that captured graph.
 
@@ -266,7 +267,7 @@ The default text output contains:
   - `tasks`: number of task ids rendered in the output
   - `unique_task_edges`: number of unique `(pred, succ)` task pairs
   - `annotated_edges`: number of annotated edge rows across all task pairs
-  - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
+  - `perf_sidecar`: `yes` when `chip_swimlane_records.json` was successfully loaded
   - `func_name_map`: `yes` when at least one task label resolved to a named `func_name`
     from either an explicit `--func-names` file or an auto-discovered sibling
     `name_map*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
@@ -327,7 +328,7 @@ edges — which is exactly why it replaced them as the sole edge source:
 
 | Edge source | Captures | Drops on race? |
 | ----------- | -------- | -------------- |
-| `task.fanout[]` (removed; formerly on L2SwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
+| `task.fanout[]` (removed; formerly on ChipSwimlaneAicpuTaskRecord) | Successors known at producer-retire time | **Yes** — sealed when producer retires |
 | `deps.json` (this feature) | Every consumer → producer reachable via tensormap / explicit_deps | No — replay sees every submit |
 
 `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py`
@@ -379,7 +380,7 @@ base via `task_id`.
 budget (`PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024` slots → roughly
 `64 + 1023 × 582 = 595450` deps max in the best case) is logged via
 `LOG_ERROR` and truncated to the largest dc that fits. Runtime
-correctness is unaffected — `L0TaskArgs::set_dependencies` keeps the full dep
+correctness is unaffected — `CoreTaskArgs::set_dependencies` keeps the full dep
 list; only the dep_gen replay graph loses the tail.
 
 ---
@@ -394,7 +395,7 @@ list; only the dep_gen replay graph loses the tail.
 | Capture call site (device-orch) | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. The schema carries `kernel_ids[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. It also carries the SPMD logical block num (`block_num` on a2a3, `core_num` on a5's launch spec) as `tasks[].block_num`. |
 | Replay | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `PTO2TensorMap` instances. Emits `deps.json` when both passes agree per record. Platform-agnostic — a5 reuses the a2a3 source verbatim. |
 | Host-direct capture (host-orch) | `src/a2a3/runtime/host_build_graph/runtime/dep_gen_host_graph.h`, `src/a2a3/runtime/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/a2a3/runtime/host_build_graph/runtime/pto_dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
-| Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
+| Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` at teardown — reading the thread-local graph its own orchestration built on the same child progress thread — and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
 | Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
 | Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py`, `tests/st/a2a3/host_build_graph/dfx/dep_gen/test_dep_gen.py` | Smoke test + 6-edge validation against `vector_example` orchestration (both platforms share byte-identical orchestration code). The host_build_graph case runs the *same* orchestration through host-direct capture and asserts the same 6 edges, so a divergence between the two shapes fails a test. |
 

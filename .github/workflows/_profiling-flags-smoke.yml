@@ -1,0 +1,103 @@
+name: Profiling Flags Smoke
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      setup_variant:
+        description: github or self-cpu.
+        required: true
+        type: string
+
+jobs:
+  run:
+    name: profiling-flags-smoke
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s "$(which g++)" /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        if: inputs.setup_variant == 'github'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip packages
+        uses: ./.github/actions/cache-pip
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind cmake>=3.15"
+          packages: "--no-build-isolation --config-settings=build.targets=_task_interface -e .[test]"
+
+      - name: Run all profiling flag combos x 2 arches
+        run: |
+          COMBO_NAMES=(dfx-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_DFX=(0 1 1 1 1 1)
+          COMBO_ORCH=(0 1 1 0 1 1)
+          COMBO_SCHED=(0 0 0 1 1 1)
+          COMBO_TENSORMAP=(0 0 1 0 0 1)
+          ARCHES=(a2a3sim a5sim)
+          FAIL=()
+
+          # Each architecture keeps one persistent CMake tree. Updating the
+          # generated config header rebuilds only objects that include it.
+          for i in "${!COMBO_NAMES[@]}"; do
+            NAME=${COMBO_NAMES[$i]}
+            for ARCH in "${ARCHES[@]}"; do
+              ARCH_DIR=${ARCH%sim}
+              echo "::group::$ARCH / $NAME"
+              if ! .venv/bin/python simpler_setup/build_runtimes.py \
+                   --platforms "$ARCH" \
+                   --profiling-dfx "${COMBO_DFX[$i]}" \
+                   --profiling-orch "${COMBO_ORCH[$i]}" \
+                   --profiling-sched "${COMBO_SCHED[$i]}" \
+                   --profiling-tensormap "${COMBO_TENSORMAP[$i]}"; then
+                echo "::error::Build failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (build)")
+                echo "::endgroup::"
+                continue
+              fi
+              if ! .venv/bin/python -m pytest \
+                   "examples/${ARCH_DIR}/tensormap_and_ringbuffer/vector_example/test_vector_example.py" \
+                   --platform "$ARCH" --device 0-1 -p no:xdist \
+                   --pto-session-timeout 600 --manual include; then
+                echo "::error::Smoke failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (pytest)")
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          if [ ${#FAIL[@]} -gt 0 ]; then
+            printf 'FAILED: %s\n' "${FAIL[@]}"
+            exit 1
+          fi

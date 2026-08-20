@@ -80,6 +80,8 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     return &contract;
 }
 
+extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
+
 static_assert(
     RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
 );
@@ -340,8 +342,8 @@ public:
         offset_ = 0;
         size_t required = 0;
         for (int i = 0; i < orch_args->tensor_count(); i++) {
-            Tensor t = orch_args->tensor(i);
-            if (t.is_child_memory() || t.nbytes() == 0) {
+            ChipTensor t = orch_args->tensor(i);
+            if (t.is_device_memory() || t.nbytes() == 0) {
                 continue;
             }
             required += align_up(static_cast<size_t>(t.nbytes()));
@@ -392,23 +394,21 @@ private:
 
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
- * the supplied runtime so a subsequent bind_callable_to_runtime_impl can use
- * them. This is the cacheable half of init_runtime_impl: nothing here depends
- * on per-run argument values, so the simpler_register_callable / simpler_run split
- * lets us run this once per callable_id and amortize across runs.
+ * CallableArtifacts for subsequent per-run binding. Nothing here depends on
+ * per-run argument values, so registration runs once per callable_id.
  *
- * @param runtime   Pointer to pre-constructed Runtime
  * @param callable  ChipCallable carrying the orch SO + child kernel binaries
+ * @param api       Context-bound platform operations used during registration
+ * @param out       Callable-owned artifacts retained across runs
  * @return 0 on success, -1 on failure
  */
-extern "C" int
-register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
+extern "C" int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
     }
-    if (upload_fn == nullptr || out == nullptr) {
-        LOG_ERROR("upload_fn or out is null");
+    if (api == nullptr || out == nullptr) {
+        LOG_ERROR("HostApi or out is null");
         return -1;
     }
     *out = CallableArtifacts{};
@@ -416,8 +416,7 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 
     LOG_INFO("Registering %d kernel(s) in register_callable_impl", callable->child_count());
     if (upload_and_collect_child_addrs(
-            callable, upload_fn, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash,
-            &out->aicore_image_hash
+            callable, api, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash, &out->aicore_image_hash
         ) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
@@ -502,6 +501,33 @@ static PrebuiltRuntimeArenaCacheProbe make_prebuilt_runtime_arena_cache_probe(co
     return probe;
 }
 
+static bool resolve_arena_sizing(
+    const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool, ArenaSizingConfig *out
+);
+
+extern "C" int prepared_run_config_compatible_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
+    if (api == nullptr) return -1;
+
+    ArenaSizingConfig sizing;
+    if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) return -1;
+
+    PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
+    void *gm_heap = nullptr;
+    void *gm_sm = nullptr;
+    void *runtime_arena = nullptr;
+    size_t runtime_offset = 0;
+    const void *image = nullptr;
+    size_t image_size = 0;
+    return api->lookup_prebuilt_runtime_arena_cache(
+               probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), &gm_heap, &gm_sm, &runtime_arena,
+               &runtime_offset, &image, &image_size
+           ) ?
+               1 :
+               0;
+}
+
 // per-(cid,config): resolve the cache-key sizing knobs. Pure host parsing over
 // per-task overrides, PTO2_RING_* env, and compile-time defaults. Derived
 // allocation sizes are computed only on cache miss.
@@ -556,10 +582,10 @@ static bool stage_device_args(
     int64_t t_args_start = _now_ms();
     STRACE_A("simpler_run.bind.args", "");
     for (int i = 0; i < tensor_count; i++) {
-        Tensor t = orch_args->tensor(i);
+        ChipTensor t = orch_args->tensor(i);
 
-        if (t.is_child_memory()) {
-            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+        if (t.is_device_memory()) {
+            LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             out->add_tensor(t);
             continue;
         }
@@ -606,13 +632,13 @@ static bool stage_device_args(
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
-        // by the orch tensor index `i` (child_memory tensors are skipped above
+        // by the orch tensor index `i` (device-space tensors are skipped above
         // but do not consume a separate signature slot — scalars follow the
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, release_kind});
-        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
         out->add_tensor(t);
@@ -729,10 +755,6 @@ static int bind_cached_runtime_image(
     Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe,
     const ChipStorageTaskArgs &device_args
 ) {
-    if (api->lookup_prebuilt_runtime_arena_cache == nullptr) {
-        return 1;
-    }
-
     void *gm_heap = nullptr;
     void *sm_ptr = nullptr;
     void *runtime_arena_dev = nullptr;
@@ -759,9 +781,6 @@ static void store_prebuilt_runtime_image(
     const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
     const PTO2RuntimeArenaLayout &layout, const DeviceArena &host_arena
 ) {
-    if (api->mark_prebuilt_runtime_arena_cached == nullptr) {
-        return;
-    }
     api->mark_prebuilt_runtime_arena_cached(
         probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), ptrs.gm_heap, ptrs.gm_sm,
         ptrs.runtime_arena_dev, layout.offsets.off_runtime, host_arena.base(), layout.offsets.arena_size
@@ -870,14 +889,12 @@ extern "C" int bind_callable_to_runtime_impl(
     }
 
     // The retained temporary buffer is always used on the trb path — it is an
-    // internal allocation optimization, not user-facing config. Gate only on
-    // whether the platform wired the slot accessors (trb always does; a backend
-    // that leaves them null transparently falls back to per-tensor
-    // device_malloc). The buffer itself lives on the runner across runs; here we
-    // just grow it to this run's packed size and bump-slice from it.
+    // internal allocation optimization, not user-facing config. Every host
+    // runtime provides the uniform HostApiOps table. The buffer itself lives on
+    // the runner across runs; here we grow it to this run's packed size and
+    // bump-slice from it.
     RetainedTempBump bump;
-    bool use_temporary_buffer = api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
-    if (use_temporary_buffer && !bump.begin(api, orch_args)) {
+    if (!bump.begin(api, orch_args)) {
         return -1;
     }
 
@@ -886,9 +903,7 @@ extern "C" int bind_callable_to_runtime_impl(
     });
 
     ChipStorageTaskArgs device_args;
-    if (!stage_device_args(
-            runtime, api, orch_args, signature, sig_count, use_temporary_buffer ? &bump : nullptr, &device_args
-        )) {
+    if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
         return -1;
     }
 
@@ -966,7 +981,8 @@ extern "C" int prewarm_config_impl(
  * 3. Clears tensor lease state
  *
  * @param runtime       Pointer to Runtime
- * @param execution_rc  Status returned by DeviceRunner::run
+ * @param execution_rc  Device-runner drain status after successful enqueue,
+ *                      or enqueue status on failure
  * @return 0 on success, -1 on failure
  */
 extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
@@ -987,7 +1003,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     TensorLease *tensor_leases = runtime->tensor_leases_.data();
     int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
 
-    LOG_INFO("Tensor leases to process: %d", tensor_lease_count);
+    LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
@@ -1029,13 +1045,13 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
             // Skip if device pointer is null
             if (lease.dev_ptr == nullptr) {
-                LOG_WARN("Tensor %d has null device pointer, skipping", i);
+                LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (lease.host_ptr == nullptr) {
-                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("ChipTensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -1043,7 +1059,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still released through release_kind below.
             if (!lease.needs_copy_back) {
-                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("ChipTensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
@@ -1052,7 +1068,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, lease.size);
+                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }

@@ -24,7 +24,7 @@ For the `Worker` API underneath the framework, see
 
 | Example | What it teaches |
 | ------- | --------------- |
-| [`benchmark_bgemm/`](benchmark_bgemm/) | Runtime-configurable tiled matmul `C = sum(k) A[k] @ B[k]`, laid out as single-axis moves over task count, tile size, work per task, and accumulation depth. Runs on sim. Four of its six cases are `"manual": True` and need `--manual include`. |
+| [`benchmark_bgemm/`](benchmark_bgemm/) | Runtime-configurable tiled matmul `C = sum(k) A[k] @ B[k]`, laid out as single-axis moves over task count, tile size, work per task, and accumulation depth. On Sim, five of six cases are manual and Per-PR keeps the 500-task `Case0`; Onboard still runs `Case0` and `Bgemm64` by default. |
 | [`paged_attention/`](paged_attention/) | Online softmax with AIC/AIV subgraph splitting, bfloat16. The baseline the three variants below are compared against. |
 | [`paged_attention_manual_scope/`](paged_attention_manual_scope/) | The same computation with explicit scope control — kernels byte-identical to the baseline's, only the orchestration differs. See [`docs/manual-scope.md`](../../../docs/manual-scope.md). |
 | [`paged_attention_unroll_manual_scope/`](paged_attention_unroll_manual_scope/) | A second implementation, not a patch on the baseline: KV blocks batched into groups of `N_UNROLL`, four tasks per group instead of per block, with the kernels rewritten to match. |
@@ -35,16 +35,20 @@ For the `Worker` API underneath the framework, see
 ## Asynchronous completion and cross-card transfer
 
 Each of these registers an async event and lets the consumer wait on deferred
-completion rather than on task end. All but `deferred_notify_demo`, which runs
-the simulator path, are **onboard-only**; every one except `prefetch_async_demo`
-needs two dies.
+completion rather than on task end. Both are **onboard-only**;
+`sdma_async_completion_demo` needs two dies.
+
+These mechanism-focused examples use the scene-test lifecycle. For a complete
+direct `Worker` communication-domain walkthrough from construction through
+`close()`, see [`examples/workers/l3/allreduce/`](../../workers/l3/allreduce/).
 
 | Example | Mechanism | Devices |
 | ------- | --------- | ------- |
 | [`prefetch_async_demo/`](prefetch_async_demo/) | `TPREFETCH_ASYNC` over the runtime-injected SDMA workspace, provisioned once by `Worker(enable_sdma=True)` and injected into every kernel's `GlobalContext`. | 1 |
 | [`sdma_async_completion_demo/`](sdma_async_completion_demo/) | `TGET_ASYNC` from a peer's window slot, completion registered via `defer_pto_async_event`. | 2 |
-| [`async_notify_demo/`](async_notify_demo/) | Notification counters alongside deferred completion. | 2 |
-| [`deferred_notify_demo/`](deferred_notify_demo/) | The same shape on the simulator. | 2 |
+
+The cross-architecture notification-counter and deferred-notify watchdogs live
+under [`tests/st/worker/comm_domain/`](../../../tests/st/worker/comm_domain/).
 
 ## Running
 
@@ -58,21 +62,19 @@ pytest examples/a2a3/tensormap_and_ringbuffer/paged_attention --platform a2a3 --
 
 Most examples here are marked `platforms=["a2a3"]` — onboard only — because
 they exercise real AIC/AIV timing or cross-card transfer. `vector_example` and
-`benchmark_bgemm` are marked for `a2a3sim` as well, and `deferred_notify_demo`
-always runs the simulator path.
+`benchmark_bgemm` are marked for `a2a3sim` as well.
 
 Wrap hardware runs in `task-submit` on a shared box; see
 [`.claude/rules/running-onboard.md`](../../../.claude/rules/running-onboard.md).
 
 ## Relationship to `examples/a5/`
 
-Seven examples exist under both architectures with the same name:
+Five examples exist under both architectures with the same name:
 `vector_example`, `paged_attention`, `paged_attention_manual_scope`,
-`paged_attention_unroll_manual_scope`, `async_notify_demo`,
-`deferred_notify_demo`, `sdma_async_completion_demo`. They are ports of each
-other and differ mainly in tile shapes and platform strings — `vector_example`
-differs by two lines. When you change one, check whether its sibling needs the
-same change.
+`paged_attention_unroll_manual_scope`, and `sdma_async_completion_demo`. They
+are ports of each other and differ mainly in tile shapes and platform strings
+— `vector_example` differs by two lines. When you change one, check whether its
+sibling needs the same change.
 
 Only here: `benchmark_bgemm` (a5 has `bgemm` instead),
 `merge_pipeline_barrier`, `paged_attention_ringbuffer`, `prefetch_async_demo`,

@@ -27,13 +27,14 @@ import re
 
 import pytest
 from simpler._log import get_current_config
-from simpler.task_interface import CallConfig, ChipStorageTaskArgs, DataType, Tensor
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.log_config import configure_logging
 
 from .main import N_COLS, N_ELEMS, N_ROWS, NBYTES, build_chip_callable
 
+_F32 = DataType.FLOAT32
 _STRACE_RE = re.compile(r"\[STRACE\] .*\bname=(?P<name>\S+)\b.*\bdur=(?P<dur>\d+)")
 
 
@@ -47,7 +48,7 @@ def _strace_durs(captured: str, name: str) -> list:
     return out
 
 
-def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = False):
+def _drive_one_run(platform: str, device_id: int, *, enable_chip_swimlane: bool = False):
     import torch  # noqa: PLC0415
 
     worker = Worker(
@@ -68,16 +69,16 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         dev_a = worker.malloc(NBYTES)
         dev_b = worker.malloc(NBYTES)
         dev_out = worker.malloc(NBYTES)
-        worker.copy_to(dev_a, host_a.data_ptr(), NBYTES)
-        worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
+        worker.copy_to(dev_a, host_a)
+        worker.copy_to(dev_b, host_b)
 
-        args = ChipStorageTaskArgs()
-        args.add_tensor(Tensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
+        args = TaskArgs()
+        args.add_tensor(dev_a.tensor((N_ROWS, N_COLS), _F32), TensorArgType.INPUT)
+        args.add_tensor(dev_b.tensor((N_ROWS, N_COLS), _F32), TensorArgType.INPUT)
+        args.add_tensor(dev_out.tensor((N_ROWS, N_COLS), _F32), TensorArgType.OUTPUT_EXISTING)
 
         config = CallConfig()
-        config.enable_l2_swimlane = enable_l2_swimlane
+        config.enable_chip_swimlane = enable_chip_swimlane
 
         # run() returns None; timing is emitted as [STRACE] markers on stderr.
         assert worker.run(chip_handle, args, config) is None
@@ -85,7 +86,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         # Verify the output is sane (so we know the kernel actually ran and
         # the markers aren't from an early-error path).
         host_out = torch.zeros(N_ROWS, N_COLS, dtype=torch.float32)
-        worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
+        worker.copy_from(host_out, dev_out)
         worker.free(dev_a)
         worker.free(dev_b)
         worker.free(dev_out)
@@ -101,6 +102,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim"])
 def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
     _drive_one_run(st_platform, int(st_device_ids[0]))
     err = capfd.readouterr().err
@@ -126,6 +128,7 @@ def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
 @pytest.mark.platforms(["a2a3sim", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_sim_forwards_info_level_to_aicpu(st_platform, st_device_ids, capfd):
     previous_level = get_current_config()
     configure_logging("info")

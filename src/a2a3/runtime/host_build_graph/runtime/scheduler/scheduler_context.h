@@ -8,12 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef SCHEDULER_CONTEXT_H
-#define SCHEDULER_CONTEXT_H
+#pragma once
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -209,10 +208,10 @@ private:
     std::atomic<uint64_t> drain_ack_tokens_[MAX_AICPU_THREADS]{};
 
 #if SIMPLER_DFX
-    SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_swimlane_level(), AFTER
-    // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
-    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
+    SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_chip_swimlane_level(), AFTER
+    // chip_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
@@ -272,6 +271,8 @@ private:
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
 
+    __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
+
     // =========================================================================
     // Dispatch (scheduler_dispatch.cpp)
     // =========================================================================
@@ -309,7 +310,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;
@@ -332,7 +333,7 @@ private:
         }
         // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
         // task, folded as min. Untagged tasks pay only this cache-hot compare and
-        // never read the sys counter. Independent of L2 swimlane level.
+        // never read the sys counter. Independent of chip swimlane level.
         if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
             aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
         }
@@ -560,7 +561,7 @@ private:
     );
 
 #if SIMPLER_DFX
-    __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_chip_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================
@@ -575,5 +576,3 @@ private:
         return func_id_to_addr_[func_id];
     }
 };
-
-#endif  // SCHEDULER_CONTEXT_H

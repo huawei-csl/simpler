@@ -36,13 +36,12 @@
  * The runtime translation unit links weak no-op fallbacks (pto_orchestrator.cpp)
  * so the AICPU build, which has no host graph, resolves without this .cpp.
  *
- * The graph is per-thread state. A runner is bound to the thread that issues
- * its run (both c_api_shared.cpp files key it off a `pthread_key_t`), and every
- * call above lands on that same thread — enable and emit from the runner's
- * `simpler_run`, capture from the orchestration the bind runs inline. Two
- * runners on two threads therefore build two independent graphs instead of
- * racing one, which is the same per-runner isolation the device-orch shape gets
- * from `DeviceRunner::dep_gen_collector_` being a member.
+ * The graph lives in thread-local state, so capture is lock-free and two
+ * prepared contexts on different threads cannot overwrite one another. Emit
+ * reads the calling thread's state, so a run's orchestration (which builds the
+ * graph) and its drain (which emits it) must land on the same thread. The child
+ * progress loop satisfies this by being single-threaded; emit returns -3 if the
+ * invariant is ever broken.
  *
  * Per-task producer dedup mirrors PTO2FaninBuilder, which keys on (ring, slot);
  * this keys on producer task id. The two agree only because host_build_graph is
@@ -101,11 +100,11 @@ void dep_gen_host_graph_end_task();
 void dep_gen_host_graph_add_explicit_edge(uint64_t producer_raw);
 
 /** STEP 3 Step A: the producer that created the tensor this task consumes. */
-void dep_gen_host_graph_add_creator_edge(uint64_t producer_raw, int32_t arg_idx, const Tensor &consumer);
+void dep_gen_host_graph_add_creator_edge(uint64_t producer_raw, int32_t arg_idx, const ChipTensor &consumer);
 
 /** STEP 3 Step B: a tensormap producer whose written slice this task reads. */
 void dep_gen_host_graph_add_tensormap_edge(
-    uint64_t producer_raw, int32_t arg_idx, const Tensor &consumer, const PTO2TensorMapEntry &entry,
+    uint64_t producer_raw, int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry,
     OverlapStatus overlap
 );
 

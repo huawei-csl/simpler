@@ -26,17 +26,16 @@
 #include "platform_comm/comm_context.h"
 
 #include "common/unified_log.h"
+#include "host/file_marker_handshake.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -158,25 +157,11 @@ static uint64_t make_run_token(int rank) {
 
 static std::string
 barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const std::string &tag, int rank) {
-    return handshake_dir(rootinfo_path) + "/barrier_" + handshake_prefix(rootinfo_path) + "_" + tag + "_" +
-           run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
+    return file_marker_handshake::marker_path(rootinfo_path, run_token, tag, rank);
 }
 
 static void cleanup_handshake_files(const std::string &rootinfo_path) {
-    std::error_code ec;
-    std::filesystem::remove(rootinfo_path, ec);
-
-    const std::string prefix = "barrier_" + handshake_prefix(rootinfo_path) + "_";
-    const std::string dir = handshake_dir(rootinfo_path);
-    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file(ec)) continue;
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) continue;
-        if (name.size() < 6 || name.substr(name.size() - 6) != ".ready") continue;
-        std::filesystem::remove(entry.path(), ec);
-        ec.clear();
-    }
+    (void)file_marker_handshake::cleanup(rootinfo_path);
 }
 
 static bool
@@ -743,10 +728,7 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
 // workspace on the comm handle and mirror its address into host_ctx.  Both
 // the base-window path and the dynamic per-domain path call this; only the
 // first call allocates.  Requires CANN to expose working
-// aclnnShmemSdmaStarsQuery primitives — see docs/a5-sdma-overlay.md for why
-// this is gated behind SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (default OFF) and
-// how to re-enable it once the a5 environment supports it (#1315).  No-op (workSpace
-// stays 0, SDMA demos self-skip) when the macro is undefined.
+// aclnnShmemSdmaStarsQuery primitives.
 static void ensure_sdma_workspace(CommHandle h) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (h->sdma_workspace) return;
@@ -755,6 +737,11 @@ static void ensure_sdma_workspace(CommHandle h) {
         h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
         h->host_ctx.workSpaceSize = 16 * 1024;
     } else {
+        // SDMA workspace initialization failed - this may occur due to:
+        // 1. Missing ACL symbols in libopapi.so (CANN version compatibility)
+        // 2. Device state issues (e.g., Critical health status)
+        // 3. Resource exhaustion from repeated test runs
+        // The system gracefully degrades to non-SDMA mode when this occurs.
         h->sdma_workspace.reset();
     }
 #else
@@ -765,8 +752,7 @@ static void ensure_sdma_workspace(CommHandle h) {
 // Callable-declared workspace injection is not available on a5 yet. Its URMA
 // workspace is sized per communication domain (rank count), not per device;
 // reject required masks before a callable runs instead of silently launching
-// it with a null workspace. The separate, default-off communication overlay
-// above remains gated by SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (#1315).
+// it with a null workspace.
 extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
 
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
@@ -1396,14 +1382,35 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 }
 
+extern "C" int
+comm_global_domain_prepare(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
+extern "C" int comm_global_domain_import(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
+extern "C" int comm_global_domain_release(uint64_t) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
-    if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "destroy", h->run_token)) {
-        LOG_WARN("[comm rank %d] comm_destroy: final barrier timed out; releasing local state anyway", h->rank);
+    const auto destroy_handshake =
+        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+    if (!destroy_handshake.ok()) {
+        LOG_WARN(
+            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
+            h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
+        );
         rc = -1;
     }
 
@@ -1441,13 +1448,23 @@ extern "C" int comm_destroy(CommHandle h) try {
     // lifecycle belongs to DeviceRunner, whose finalize() releases all
     // device memory before resetting the device and running aclFinalize.
 
-    // Only rank 0 sweeps the on-disk handshake markers, and only if the
-    // final barrier succeeded.  Deleting them after a timeout would strand
-    // any peer that hasn't observed our marker yet, and leak that peer
-    // into the next run with no rootinfo to discover.  Letting cleanup
-    // ride on the next rank-0 init is the safer recovery path.
-    if (h->rank == 0 && rc == 0) {
-        cleanup_handshake_files(h->rootinfo_path);
+    // Do not let a faster follower return and reuse this path while rank 0
+    // can still sweep the old generation. Rank 0 first retires rootinfo and
+    // best-effort sweeps its token-scoped barrier markers, then publishes a
+    // per-follower release outside the sweep namespace; each follower
+    // consumes its own release before return.
+    // This post phase runs after HcclCommDestroy, so waiting cannot hold a
+    // communicator resource needed by rank 0's teardown.
+    if (destroy_handshake.ok()) {
+        const auto destroy_release =
+            file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+        if (!destroy_release.ok()) {
+            LOG_WARN(
+                "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,
+                file_marker_handshake::stage_name(destroy_release.stage), destroy_release.rank
+            );
+            rc = -1;
+        }
     }
 
     delete h;

@@ -37,10 +37,46 @@ Both immediately-ready submissions and dependency-released consumers use
 this function. A directed task therefore cannot re-enter a shared
 NEXT_LEVEL queue after waiting in PENDING.
 
-Each `ReadyQueue` is a mutex-protected non-blocking FIFO. Root submission,
-worker completion, and stop requests notify the Scheduler condition variable;
-its wait predicate checks the completion FIFO, every ready queue, and the stop
-flag. Ready queues have no blocking pop or shutdown state.
+Each `ReadyQueue` is a mutex-protected non-blocking FIFO, partitioned by run:
+a task is enqueued under its own `run_id`, and the Scheduler pops only from the
+partition of the run that currently holds the FIFO head. That is what keeps two
+admitted runs from interleaving their device work while both are live.
+
+Root submission, run activation, stop requests, a worker publishing itself
+idle, and group-member completions that do not enqueue a terminal task
+completion all advance a wake generation under the Scheduler
+condition-variable mutex. Terminal task completions push the completion FIFO
+under the same mutex. The wait predicate checks for a completion or an
+unconsumed wake generation.
+Blocked queue heads therefore remain queued without keeping the predicate
+permanently true. Ready queues have no blocking pop or shutdown state.
+
+The predicate is edge-triggered, and that is a contract on everything that
+feeds it: **any state change that turns already-queued work into placeable
+work must push a completion or advance the generation.** The predicate no
+longer re-reads queue occupancy or worker state, so a change that only mutates
+those is invisible to a parked Scheduler.
+
+Two producers are easy to miss because neither pushes a completion.
+`dispatch_ready` re-queues work it could not place — through
+`enqueue_ready_cb`, which by design does not notify — so the retry depends
+entirely on a later edge. And an endpoint lane publishes its completion *before*
+it publishes its lane state: it calls `on_complete` and only then decrements
+`inflight_`. That order is deliberate, so a stopping Scheduler cannot read a
+worker as no longer busy while its final completion is still unqueued — which
+means the completion wake alone can land on a worker that still reads as
+occupied, and the dispatch pass it triggers finds nothing placeable.
+
+What makes the retry happen is that the Scheduler does not park while any lane
+is busy: the wait on `completion_cv_` is taken only when
+`WorkerManager::any_busy()` is false. A lane that is still occupied therefore
+gets another progress round and another dispatch pass without needing an edge
+at all, and the edge-triggered predicate governs only the genuinely idle case.
+
+Popping a slot is not the same as owning it. A run whose graph callback throws
+fails and consumes its own unstarted slots, so the Scheduler claims each slot
+with an atomic `READY -> RUNNING` compare-exchange at the moment it dispatches;
+a lost claim means the cancelling path already owns that slot.
 
 ## 2. Scheduler loop
 
@@ -48,7 +84,7 @@ The Scheduler drains completions before dispatching new work:
 
 ```cpp
 while (true) {
-    wait_until_completion_ready_or_stop();
+    wait_until_completion_or_new_wake_generation();
 
     while (completion_queue has an item) {
         on_task_complete(item);
@@ -112,6 +148,14 @@ single-task dispatch while existing work drains. Singles on other workers
 continue normally, and later groups do not reserve workers because the
 Scheduler does not scan past the FIFO head. The reservation is released when
 the group launches.
+
+A blocked head is structurally stalled when one of its reserved targets is
+idle and that target's single FIFO is non-empty. If that state persists for
+five seconds, the Scheduler emits one native warning for the episode with the
+group slot, busy target IDs, idle-but-queued target IDs, and their single FIFO
+head slots. A head change or disappearance of the structural condition starts
+a new episode. The warning does not classify the state as a deadlock and does
+not release the reservation.
 
 ## 4. SUB dispatch
 

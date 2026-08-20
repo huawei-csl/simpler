@@ -19,34 +19,29 @@ from typing import Optional
 
 from .environment import PROJECT_ROOT
 from .platform_info import TARGETS, load_build_config, parse_platform
-from .runtime_compiler import (
-    RuntimeCompiler,
-    _sdma_workspace_enabled,
-    _urma_workspace_enabled,
-)
+from .runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
+_DEFAULT_SIM_PROFILING_CONFIG = {
+    "SIMPLER_DFX": "1",
+    "SIMPLER_ORCH_PROFILING": "0",
+    "SIMPLER_SCHED_PROFILING": "0",
+    "SIMPLER_TENSORMAP_PROFILING": "0",
+}
 
 
 def platform_embeds_pto_isa(platform: str) -> bool:
     """Return True when this platform's onboard host embeds PTO-ISA headers.
 
-    a2a3 onboard always embeds (workspace forced ON in CMake). a5 onboard
-    embeds only when the SDMA or URMA async workspace overlay is opted in
-    (``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE`` / ``SIMPLER_ENABLE_PTO_URMA_WORKSPACE``
-    truthy) — the overlays are opt-in, so default-OFF a5 builds must not pull
-    in pin/metadata machinery. See issues #1351 (SDMA) and #1392 (URMA).
+    a2a3 and a5 onboard always embed a PTO-ISA async workspace. Simulation
+    platforms do not embed PTO-ISA host headers.
     """
     arch, variant = parse_platform(platform)
     if variant != "onboard":
         return False
-    if arch == "a2a3":
-        return True
-    if arch == "a5":
-        return _sdma_workspace_enabled() or _urma_workspace_enabled()
-    return False
+    return arch in {"a2a3", "a5"}
 
 
 def _get_git_head(repo_root: Path) -> str:
@@ -204,19 +199,16 @@ class RuntimeBuilder:
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
-        Driven by :func:`platform_embeds_pto_isa`: a2a3 onboard always (CMake
-        forces the SDMA workspace ON), a5 onboard only when the SDMA or URMA
-        async workspace overlay is truthy. a5 must key on the overlay env/CMake
-        option — not bare ``arch == "a5"`` — so default-OFF a5 builds never
-        clone pto-isa or write metadata for nothing (#1351).
+        Driven by :func:`platform_embeds_pto_isa`: a2a3 and a5 onboard always
+        embed one async workspace backend; simulation platforms do not.
         """
         return platform_embeds_pto_isa(self.platform)
 
     def _resolve_build_pto_isa_commit(self) -> str:
         """Return the pinned pto-isa commit baked into this build.
 
-        When host code embeds pto-isa headers (a2a3 onboard, or a5 onboard
-        with the SDMA or URMA overlay ON), a pto-isa bump must invalidate that build's
+        When host code embeds pto-isa headers (a2a3 or a5 onboard), a pto-isa
+        bump must invalidate that build's
         cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
         survives a reinstall). For every other arch/variant the pto-isa
@@ -236,9 +228,9 @@ class RuntimeBuilder:
     def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
         """Stamp identifying the sources this build was compiled from.
 
-        Combines the runtime repo HEAD with the pto-isa commit (a2a3 onboard
-        only) so the cmake cache is invalidated whenever either changes. An
-        empty runtime HEAD is preserved verbatim so the
+        Combines the runtime repo HEAD with the pto-isa commit for a2a3 and a5
+        onboard builds so the cmake cache is invalidated whenever either
+        changes. An empty runtime HEAD is preserved verbatim so the
         ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
         fires rather than being masked by a present pto-isa commit.
         """
@@ -320,7 +312,14 @@ class RuntimeBuilder:
             dispatcher_path=dispatcher_path,
         )
 
-    def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
+    def get_binaries(
+        self,
+        name: str,
+        build: bool = False,
+        *,
+        build_shared: bool = True,
+        profiling_config: Optional[dict[str, str]] = None,
+    ) -> RuntimeBinaries:
         """Return paths to compiled runtime binaries.
 
         By default, looks up pre-built binaries from build/lib/. When
@@ -331,6 +330,13 @@ class RuntimeBuilder:
             name: Name of the runtime implementation (e.g. 'host_build_graph')
             build: If True, compile the runtime before returning paths.
                 If False (default), return pre-built binary paths.
+            build_shared: If True (default), build the process-global helper
+                libraries as part of this call. ``build_runtimes.py`` sets this
+                to False after pre-building them once for the whole batch.
+            profiling_config: Complete profiling macro configuration passed to
+                each runtime target's CMake configure step. Simulation builds
+                explicitly use source defaults when this is omitted, preventing
+                values from an earlier profiling build remaining in CMake cache.
 
         Returns:
             RuntimeBinaries with paths to host, aicpu, and aicore binaries.
@@ -359,12 +365,14 @@ class RuntimeBuilder:
 
         build_pto_isa_commit = self._resolve_build_pto_isa_commit()
         cache_stamp = self._build_cache_stamp(build_pto_isa_commit)
+        effective_profiling_config = profiling_config
+        if variant == "sim" and effective_profiling_config is None:
+            effective_profiling_config = _DEFAULT_SIM_PROFILING_CONFIG
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
-            cmake_defines = None
+            defines = dict(effective_profiling_config or {})
             if target == "host":
-                defines: dict[str, str] = {}
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
                 # Pin-resolved checkout path for host CMake include dirs (#1403).
@@ -378,13 +386,10 @@ class RuntimeBuilder:
 
                         pto_root = ensure_pto_isa_root(verbose=True)
                     defines["PTO_ISA_ROOT"] = pto_root
-                for opt_in_define in (
-                    "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
-                    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
-                ):
+                for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
                     if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
                         defines[opt_in_define] = "ON"
-                cmake_defines = defines or None
+            cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -410,13 +415,13 @@ class RuntimeBuilder:
 
         # libsimpler_log.so must finish before the host runtime is built —
         # the host CMake links against it via -lsimpler_log -L<output_dir>.
-        simpler_log_path = self.ensure_simpler_log(build=True)
+        simpler_log_path = self.ensure_simpler_log(build=build_shared)
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             fut_host = executor.submit(_compile_target, "host")
             fut_aicpu = executor.submit(_compile_target, "aicpu")
             fut_aicore = executor.submit(_compile_target, "aicore")
-            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=True) if variant == "sim" else None
+            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
 
             host_path = fut_host.result()
             aicpu_path = fut_aicpu.result()

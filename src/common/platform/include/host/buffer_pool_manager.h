@@ -11,7 +11,7 @@
 
 /**
  * @file buffer_pool_manager.h
- * @brief Generic buffer-pool data structure shared by L2Swimlane, PMU,
+ * @brief Generic buffer-pool data structure shared by ChipSwimlane, PMU,
  *        DepGen, ArgsDump, and ScopeStats collectors. Owns:
  *
  *   - ready_queue shard(s) (mgmt → collector) as SPSC rings,
@@ -43,7 +43,7 @@
  *      A bulk host→device write-back is deliberately avoided — it would
  *      race with AICPU writes to device-only fields (current_buf_ptr,
  *      total/dropped/mismatch counters, queue_tails, free_queue.head, and
- *      on a5 L2SwimlaneAicpuPhaseHeader::magic).
+ *      on a5 ChipSwimlaneAicpuPhaseHeader::magic).
  *   2. Pulls each popped buffer's contents from device via
  *      `copy_buffer_from_device` inside ProfilerAlgorithms::process_entry
  *      before delivering it to the collector.
@@ -233,6 +233,12 @@ public:
         uint64_t tail = tail_.load(std::memory_order_acquire);
         uint64_t head = head_.load(std::memory_order_acquire);
         return tail == head;
+    }
+
+    bool full() const {
+        uint64_t head = head_.load(std::memory_order_acquire);
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        return head - tail >= Capacity;
     }
 
     size_t size() const {
@@ -572,7 +578,7 @@ public:
     }
 
     /**
-     * Pull a single buffer's contents (e.g. an L2SwimlaneAicpuTaskBuffer / PmuBuffer /
+     * Pull a single buffer's contents (e.g. an ChipSwimlaneAicpuTaskBuffer / PmuBuffer /
      * DumpMetaBuffer) from device to its host shadow. Called by
      * ProfilerAlgorithms::process_entry after resolving the host pointer
      * for a popped ready entry, before delivering it to the collector.
@@ -602,28 +608,59 @@ public:
             LOG_ERROR("BufferPoolManager: ready queue full for shard=%d capacity=%zu", shard_index, kHostQueueCapacity);
             return false;
         }
-        shard.notify_epoch.fetch_add(1, std::memory_order_release);
+        shard.state_epoch.fetch_add(1, std::memory_order_release);
         shard.cv.notify_one();
         return true;
     }
 
+    /**
+     * Publish one ready buffer, waiting for the collector to free a slot when
+     * the host hand-off ring is full. The caller retains ownership until this
+     * method returns, so a buffer already removed from the device ready queue
+     * can never be retired merely because the host consumer is temporarily
+     * slower than the drain thread.
+     *
+     * The timed tick bounds the impact of a condition-variable lost wakeup
+     * without putting a mutex on the SPSC pop hot path: a missed notification
+     * delays a retry by at most one tick, while every successful pop normally
+     * wakes the producer immediately.
+     */
+    void wait_push_to_ready(const ReadyBufferInfo &info, int shard_index = 0) {
+        auto &shard = ready_shards_[normalize_shard(shard_index)];
+        constexpr auto kRetryTick = std::chrono::milliseconds(100);
+
+        while (!shard.queue.push(info)) {
+            uint64_t seen = shard.state_epoch.load(std::memory_order_acquire);
+            std::unique_lock<std::mutex> lock(shard.wait_mutex);
+            (void)shard.cv.wait_for(lock, kRetryTick, [&shard, seen] {
+                return shard.state_epoch.load(std::memory_order_acquire) != seen || !shard.queue.full();
+            });
+        }
+
+        shard.state_epoch.fetch_add(1, std::memory_order_release);
+        shard.cv.notify_one();
+    }
+
     bool try_pop_ready(ReadyBufferInfo &out, int shard_index = 0) {
         auto &shard = ready_shards_[normalize_shard(shard_index)];
-        return shard.queue.pop(out);
+        if (!shard.queue.pop(out)) return false;
+        shard.state_epoch.fetch_add(1, std::memory_order_release);
+        shard.cv.notify_one();
+        return true;
     }
 
     bool wait_pop_ready(ReadyBufferInfo &out, std::chrono::milliseconds timeout, int shard_index = 0) {
         auto &shard = ready_shards_[normalize_shard(shard_index)];
-        if (shard.queue.pop(out)) return true;
+        if (try_pop_ready(out, shard_index)) return true;
 
-        uint64_t seen = shard.notify_epoch.load(std::memory_order_acquire);
+        uint64_t seen = shard.state_epoch.load(std::memory_order_acquire);
         std::unique_lock<std::mutex> lock(shard.wait_mutex);
         if (!shard.cv.wait_for(lock, timeout, [&shard, seen] {
-                return shard.notify_epoch.load(std::memory_order_acquire) != seen || !shard.queue.empty();
+                return shard.state_epoch.load(std::memory_order_acquire) != seen || !shard.queue.empty();
             })) {
             return false;
         }
-        return shard.queue.pop(out);
+        return try_pop_ready(out, shard_index);
     }
 
     // -------------------------------------------------------------------------
@@ -972,7 +1009,10 @@ private:
         ReadyRing queue;
         std::mutex wait_mutex;
         std::condition_variable cv;
-        std::atomic<uint64_t> notify_epoch{0};
+        // Incremented after every successful push or pop. Both sides use the
+        // epoch to distinguish a real queue-state transition from a spurious
+        // condition-variable wakeup.
+        std::atomic<uint64_t> state_epoch{0};
     };
 
     struct DoneQueueShard {

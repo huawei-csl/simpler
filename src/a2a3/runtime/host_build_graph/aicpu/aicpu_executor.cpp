@@ -24,6 +24,7 @@
 #include <tracr_simpler_markers.hpp>
 
 #include "aicpu/device_time.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -35,16 +36,17 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
-#include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
+#include "utils/thread_completion_gate.h"
 
 // Core type definitions
 #include "common/core_type.h"
@@ -85,7 +87,6 @@ struct AicpuExecutor {
     std::atomic<int32_t> thread_idx_{0};
     std::atomic<bool> init_done_{false};
     std::atomic<bool> init_failed_{false};
-    std::atomic<bool> finished_{false};
 
     // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
     // is published by the leader once the shared pre-handshake setup is visible;
@@ -109,7 +110,7 @@ struct AicpuExecutor {
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
-    std::atomic<int32_t> finished_count_{0};
+    simpler::ThreadCompletionGate completion_gate_;
     std::atomic<bool> runtime_init_ready_{false};
 
     // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
@@ -198,7 +199,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
-        finished_count_.store(0, std::memory_order_release);
+        completion_gate_.reset();
         if (sched_ctx_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
             init_done_.store(true, std::memory_order_release);
@@ -248,8 +249,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // run() — it must NOT return early. This thread owns a core slice
         // (handshake_partition assigns [lo, total) to the last thread), so an
         // early return would skip shutdown(thread_idx) — leaving its AICore
-        // cores spinning on an unclosed register window — and finished_count_,
-        // so finished_ never publishes and the host hangs into the op-execute
+        // cores spinning on an unclosed register window — and the completion
+        // gate never opens, so the host hangs into the op-execute
         // timeout (507018) instead of seeing the failure. On failure: record it
         // in run_rc, leave rt null so the dispatch block below skips, and still
         // publish runtime_init_ready_ (single point at the block's end) so the
@@ -283,7 +284,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime->set_slot_states_ptr(nullptr);
 
             sched_ctx_.bind_runtime(rt);
-
             // Latch the host-built task count (on_orchestration_done sets total_tasks_)
             // BEFORE the runtime_init_ready_ release below — that store is the barrier
             // that unblocks the scheduler threads. Otherwise they would acquire
@@ -292,13 +292,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // to keep them alive).
             // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
             // called it in run_host_orchestration; the orchestrator's own
-            // task-allocator pointers are intentionally NOT relocated (only the
-            // SM cross-task pointers and the host-built fanout adjacency —
-            // dep_pool / ready queues / fanout_head — were), so they still hold
-            // host addresses and mark_done()'s active_count() read would
-            // dereference host memory and fault the AICPU. on_orchestration_done
-            // only needs total_tasks and the scalar
-            // orchestrator.inline_completed_tasks, both already valid.
+            // task-allocator pointers are intentionally NOT relocated, so they
+            // still hold host addresses and mark_done() would fault the AICPU.
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
             LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
         }
@@ -313,8 +308,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // orchestration setup, seeds its disjoint slice of the whole graph's ready
     // set + wake lists, then barriers. Only once all slices are done does the
     // leader publish runtime_init_ready_, so no thread dispatches against a
-    // half-seeded graph. This replaces the O(total_tasks) serial classify the
-    // leader used to run alone while the others idle-waited.
+    // half-seeded graph.
     while (!classify_ready_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
@@ -371,19 +365,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     LOG_INFO("Thread %d: Completed", thread_idx);
 
-    // Check if this is the last thread to finish
-    int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
-    if (prev_finished + 1 == aicpu_thread_num_) {
-        finished_.store(true, std::memory_order_release);
-        // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
-        // always tear them down here.
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
+        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
+        // Destroy the host_build_graph runtime. sm_handle / rt are recreated
+        // every run, so always tear them down here.
         if (rt != nullptr) {
             // Clear g_current_runtime in this DSO before destroying rt.
             framework_bind_runtime(nullptr);
+            // Graph execution blocks are host-owned GM retained by the
+            // DeviceRunner. This run only drops its submission references;
+            // the blocks remain reusable until Worker finalization.
             runtime_destroy(rt, runtime_arena_);
             rt = nullptr;
         }
-    }
+    });
 
     return run_rc;
 }
@@ -397,12 +392,12 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    finished_count_.store(0, std::memory_order_release);
+    completion_gate_.reset();
     runtime_init_ready_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
 
-    // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
+    // Clear the file-scope runtime pointer (freed by the last scheduler thread before deinit).
     rt = nullptr;
 
     LOG_INFO("DeInit: Runtime execution state reset");
@@ -415,7 +410,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     classify_ready_.store(false, std::memory_order_release);
     classify_arrived_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
-    finished_.store(false, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
@@ -532,9 +526,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
 
-    // Last thread cleans up
-    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
+    // The finalizer publishes cleanup eligibility only after runtime destruction.
+    if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
+        LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
 

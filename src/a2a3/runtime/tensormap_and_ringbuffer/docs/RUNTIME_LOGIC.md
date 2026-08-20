@@ -127,11 +127,10 @@ On each trb bind, `RetainedTempBump`:
   falls back to `device_malloc` mid-run.
 
 Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
-the retained buffer is neither freed at end of run nor per run — it lives on
-the runner and is freed once in `finalize`. If the platform leaves the slot
-callbacks null (e.g. a backend without a retained buffer), bind transparently
-falls back to per-tensor `device_malloc` (recorded as `Free` leases, freed in
-validate).
+the retained buffer is neither freed at end of run nor per run — each slot's
+buffer lives on the runner and is freed once in `finalize`. The uniform host-runtime contract
+requires the retained-buffer callbacks on every backend; bind has no
+per-tensor allocation fallback.
 
 Public device-memory APIs keep their original semantics. `device_malloc_ctx`,
 `device_free_ctx`, `Worker.malloc()`, and `Worker.free()` still allocate and
@@ -604,7 +603,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `init(runtime, aicpu_thread_num, sched_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
-| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
+| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled. No-op on a fatal run — `emergency_shutdown` has already quiesced every core, and PMU finalize is skipped with it |
 | `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_` (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
@@ -798,7 +797,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
 | `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
-Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `chip_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
 scheduler/orchestrator thread starts — so it needs no cross-thread init
 handshake.

@@ -82,16 +82,34 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 // SimDeviceRunnerBase Implementation
 // =============================================================================
 
-int SimDeviceRunnerBase::select_pipeline_slot(uint32_t slot_id) {
-    if (slot_id >= PTO_PIPELINE_MAX_DEPTH) return -1;
-    pipeline_slot_ = slot_id;
-    return 0;
+bool SimDeviceRunnerBase::try_acquire_native_run(
+    const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit
+) {
+    if (owner == nullptr || permit == nullptr) return false;
+    const void *expected = nullptr;
+    if (!active_native_run_.compare_exchange_strong(
+            expected, owner, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    *permit = LaunchPermit(identity);
+    return true;
 }
 
-int SimDeviceRunnerBase::select_arena_bank(uint32_t bank_id) {
-    if (bank_id >= PTO_PIPELINE_MAX_DEPTH) return -1;
-    arena_bank_ = bank_id;
-    return 0;
+void SimDeviceRunnerBase::release_native_run(const void *owner) {
+    if (active_native_run_.load(std::memory_order_acquire) != owner) return;
+    const void *expected = owner;
+    (void)active_native_run_.compare_exchange_strong(
+        expected, nullptr, std::memory_order_release, std::memory_order_relaxed
+    );
+}
+
+bool SimDeviceRunnerBase::native_run_active() const {
+    return active_native_run_.load(std::memory_order_acquire) != nullptr;
+}
+
+bool SimDeviceRunnerBase::native_run_owned_by(const void *owner) const {
+    return owner != nullptr && active_native_run_.load(std::memory_order_acquire) == owner;
 }
 
 uint64_t SimDeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
@@ -105,8 +123,11 @@ uint64_t SimDeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
     return reinterpret_cast<uint64_t>(retained_temp_addrs_[slot_id]);
 }
 
-int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
-    ArenaBank &bank = arena_bank();
+int SimDeviceRunnerBase::setup_static_arena(
+    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+) {
+    if (arena_bank >= arena_banks_.size()) return -1;
+    ArenaBank &bank = this->arena_bank(arena_bank);
     // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
@@ -174,12 +195,12 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
 }
 
 bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
-    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
     void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
 ) const {
     // The cache holds one entry and its bases point into bank 0, so any other
     // bank must rebuild rather than be handed a region it does not own.
-    if (arena_bank_ != 0) return false;
+    if (arena_bank != 0) return false;
     if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
         prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
         sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
@@ -199,11 +220,11 @@ bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
 }
 
 void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
-    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
-    size_t runtime_off, const void *image_data, size_t image_size
+    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+    void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
 ) {
     // Single-entry cache owned by bank 0; see lookup_prebuilt_runtime_arena_cache.
-    if (arena_bank_ != 0) return;
+    if (arena_bank != 0) return;
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_hash_ = hash;
     prebuilt_runtime_arena_cache_key_.assign(
@@ -219,20 +240,23 @@ void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
     prebuilt_runtime_arena_cache_valid_ = true;
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_gm_heap() {
-    DeviceArena &arena = arena_bank().gm_heap;
+void *SimDeviceRunnerBase::acquire_pooled_gm_heap(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_heap;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_gm_sm() {
-    DeviceArena &arena = arena_bank().gm_sm;
+void *SimDeviceRunnerBase::acquire_pooled_gm_sm(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_sm;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_runtime_arena() {
-    DeviceArena &arena = arena_bank().runtime_pool;
+void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).runtime_pool;
     if (!arena.is_committed()) return nullptr;
     return arena.base();
 }
@@ -276,9 +300,11 @@ int SimDeviceRunnerBase::ensure_device_initialized() {
 }
 
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
-    if (config.aicpu_thread_num < 1 || config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
+    if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
+        config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
-            "launch_aicpu_num (%d) must be in range [1, %d]", config.aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
+            "launch_aicpu_num (%d) must be 0 (auto) or in range [2, %d]", config.aicpu_thread_num,
+            PLATFORM_MAX_AICPU_THREADS
         );
         return -1;
     }
@@ -332,14 +358,67 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
-void SimDeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addrs_[pipeline_slot_];
-    if (size != nullptr) *size = retained_temp_sizes_[pipeline_slot_];
+void SimDeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (pipeline_slot >= retained_temp_addrs_.size()) {
+        if (addr != nullptr) *addr = nullptr;
+        if (size != nullptr) *size = 0;
+        return;
+    }
+    if (addr != nullptr) *addr = retained_temp_addrs_[pipeline_slot];
+    if (size != nullptr) *size = retained_temp_sizes_[pipeline_slot];
 }
 
-void SimDeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addrs_[pipeline_slot_] = addr;
-    retained_temp_sizes_[pipeline_slot_] = size;
+void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size) {
+    if (pipeline_slot >= retained_temp_addrs_.size()) return;
+    retained_temp_addrs_[pipeline_slot] = addr;
+    retained_temp_sizes_[pipeline_slot] = size;
+}
+
+void *SimDeviceRunnerBase::acquire_graph_execution_buffer(
+    uint32_t pipeline_slot, uint64_t graph_key, uint32_t occurrence, size_t bytes, size_t alignment
+) {
+    if (pipeline_slot >= graph_execution_buffers_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return nullptr;
+    }
+    std::vector<RetainedGraphExecutionBuffer> &buffers = graph_execution_buffers_[pipeline_slot][graph_key];
+    if (occurrence >= buffers.size()) buffers.resize(static_cast<size_t>(occurrence) + 1);
+    RetainedGraphExecutionBuffer &buffer = buffers[occurrence];
+    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
+        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
+        return buffer.aligned_addr;
+    }
+
+    const size_t allocation_bytes = bytes + alignment - 1;
+    void *allocation = mem_alloc_.alloc(allocation_bytes);
+    if (allocation == nullptr) return nullptr;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+    if (raw > UINTPTR_MAX - (alignment - 1)) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+    if (device_memset(aligned_addr, 0, bytes) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    buffer = RetainedGraphExecutionBuffer{allocation, aligned_addr, bytes};
+    return aligned_addr;
+}
+
+void SimDeviceRunnerBase::release_graph_execution_buffers() {
+    for (GraphExecutionBufferMap &by_key : graph_execution_buffers_) {
+        for (auto &entry : by_key) {
+            for (RetainedGraphExecutionBuffer &buffer : entry.second) {
+                if (buffer.allocation != nullptr) mem_alloc_.free(buffer.allocation);
+            }
+        }
+        by_key.clear();
+    }
 }
 
 void SimDeviceRunnerBase::clear_temporary_buffer() {
@@ -587,7 +666,7 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 }
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
-    set_l2_swimlane_enabled(config.enable_l2_swimlane);
+    set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);
     set_pmu_enabled(config.enable_pmu);
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.

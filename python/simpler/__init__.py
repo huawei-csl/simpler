@@ -8,13 +8,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Simpler runtime — public Python surface.
 
-Host-side log filter setup happens in `ChipWorker.init` (see
-`simpler.task_interface`): it `ctypes.CDLL`s libsimpler_log.so RTLD_GLOBAL,
-calls its `simpler_log_init` C entry to seed the process-wide HostLogger, then
-hands off to the C++ `_ChipWorker.init` which dlopens host_runtime.so (whose
-`simpler_init` reads CANN dlog config off that same HostLogger, onboard only).
-The level forwarded is a one-shot snapshot of the `simpler` Python logger.
-Nothing log-related needs to happen at import time here.
+Host-side log filter setup happens during worker initialization. A hierarchical
+`Worker` seeds the parent before its first fork; `ChipWorker.init` (see
+`simpler.task_interface`) repeats that initialization in each child before the
+C++ `_ChipWorker.init` dlopens host_runtime.so. The level forwarded is a
+one-shot snapshot of the `simpler` Python logger, and onboard `simpler_init`
+maps it onto CANN's coarser dlog ladder.
+Import time here only dlopens libsimpler_log.so into the global symbol scope
+(`simpler._log_preload`, reached through `._log` below); no level is seeded and
+no failure is raised if the library is absent. When `_task_interface` is
+available, `_log` passes the logger entry point into the extension's nullable,
+extension-local host-span sink slot before Worker initialization.
 
 `Worker` and the `task_interface` submodule resolve on first attribute access
 rather than at import time: both pull in the `_task_interface` extension, so
@@ -41,12 +45,13 @@ __all__ = [
     "TIMING",
     "get_current_config",
     "get_logger",
+    "comm_endpoints",
     "task_interface",
 ]
 
 # name -> (module, attribute). Resolved by __getattr__ on first access.
 _LAZY_ATTRS = {"Worker": (f"{__name__}.worker", "Worker")}
-_LAZY_SUBMODULES = ("task_interface",)
+_LAZY_SUBMODULES = ("comm_endpoints", "task_interface")
 
 
 def __getattr__(name: str) -> Any:

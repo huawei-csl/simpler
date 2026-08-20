@@ -15,7 +15,7 @@
  * This header defines all fundamental types used by the PTO Runtime2 system:
  * - Configuration constants
  * - Worker types and task states
- * - Tensor regions and task parameters
+ * - ChipTensor regions and task parameters
  * - Task descriptors with fanin/fanout tracking
  * - Dependency list entries
  *
@@ -43,6 +43,7 @@
 // pto_runtime2_types.h never references PTO2DispatchPayload itself; consumers that
 // need it include it via runtime.h directly.
 #include "aicore_completion_mailbox.h"
+#include "common/args_dump_task_metadata.h"
 #include "pto_submit_types.h"
 #include "pto_task_id.h"
 #include "pto_types.h"
@@ -77,8 +78,8 @@
 #endif
 
 // Single ring. host_build_graph is host-orch: the whole graph is built on the
-// host, fits one ring, and the device runs it once without reclaim (see stages
-// 1-2 — execution-time recycle removed). The multi-ring design existed only to
+// host, fits one ring, and the device runs it once without reclaim. The
+// multi-ring design existed only to
 // let inner scopes reclaim independently under small rings; with no reclaim and
 // a whole-graph-resident ring, per-depth isolation is moot, so all scope depths
 // map to the single ring 0 (0 == 0).
@@ -98,8 +99,13 @@
 // buffer (which would be UB on the arena's malloc'd backing).
 #define PTO2_SCOPE_TASKS_CAP (PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH)
 
-// Ready queue
-#define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
+// Per-shape ready-queue capacity (power of two). This is a ring buffer that
+// bounds peak CONCURRENT occupancy (enqueue_pos - dequeue_pos), not total task
+// count: slots recycle, so capacity need only exceed the most tasks ever
+// simultaneously ready in any one queue. Overflow on the ready/sync/dummy queues
+// latches PTO2_ERROR_READY_QUEUE_OVERFLOW (safe-fail), so it must exceed the
+// worst-case ready burst with margin.
+#define PTO2_READY_QUEUE_SIZE 8192
 
 // Cross-thread early-dispatch work queue (power of two)
 #define PTO2_EARLY_DISPATCH_QUEUE_SIZE 64
@@ -149,7 +155,7 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_MS = 15000;  // 15 s
  * Conditions:
  *   PENDING->COMPLETED:   all subtasks finish (set by scheduler) or task is a
  *                         hidden alloc completed inline by the orchestrator
- *   COMPLETED->CONSUMED:  fanout_refcount == fanout_count && state == COMPLETED
+ *   COMPLETED->CONSUMED:  per-ring completed_watermark >= last_consumer_local_id
  */
 typedef enum {
     PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
@@ -167,6 +173,13 @@ struct PTO2TaskAllocResult {
     void *packed_end;   // packed_base + aligned output_size
 
     bool failed() const { return task_id < 0; }
+};
+
+enum class TaskKind : uint8_t {
+    KERNEL = 0,
+    DUMMY = 1,
+    GRAPH = 2,
+    GRAPH_NODE = 3,
 };
 
 struct PTO2OutputLayout {
@@ -325,13 +338,14 @@ struct PTO2TaskPayload {
     // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
     // dispatch.
     alignas(64) DispatchPredicate predicate;
+    ArgsDumpTaskMetadata dump_metadata;
     // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
-    Tensor tensors[MAX_TENSOR_ARGS];
+    ChipTensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 74-75 (128B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
-    static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
+    static_assert(sizeof(ChipTensor) == 128, "ChipTensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 128, "scalar region must be 128B (2 cache lines)");
 
     /**
@@ -366,7 +380,7 @@ struct PTO2TaskPayload {
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
     void init(
-        const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
+        const CoreTaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
     ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
@@ -388,6 +402,13 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+
+        dump_metadata = {};
+#if SIMPLER_DFX
+        dump_metadata.dump_arg_mask = args.dump_arg_mask();
+        dump_metadata.dump_arg_flags = args.dump_arg_index_ambiguous_mask();
+        memcpy(dump_metadata.scalar_dtypes, args.scalar_dtypes(), args.scalar_count() * sizeof(uint8_t));
+#endif
 
         // Early-dispatch metadata — the single init point for these
         // fields. reset_for_reuse MUST NOT touch the payload (it runs at slot
@@ -421,14 +442,18 @@ static_assert(
     "dispatch predicate occupies cache line 9 at fixed byte 576 (before tensors, never moves)"
 );
 static_assert(
+    offsetof(PTO2TaskPayload, dump_metadata) + sizeof(ArgsDumpTaskMetadata) <= 640,
+    "dump metadata must fit in the AICPU-only cache line before tensors"
+);
+static_assert(
     offsetof(PTO2TaskPayload, tensors) == 640, "tensors must start at byte 640 (cache line 10, after predicate)"
 );
 static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    offsetof(PTO2TaskPayload, scalars) == 640 + MAX_TENSOR_ARGS * sizeof(ChipTensor),
     "scalars must immediately follow tensors"
 );
 static_assert(
-    sizeof(PTO2TaskPayload) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    sizeof(PTO2TaskPayload) == 640 + MAX_TENSOR_ARGS * sizeof(ChipTensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
     "PTO2TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars"
 );
 
@@ -484,7 +509,7 @@ struct alignas(64) PTO2TaskSlotState {
     // MPSC-deferred completion. The release write is sequenced before
     // on_subtask_complete's acq_rel fetch_add and the acquire read after.
     std::atomic<bool> any_subtask_deferred{false};
-    uint8_t _async_pad{0};
+    TaskKind task_kind{TaskKind::KERNEL};
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -493,6 +518,14 @@ struct alignas(64) PTO2TaskSlotState {
     // can run concurrently after a partial staged release. All paths claim
     // ranges through claim_block_range().
     std::atomic<int16_t> next_block_idx{0};
+
+    // Graph-only scheduling metadata occupies the former tail padding, keeping
+    // the slot state at one cache line and preserving the 40-byte descriptor
+    // ABI consumed by AICore. Readiness uses the shared intrusive wake-list
+    // fields above; this index identifies the node in the saved fanin CSR.
+    // Ordinary ring tasks leave both Graph fields -1/null.
+    int32_t graph_node_index{-1};
+    void *graph_context{nullptr};
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);
@@ -527,18 +560,26 @@ struct alignas(64) PTO2TaskSlotState {
     bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
     /**
-     * Reset dynamic scheduling fields to their pristine values. Runs once per
-     * slot at init (pto_shared_memory.cpp) — whole-graph-resident hbg has no
-     * execution-time slot recycle. Skips payload/task (bound once) and
+     * Reset dynamic scheduling fields to their pristine values. Called once per
+     * slot as the orchestrator claims it in prepare_task — whole-graph-resident
+     * hbg has no execution-time slot recycle. Skips payload/task (bound once) and
      * task_state (the orchestrator sets PENDING when it populates the slot).
      * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
+     * Graph-affine replay passes preserve_graph_binding=true because its node
+     * index, kind, and execution pointer are static properties of the retained
+     * storage block.
      */
-    void reset_for_reuse() {
+    void reset_for_reuse(bool preserve_graph_binding = false) {
         wake_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_wake_list = nullptr;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
+        if (!preserve_graph_binding) {
+            graph_node_index = -1;
+            graph_context = nullptr;
+            task_kind = TaskKind::KERNEL;
+        }
         // Note: active_mask and task_attrs are per-submit-constant fields
         // rewritten in prepare_task on every reuse, so they are not reset here.
         // last_consumer_local_id is seeded in prepare_task once the id is known.

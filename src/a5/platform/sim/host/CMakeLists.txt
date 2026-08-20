@@ -45,7 +45,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
@@ -73,6 +73,8 @@ endif()
 
 # Create shared library
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../../cmake/profiling_config.cmake")
+simpler_configure_profiling(host_runtime)
 
 # TraCR
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)

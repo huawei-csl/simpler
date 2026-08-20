@@ -106,7 +106,10 @@ DeviceRunner runner;
 void *ptr = runner.allocate_tensor(bytes);
 runner.copy_to_device(dev_ptr, host_ptr, bytes);
 runner.set_executors(aicpu_binary, aicore_binary);   // once, at init time
-runner.run(runtime, config);                         // config carries aicpu_thread_num, diagnostics
+std::unique_ptr<DeviceRunnerBase::PreparedExecution> prepared;
+runner.prepare_execution(runtime, config, pipeline_slot, identity, &prepared);
+auto launched = runner.launch_execution(std::move(prepared), std::move(permit));
+runner.drain_execution(*launched.active);            // child progress path owns progress
 runner.finalize();
 ```
 
@@ -122,13 +125,22 @@ simpler_init(ctx, device_id,                          // attach + binary takeove
              aicpu_binary, aicpu_size,
              aicore_binary, aicore_size);
 size_t size = get_runtime_size();
-register_callable(ctx, cid, callable);                 // one-time per callable
-simpler_run(ctx, runtime, cid, args, config);        // per-launch — no binaries; config
-                                                       // carries aicpu_thread_num,
-                                                       // diagnostics + ring overrides
-unregister_callable(ctx, cid);
+size_t alignment = get_runtime_alignment();
+void *runtime = allocate_zeroed_aligned(size, alignment); // stable until finalize
+simpler_register_callable(ctx, cid, callable);        // one-time per callable
+
+// Progressable form; simpler_run(...) composes these phases synchronously.
+// `descriptor` carries this run's slot/bank/identity and the optional
+// launch-acceptance target published at the kernel-launch marker.
+simpler_prepare_run(ctx, runtime, cid, args, config, &descriptor); // bind, no device launch
+simpler_launch_run(ctx, runtime);  // publishes descriptor acceptance and returns after launch fence
+simpler_wait_run(ctx, runtime);                                    // or poll until complete
+simpler_finalize_run(ctx, runtime);                                // validate, copy back, destroy
+
+simpler_unregister_callable(ctx, cid);
 finalize_device(ctx);
 destroy_device_context(ctx);
+free(runtime);
 ```
 
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
@@ -141,7 +153,7 @@ worker.init(device_id=0, bins=bins)   # bins = RuntimeBuilder(platform).get_bina
 
 config = CallConfig()
 # A run always takes the whole device; there is no per-call width knob.
-config.aicpu_thread_num = 3
+config.aicpu_thread_num = 0  # auto
 config.enable_pmu = 0
 worker.run(callable, args, config)
 worker.finalize()

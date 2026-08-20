@@ -40,8 +40,7 @@
  * std::function — it would break the inlining and add ~5 ns/call to the orch hot path.
  */
 
-#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_
-#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_
+#pragma once
 
 #include <cstdint>
 
@@ -92,7 +91,7 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
             continue;
         }
 
-        const Tensor *tensor = &inputs.tensors[i].ref();
+        const ChipTensor *tensor = &inputs.tensors[i].ref();
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
@@ -144,7 +143,7 @@ register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            const Tensor *tensor = &inputs.tensors[i].ref();
+            const ChipTensor *tensor = &inputs.tensors[i].ref();
             if (!tensor->manual_dep) {
                 tensor_map.insert(*tensor, task_id);
             }
@@ -175,5 +174,3 @@ inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual
     }
     return needed;
 }
-
-#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_

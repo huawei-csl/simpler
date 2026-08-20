@@ -8,8 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef SCHEDULER_TYPES_H
-#define SCHEDULER_TYPES_H
+#pragma once
 
 #include <atomic>
 #include <cstddef>
@@ -17,7 +16,6 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
-#include "pto2_dispatch_payload.h"
 #include "pto_runtime2_types.h"
 #include "spin_hint.h"
 
@@ -258,9 +256,9 @@ public:
     BitStates get_all_running_cores() const { return (~core_states_) & (aic_mask_ | aiv_mask_); }
     BitStates get_cluster_offset_states() const { return aic_mask_; }
 
-    // Free capacity for early-dispatch staging: any core whose pending slot is
-    // not occupied (idle RUNNING or dual-issue PENDING). Matches a2a3 #1288-ish
-    // spare-slot gate (not full-idle-only).
+    // Every core whose pending slot is free has capacity for early-dispatch
+    // staging: an idle core uses its running slot, while a running core uses its
+    // pending slot. This is local tracker state with no shared-memory access.
     BitStates get_free_slot_states() const { return (~pending_occupied_) & (aic_mask_ | aiv_mask_); }
     bool has_any_free_slot() const { return get_free_slot_states().has_value(); }
 
@@ -384,8 +382,14 @@ public:
         return get_mix_running_cluster_offset_states(core_mask).count();
     }
 
-    // Gated MIX split placement (#1304): each used core independently takes
-    // running-if-idle / pending-if-busy while every used core waits on the doorbell.
+    // --- Gated MIX split placement ---
+    // A gated MIX block can place each core independently: idle cores take
+    // running slots and busy cores with free capacity take pending slots. Every
+    // core waits on the doorbell, so nothing executes before the rendezvous.
+    // Immediate dispatch instead uses classify_mix_cluster to require one
+    // placement for the whole cluster.
+
+    // Cores of `cluster_offset` named by core_mask.
     BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used;
         if (core_mask & PTO2_SUBTASK_MASK_AIC) used |= BitStates::bit(cluster_offset);
@@ -397,14 +401,18 @@ public:
     bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used = mix_used_cores(cluster_offset, core_mask);
         if (!used.has_value()) return false;
+        // A used core has no capacity only while both running and pending slots
+        // are occupied.
         BitStates no_slot = (~core_states_) & pending_occupied_;
         return !(used & no_slot).has_value();
     }
 
+    // Used idle cores take running slots and seed the rendezvous count.
     int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
         return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
     }
 
+    // Clusters where every used core has a free slot.
     BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
@@ -472,7 +480,7 @@ public:
     int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
 
     const int32_t *core_ids() const { return core_id_map_; }
-    int32_t core_num() const { return cluster_count_ * 3; }
+    int32_t core_num() const { return cluster_count_ * PLATFORM_CORES_PER_BLOCKDIM; }
 
 private:
     int32_t cluster_count_;
@@ -501,19 +509,23 @@ struct SlotTransition {
 // =============================================================================
 
 #if SIMPLER_DFX
-struct alignas(64) SchedL2SwimlaneCounters {
-    bool l2_swimlane_enabled{false};
+struct alignas(64) SchedChipSwimlaneCounters {
+    bool chip_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
-    uint64_t sched_scan_cycle{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_async_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
+    // Sub-block retires that did not finish a slot (SPMD blocks of a
+    // multi-block task retiring one at a time). Keep this separate from
+    // phase_complete_count so the Complete phase remains visible during the
+    // serial-harvest tail of an SPMD task.
+    uint32_t phase_subretire_count{0};
     uint32_t phase_dispatch_count{0};
     // Per-emit delta is (current - *_at_last_emit). Accumulated only when
-    // l2_swimlane_level_ >= SCHED_PHASES.
+    // chip_swimlane_level_ >= SCHED_PHASES.
     uint64_t pop_hit{0};
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
@@ -525,7 +537,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};
 #endif
-    void reset() { *this = SchedL2SwimlaneCounters{}; }
+    void reset() { *this = SchedChipSwimlaneCounters{}; }
 };
 #endif
 
@@ -539,9 +551,13 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
     std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     std::atomic<uint64_t> drain_attempt{0};                  // incremented whenever an ack round is reset
-    std::atomic<int32_t> drain_stage_go{0};
-    std::atomic<uint32_t> drain_stage_done_mask{0};
-    std::atomic<int32_t> drain_running_staged{0};
+    // The coordinator publishes stage_go after global capacity is confirmed.
+    // Each scheduler stages its local cores, publishes its bit in
+    // stage_done_mask, and contributes running-slot cores to running_staged.
+    // The coordinator waits for all scheduler bits before seeding the rendezvous.
+    std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=parallel staging enabled
+    std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per scheduler thread
+    std::atomic<int32_t> drain_running_staged{0};    // total running-slot cores staged
     int32_t _pad[7];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
@@ -560,5 +576,3 @@ inline uint64_t sync_start_drain_next_attempt(uint64_t attempt) {
 inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
     return attempt | SYNC_START_DRAIN_ACK_SUBTREE_READY;
 }
-
-#endif  // SCHEDULER_TYPES_H

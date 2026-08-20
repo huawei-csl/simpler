@@ -28,7 +28,6 @@
 #include "aicpu/device_time.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/orch_so_file.h"
-#include "aicpu/platform_aicpu_affinity.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
 #include "pto2_dispatch_payload.h"
@@ -41,15 +40,16 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
-#include "aicpu/dep_gen_collector_aicpu.h"
-#include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
-#include "common/l2_swimlane_profiling.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
 #include "aicpu/aicpu_device_config.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
@@ -68,11 +68,11 @@
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
-typedef void (*DeviceOrchestrationFunc)(const L2TaskArgs &orch_args);
+typedef void (*DeviceOrchestrationFunc)(const ChipTaskArgs &orch_args);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 
 // Config function exported by orchestration .so
-typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const L2TaskArgs &orch_args);
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipTaskArgs &orch_args);
 
 // From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
 // framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
@@ -150,9 +150,9 @@ struct AicpuExecutor {
     // Default-constructed: libc-backed backend, no ctx.
     DeviceArena runtime_arena_;
 
-    // Entry-arg L2TaskArgs built (via create_from_chip_args) from get_orch_args()
+    // Entry-arg ChipTaskArgs built (via create_from_chip_args) from get_orch_args()
     // before scheduler init; consumed by the (*p_func)(orch_args_cached_) below.
-    L2TaskArgs orch_args_cached_;
+    ChipTaskArgs orch_args_cached_;
 
     // Per-callable_id table. Single orch thread today, so first-write/read
     // race is not possible; if multiple orch threads are ever introduced,
@@ -488,6 +488,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // its own stub; the fallback covers any path that bypassed the gate).
     int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
     int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
+            MAX_AICPU_THREADS, affinity_exec_idx
+        );
+        // Reachable before the orchestrator split: this thread may be the
+        // would-be orchestrator, so release the scheduler threads waiting on
+        // runtime_init_ready_ (the orchestrator block is the only other publisher).
+        runtime_init_ready_.store(true, std::memory_order_release);
+        return -1;
+    }
     int32_t run_rc = 0;
     // Publish the resolved index so per-thread readers in this `.so` (notably
     // the AICPU phase-record slot) agree with the executor. On sim the basic
@@ -645,7 +656,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
 
 #if SIMPLER_DFX
-                rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
+                rt->orchestrator.chip_swimlane_level = get_chip_swimlane_level();
                 {
                     auto &orch = rt->orchestrator;
                     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -667,15 +678,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             runtime_init_ready_.store(true, std::memory_order_release);
 
 #if SIMPLER_DFX
-            if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
-                l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
+            if (get_chip_swimlane_level() >= ChipSwimlaneLevel::ORCH_PHASES) {
+                chip_swimlane_aicpu_set_orch_thread_idx(thread_idx);
             }
-            // scope_stats streams scope_end records off the orchestrator thread:
-            // record the per-thread ready_queue index. No-op (writer shared
-            // state null) when scope_stats is disabled; the current buffer is
-            // popped lazily on the first scope_end append.
-            scope_stats_aicpu_set_orch_thread_idx(thread_idx);
+#endif
 
+#if SIMPLER_DFX
             // dep_gen plugs into the orchestrator thread (single-instance subsystem):
             // resolve its buffer state and record the per-thread ready_queue index
             // before any submit_task fires inside orch_func_. The init belongs to
@@ -693,6 +701,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_init();
                 dep_gen_aicpu_set_orch_thread_idx(thread_idx);
             }
+
+            // scope_stats streams scope_end records off the orchestrator thread:
+            // record the per-thread ready_queue index. No-op (writer shared
+            // state null) when scope_stats is disabled; the current buffer is
+            // popped lazily on the first scope_end append.
+            scope_stats_aicpu_set_orch_thread_idx(thread_idx);
 #endif
 
 #if SIMPLER_DFX
@@ -791,7 +805,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // device LOG_INFO "orch_start=… orch_end=… orch_cost=…" line
             // below carries the same envelope info for debugging, and
             // host-side swimlane derives per-phase timing from the per-event
-            // L2SwimlaneAicpuOrchPhaseRecord[] stream that already covers everything inside
+            // ChipSwimlaneAicpuOrchPhaseRecord[] stream that already covers everything inside
             // submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {
@@ -871,6 +885,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     if (prev_finished + 1 == aicpu_thread_num_) {
+        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries

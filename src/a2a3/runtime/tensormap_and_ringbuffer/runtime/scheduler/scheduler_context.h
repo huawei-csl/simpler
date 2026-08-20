@@ -13,7 +13,7 @@
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
 
@@ -26,7 +26,7 @@
 // (it pulls in Handshake which we only forward-declare).  Mirror the
 // authoritative values so the class layout compiles standalone.
 #ifndef RUNTIME_MAX_WORKER
-#define RUNTIME_MAX_WORKER 72
+#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
 #endif
 #ifndef RUNTIME_MAX_FUNC_ID
 #define RUNTIME_MAX_FUNC_ID 1024
@@ -167,10 +167,10 @@ private:
     std::atomic<uint64_t> drain_ack_tokens_[MAX_AICPU_THREADS]{};
 
 #if SIMPLER_DFX
-    SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
-    // Cached once at init() from get_l2_swimlane_level(), AFTER
-    // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
-    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
+    SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_chip_swimlane_level(), AFTER
+    // chip_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
 #endif
 
     // --- Task-execution tracking ---
@@ -179,6 +179,7 @@ private:
     // Device orchestration: set by last orchestrator when graph is built; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
+    std::atomic<bool> fatal_shutdown_started_{false};
     uint64_t *func_id_to_addr_{nullptr};
 
     // --- Thread/core configuration ---
@@ -220,8 +221,10 @@ private:
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();
 
-    // Emergency shutdown: broadcast exit signal to every handshake'd core and
-    // deinit their AICore register blocks. Idempotent.
+    // Publish fatal state before completion, then elect one thread to broadcast
+    // exit to every handshake'd core. Idempotent.
+    bool begin_emergency_shutdown();
+    void signal_emergency_shutdown(Runtime *runtime);
     void emergency_shutdown(Runtime *runtime);
 
     // =========================================================================
@@ -261,7 +264,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;
@@ -284,7 +287,7 @@ private:
         }
         // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
         // task, folded as min. Untagged tasks pay only this cache-hot compare and
-        // never read the sys counter. Independent of L2 swimlane level.
+        // never read the sys counter. Independent of chip swimlane level.
         if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
             aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
         }
@@ -464,7 +467,9 @@ private:
     // out_stage_wall_cycles (profiling only): cycles this thread spent in stage_sync_start_cores
     // (prepare + publish), set ONLY on threads that actually staged. Lets the caller isolate
     // the pure stage wall from the ack-barrier + finalize spans in the Drain bar.
-    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
+    void handle_drain_mode(
+        int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr, int32_t *out_staged_blocks = nullptr
+    );
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
@@ -534,7 +539,7 @@ private:
     );
 
 #if SIMPLER_DFX
-    __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_chip_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================

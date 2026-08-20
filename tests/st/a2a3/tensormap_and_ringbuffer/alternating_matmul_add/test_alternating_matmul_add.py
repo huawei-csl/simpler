@@ -18,7 +18,7 @@ import ctypes
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -54,20 +54,17 @@ class TestAlternatingMatmulAdd(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"batch": 1, "M": 1, "N": 1, "matmul_batch": 1, "add_batch": 1},
         },
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"batch": 500, "M": 4, "N": 4, "matmul_batch": 4, "add_batch": 4},
             "manual": True,
         },
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"batch": 512, "M": 2, "N": 5, "matmul_batch": 4, "add_batch": 5},
             "manual": True,
         },
@@ -92,12 +89,12 @@ class TestAlternatingMatmulAdd(SceneTestCase):
         Z = torch.zeros(batch, N, add_rows, add_cols, dtype=torch.float32)
 
         return TaskArgsBuilder(
-            Tensor("A", A.flatten()),
-            Tensor("B", B.flatten()),
-            Tensor("C", C.flatten()),
-            Tensor("X", X.flatten()),
-            Tensor("Y", Y.flatten()),
-            Tensor("Z", Z.flatten()),
+            TensorArg("A", A.flatten()),
+            TensorArg("B", B.flatten()),
+            TensorArg("C", C.flatten()),
+            TensorArg("X", X.flatten()),
+            TensorArg("Y", Y.flatten()),
+            TensorArg("Z", Z.flatten()),
             Scalar("batch", ctypes.c_int64(batch)),
             Scalar("M_val", ctypes.c_int64(M)),
             Scalar("N_val", ctypes.c_int64(N)),

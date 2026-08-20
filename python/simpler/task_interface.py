@@ -9,20 +9,24 @@
 # ruff: noqa: PLW0603, PLC0415
 """Public Python API for task_interface nanobind bindings.
 
-Re-exports the canonical C++ types (DataType, Tensor, ChipStorageTaskArgs,
-TaskArgs, TensorArgType) plus ``scalar_to_uint64``. Torch-aware helpers
-(``make_tensor_arg``, ``torch_dtype_to_datatype``) live in
-``simpler_setup.torch_interop`` — this module has no torch dependency.
+Re-exports the canonical C++ types (DataType, ChipTensor, ChipStorageTaskArgs, TaskArgs,
+TensorArgType) plus ``scalar_to_uint64``, and re-exports the address-free ``Tensor`` — the task
+argument users build — from ``simpler.buffer``. Torch-aware helpers (``make_chip_tensor_arg``,
+``torch_dtype_to_datatype``) live in ``simpler_setup.torch_interop`` — this module has no torch
+dependency.
+
+``ChipTensor`` is the chip-only POD the runtime ABI expects, paired with
+``ChipStorageTaskArgs`` on the direct ``ChipWorker`` path; it carries a
+materialized address and never crosses a process boundary.
 
 Usage:
-    from simpler.task_interface import DataType, Tensor, ChipStorageTaskArgs
-    from simpler_setup.torch_interop import make_tensor_arg
+    from simpler.task_interface import DataType, TaskArgs, Tensor, TensorArgType
+    from simpler_setup.torch_interop import make_chip_tensor_arg
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
 import threading
 import uuid
 import weakref
@@ -31,6 +35,15 @@ from enum import IntEnum
 from math import prod
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+# `preload_global` is the process-wide RTLD_GLOBAL dlopen registry.
+# host_runtime.so resolves its undefined HostLogger / unified_log_* (and, on sim,
+# sim_context_*) symbols against those globals, so each must be loaded — exactly
+# once — before any host_runtime.so dlopen. The registry lives in _log_preload so
+# the import-time logger preload and _initialize_simpler_log share one entry per path.
+from ._log_preload import host_span_sink_address as _host_span_sink_address
+from ._log_preload import preload as _preload_simpler_log
+from ._log_preload import preload_global as _preload_global
 
 if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
@@ -41,20 +54,23 @@ if TYPE_CHECKING:
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_ERROR_MSG_SIZE,
+    MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
+    MAILBOX_STATE_VALUES,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
+    ChipTensor,
     CoreCallable,
     DataType,
     RuntimeEnv,
     TaskArgs,
     TaskState,
-    Tensor,
     TensorArgType,
     WorkerType,
     _ChipWorker,
@@ -64,6 +80,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     get_element_size,
     read_args_from_blob,
 )
+
+from .buffer import Buffer, Tensor
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -75,7 +93,7 @@ def _assert_bindings_match_source_tree() -> None:
     Nothing then rebuilds, and a changed struct layout — `CallConfig` losing a
     field, say — makes attributes read as 0 with no error at all. That surfaces
     much later as a plausible-looking runtime rejection
-    (``launch_aicpu_num (0) must be in range [1, 4]``) and reads as a product
+    (``launch_aicpu_num (1) must be 0 (auto) or in range [2, 4]``) and reads as a product
     bug, so it is worth one git call at import to stop.
 
     Only source-tree installs are checked: a wheel has no ``.git`` to compare
@@ -130,12 +148,15 @@ def _assert_bindings_match_source_tree() -> None:
 
 _assert_bindings_match_source_tree()
 
+from .global_comm_domain import GlobalDomainBuffer, GlobalDomainMember  # noqa: E402
+
 __all__ = [
     "DataType",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
     "Tensor",
+    "ChipTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
     "TaskArgs",
@@ -156,13 +177,18 @@ __all__ = [
     "TaskState",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_FRAME_SIZE",
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
+    "MAILBOX_STATE_VALUES",
+    "MAILBOX_PREPARATION_DISPOSITION_VALUES",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "GlobalCommDomainHandle",
+    "GlobalCommDomainView",
 ]
 
 COMM_MAX_RANK_NUM = 64
@@ -173,7 +199,7 @@ class RemoteAddressSpace(IntEnum):
 
     ``HOST_INLINE`` carries the payload in the message itself rather than
     naming remote memory. ``REMOTE_WINDOW`` and ``UB_LDST`` are protocol
-    placeholders: the shipped transport is simulation-backed.
+    placeholders: the shipped host_tcp transport uses host-side session buffers.
     """
 
     HOST_INLINE = 1
@@ -220,9 +246,10 @@ class RemoteBufferHandle:
         "_ub_ldst_va",
         "_access_flags",
         "_released",
-        "_live_slot_refs",
-        "_live_import_refs",
+        "_slot_ref_tokens",
+        "_import_ref_tokens",
         "_owner_handle_ref",
+        "_owner_import_ref_token",
     )
 
     def __init__(  # noqa: PLR0913
@@ -242,6 +269,7 @@ class RemoteBufferHandle:
         access_flags: int = 3,
         released: bool = False,
         owner_handle_ref: RemoteBufferHandle | None = None,
+        owner_import_ref_token: object | None = None,
         _internal_token: object | None = None,
     ) -> None:
         address_space = RemoteAddressSpace(int(address_space))
@@ -261,9 +289,10 @@ class RemoteBufferHandle:
         self._ub_ldst_va = int(ub_ldst_va)
         self._access_flags = int(access_flags)
         self._released = bool(released)
-        self._live_slot_refs = 0
-        self._live_import_refs = 0
+        self._slot_ref_tokens: set[object] = set()
+        self._import_ref_tokens: set[object] = set()
         self._owner_handle_ref = owner_handle_ref
+        self._owner_import_ref_token = owner_import_ref_token
 
         if self._worker_id < 0:
             raise ValueError("RemoteBufferHandle.worker_id must be non-negative")
@@ -336,6 +365,7 @@ class RemoteBufferHandle:
         access_flags: int = 0,
         released: bool = False,
         owner_handle_ref: RemoteBufferHandle | None = None,
+        owner_import_ref_token: object | None = None,
     ) -> RemoteBufferHandle:
         return cls(
             worker_id=worker_id,
@@ -352,6 +382,7 @@ class RemoteBufferHandle:
             access_flags=access_flags,
             released=released,
             owner_handle_ref=owner_handle_ref,
+            owner_import_ref_token=owner_import_ref_token,
             _internal_token=_REMOTE_BUFFER_HANDLE_TOKEN,
         )
 
@@ -395,28 +426,48 @@ class RemoteBufferHandle:
         """Whether this came from ``remote_import`` rather than ``remote_malloc``."""
         return self._import_id != 0
 
+    @property
+    def _live_slot_refs(self) -> int:
+        return len(self._slot_ref_tokens)
+
+    @property
+    def _live_import_refs(self) -> int:
+        return len(self._import_ref_tokens)
+
     def _mark_released(self) -> None:
         self._released = True
 
-    def _acquire_slot_ref(self) -> None:
+    def _acquire_slot_ref(self, token: object | None = None) -> object:
         if self._released:
             raise RuntimeError("RemoteBufferHandle has already been released")
-        self._live_slot_refs += 1
+        if token is None:
+            token = object()
+        self._slot_ref_tokens.add(token)
+        return token
 
-    def _release_slot_ref(self) -> None:
-        if self._live_slot_refs <= 0:
+    def _release_slot_ref(self, token: object | None = None) -> None:
+        if token is not None:
+            self._slot_ref_tokens.discard(token)
+            return
+        if not self._slot_ref_tokens:
             raise RuntimeError("RemoteBufferHandle live slot refs underflow")
-        self._live_slot_refs -= 1
+        self._slot_ref_tokens.pop()
 
-    def _acquire_import_ref(self) -> None:
+    def _acquire_import_ref(self, token: object | None = None) -> object:
         if self._released:
             raise RuntimeError("RemoteBufferHandle has already been released")
-        self._live_import_refs += 1
+        if token is None:
+            token = object()
+        self._import_ref_tokens.add(token)
+        return token
 
-    def _release_import_ref(self) -> None:
-        if self._live_import_refs <= 0:
+    def _release_import_ref(self, token: object | None = None) -> None:
+        if token is not None:
+            self._import_ref_tokens.discard(token)
+            return
+        if not self._import_ref_tokens:
             raise RuntimeError("RemoteBufferHandle live import refs underflow")
-        self._live_import_refs -= 1
+        self._import_ref_tokens.pop()
 
     def __repr__(self) -> str:
         return (
@@ -738,17 +789,32 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
         return storage
 
 
-def _task_args_add_tensor(
-    self: TaskArgs, tensor: Tensor | RemoteTensorRef, tag: TensorArgType = TensorArgType.INPUT
-) -> None:
+def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT) -> None:
+    """Add a task arg. ``tensor`` is a ``simpler.buffer.Tensor`` (packable) or its packed
+    bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a REMOTE_SIDECAR
+    ``Tensor`` (no local backing) with its remote descriptor tracked in the sidecar."""
     if isinstance(tensor, RemoteTensorRef):
+        from .buffer import AddressSpace, remote_sidecar_tensor
+
         storage = _storage_for_remote_task_args(self)
-        metadata = Tensor.make(0, tensor.shape, tensor.dtype)
-        _TASK_ARGS_ADD_TENSOR(self, metadata, tag)
+        handle = tensor.handle
+        inline = handle.address_space == RemoteAddressSpace.HOST_INLINE
+        nbytes = tensor.nbytes
+        assert nbytes is not None
+        placeholder = remote_sidecar_tensor(
+            shapes=tuple(int(s) for s in tensor.shape),
+            dtype=int(tensor.dtype.value),
+            nbytes=int(nbytes),
+            owner_worker_id=0 if inline else int(handle.owner_worker_id),
+            buffer_id=0 if inline else int(handle._buffer_id),
+            generation=0 if inline else int(handle._generation),
+            address_space=(
+                AddressSpace.DEVICE if handle.address_space == RemoteAddressSpace.REMOTE_DEVICE else AddressSpace.HOST
+            ),
+        )
+        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    if not isinstance(tensor, Tensor):
-        raise TypeError("TaskArgs.add_tensor expects Tensor or RemoteTensorRef")
     _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
@@ -881,9 +947,8 @@ def scalar_to_uint64(value) -> int:
 class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
-    Buffers are placed sequentially inside the window in declaration order —
     Buffers are placed sequentially inside the window in declaration order.
-    The ``CommDomainHandle.contexts[chip_idx].buffer_ptrs`` dict returned by
+    The ``CommDomainHandle.contexts[chip_idx].buffers`` dict returned by
     ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
     """
 
@@ -907,7 +972,9 @@ class ChipDomainContext:
     device_ctx: int
     local_window_base: int
     actual_window_size: int
-    buffer_ptrs: dict[str, int]
+    # Each named window slice as a device ``VMM_WINDOW`` Buffer owned by this chip. Name a task
+    # arg with ``buffers[name].tensor(shapes, dtype)`` and dispatch it only to this chip (``domain_rank``).
+    buffers: dict[str, Buffer]
 
 
 class CommDomainHandle:
@@ -932,7 +999,17 @@ class CommDomainHandle:
     ``released → freed`` transition is the runtime's job at end-of-run.
     """
 
-    __slots__ = ("name", "workers", "contexts", "allocation_id", "_release_fn", "_released", "_freed")
+    __slots__ = (
+        "name",
+        "workers",
+        "contexts",
+        "allocation_id",
+        "_domain_size",
+        "_domain_ranks",
+        "_release_fn",
+        "_released",
+        "_freed",
+    )
 
     def __init__(
         self,
@@ -942,12 +1019,18 @@ class CommDomainHandle:
         contexts: dict[int, ChipDomainContext],
         allocation_id: int,
         _release_fn,
+        _domain_size: int | None = None,
+        _domain_ranks: dict[int, int] | None = None,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
         # Frozen dict-ish — we don't expose mutation
         self.contexts: dict[int, ChipDomainContext] = dict(contexts)
         self.allocation_id = int(allocation_id)
+        self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
+        self._domain_ranks = (
+            {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
+        )
         self._release_fn = _release_fn
         self._released = False
         self._freed = False
@@ -956,7 +1039,7 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(
                 f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
-                "after release(). Submitted tasks that captured device_ctx / buffer_ptrs before "
+                "after release(). Submitted tasks that captured device_ctx / buffers before"
                 "release will still see live memory until Worker.run drains."
             )
         return self.contexts[chip_idx]
@@ -1017,25 +1100,172 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
+class GlobalCommDomainHandle:
+    """L4-owned handle for one CommDomain spanning local and/or remote L3 nodes.
+
+    The handle contains stable topology and buffer offsets only. Device
+    addresses remain in the L3/L2 process that imported the transport handles.
+    """
+
+    __slots__ = (
+        "_freed",
+        "_release_fn",
+        "_released",
+        "buffers",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "members",
+        "name",
+        "retain_after_run",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        members: tuple[GlobalDomainMember, ...],
+        buffers: tuple[GlobalDomainBuffer, ...],
+        domain_id: int,
+        generation: int,
+        mapping_size: int,
+        retain_after_run: bool,
+        _release_fn,
+    ) -> None:
+        self.name = str(name)
+        self.members = tuple(members)
+        self.buffers = tuple(buffers)
+        self.domain_id = int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self.retain_after_run = bool(retain_after_run)
+        self._release_fn = _release_fn
+        self._released = False
+        self._freed = False
+
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        if self._released:
+            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
+        rank = int(domain_rank)
+        if rank < 0 or rank >= len(self.members):
+            raise IndexError(f"global domain rank {rank} is out of range")
+        member = self.members[rank]
+        if member.domain_rank != rank:
+            raise RuntimeError("global domain member table is not rank ordered")
+        return member
+
+    def buffer_range(self, name: str) -> tuple[int, int]:
+        if self._released:
+            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
+        offset = 0
+        for buffer in self.buffers:
+            if buffer.name == name:
+                return offset, buffer.nbytes
+            offset += buffer.nbytes
+        raise KeyError(f"global domain {self.name!r} has no buffer {name!r}")
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    @property
+    def freed(self) -> bool:
+        return self._freed
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._release_fn(self)
+        self._released = True
+
+    def __enter__(self) -> GlobalCommDomainHandle:
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+class GlobalCommDomainView:
+    """L3-local imported view exposed to remote orchestration callables."""
+
+    __slots__ = (
+        "_committed",
+        "contexts",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "members",
+        "name",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        members: tuple[GlobalDomainMember, ...],
+        contexts: dict[int, ChipDomainContext],
+        domain_id: int,
+        generation: int,
+        mapping_size: int,
+    ) -> None:
+        self.name = str(name)
+        self.members = tuple(members)
+        self.contexts = dict(contexts)
+        self.domain_id = int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self._committed = False
+
+    def __getitem__(self, local_worker_id: int) -> ChipDomainContext:
+        if not self._committed:
+            raise RuntimeError(f"GlobalCommDomainView({self.name!r}) is not committed")
+        return self.contexts[int(local_worker_id)]
+
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
+
 # Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its
 # undefined HostLogger / unified_log_* (and, on sim, sim_context_*) symbols
 # against these globals, so they must be loaded — exactly once — before any
-# host_runtime.so dlopen. Keyed by path; mirrors the C++ side's old
-# std::once_flag semantics. Never closed.
-_preloaded_globals: dict[str, ctypes.CDLL] = {}
+# host_runtime.so dlopen. The registry lives in _log_preload so the import-time
+# logger preload and ChipWorker.init below share one entry per path: a second
+# dlopen of an already-registered path is skipped rather than repeated.
 
 
-def _preload_global(path: str) -> ctypes.CDLL:
-    """dlopen `path` with RTLD_NOW | RTLD_GLOBAL, idempotently (one CDLL per path).
+def _initialize_simpler_log(bins: Any | None, log_level: int | None = None) -> ctypes.CDLL | None:
+    """Seed this process's logger threshold, before any runtime use or fork.
 
-    Eager resolution (RTLD_NOW) mirrors the previous C++ dlopen flags and
-    surfaces any missing-symbol problem at load time rather than first use.
+    ``bins`` names the copy a chip child must load, which is the one its
+    host_runtime.so resolves against. A Worker process that owns no chips has no
+    ``bins`` and passes None: the library the package already preloaded at import
+    is seeded instead, and a process where that preload found nothing keeps a
+    null host-span sink and emits nothing.
     """
-    handle = _preloaded_globals.get(path)
-    if handle is None:
-        handle = ctypes.CDLL(path, mode=os.RTLD_NOW | os.RTLD_GLOBAL)
-        _preloaded_globals[path] = handle
-    return handle
+    if log_level is None:
+        from . import _log  # noqa: PLC0415
+
+        log_level = _log.get_current_config()
+
+    if bins is None:
+        log_handle = _preload_simpler_log()
+        if log_handle is None:
+            return None
+    else:
+        if not bins.simpler_log_path:
+            raise ValueError("simpler log init: bins.simpler_log_path is required")
+        log_handle = _preload_global(str(bins.simpler_log_path))
+
+    bind_host_span_sink = getattr(_ti_module, "_bind_host_span_sink", None)
+    if bind_host_span_sink is not None:
+        bind_host_span_sink(_host_span_sink_address(log_handle))
+    log_handle.simpler_log_init.argtypes = [ctypes.c_int]
+    log_handle.simpler_log_init.restype = ctypes.c_int
+    rc = log_handle.simpler_log_init(int(log_level))
+    if rc != 0:
+        raise RuntimeError(f"simpler_log_init failed with code {rc}")
+    return log_handle
 
 
 class ChipWorker:
@@ -1059,6 +1289,9 @@ class ChipWorker:
     def __init__(self):
         self._impl = _ChipWorker()
         self._owner_id = uuid.uuid4().hex
+        self._lifecycle_lock = threading.Lock()
+        self._init_owner_thread: threading.Thread | None = None
+        self._init_in_progress = False
         self._registry_lock = threading.Lock()
         self._callable_registry: dict[int, ChipCallable] = {}
         self._identity_registry: dict[bytes, Any] = {}
@@ -1106,48 +1339,51 @@ class ChipWorker:
         `_ChipWorker.init(...)` from `_task_interface` instead of going
         through this wrapper.
         """
-        if log_level is None:
-            from . import _log  # noqa: PLC0415
+        with self._lifecycle_lock:
+            if self._init_in_progress:
+                raise RuntimeError("ChipWorker.init() is already in progress")
+            if self._impl.initialized:
+                raise RuntimeError("ChipWorker is already initialized")
+            self._init_owner_thread = threading.current_thread()
+            self._init_in_progress = True
 
-            log_level = _log.get_current_config()
+        try:
+            # 1. libsimpler_log.so — RTLD_GLOBAL singleton, before host_runtime.so.
+            _initialize_simpler_log(bins, log_level)
 
-        # 1. libsimpler_log.so — RTLD_GLOBAL singleton, before host_runtime.so.
-        if not bins.simpler_log_path:
-            raise ValueError("ChipWorker.init: bins.simpler_log_path is required")
-        log_handle = _preload_global(str(bins.simpler_log_path))
-        log_handle.simpler_log_init.argtypes = [ctypes.c_int]
-        log_handle.simpler_log_init.restype = ctypes.c_int
-        rc = log_handle.simpler_log_init(int(log_level))
-        if rc != 0:
-            raise RuntimeError(f"simpler_log_init failed with code {rc}")
+            # 2. libcpu_sim_context.so — sim platforms only.
+            if bins.sim_context_path:
+                _preload_global(str(bins.sim_context_path))
 
-        # 2. libcpu_sim_context.so — sim platforms only (host_runtime.so's sim
-        #    variant resolves sim_context_set_* / pto_sim_get_* against it).
-        if bins.sim_context_path:
-            _preload_global(str(bins.sim_context_path))
-
-        # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
-        #    dispatcher_path is passed as an empty string on sim (where bins
-        #    has dispatcher_path=None); the onboard simpler_init reads it
-        #    via LoadAicpuOp::BootstrapDispatcher, sim ignores it.
-        dispatcher_path = getattr(bins, "dispatcher_path", None)
-        self._impl.init(
-            str(bins.host_path),
-            str(bins.aicpu_path),
-            str(bins.aicore_path),
-            "" if dispatcher_path is None else str(dispatcher_path),
-            int(device_id),
-            prewarm_config,
-            bool(enable_sdma),
-        )
-        for slot_id, callable_obj in list(self._callable_registry.items()):
-            self._impl.register_callable(int(slot_id), callable_obj)
+            # 3. host_runtime.so is dlopen'd RTLD_LOCAL inside _impl.init.
+            # dispatcher_path is empty on sim; onboard consumes the real path.
+            dispatcher_path = getattr(bins, "dispatcher_path", None)
+            self._impl.init(
+                str(bins.host_path),
+                str(bins.aicpu_path),
+                str(bins.aicore_path),
+                "" if dispatcher_path is None else str(dispatcher_path),
+                int(device_id),
+                prewarm_config,
+                bool(enable_sdma),
+            )
+            for slot_id, callable_obj in list(self._callable_registry.items()):
+                self._impl.register_callable(int(slot_id), callable_obj)
+        finally:
+            with self._lifecycle_lock:
+                self._init_in_progress = False
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
         Terminal operation — the object cannot be reused after this.
         """
+        with self._lifecycle_lock:
+            owner = self._init_owner_thread
+            if owner is not None and owner is not threading.current_thread():
+                raise RuntimeError("ChipWorker.finalize() must run on the thread that called ChipWorker.init()")
+            if self._init_in_progress:
+                raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
         try:
             self._impl.finalize()
         finally:
@@ -1279,7 +1515,7 @@ class ChipWorker:
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g.
-                ``aicpu_thread_num=4``). A run always takes the whole device;
+                ``aicpu_thread_num=2``). A run always takes the whole device;
                 orchestration reads the resulting width back through
                 ``rt_available_cluster_count()``.
 
@@ -1322,6 +1558,35 @@ class ChipWorker:
             setattr(config, k, v)
         self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
 
+    def _prepare_native_run_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
+        """Prepare one native run without crossing its device launch fence.
+
+        The lease generation is validated during admission. The returned
+        token's unique prepare epoch is authoritative for subsequent
+        launch/poll/wait/finalize calls on this ChipWorker.
+        Keep every tensor backing buffer referenced by ``args`` alive until
+        finalize returns.
+        """
+        if config is None:
+            config = CallConfig()
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        return self._impl._prepare_native_run_with_pipeline_lease(
+            int(callable_id), args, config, int(slot_id), int(generation)
+        )
+
+    def _launch_native_run(self, run):
+        self._impl._launch_native_run(run)
+
+    def _poll_native_run(self, run):
+        return bool(self._impl._poll_native_run(run))
+
+    def _wait_native_run(self, run):
+        self._impl._wait_native_run(run)
+
+    def _finalize_native_run(self, run):
+        self._impl._finalize_native_run(run)
+
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
 
@@ -1350,7 +1615,7 @@ class ChipWorker:
 
     @property
     def runtime_buffer_addrs(self):
-        """Address of each host Runtime staging buffer, in slot order."""
+        """Address of each opaque host native-run storage buffer, in slot order."""
         return list(self._impl.runtime_buffer_addrs)
 
     def arena_bank_gm_heap_base(self, bank_id):

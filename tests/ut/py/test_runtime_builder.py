@@ -156,28 +156,20 @@ class TestRuntimeBuilderPtoIsaValidation:
     """Test PTO-ISA metadata validation is scoped to embedding runtimes."""
 
     @pytest.mark.parametrize(
-        ("platform", "overlay", "should_validate", "expected_key"),
+        ("platform", "should_validate", "expected_key"),
         [
-            ("a2a3", None, True, "a2a3/onboard/test_rt"),
-            ("a2a3sim", None, False, None),
-            ("a5", None, False, None),
-            ("a5", "ON", True, "a5/onboard/test_rt"),
-            ("a5sim", "ON", False, None),
-            ("a5sim", None, False, None),
+            ("a2a3", True, "a2a3/onboard/test_rt"),
+            ("a2a3sim", False, None),
+            ("a5", True, "a5/onboard/test_rt"),
+            ("a5sim", False, None),
         ],
     )
     def test_pto_isa_validation_scoped_to_embedding_platforms(
-        self, tmp_path, monkeypatch, platform, overlay, should_validate, expected_key
+        self, tmp_path, monkeypatch, platform, should_validate, expected_key
     ):
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.platform_info import TARGETS, parse_platform  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        if overlay is None:
-            monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
-        else:
-            monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", overlay)
 
         class _Target:
             def __init__(self, name):
@@ -286,6 +278,55 @@ class TestRuntimeBuilderGetBinaries:
         assert mock_instance.compile.call_count == 3
         targets = sorted(call.args[0] for call in mock_instance.compile.call_args_list)
         assert targets == ["aicore", "aicpu", "host"]
+        expected_defaults = {
+            "SIMPLER_DFX": "1",
+            "SIMPLER_ORCH_PROFILING": "0",
+            "SIMPLER_SCHED_PROFILING": "0",
+            "SIMPLER_TENSORMAP_PROFILING": "0",
+        }
+        for call in mock_instance.compile.call_args_list:
+            assert call.kwargs["cmake_defines"] == expected_defaults
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_reuses_prebuilt_shared_libraries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
+        """A batch build can locate shared libraries without rebuilding them."""
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, test_arch)
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+
+        builder = RuntimeBuilder(platform=default_test_platform)
+        with (
+            patch.object(builder, "ensure_simpler_log", return_value=tmp_path / "libsimpler_log.so") as log,
+            patch.object(builder, "ensure_sim_context", return_value=tmp_path / "libcpu_sim_context.so") as sim,
+        ):
+            builder.get_binaries("test_rt", build=True, build_shared=False)
+
+        log.assert_called_once_with(build=False)
+        sim.assert_called_once_with(build=False)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_passes_profiling_config_to_every_target(self, MockCompiler, tmp_path, default_test_platform, test_arch):
+        """All runtime binaries use one complete profiling configuration."""
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, test_arch)
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        config = {
+            "SIMPLER_DFX": "1",
+            "SIMPLER_ORCH_PROFILING": "1",
+            "SIMPLER_SCHED_PROFILING": "0",
+            "SIMPLER_TENSORMAP_PROFILING": "0",
+        }
+
+        RuntimeBuilder(platform=default_test_platform).get_binaries("test_rt", build=True, profiling_config=config)
+
+        assert mock_instance.compile.call_count == 3
+        for call in mock_instance.compile.call_args_list:
+            assert call.kwargs["cmake_defines"] == config
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_resolves_paths_relative_to_config(self, MockCompiler, tmp_path, default_test_platform, test_arch):
@@ -374,15 +415,14 @@ class TestRuntimeBuilderGetBinaries:
         assert all(call.kwargs["cmake_defines"] is None for call in non_host_calls)
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_a5_overlay_on_direct_build_writes_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
-        """a5 onboard with SDMA overlay ON records PTO-ISA provenance (#1351)."""
+    def test_a5_default_build_writes_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
+        """a5 onboard records PTO-ISA provenance for its default SDMA workspace."""
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, "a5")
         calls = []
 
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
@@ -400,15 +440,13 @@ class TestRuntimeBuilderGetBinaries:
         assert calls == [(RuntimeBuilder._LIB_DIR, "/tmp/pto-isa", ["a5/onboard/test_rt"])]
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_a5_overlay_on_host_build_passes_pto_isa_cmake_define(self, MockCompiler, tmp_path, monkeypatch):
-        """a5 overlay ON host ccache key includes the pinned PTO-ISA commit."""
+    def test_a5_default_host_build_passes_pto_isa_cmake_define(self, MockCompiler, tmp_path, monkeypatch):
+        """a5 host ccache key includes the pinned PTO-ISA commit."""
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         pin = "b" * 40
         self._make_runtime(tmp_path, "a5")
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
-
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
@@ -421,27 +459,8 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] == "ON"
+        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["PTO_ISA_ROOT"] == "/tmp/pto-isa"
-
-    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_a5_overlay_off_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
-        """Default a5 (overlay OFF) must not touch PTO-ISA metadata (#1351)."""
-        from simpler_setup import pto_isa  # noqa: PLC0415
-        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        self._make_runtime(tmp_path, "a5")
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-
-        mock_instance = MockCompiler.get_instance.return_value
-        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
-        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
-        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: pytest.fail("unexpected metadata"))
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
-
-        builder = RuntimeBuilder(platform="a5")
-        builder.get_binaries("test_rt", build=True)
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_sim_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
@@ -552,30 +571,17 @@ class TestBuildCacheStamp:
         builder = self._make_builder("a2a3")
         assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
 
-    def test_a5_overlay_on_folds_in_pto_isa_commit(self, monkeypatch):
-        """a5 overlay ON folds the pto-isa pin into the cache stamp (#1351)."""
+    def test_a5_default_folds_in_pto_isa_commit(self, monkeypatch):
+        """a5 default SDMA workspace folds the pto-isa pin into the cache stamp."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
+        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
         monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a5")
         assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
-
-    def test_a5_overlay_off_uses_pure_runtime_sha(self, monkeypatch):
-        """a5 overlay OFF ignores pto-isa → stamp keyed on runtime HEAD only."""
-        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
-        from simpler_setup import pto_isa  # noqa: PLC0415
-
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
-
-        builder = self._make_builder("a5")
-        assert builder._build_cache_stamp() == "runtime_sha"
 
     def test_non_a2a3_onboard_uses_pure_runtime_sha(self, monkeypatch):
         """Other arch/variant ignores pto-isa → stamp keyed on runtime HEAD only."""
@@ -620,22 +626,12 @@ class TestResolveBuildPtoIsaCommit:
         builder = self._make_builder("a2a3sim")
         assert builder._resolve_build_pto_isa_commit() == ""
 
-    def test_a5_overlay_off_returns_empty(self, monkeypatch):
-        from simpler_setup import pto_isa  # noqa: PLC0415
-
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
-
-        builder = self._make_builder("a5")
-        assert builder._resolve_build_pto_isa_commit() == ""
-
-    def test_a5_overlay_on_reads_pin(self, monkeypatch):
+    def test_a5_default_reads_pin(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
+
         builder = self._make_builder("a5")
         assert builder._resolve_build_pto_isa_commit() == "isa_sha"
 
@@ -643,7 +639,6 @@ class TestResolveBuildPtoIsaCommit:
         """URMA overlay also embeds pto-isa, so it reads the pin too (#1392)."""
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
         monkeypatch.setenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "ON")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
         builder = self._make_builder("a5")
@@ -667,6 +662,71 @@ class TestResolveBuildPtoIsaCommit:
         builder = self._make_builder("a2a3")
         with pytest.raises(RuntimeError, match="bad pin"):
             builder._resolve_build_pto_isa_commit()
+
+
+class TestPlaceBinary:
+    """place_binary must never rewrite the destination in place.
+
+    A build that replaces a .so already dlopened by the running process — which
+    every `pip install -e .` does, and which `get_binaries(build=True)` does to
+    build/lib/libsimpler_log.so mid-test-session — corrupts that mapping if the
+    destination is truncated and rewritten. The fault surfaces far away, as a
+    SIGSEGV inside the dynamic linker on an unrelated dlopen or at interpreter
+    exit, so the invariant is asserted here rather than left to a crash.
+    """
+
+    def _library(self, path: Path) -> Path:
+        """Compile a trivial shared object at `path`."""
+        import subprocess  # noqa: PLC0415
+
+        source = path.with_suffix(".c")
+        source.write_text("int probe(void) { return 7; }\n", encoding="utf-8")
+        # gcc is a fixed test-only toolchain dependency, not user input.
+        subprocess.run(  # noqa: S603
+            ["gcc", "-shared", "-fPIC", "-o", str(path), str(source)],  # noqa: S607
+            check=True,
+        )
+        return path
+
+    def test_replaces_by_rename_not_in_place(self, tmp_path):
+        from simpler_setup.runtime_compiler import place_binary  # noqa: PLC0415
+
+        dest = self._library(tmp_path / "libprobe.so")
+        src = self._library(tmp_path / "libnewer.so")
+        before = dest.stat().st_ino
+
+        place_binary(src, dest)
+
+        assert dest.stat().st_ino != before, "destination was rewritten in place, not renamed over"
+
+    def test_leaves_an_open_mapping_of_the_old_inode_valid(self, tmp_path):
+        import ctypes  # noqa: PLC0415
+
+        from simpler_setup.runtime_compiler import place_binary  # noqa: PLC0415
+
+        dest = self._library(tmp_path / "libprobe.so")
+        handle = ctypes.CDLL(str(dest))
+        assert handle.probe() == 7
+
+        place_binary(self._library(tmp_path / "libnewer.so"), dest)
+
+        # The already-loaded copy keeps its own inode, so calling into it after
+        # the replacement is still defined behaviour.
+        assert handle.probe() == 7
+
+    def test_leaves_no_temporary_behind_when_post_process_fails(self, tmp_path):
+        from simpler_setup.runtime_compiler import place_binary  # noqa: PLC0415
+
+        dest = self._library(tmp_path / "libprobe.so")
+        src = self._library(tmp_path / "libnewer.so")
+
+        def _fail(_staged):
+            raise RuntimeError("strip failed")
+
+        with pytest.raises(RuntimeError, match="strip failed"):
+            place_binary(src, dest, post_process=_fail)
+
+        assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
 # --- Full integration tests (real compilation) ---

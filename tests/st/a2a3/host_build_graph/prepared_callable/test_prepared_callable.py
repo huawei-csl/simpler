@@ -22,7 +22,7 @@ import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 
 _VECTOR_KERNELS = "../vector_example/kernels"
@@ -84,14 +84,12 @@ class TestPreparedCallableHbg(SceneTestCase):
         ],
     }
 
-    _COMMON_CONFIG = {"aicpu_thread_num": 4}
     _PLATFORMS = ["a2a3sim", "a2a3"]
 
     CASES = [
         {
             "name": "prepare_run_twice",
             "platforms": _PLATFORMS,
-            "config": _COMMON_CONFIG,
             "params": {"a": 2.0, "b": 3.0},
         },
     ]
@@ -100,9 +98,9 @@ class TestPreparedCallableHbg(SceneTestCase):
         size = 128 * 128
         a, b = params["a"], params["b"]
         return TaskArgsBuilder(
-            Tensor("a", torch.full((size,), a, dtype=torch.float32)),
-            Tensor("b", torch.full((size,), b, dtype=torch.float32)),
-            Tensor("f", torch.zeros(size, dtype=torch.float32)),
+            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
+            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -122,7 +120,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_chip_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -171,7 +169,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     def _setup_dlopen_count_test(self, st_worker, st_platform):
         case = self.CASES[0]
         callable_obj = self.build_callable(st_platform)
-        config = self._build_config(case["config"])
+        config = self._build_config(case.get("config", {}))
         return callable_obj, config, case
 
     def _run_one(self, worker, slot, config, case):

@@ -9,7 +9,7 @@
 """End-to-end ST for selective task-timing slots (issue #1325).
 
 A two-task chain (`c = a + b` tagged slot 0, `out = c + b` tagged slot 1) is
-run with L2 swimlane OFF. The contract being verified:
+run with chip swimlane OFF. The contract being verified:
 
     * both `simpler_run.runner_run.device_wall.task_slot_0` and `..._1`
       [STRACE] markers are present with strictly positive duration — proving
@@ -31,10 +31,10 @@ from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ChipStorageTaskArgs,
     CoreCallable,
     DataType,
-    Tensor,
+    TaskArgs,
+    TensorArgType,
 )
 from simpler.worker import Worker
 
@@ -118,16 +118,6 @@ def _drive(
     """
     import torch  # noqa: PLC0415
 
-    # This harness compiles the RT2-style orch (task_timing_orch.cpp: L0TaskArgs +
-    # rt_submit_aiv_task), which a5 host_build_graph's legacy add_task API cannot
-    # consume. That path's slots are covered by the dedicated legacy-API ST at
-    # tests/st/task_timing/task_timing_a5hbg/test_task_timing_a5hbg.py.
-    if platform.startswith("a5") and runtime == "host_build_graph":
-        pytest.skip(
-            "a5 host_build_graph uses the legacy add_task orch API, incompatible with this "
-            "RT2 orch; slots covered by tests/st/task_timing/task_timing_a5hbg"
-        )
-
     worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
     chip_callable = _build_chip_callable(platform, func_name, runtime)
     chip_handle = worker.register(chip_callable)
@@ -137,27 +127,27 @@ def _drive(
         host_b = torch.full((N_ROWS, N_COLS), 2.0, dtype=torch.float32)
         expected = host_a + b_multiplier * host_b
 
-        dev_a = worker.malloc(NBYTES)
-        dev_b = worker.malloc(NBYTES)
-        dev_out = worker.malloc(NBYTES)
-        worker.copy_to(dev_a, host_a.data_ptr(), NBYTES)
-        worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
+        a_h = worker.malloc(NBYTES)
+        b_h = worker.malloc(NBYTES)
+        out_h = worker.malloc(NBYTES)
+        worker.copy_to(a_h, host_a)
+        worker.copy_to(b_h, host_b)
 
-        args = ChipStorageTaskArgs()
-        args.add_tensor(Tensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
+        args = TaskArgs()
+        args.add_tensor(a_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+        args.add_tensor(b_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+        args.add_tensor(out_h.tensor(shapes=(N_ROWS, N_COLS), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 
         config = CallConfig()
-        config.enable_l2_swimlane = False  # slots must work with swimlane OFF
+        config.enable_chip_swimlane = False  # slots must work with swimlane OFF
 
         assert worker.run(chip_handle, args, config) is None
 
         host_out = torch.zeros(N_ROWS, N_COLS, dtype=torch.float32)
-        worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
-        worker.free(dev_a)
-        worker.free(dev_b)
-        worker.free(dev_out)
+        worker.copy_from(host_out, out_h)
+        worker.free(a_h)
+        worker.free(b_h)
+        worker.free(out_h)
         assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5), (
             f"{func_name} output diverged; max |expected - out| = "
             f"{float(torch.max(torch.abs(host_out - expected))):.3e}"
@@ -169,6 +159,7 @@ def _drive(
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
     # Two-task chain: t0 -> slot 0, t1 -> slot 1. out = a + 2b.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2)
@@ -189,6 +180,7 @@ def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
     dev = int(st_device_ids[0])
 
@@ -217,11 +209,11 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
 # a2a3 host_build_graph exercises a distinct fold path from tensormap_and_ringbuffer:
 # the RT2 orch is identical, but hbg builds the graph on the host and its Scheduler
 # folds dispatch via the PublishHandle (scheduler_context.h) rather than the inline
-# tensormap dispatch. These two cases give that path direct e2e coverage. (a5
-# host_build_graph uses the legacy add_task orch — covered by task_timing_a5hbg.)
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+# tensormap dispatch. These two cases give that path direct e2e coverage.
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
     # Same two-task chain as test_distinct_slots_emit_markers, on the hbg path.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2, runtime="host_build_graph")
@@ -239,9 +231,10 @@ def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
     assert disp1 >= fin0, f"expected dispatch(slot1)={disp1} >= finish(slot0)={fin0} (dependency ordering)"
 
 
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_hbg_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
     # Same 3-task same-slot merge as test_duplicate_slot_merges_window, on the hbg
     # path: min(dispatch)/max(finish) must fold into a single slot-0 window.
@@ -304,6 +297,7 @@ def _build_mix_chip_callable(platform: str) -> ChipCallable:
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim"])
 def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
     # One MIX task (AIC matmul + AIV0 add + AIV1 mul) tagged slot 0. All three
     # subtasks fold their dispatch/finish into slot 0 -> one complete window.
@@ -314,7 +308,6 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
         platform=st_platform,
         runtime="tensormap_and_ringbuffer",
         device_id=int(st_device_ids[0]),
-        aicpu_thread_num=4,
     )
     chip_handle = worker.register(_build_mix_chip_callable(st_platform))
     worker.init()
@@ -332,25 +325,26 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
         nb = _TILE_ELEMS * 4
         bufs = {n: worker.malloc(nb) for n in "ABCDEFGHI"}
         for name, t in {"A": A.flatten(), "B": B.flatten(), "D": D, "E": E, "G": G, "H": H}.items():
-            worker.copy_to(bufs[name], t.contiguous().data_ptr(), nb)
+            worker.copy_to(bufs[name], t.contiguous())
 
-        args = ChipStorageTaskArgs()
-        args.add_tensor(Tensor.make(bufs["A"], (_MATMUL_SIZE, _MATMUL_SIZE), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(bufs["B"], (_MATMUL_SIZE, _MATMUL_SIZE), DataType.FLOAT32))
-        args.add_tensor(Tensor.make(bufs["C"], (_TILE_ELEMS,), DataType.FLOAT32))
-        for n in "DEFGHI":
-            args.add_tensor(Tensor.make(bufs[n], (_TILE_ELEMS,), DataType.FLOAT32))
+        # Arg order matches the ChipCallable signature: A,B->C (matmul), D,E->F (add), G,H->I (mul).
+        _shapes = {"A": (_MATMUL_SIZE, _MATMUL_SIZE), "B": (_MATMUL_SIZE, _MATMUL_SIZE)}
+        _outputs = {"C", "F", "I"}
+        args = TaskArgs()
+        for n in "ABCDEFGHI":
+            tag = TensorArgType.OUTPUT_EXISTING if n in _outputs else TensorArgType.INPUT
+            args.add_tensor(bufs[n].tensor(shapes=_shapes.get(n, (_TILE_ELEMS,)), dtype=DataType.FLOAT32), tag)
 
         config = CallConfig()
-        config.enable_l2_swimlane = False
+        config.enable_chip_swimlane = False
         assert worker.run(chip_handle, args, config) is None
 
         out_C = torch.zeros(_TILE_ELEMS, dtype=torch.float32)
         out_F = torch.zeros(_TILE_ELEMS, dtype=torch.float32)
         out_I = torch.zeros(_TILE_ELEMS, dtype=torch.float32)
-        worker.copy_from(out_C.data_ptr(), bufs["C"], nb)
-        worker.copy_from(out_F.data_ptr(), bufs["F"], nb)
-        worker.copy_from(out_I.data_ptr(), bufs["I"], nb)
+        worker.copy_from(out_C, bufs["C"])
+        worker.copy_from(out_F, bufs["F"])
+        worker.copy_from(out_I, bufs["I"])
         for b in bufs.values():
             worker.free(b)
         # The AIV0/AIV1 subtasks are element-wise (layout-agnostic): their correct
@@ -371,6 +365,7 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
+@pytest.mark.manual(["a2a3sim", "a5sim"])
 def test_spmd_task_aggregates_across_threads(st_platform, st_device_ids, capfd):
     # One SPMD task (block_num=8) tagged slot 0; blocks dispatch across multiple
     # scheduler threads and must reduce to one complete slot. out = a + b.

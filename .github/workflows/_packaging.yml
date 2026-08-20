@@ -1,0 +1,100 @@
+name: Packaging Matrix
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      setup_variant:
+        description: github or self-cpu.
+        required: true
+        type: string
+      python_version:
+        required: false
+        default: "3.10"
+        type: string
+
+jobs:
+  run:
+    name: packaging
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            missing_packages=()
+            command -v ninja >/dev/null 2>&1 || missing_packages+=(ninja-build)
+            command -v ccache >/dev/null 2>&1 || missing_packages+=(ccache)
+            if ! command -v gcc >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+              missing_packages+=(g++)
+            fi
+            if (( ${#missing_packages[@]} )); then
+              sudo apt-get update
+              sudo apt-get install -y "${missing_packages[@]}"
+            fi
+          else
+            command -v ninja >/dev/null 2>&1 || brew install ninja
+            command -v ccache >/dev/null 2>&1 || brew install ccache
+            if ! command -v gcc-15 >/dev/null 2>&1 || ! command -v g++-15 >/dev/null 2>&1; then
+              brew install gcc@15 || brew install gcc
+            fi
+          fi
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.setup_variant == 'github'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Cache pip packages
+        if: inputs.setup_variant == 'self-cpu'
+        uses: ./.github/actions/cache-pip
+
+      - name: Install build + runtime deps in venv
+        uses: ./.github/actions/setup-venv
+        with:
+          packages: "scikit-build-core>=0.10.0 nanobind>=2.0.0 cmake>=3.15 pytest>=6.0"
+
+      - name: Run packaging matrix
+        run: |
+          . .venv/bin/activate
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET
+            MACOSX_DEPLOYMENT_TARGET="$(sw_vers -productVersion | cut -d. -f1,2)"
+          fi
+          if command -v ccache >/dev/null 2>&1; then
+            export CCACHE_DIR="$RUNNER_TEMP/simpler-packaging-ccache"
+            # Keep one cold build per job while reusing identical objects
+            # across the remaining clean-install modes.
+            if ccache --clear && ccache --max-size=1G && ccache --zero-stats; then
+              export CMAKE_C_COMPILER_LAUNCHER=ccache
+              export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+              trap 'ccache --show-stats || true' EXIT
+            else
+              unset CCACHE_DIR
+              echo "::warning::ccache initialization failed; running without compiler cache"
+            fi
+          else
+            echo "::notice::ccache not found; running packaging matrix without compiler cache"
+          fi
+          bash tools/verify_packaging.sh

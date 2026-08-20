@@ -87,7 +87,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | Constant | Value | Description |
 | -------- | ----- | ----------- |
 | `PLATFORM_MAX_BLOCKDIM` | 36 | Maximum blocks (each = 1 AIC + 2 AIV) |
-| `PLATFORM_MAX_AICPU_THREADS` | 7 | Maximum total AICPU threads (up to 6 schedulers + 1 orchestrator) |
+| `PLATFORM_MAX_AICPU_THREADS` | 5 | Maximum active AICPU threads (up to 4 schedulers + 1 orchestrator) |
 | `PLATFORM_MAX_AIC_PER_THREAD` | 36 | Max AIC cores per scheduler thread |
 | `PLATFORM_MAX_AIV_PER_THREAD` | 72 | Max AIV cores per scheduler thread |
 | `PLATFORM_PROF_SYS_CNT_FREQ` | 1000 MHz | System counter frequency for profiling |
@@ -97,12 +97,16 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 TRB bind normally allocates one device buffer per ordinary non-child tensor
 during host-side argument staging, copies input bytes as needed, records
 copy-back metadata, and frees those temporary buffers during runtime
-validation. TRB replaces those per-run malloc/free pairs with a single
-retained buffer, owned per pipeline slot, that its runs reuse. This is always on for
-TRB — an internal allocation optimization, not user-facing configuration.
+validation. TRB replaces those per-run malloc/free pairs with a retained buffer
+that its runs reuse. This is always on for TRB — an internal allocation
+optimization, not user-facing configuration.
+
+The buffer is owned per pipeline slot, not per runner: TRB's task args are
+`HOST_PER_RUN`, so two runs holding different slot leases stage through
+different buffers even though they share arena bank 0 for device scratch.
 
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
-`{addr, size}` slot across runs, exposed through two HostApi callbacks —
+`{addr, size}` slot per pipeline slot, exposed through two HostApi callbacks —
 `get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
 allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
 (`RetainedTempBump`).
@@ -124,11 +128,10 @@ On each trb bind, `RetainedTempBump`:
   falls back to `device_malloc` mid-run.
 
 Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
-the retained buffer is neither freed at end of run nor per run — it lives on
-the runner and is freed once in `finalize`. If the platform leaves the slot
-callbacks null (e.g. a backend without a retained buffer), bind transparently
-falls back to per-tensor `device_malloc` (recorded as `Free` leases, freed in
-validate).
+the retained buffer is neither freed at end of run nor per run — each slot's
+buffer lives on the runner and is freed once in `finalize`. The uniform host-runtime contract
+requires the retained-buffer callbacks on every backend; bind has no
+per-tensor allocation fallback.
 
 Public device-memory APIs keep their original semantics. `device_malloc_ctx`,
 `device_free_ctx`, `Worker.malloc()`, and `Worker.free()` still allocate and
@@ -555,7 +558,9 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 2 — Dispatch** (full model in §8.6):
 
-- For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
+- Service each source (normal ready ▸ speculative early) in occupancy order — `sync_start`
+  Tier-0 ▸ MIX ▸ AIC/AIV, idle ▸ pending — popping from the matching shape-based ready queue
+  (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE` (DMB offset `0xD0` on a5)
 - After normal ready queues are empty, Phase **4b** may stage speculative early-dispatch candidates onto spare slots (`early_dispatch_queues[]` / `early_sync_start_queue`)
@@ -566,13 +571,14 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (`MIX` / `AIC` / `AIV` in the production tensormap path)
-- **Push**: any thread (orchestrator via wiring, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
+- One `PTO2ReadyQueue` per resource shape — 3 shapes (`PTO2_NUM_RESOURCE_SHAPES`): `MIX`
+  (AIC+AIV cluster), `AIC`, `AIV`. Alongside `ready_queues[]` there is a per-shape
+  `ready_sync_queues[]` (sync_start Tier-0) and the speculative `early_dispatch_queues[]` /
+  `early_sync_start_queue` — see §8.6 for the full source × tier model.
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()` (sync_start cohorts to the sync lane)
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
-
-Unlike a2a3, a5 does **not** keep a separate `ready_sync_queues[]` tier: ready `require_sync_start` cohorts share `ready_queues[]`. Speculative sync_start early candidates still use the dedicated `early_sync_start_queue` (see §8.6).
 
 ### 8.4 Watermark Advancement (last_task_alive)
 
@@ -620,31 +626,31 @@ Private internals are split across three .cpp files by responsibility:
 ### 8.6 Dispatch model — two sources, sync tiers, occupancy order
 
 `resolve_and_dispatch` places ready and speculative work onto AICore cores under one
-occupancy model (ported from a2a3 early-dispatch; a5 specifics called out below). Two
-orthogonal axes decide *what* runs and *where*:
+occupancy model. Two orthogonal axes decide *what* runs and *where*:
 
 - **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
   pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; its dispatch
-  payload carries a non-zero `src_payload` gate and launches later by a high-32 doorbell on
-  `DATA_MAIN_BASE`). Normal strictly precedes early.
+  payload carries a non-zero `src_payload` gate and launches later by a doorbell). Normal
+  strictly precedes early.
 - **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
   block launches independently). "is it ready" (source) and "does it need a rendezvous"
   (cohort) are orthogonal.
 
-Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV`** (shape), and per
+Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV** (shape), and per
 shape **idle ▸ pending** (an idle core takes its running slot; a busy core takes its gated
-pending slot, promoted on completion). a5 implements this order inline in
-`dispatch_ready_tasks` / `try_early_dispatch` (no separate `run_staging_order` helper).
+pending slot, promoted on completion). This order lives in one shared skeleton,
+`run_staging_order`; the normal and early sources differ only in the per-shape stage callback
+(pickup vs gated).
 
 #### Queues
 
 | Source | Regular lanes | sync_start lane |
 | ------ | ------------- | --------------- |
-| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | *(same `ready_queues[]` — a5 has no `ready_sync_queues[]`)* |
+| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | `ready_sync_queues[MIX\|AIC\|AIV]` (per-shape) |
 | EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
 
 A task routes to the early sync lane iff `task_attrs.requires_sync_start()`. Early
-dispatch runs only once normal `ready_queues[]` are empty **and** the local
+dispatch runs only once both normal ready lanes are empty **and** the local
 `CoreTracker` has a spare slot (`has_any_free_slot`, a2a3 #1288).
 
 **Direct-only eligibility (a2a3 #1285/#1292):** a consumer is an early candidate only when
@@ -710,7 +716,8 @@ edge (#1405).
 
 #### MIX per-core placement
 
-A MIX task spans a cluster (1 AIC + 2 AIV). Gated MIX may place **per core**
+A MIX task spans a cluster (1 AIC + 2 AIV). `classify_mix_cluster` admits a cluster whenever
+every used core has a free slot; `prepare_block_for_dispatch` then places **per core**
 (`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
 skew within a block is tolerated by AICore incore synchronization.
 
@@ -799,7 +806,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
 | `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
-Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `chip_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
 scheduler/orchestrator thread starts — so it needs no cross-thread init
 handshake.

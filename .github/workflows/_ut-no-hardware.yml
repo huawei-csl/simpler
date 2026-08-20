@@ -1,0 +1,92 @@
+name: No-hardware Unit Tests
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      setup_variant:
+        description: github or self-cpu.
+        required: true
+        type: string
+      python_version:
+        required: false
+        default: "3.10"
+        type: string
+
+jobs:
+  run:
+    name: ut
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: ${{ inputs.setup_variant == 'self-cpu' && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Set up Python ${{ inputs.python_version }}
+        if: inputs.setup_variant == 'github'
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install GoogleTest
+        if: inputs.setup_variant == 'github'
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y libgtest-dev
+          else
+            brew install googletest
+          fi
+
+      - name: Cache pip packages
+        uses: ./.github/actions/cache-pip
+
+      - name: Install dependencies
+        if: inputs.setup_variant == 'github'
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0' 'cmake>=3.15'
+          # Worker integration tests exercise both a2a3sim and a5sim.
+          pip install --no-build-isolation \
+            --config-settings=build.targets=build_package_sim -e '.[test]'
+
+      - name: venv + deps
+        if: inputs.setup_variant == 'self-cpu'
+        uses: ./.github/actions/setup-venv
+        with:
+          packages: ".[test]"
+
+      - name: Run Python unit tests
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+            python -m pytest tests/ut -m "not requires_hardware" -v
+          else
+            pytest tests/ut -m "not requires_hardware" -v
+          fi
+
+      - name: Build and run C++ unit tests
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp
+          cmake --build tests/ut/cpp/build --parallel 4
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure

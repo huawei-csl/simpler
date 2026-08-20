@@ -27,11 +27,11 @@ Task IDs are widened from 32-bit to 64-bit to carry the ring identity:
 task_id.raw = (ring_id << 32) | local_id
 ```
 
-`PTO2TaskId` exposes direct accessors in `pto_runtime2_types.h`:
+`PTO2TaskId` exposes direct accessors in `src/common/task_interface/pto_task_id.h`:
 
 | API | Purpose |
 | --- | ------- |
-| `pto2_make_task_id(ring_id, local_id)` | Compose a 64-bit task ID (`PTO2TaskId`) |
+| `PTO2TaskId::make(ring_id, local_id)` | Compose a 64-bit task ID (`PTO2TaskId`) |
 | `task_id.ring()` | Extract `ring_id` (bits 63-32) |
 | `task_id.local()` | Extract `local_id` (bits 31-0) |
 | `task_id.raw` | Access the packed 64-bit encoding |
@@ -93,7 +93,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     uint64_t heap_size;
     uint64_t task_descriptors_offset;
 
-    // Per-ring data pointers (host-side, set by PTO2SharedMemoryHandle::setup_pointers)
+    // Per-ring data pointers (host-side, set by setup_pointers)
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;

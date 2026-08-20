@@ -1,13 +1,15 @@
 # CI Change Detection and Job Gating
 
-Every *downstream* PR job in `.github/workflows/ci.yml` is gated by an output
-of the `detect-changes` job. Two are deliberately ungated: `detect-changes`
-itself, which produces the outputs, and `pre-commit`, which every gated job
-declares in `needs:` and which must therefore always run. Those gates decide
-whether a change occupies four self-hosted NPU machines for ten minutes or
-finishes in ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the symptom is silent —
-a job that should have skipped merely *passes*, so nobody notices until a
-flake in it reddens an unrelated PR.
+Every *downstream* PR job in `.github/workflows/ci.yml` and the emergency CPU
+lane in `.github/workflows/ci-self-cpu.yml` is gated by an output of the
+canonical `.github/workflows/_detect-changes.yml` reusable workflow. Two jobs
+are deliberately ungated in the main CI path: `detect-changes` itself, which
+produces the outputs, and `pre-commit`, which every gated job declares in
+`needs:` and which must therefore always run. Those gates decide whether a
+change occupies four self-hosted NPU machines for ten minutes or finishes in
+ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the
+symptom is silent — a job that should have skipped merely *passes*, so nobody
+notices until a flake in it reddens an unrelated PR.
 
 This rule is about keeping the gates honest. It is not a description of the
 current filters; those change. It is the set of invariants they must satisfy.
@@ -36,9 +38,10 @@ A file belongs in `NON_CODE` when changing it cannot change what the code does
 - `mkdocs.yml` sits at the repo root and is pure docs tooling. **In.**
 - `.github/workflows/docs.yml` is a workflow, and is also pure docs tooling —
   and it runs unconditionally on every PR, so it is its own gate. **In.**
-- `.github/workflows/ci.yml` defines the gates themselves. **Out, always.** A
-  change to the gating must run everything, including the jobs it might have
-  just switched off.
+- `.github/workflows/ci.yml`, `.github/workflows/ci-self-cpu.yml`, and the
+  reusable `.github/workflows/_*.yml` CI implementation workflows define gates
+  or job bodies. **Out, always.** A change to CI implementation must run
+  everything, including the jobs it might have just switched off.
 
 The corollary is a habit, not a pattern: **adding a top-level config file or a
 tooling workflow is a change-detection event.** Ask whether `NON_CODE` needs to
@@ -53,14 +56,14 @@ never sit behind a *more permissive* condition than a GitHub-hosted one. If you
 find yourself writing a looser `if:` for the more expensive job, the vocabulary
 is wrong (see §1) — fix that instead of widening the gate.
 
-## 4. Three axes, layered — and the non-code one is subtracted first
+## 4. Four axes, layered — and the non-code one is subtracted first
 
 | Axis | Output | Answers |
 | ---- | ------ | ------- |
 | non-code | `non_code_only` | can this diff change what the code does at all? |
 | architecture | `a2a3_changed` / `a5_changed` | which silicon can it reach? |
 | test category | `st_affected` / `ut_affected` | which suite can it break? |
-| example corpus | `examples_only` | can it reach a job that builds the product and runs a fixed payload? |
+| corpus | `examples_only` / `tests_only` | can it reach a job that builds the product and runs a fixed payload? |
 
 They are layered, not redundant. **Every arch and category flag subtracts
 `NON_CODE` before deciding**, so a non-code-only change already makes all four
@@ -72,23 +75,35 @@ A job composes the axes it is actually subject to:
 | Job family | Gate |
 | ---------- | ---- |
 | `st-sim-*`, `st-onboard-*` | `<arch>_changed && st_affected` |
-| `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only` |
+| `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only && !tests_only` |
 | `ut`, `ut-a2a3`, `ut-a5` | `non_code_only != true && ut_affected` |
-| `packaging-matrix` | `non_code_only != true && !examples_only` |
+| `packaging-matrix` | `non_code_only != true && !examples_only && !tests_only` |
 
 `packaging-matrix` and `profiling-flags-smoke` build and install the product and
-then exercise it with a **fixed, tiny payload** — one entry-point script and one
-`vector_example` respectively. They are the only jobs that consume neither test
-suite as a corpus, which is why they take the example axis rather than the
-category one. Note what stays in: `tests/` still triggers packaging, because
-`tools/verify_packaging.sh` runs a `tests/st/` file as its entry-point smoke and
-`tests/` is in the sdist `include`. Only `examples/` is provably absent from
-both jobs.
+then exercise it with a **fixed, tiny payload** — packaging's entry-point smoke
+is one `tests/st/` file, profiling's is one `vector_example`. They are the only
+jobs that consume neither test suite as a corpus, which is why they take the
+corpus axis rather than the category one — and the corpus axis comes in the
+same shape on both sides, so a diff confined to `examples/` or to `tests/`
+cannot reach either job. That is not a gap: `wheel.packages` is
+`["simpler_setup", "python/simpler"]`, so both partitions are provably absent
+from the product, and a payload file changed under either is still exercised by
+the scene-test job that reads the same corpus. A change to a payload file was
+the historical reason `tests/` stayed in — a now-deleted claim that `tests/`
+was "in the sdist include", which no configuration ever made true.
 
 The UT jobs stay off the arch axis on purpose — unit tests cover shared
 contracts, so the cost of a falsely-skipped regression outweighs the minutes.
 That is a decision about the *arch* axis only; the category axis is a different
 question, because a scene-test-only change genuinely cannot break a unit test.
+
+The vocabulary exists once, in `.github/workflows/_detect-changes.yml`. Both
+`.github/workflows/ci.yml` and `.github/workflows/ci-self-cpu.yml` call that
+workflow and consume the same output names. Do not reintroduce a lane-local
+copy. That copy drifted twice — `examples_only` never reached the CPU lane
+(#1607), and `tests_only` did not either (#1635). Any change to an axis now
+means one detector file plus any consumers whose `if:` expression actually
+changes.
 
 ### Write every axis in the same shape
 
@@ -164,8 +179,24 @@ Confirm the jobs you expected to skip report `skipping`, not `pass`. **A gating
 bug shows up as a green check, so "CI passed" is not evidence.** Where the
 change is to `NON_CODE` itself, replay the pattern locally against
 representative file lists — a docs-only set, a `.gitignore`-only set, a
-single-arch set, a `ci.yml` set — and check all four land where you intended
-before pushing.
+single-arch set, a CI workflow set — and check all four land where you
+intended before pushing. Where the change is to an *axis*, also verify both callers
+consume only outputs declared by the canonical reusable workflow:
+
+```bash
+echo "== declared by _detect-changes.yml"
+awk '
+  /^jobs:/ { in_outputs = 0; seen_jobs = 1; next }
+  !seen_jobs && /^    outputs:/ { in_outputs = 1; next }
+  in_outputs && /^    [a-z0-9_]+:/ { in_outputs = 0 }
+  in_outputs && /^      [a-z0-9_]+:/ { print }
+' .github/workflows/_detect-changes.yml | sed 's/[ :]*//g' | sort -u
+
+echo "== consumed by callers"
+grep -h -oE 'needs\.detect-changes\.outputs\.[a-z0-9_]+' \
+  .github/workflows/ci.yml .github/workflows/ci-self-cpu.yml |
+  sed 's/.*outputs\.//' | sort -u
+```
 
 ## Relation to the other rules
 

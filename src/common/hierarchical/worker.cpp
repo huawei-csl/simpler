@@ -11,6 +11,10 @@
 
 #include "worker.h"
 
+#include <unistd.h>
+
+#include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
@@ -32,6 +36,49 @@
 namespace {
 
 std::once_flag g_fork_hygiene_once;
+
+// Appends into a NUL-terminated buffer, truncating rather than overflowing.
+// snprintf reports the length it wanted, not the length it wrote, so a
+// would-be-longer result saturates `len` at the last writable index.
+template <typename... Args>
+size_t append_truncating(char *buf, size_t cap, size_t len, const char *fmt, Args... args) {
+    if (len + 1 >= cap) return cap - 1;
+    const int wanted = std::snprintf(buf + len, cap - len, fmt, args...);
+    if (wanted < 0) return len;
+    return static_cast<size_t>(wanted) >= cap - len ? cap - 1 : len + static_cast<size_t>(wanted);
+}
+
+void report_reservation_stall(void *, const Scheduler::ReservationStallDiagnostic &diagnostic) noexcept {
+    // Formatted into automatic storage and emitted with one write(2): the sink
+    // is noexcept and runs on the scheduler dispatch path, so it allocates
+    // nothing (a throwing allocation here would terminate the process), takes
+    // no stdio lock a forked Worker child could inherit held, and leaves
+    // nothing running for process exit to race. A message longer than the
+    // buffer loses its tail, which for a diagnostic beats any of those.
+    char message[512];
+    size_t len = append_truncating(
+        message, sizeof(message), 0, "[WARN] NEXT_LEVEL group reservation stalled: group_slot=%d busy_target_ids=[",
+        diagnostic.group_slot
+    );
+    for (size_t i = 0; i < diagnostic.busy_target_count; ++i) {
+        len = append_truncating(
+            message, sizeof(message), len, "%s%d", i == 0 ? "" : ",", diagnostic.busy_target_worker_ids[i]
+        );
+    }
+    len = append_truncating(message, sizeof(message), len, "] idle_targets_with_queued_singles=[");
+    for (size_t i = 0; i < diagnostic.idle_queued_target_count; ++i) {
+        len = append_truncating(
+            message, sizeof(message), len, "%s%d:head_slot=%d", i == 0 ? "" : ",",
+            diagnostic.idle_queued_target_worker_ids[i], diagnostic.idle_queued_single_head_slots[i]
+        );
+    }
+    len = append_truncating(message, sizeof(message), len, "]\n");
+    // A truncated tail still has to end the line, or this diagnostic runs into
+    // whatever writes to stderr next.
+    if (len > 0 && message[len - 1] != '\n') message[len - 1] = '\n';
+    ssize_t written = ::write(STDERR_FILENO, message, len);
+    (void)written;
+}
 
 void apply_env_defaults_once() {
     // setenv with overwrite=0 leaves user-supplied values intact.
@@ -68,15 +115,16 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox, int child_pid) {
+void Worker::add_worker(WorkerType type, void *mailbox, int child_pid, uint32_t task_frame_count) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
-    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox, child_pid);
-    else manager_.add_sub(mailbox, child_pid);
+    if (type == WorkerType::NEXT_LEVEL) {
+        manager_.add_next_level(mailbox, child_pid, task_frame_count);
+    } else manager_.add_sub(mailbox, child_pid);
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid) {
+void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) {
     if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox, child_pid);
+    manager_.add_next_level_at(worker_id, mailbox, child_pid, task_frame_count);
 }
 
 void Worker::add_remote_l3_socket(
@@ -96,7 +144,7 @@ void Worker::add_remote_l3_socket(
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    // Start WorkerManager first — creates WorkerThreads.
+    // Start WorkerManager first — creates endpoint lanes.
     // The on_complete callback routes through the Scheduler's worker_done().
     manager_.start(
         &allocator_,
@@ -122,12 +170,19 @@ void Worker::init() {
     cfg.enqueue_ready_cb = [this](TaskSlot slot) {
         orchestrator_.enqueue_ready(slot);
     };
+    cfg.active_run_cb = [this] {
+        return orchestrator_.dispatchable_run_id();
+    };
+    cfg.preparable_run_cb = [this] {
+        return orchestrator_.preparable_run_id();
+    };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
     cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
         orchestrator_.report_task_error(slot, message);
     };
+    cfg.reservation_stall_sink = report_reservation_stall;
 
     scheduler_.start(cfg);
     // Allocator compaction and scheduler slot access share this mutex.
@@ -137,6 +192,7 @@ void Worker::init() {
 
 void Worker::close() {
     if (!initialized_) return;
+    scheduler_.request_stop();
     scheduler_.stop();
     manager_.stop();
     allocator_.shutdown();

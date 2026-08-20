@@ -11,9 +11,9 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-#include "aicore/l2_swimlane_collector_aicore.h"
+#include "aicore/chip_swimlane_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -49,18 +49,18 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * Implements the AICPU-AICore register-based dispatch protocol:
  * 1. Report physical core ID and core type, signal aicore_done (no AICPU wait)
  * 2. Wait for the AICPU to open our register window (DATA_MAIN_BASE != 0)
- * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
+ * 3. Cache per-core PTO2DispatchPayload pointer from my_hank->task
  * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
  * AICore reports on launch; the AICPU writes &s_payload_per_core[i] to
- * hank->task and then opens the register window (DATA_MAIN_BASE = IDLE), which
+ * my_hank->task and then opens the register window (DATA_MAIN_BASE = IDLE), which
  * is itself the acknowledgement. AICore caches this pointer and reads
  * function_bin_addr + args pointer from it on each dispatch. reg_val is a
  * monotonically increasing task ID used only for dispatch signaling and
  * ACK/FIN protocol.
  *
- * Profiling state (enable flag, L2 swimlane rotation channel) is published into the platform
- * via set_aicore_profiling_flag / set_aicore_l2_swimlane_ring at kernel entry —
+ * Profiling state (enable flag, chip swimlane rotation channel) is published into the platform
+ * via set_aicore_profiling_flag / set_chip_swimlane_aicore_head_slot at kernel entry —
  * this routine reads it through the matching getters, so neither Handshake
  * nor this signature carry profiling fields.
  *
@@ -104,19 +104,20 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
 
-    // Per-core L2SwimlaneActiveHead channel. AICPU completes
-    // `l2_swimlane_aicpu_init` (in pre_handshake_init) before any thread opens a
+    // Per-core ChipSwimlaneActiveHead channel. AICPU completes
+    // `chip_swimlane_aicpu_init` (in pre_handshake_init) before any thread opens a
     // register window in `handshake_partition`, and Phase 2 above has already
     // observed our window open, so the rotation-table slot is populated and the
     // first deref is safe here — off the dispatch→start critical path.
-    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = l2_swimlane_enabled ? get_l2_swimlane_aicore_head() : nullptr;
+    __gm__ ChipSwimlaneActiveHead *chip_swimlane_head =
+        chip_swimlane_enabled ? get_chip_swimlane_aicore_head() : nullptr;
     // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
     // so the first reservation observes a mismatch and loads the buffer ptr.
-    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
+    ChipSwimlaneAicoreLocalState chip_swimlane_local = {nullptr, UINT32_MAX, 0};
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -188,7 +189,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 // already invalidated src's lines, so tensor_count/scalar_count/
                 // scalars read coherently with the orchestrator's submit writes.
                 // args[SPMD_LOCAL_CONTEXT_INDEX]/[SPMD_GLOBAL_CONTEXT_INDEX] are
-                // still written by the AICPU (num_args <= 48 never reaches them).
+                // pre-filled once at init() and never changed; tensor and scalar
+                // counts are set by the orchestrator, so num_args never reaches them.
                 __gm__ char *src = reinterpret_cast<__gm__ char *>(exec_payload->src_payload);
                 int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
                 int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(src + PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
@@ -235,9 +237,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Bind this task to the currently-published buffer generation
             // before ACK makes progress visible to AICPU.
-            __gm__ L2SwimlaneAicoreTaskRecord *l2_swimlane_record = nullptr;
-            if (l2_swimlane_enabled) {
-                l2_swimlane_record = l2_swimlane_aicore_reserve_task_record(l2_swimlane_head, &l2_swimlane_local);
+            __gm__ ChipSwimlaneAicoreTaskRecord *chip_swimlane_record = nullptr;
+            if (chip_swimlane_enabled) {
+                chip_swimlane_record =
+                    chip_swimlane_aicore_reserve_task_record(chip_swimlane_head, &chip_swimlane_local);
             }
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
@@ -254,7 +257,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             execute_task(exec_payload);
 
             // Keep start_time -> end_time scoped to AICore execution.
-            uint64_t end_time = l2_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+            uint64_t end_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
 
             if (pmu_enabled) {
                 pmu_aicore_end();
@@ -281,10 +284,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             last_reg_val = reg_val;
             write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
 
-            if (l2_swimlane_enabled) {
+            if (chip_swimlane_enabled) {
                 uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
-                l2_swimlane_aicore_commit_task_record(
-                    l2_swimlane_record, task_token_raw, task_id, receive_time, start_time, end_time
+                chip_swimlane_aicore_commit_task_record(
+                    chip_swimlane_record, task_token_raw, task_id, receive_time, start_time, end_time
                 );
             }
         }

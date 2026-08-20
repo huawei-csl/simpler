@@ -154,7 +154,7 @@ def _l2_config(base: CallConfig, spec: dict) -> CallConfig:
     """
     cfg = CallConfig()
     cfg.aicpu_thread_num = base.aicpu_thread_num
-    cfg.enable_l2_swimlane = base.enable_l2_swimlane
+    cfg.enable_chip_swimlane = base.enable_chip_swimlane
     cfg.enable_dump_args = base.enable_dump_args
     cfg.enable_pmu = base.enable_pmu
     cfg.enable_dep_gen = base.enable_dep_gen
@@ -199,9 +199,9 @@ def run(platform: str, device_id: int) -> int:
             # launch, each binding its own rings.
             for i, spec in enumerate(L2_TASKS):
                 chip_args = TaskArgs()
-                chip_args.add_tensor(make_tensor_arg(host_a[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(host_b[i]), TensorArgType.INPUT)
-                chip_args.add_tensor(make_tensor_arg(host_out[i]), TensorArgType.OUTPUT_EXISTING)
+                chip_args.add_tensor(make_tensor_arg(worker, host_a[i]), TensorArgType.INPUT)
+                chip_args.add_tensor(make_tensor_arg(worker, host_b[i]), TensorArgType.INPUT)
+                chip_args.add_tensor(make_tensor_arg(worker, host_out[i]), TensorArgType.OUTPUT_EXISTING)
                 cfg = _l2_config(_cfg, spec)
                 print(f"[per_task_runtime_env] submit '{spec['label']}': runtime_env={cfg.runtime_env!r}")
                 orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)

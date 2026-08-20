@@ -18,12 +18,12 @@
 
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "common/memory_barrier.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
@@ -45,6 +45,13 @@ static void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread
     }
     if (thread_idx >= 0 && thread_idx < 32) {
         header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+    }
+}
+
+void SchedulerContext::fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code) {
+    latch_scheduler_error(sched_ == nullptr ? nullptr : sched_->sm_header, thread_idx, error_code);
+    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        emergency_shutdown(runtime);
     }
 }
 
@@ -393,6 +400,9 @@ int32_t SchedulerContext::handle_timeout_exit(
                 },
                 [this](int32_t func_id) {
                     return get_function_bin_addr(func_id);
+                },
+                [](const PTO2TaskSlotState &slot_state) {
+                    return &slot_state.payload->dump_metadata;
                 }
             );
         }
@@ -411,17 +421,17 @@ int32_t SchedulerContext::handle_timeout_exit(
 }
 
 #if SIMPLER_DFX
-void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
+void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
+    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
     LOG_INFO(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
-        static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
-        cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
+        static_cast<uint64_t>(chip_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
+        cycles_to_us(sched_end_ts - chip_swimlane.sched_start_ts)
     );
 
     uint64_t sched_total =
-        l2_swimlane.sched_complete_cycle + l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
+        chip_swimlane.sched_complete_cycle + chip_swimlane.sched_dispatch_cycle + chip_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
 #if SIMPLER_SCHED_PROFILING
@@ -429,13 +439,13 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
         PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
         uint64_t complete_poll =
-            (l2_swimlane.sched_complete_cycle > otc_total + l2_swimlane.sched_complete_perf_cycle) ?
-                (l2_swimlane.sched_complete_cycle - otc_total - l2_swimlane.sched_complete_perf_cycle) :
+            (chip_swimlane.sched_complete_cycle > otc_total + chip_swimlane.sched_complete_perf_cycle) ?
+                (chip_swimlane.sched_complete_cycle - otc_total - chip_swimlane.sched_complete_perf_cycle) :
                 0;
-        uint64_t dispatch_poll = (l2_swimlane.sched_dispatch_cycle >
-                                  l2_swimlane.sched_dispatch_pop_cycle + l2_swimlane.sched_dispatch_setup_cycle) ?
-                                     (l2_swimlane.sched_dispatch_cycle - l2_swimlane.sched_dispatch_pop_cycle -
-                                      l2_swimlane.sched_dispatch_setup_cycle) :
+        uint64_t dispatch_poll = (chip_swimlane.sched_dispatch_cycle >
+                                  chip_swimlane.sched_dispatch_pop_cycle + chip_swimlane.sched_dispatch_setup_cycle) ?
+                                     (chip_swimlane.sched_dispatch_cycle - chip_swimlane.sched_dispatch_pop_cycle -
+                                      chip_swimlane.sched_dispatch_setup_cycle) :
                                      0;
 
         LOG_INFO(
@@ -447,21 +457,21 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
         // sched_overhead_analysis.compute_dag_stats_from_deps (deps.json edges
         // × core_to_thread).
         LOG_INFO(
-            "Thread %d:   complete       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_complete_cycle),
-            l2_swimlane.sched_complete_cycle * 100.0 / sched_total
+            "Thread %d:   complete       : %.3fus (%.1f%%)", thread_idx,
+            cycles_to_us(chip_swimlane.sched_complete_cycle), chip_swimlane.sched_complete_cycle * 100.0 / sched_total
         );
 
-        uint64_t c_parent = l2_swimlane.sched_complete_cycle > 0 ? l2_swimlane.sched_complete_cycle : 1;
-        uint64_t complete_miss_count = (l2_swimlane.complete_probe_count > l2_swimlane.complete_hit_count) ?
-                                           (l2_swimlane.complete_probe_count - l2_swimlane.complete_hit_count) :
+        uint64_t c_parent = chip_swimlane.sched_complete_cycle > 0 ? chip_swimlane.sched_complete_cycle : 1;
+        uint64_t complete_miss_count = (chip_swimlane.complete_probe_count > chip_swimlane.complete_hit_count) ?
+                                           (chip_swimlane.complete_probe_count - chip_swimlane.complete_hit_count) :
                                            0;
-        double complete_hit_rate = l2_swimlane.complete_probe_count > 0 ?
-                                       l2_swimlane.complete_hit_count * 100.0 / l2_swimlane.complete_probe_count :
+        double complete_hit_rate = chip_swimlane.complete_probe_count > 0 ?
+                                       chip_swimlane.complete_hit_count * 100.0 / chip_swimlane.complete_probe_count :
                                        0.0;
         LOG_INFO(
             "Thread %d:     poll         : %.3fus (%.1f%%)  hit=%" PRIu64 ", miss=%" PRIu64 ", hit_rate=%.1f%%",
             thread_idx, cycles_to_us(complete_poll), complete_poll * 100.0 / c_parent,
-            static_cast<uint64_t>(l2_swimlane.complete_hit_count), static_cast<uint64_t>(complete_miss_count),
+            static_cast<uint64_t>(chip_swimlane.complete_hit_count), static_cast<uint64_t>(complete_miss_count),
             complete_hit_rate
         );
         LOG_INFO(
@@ -488,48 +498,49 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
         );
         LOG_INFO(
             "Thread %d:     perf         : %.3fus (%.1f%%)", thread_idx,
-            cycles_to_us(l2_swimlane.sched_complete_perf_cycle),
-            l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
+            cycles_to_us(chip_swimlane.sched_complete_perf_cycle),
+            chip_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
         LOG_INFO(
-            "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_dispatch_cycle),
-            l2_swimlane.sched_dispatch_cycle * 100.0 / sched_total
+            "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx,
+            cycles_to_us(chip_swimlane.sched_dispatch_cycle), chip_swimlane.sched_dispatch_cycle * 100.0 / sched_total
         );
 
-        uint64_t d_parent = l2_swimlane.sched_dispatch_cycle > 0 ? l2_swimlane.sched_dispatch_cycle : 1;
+        uint64_t d_parent = chip_swimlane.sched_dispatch_cycle > 0 ? chip_swimlane.sched_dispatch_cycle : 1;
         LOG_INFO(
             "Thread %d:     poll         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(dispatch_poll),
             dispatch_poll * 100.0 / d_parent
         );
         LOG_INFO(
             "Thread %d:     pop          : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "", thread_idx,
-            cycles_to_us(l2_swimlane.sched_dispatch_pop_cycle), l2_swimlane.sched_dispatch_pop_cycle * 100.0 / d_parent,
-            cycles_to_us(l2_swimlane.sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
+            cycles_to_us(chip_swimlane.sched_dispatch_pop_cycle),
+            chip_swimlane.sched_dispatch_pop_cycle * 100.0 / d_parent,
+            cycles_to_us(chip_swimlane.sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
             static_cast<uint64_t>(sp.pop_atomic_count)
         );
         LOG_INFO(
             "Thread %d:     setup        : %.3fus (%.1f%%)", thread_idx,
-            cycles_to_us(l2_swimlane.sched_dispatch_setup_cycle),
-            l2_swimlane.sched_dispatch_setup_cycle * 100.0 / d_parent
+            cycles_to_us(chip_swimlane.sched_dispatch_setup_cycle),
+            chip_swimlane.sched_dispatch_setup_cycle * 100.0 / d_parent
         );
 
         LOG_INFO(
-            "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_idle_cycle),
-            l2_swimlane.sched_idle_cycle * 100.0 / sched_total
+            "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(chip_swimlane.sched_idle_cycle),
+            chip_swimlane.sched_idle_cycle * 100.0 / sched_total
         );
 
         if (cur_thread_completed > 0) {
             LOG_INFO(
                 "Thread %d:   avg/complete   : %.3fus", thread_idx,
-                cycles_to_us(l2_swimlane.sched_complete_cycle) / cur_thread_completed
+                cycles_to_us(chip_swimlane.sched_complete_cycle) / cur_thread_completed
             );
         }
     }
 #endif
     LOG_INFO(
         "Thread %d: Scheduler summary: total_time=%.3fus, loops=%" PRIu64 ", tasks_scheduled=%d", thread_idx,
-        cycles_to_us(sched_total), static_cast<uint64_t>(l2_swimlane.sched_loop_count), cur_thread_completed
+        cycles_to_us(sched_total), static_cast<uint64_t>(chip_swimlane.sched_loop_count), cur_thread_completed
     );
 }
 #endif
@@ -810,18 +821,18 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     regs_ = regs_base;
 
 #if SIMPLER_DFX
-    // l2_swimlane_aicpu_init promotes g_l2_swimlane_level from the shared-memory
+    // chip_swimlane_aicpu_init promotes g_chip_swimlane_level from the shared-memory
     // header — must be called BEFORE caching the level, otherwise the cached
     // value would still be 0 (only the binary enable bit has been seeded by
     // kernel.cpp at this point). Reset the cached level on disabled runs so a
     // prior enabled launch's level can't leak into the phase-record gates in
     // scheduler_dispatch. This runs on the leader before it publishes
     // hs_setup_done_, so it happens-before every thread's handshake_partition
-    // (and therefore before any aicpu_ready=1 write).
-    if (is_l2_swimlane_enabled()) {
-        l2_swimlane_aicpu_init(runtime->worker_count);
-        l2_swimlane_level_ = get_l2_swimlane_level();
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+    // and therefore before any register window is opened.
+    if (is_chip_swimlane_enabled()) {
+        chip_swimlane_aicpu_init(runtime->worker_count);
+        chip_swimlane_level_ = get_chip_swimlane_level();
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
             // below. This block runs before assign_cores_to_threads, so the
             // active_sched_threads_ member isn't set yet; every AICPU thread is a
@@ -832,10 +843,10 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
             // Orchestration is always single-threaded, so orch-phase is one pool
             // (ordinal 0) — see record_orch_phase.
             const int orch_phase_threads = 1;
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
+            chip_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
-        l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
+        chip_swimlane_level_ = ChipSwimlaneLevel::DISABLED;
     }
 #endif
 
@@ -888,7 +899,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // Profiling-subsystem buffer/state init: single-threaded cold path (leader
     // only), so the "do it once" guarantee is structural (no CAS needed). Runs
     // after the handshake / assign_cores_to_threads because pmu_aicpu_init needs
-    // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
+    // physical_core_ids_ / cores_total_num_. Mirrors the chip_swimlane_aicpu_init
     // convention above.
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -1055,11 +1066,11 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
 ) {
 #if SIMPLER_DFX
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::ORCH_PHASES) {
         // Flush the orchestrator's orch-phase buffer (single instance, pool 0).
         // The orchestrator has no scheduler-phase pool of its own — those belong
         // to the scheduler threads and are flushed in scheduler_dispatch.
-        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
+        chip_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
     }
 #endif
 
@@ -1117,10 +1128,10 @@ void SchedulerContext::on_orchestration_done(
 #if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
     // scheduler threads' final core distribution.
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        l2_swimlane_aicpu_init_core_assignments(cores_total_num_);
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+        chip_swimlane_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {
-            l2_swimlane_aicpu_write_core_assignments_for_thread(
+            chip_swimlane_aicpu_write_core_assignments_for_thread(
                 t, core_trackers_[t].core_ids(), core_trackers_[t].core_num()
             );
         }
@@ -1129,20 +1140,10 @@ void SchedulerContext::on_orchestration_done(
 }
 
 // Polling initial classify (device boot), partitioned across all AICPU threads.
-// The host built the whole graph and no producer has executed yet — every
-// completion_flags byte is 0 except the hidden-alloc tasks the host completed
-// inline (pre-set to 1). Each thread classifies its contiguous slice of the
-// submitted-task range exactly once: route roots (all fanin met) to the ready
-// queues and register the rest on their first unmet producer's wake list.
-//
-// This is the same work the wiring model deferred to a device queue, now run
-// N-way parallel. push_ready_routed (MPMC ready queues) and register_wake
-// (lock-free wake-list CAS) are the same concurrency-safe primitives the
-// scheduler threads use during the run, and at boot no producer has completed
-// (wake_list heads are nullptr, never SENTINEL), so registration never
-// re-classifies. The caller barriers all threads here BEFORE any of them
-// publishes runtime_init_ready_, so the whole ready-set / wake-list graph is
-// fully seeded before the first dispatch.
+// Each thread classifies its contiguous slice of the submitted-task range
+// exactly once. Graph tasks additionally enter the bounded preparation queue;
+// their external fanin follows the same ready/wake classification as any other
+// outer task.
 void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
     if (completed_.load(std::memory_order_acquire) || sched_->ring_sched_state.ring == nullptr) {
         return;
@@ -1157,13 +1158,16 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         if (ring.is_completion_flag_set(id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
-        PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
-        int32_t state = sched_->classify_fanin_state(&s);
+        PTO2TaskSlotState &slot = ring.get_slot_state_by_task_id(id);
+        if (slot.task_kind == TaskKind::GRAPH) {
+            if (!sched_->push_graph_prepare(&slot, slot.task->task_id.raw, thread_idx)) return;
+        }
+        int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {
-            sched_->push_ready_routed(&s);
+            sched_->push_ready_routed(&slot);
         } else {
-            int32_t prod_local = s.payload->fanin_local_ids[state];
-            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+            int32_t prod_local = slot.payload->fanin_local_ids[state];
+            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &slot);
         }
     }
 }

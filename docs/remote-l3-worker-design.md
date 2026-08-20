@@ -55,7 +55,7 @@ Implemented:
   `add_remote_worker()`.
 - Python `RemoteBufferHandle` and `RemoteTensorRef` wrappers. `TaskArgs`
   accepts `RemoteTensorRef` through `add_tensor(...)`, keeps
-  `Tensor.data == 0`, and carries the remote descriptor sidecar into C++
+  `ChipTensor.data == 0`, and carries the remote descriptor sidecar into C++
   submit.
 - Canonical little-endian `remote_wire.{h,cpp}` frame codec with bounds checks
   for TASK payloads, remote tensor descriptors, COMPLETION, CONTROL_REPLY, and
@@ -67,11 +67,18 @@ Implemented:
   imported-handle scheduling eligibility, and deferred owner free.
 - Registry-scope-aware remote callable manifest/control install for dispatcher
   `PYTHON_IMPORT`, inner `PYTHON_IMPORT`, and inner inline `CHIP_CALLABLE`.
+  Pre-init `ChipCallable` registrations on an L4 worker are serialized into
+  each remote session manifest and installed on that L3's L2 children.
+- The repository contains simulation coverage for the no-`mpirun` Global
+  CommDomain transaction and mixed local/remote L3 topology.
+- The two-machine `st-pod-onboard-a2a3` job covers the real `a3-fabric-v1`
+  backend through `global_tload_mixed_l3` (L4-brokered peer `TLOAD`) and
+  `compute_then_tload_mixed_l3` (one L2 compute round followed by
+  cross-machine communication through the same domain).
 
 Still pending:
 
 - A2 RoCE, A3 HCCS, and A5 UB HCOMM profiles.
-- Remote `CommDomain` allocation/import and hardware-gated validation.
 - Negotiated `PYTHON_SERIALIZED` remote callable payloads and staged
   `CHIP_CALLABLE` blob adapters.
 
@@ -130,7 +137,8 @@ Relevant code paths:
   - `_child_worker_loop()` runs a nested `Worker` child via shm mailbox.
   - `_run_chip_main_loop()` handles task and control mailbox states.
 - `src/common/hierarchical/worker_manager.{h,cpp}`
-  - `WorkerThread` owns one local mailbox and blocks until `TASK_DONE`.
+  - `WorkerThread` owns one local mailbox; the Scheduler thread advances it
+    to `TASK_DONE` through non-blocking submit/poll calls.
   - Control commands share the same mailbox and serialize on `mailbox_mu_`.
   - Errors are reported through `MAILBOX_OFF_ERROR` and
     `MAILBOX_OFF_ERROR_MSG`.
@@ -139,7 +147,7 @@ Relevant code paths:
   `CallableIdentity`, and the required target worker in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
-  - Process dispatch writes `[T][S][Tensor x T][uint64 x S]`.
+  - Process dispatch writes `[T][S][ChipTensor x T][uint64 x S]`.
   - Tags are stripped after submit.
 - `docs/comm-domain.md`
   - Dynamic communication domains already model deferred release after
@@ -186,8 +194,8 @@ success/failure outcome.
 ## Fork-Safe Remote Process Model
 
 The remote runtime must preserve the repository's fork ordering invariant:
-all chip/sub child processes are forked before any C++ Scheduler,
-`WorkerThread`, transport, or health threads are started.
+all chip/sub child processes are forked before any C++ Scheduler, transport, or
+health threads are started.
 
 Use a two-process remote model:
 
@@ -407,7 +415,7 @@ callable registry:
   inner L3 Worker registry:
     hashid -> ChipCallable register payload, when needed
     hashid -> Python import descriptor, when needed
-comm policy: roce | hccs | ub | sim
+comm policy: host_tcp | roce | hccs | ub
 feature flags
 ```
 
@@ -434,7 +442,7 @@ For a TASK frame, the session runner:
 
 1. Validates the session and sequence number.
 2. Decodes `RemoteTaskArgsWire`.
-3. Translates remote tensor descriptors into local `Tensor` values.
+3. Translates remote tensor descriptors into local `ChipTensor` values.
 4. Looks up the L3 orchestration function in the remote TASK dispatcher
    registry by hashid.
 5. Calls `inner_worker.run(orch_fn, args, config)`.
@@ -449,10 +457,9 @@ Session execution rules:
   the current one-`WorkerThread`-per-child local scheduling model and keeps
   ordering, buffer lifetime, and callable visibility simple.
 - State-changing CONTROL frames such as register, unregister, buffer free,
-  copy, export/import, and import release serialize with TASK execution on the
-  ordered command lane. They are not applied concurrently with a running TASK
-  on the same endpoint. Future Remote CommDomain controls follow the same
-  ordering rule when they enter scope.
+  copy, export/import, import release, and Global CommDomain transactions
+  serialize with TASK execution on the ordered command lane. They are not
+  applied concurrently with a running TASK on the same endpoint.
 - Bulk data movement may use a separate data plane, but the state change that
   makes staged bytes, callable payloads, or imported handles visible is ordered
   by the command lane.
@@ -467,7 +474,7 @@ Session execution rules:
 
 ## Remote TaskArgs Representation
 
-Keep `Tensor` as the L2 ABI. Do not overload raw pointer values to
+Keep `ChipTensor` as the L2 ABI. Do not overload raw pointer values to
 carry transport state.
 
 Public Python uses a sidecar representation:
@@ -480,13 +487,13 @@ Public Python uses a sidecar representation:
 - Local endpoints reject remote tensor refs. `RemoteTensorRef` is transport
   metadata, not a local mailbox ABI. A local fork/shm endpoint becomes eligible
   only after the data has been explicitly imported, staged, or materialized into
-  a local-addressable `Tensor`.
+  a local-addressable `ChipTensor`.
 - Remote endpoints require a sidecar/descriptor for every tensor that carries
   data over the remote protocol, including `HOST_INLINE` tensors. A null
   sidecar is allowed only for metadata-only tensors with no data payload.
   Remote endpoints reject bare host pointers unless an explicit staging API
   produced a remote handle.
-- Remote submits reject `OUTPUT` tensors whose `Tensor.data == 0`
+- Remote submits reject `OUTPUT` tensors whose `ChipTensor.data == 0`
   unless the caller has already supplied a `RemoteTensorRef` sidecar. The first
   implementation does not auto-allocate remote outputs during submit.
 
@@ -511,8 +518,8 @@ run as if the producer succeeded.
 
 Required parent-side behavior:
 
-- `RemoteL3Endpoint::run()` blocks for the matching completion sequence.
-- `LocalMailboxEndpoint::run()` maps a non-zero mailbox error to
+- `RemoteL3Endpoint::poll_progress()` reports the matching completion sequence.
+- `LocalMailboxEndpoint::poll_progress()` maps a non-zero mailbox error to
   `task_failure` instead of reporting a successful completion.
 - Non-zero task or endpoint errors become candidates for the worker's first
   reported error.
@@ -569,7 +576,7 @@ operations use the HCOMM data adapter. The local path keeps the existing
 mailbox layout behind `LocalMailboxEndpoint`.
 
 Remote frames use canonical little-endian field encoding for `CallConfig`,
-`Tensor`, tensor descriptors, strings, counts, and enums; they do not
+`ChipTensor`, tensor descriptors, strings, counts, and enums; they do not
 memcpy local C++ POD structs onto the wire. Each endpoint has one ordered
 command lane for runtime state-changing frames, so TASK cannot overtake
 registry-changing CONTROL. Liveness uses a separate health lane or equivalent
@@ -587,16 +594,16 @@ The recommended first cut is conservative:
    **Implemented for C++ submit, Python `TaskArgs.add_tensor(RemoteTensorRef(...))`,
    owner buffers, and imported simulation buffers.**
 3. Add the versioned frame codec and the independent health-lane contract.
-   **Implemented for the socket-backed simulation transport.**
+   **Implemented for the socket-backed host_tcp transport.**
 4. Add remote callable registration with all-or-nothing multi-endpoint
    visibility and final-unregister cleanup. **Implemented for dispatcher
    `PYTHON_IMPORT`, inner `PYTHON_IMPORT`, and inner inline
    `CHIP_CALLABLE`.**
 5. Add the fork-safe simulation session runner with explicit prestart before
    `HELLO READY`. **Implemented.**
-6. Prove local behavior is unchanged and remote sim behavior handles success,
+6. Prove local behavior is unchanged and remote host_tcp behavior handles success,
    failure, hashid mapping, timeouts, health, and buffer cleanup.
-   **Focused Python remote sim and C++ no-hardware UT coverage is present.**
+   **Focused Python remote host_tcp and C++ no-hardware UT coverage is present.**
 7. Add A2 RoCE, A3 HCCS, and A5 UB profiles behind the HCOMM adapter layer.
    **Pending.**
 

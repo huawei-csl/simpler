@@ -17,7 +17,7 @@ extension.
 from simpler import Worker           # or: from simpler.worker import Worker
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
-    CoreCallable, DataType, Tensor,
+    ChipTensor, CoreCallable, DataType,
 )
 from simpler_setup import KernelCompiler, SceneTestCase, scene_test
 ```
@@ -62,9 +62,9 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | ------ | ----- |
 | `malloc(size, worker_id=0) -> int` | Returns a device pointer as an integer |
 | `free(ptr, worker_id=0)` | |
-| `copy_to(dst, src, size, worker_id=0)` | H2D; `dst` is a device pointer, `src` a host address. `dst` may be a `base + offset` interior address as long as `[dst, dst + size)` lies within one live allocation (partial update of a persistent buffer) |
-| `copy_from(dst, src, size, worker_id=0)` | D2H; `dst` is the host address. `src` may be an interior address whose `[src, src + size)` lies within one live device allocation |
-| `create_host_buffer(nbytes) -> HostBuffer` / `free_host_buffer(handle)` | Host-side buffer the device can reach |
+| `copy_to(dst, src)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `dst` may be a `base + offset` interior handle as long as `[dst, dst + size)` lies within one live allocation (partial update of a persistent buffer) |
+| `copy_from(dst, src)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). `src` may be an interior handle whose `[src, src + size)` lies within one live device allocation |
+| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `handle.tensor(shapes, dtype)` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 ### Execution
@@ -108,10 +108,10 @@ orchestration submits. `ChipCallable` exposes `binary_size`.
 
 ```python
 args = ChipStorageTaskArgs()
-args.add_tensor(Tensor.make(dev_ptr, (rows, cols), DataType.FLOAT32))
+args.add_tensor(ChipTensor.make(dev_ptr, (rows, cols), DataType.FLOAT32))
 ```
 
-Tensors are added **in signature order**. `Tensor.make(data_ptr, shape, dtype)`
+Tensors are added **in signature order**. `ChipTensor.make(data_ptr, shape, dtype)`
 takes a device pointer; `DataType` carries the element types.
 
 ## `CallConfig`
@@ -120,8 +120,8 @@ takes a device pointer; `DataType` carries the element types.
 
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
-| `aicpu_thread_num` | `3` | AICPU threads for this run |
-| `enable_l2_swimlane` | `0` | `0` off; `1`–`4` select detail. L2 only |
+| `aicpu_thread_num` | `0` | AICPU threads for this run; `0` selects the architecture default |
+| `enable_chip_swimlane` | `0` | `0` off; `1`–`4` select detail. L2 only |
 | `enable_dump_args` | `0` | Capture per-task arguments |
 | `enable_pmu` | `0` | `0` off; `>0` selects the event type |
 | `enable_dep_gen` | `0` | Emit the dependency graph |
@@ -143,7 +143,7 @@ Compilation and test scaffolding. Exported from the package root:
 | `extract_text_section(binary)` | Required on hardware platforms before wrapping a kernel `.o` |
 | `scene_test(level, runtime)` / `SceneTestCase` | The decorator and base class for declarative examples and tests |
 | `Tensor`, `Scalar`, `TaskArgsBuilder`, `CallableNamespace` | Scene-test arg construction |
-| `make_tensor_arg`, `torch_dtype_to_datatype` | torch interop |
+| `make_chip_tensor_arg`, `torch_dtype_to_datatype` | torch interop |
 | `parse_platform` | Platform string parsing |
 | `RuntimeBuilder` | Runtime build orchestration |
 

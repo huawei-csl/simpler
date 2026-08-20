@@ -15,14 +15,140 @@
 
 #include "host_log.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <limits.h>
 #include <pthread.h>
+#include <string>
+#include <vector>
+
+#include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+
+#include "common/host_span.h"
 
 using simpler::log::LogLevel;
+
+namespace {
+
+// Every STRACE marker renders well inside this allocation bound, so the heap
+// fallback below stays off the path a traced run pays per span. This capacity
+// is not an atomic-write guarantee.
+constexpr size_t kRecordStackCapacity = 2048;
+
+// POSIX guarantees atomic pipe writes up to _POSIX_PIPE_BUF (512 bytes). A
+// conservative bound for the logger prefix, fixed-width STRACE fields, and
+// newline is 256 bytes, leaving the other half for the encoded text fields.
+constexpr size_t kHostSpanNameCapacity = 64;
+constexpr size_t kHostSpanAttributesCapacity = 192;
+static_assert(kHostSpanNameCapacity + kHostSpanAttributesCapacity <= _POSIX_PIPE_BUF - 256);
+
+std::string encode_host_span_field(const char *value, size_t capacity, bool attributes) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string encoded;
+    encoded.reserve(capacity);
+    bool truncated = false;
+    size_t last_unit_size = 0;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p != '\0'; ++p) {
+        const unsigned char c = *p;
+        const bool printable = c >= 0x20 && c <= 0x7E;
+        const bool grammar_character = attributes && (c == ' ' || c == '=');
+        const bool safe =
+            printable && c != '%' && c != '[' && c != ']' && (grammar_character || (c != ' ' && c != '='));
+        const size_t required = safe ? 1 : 3;
+        if (encoded.size() + required > capacity) {
+            truncated = true;
+            break;
+        }
+        if (safe) {
+            encoded.push_back(static_cast<char>(c));
+        } else {
+            encoded.push_back('%');
+            encoded.push_back(kHex[c >> 4]);
+            encoded.push_back(kHex[c & 0x0F]);
+        }
+        last_unit_size = required;
+    }
+    // A `%XX` escape is one indivisible unit, so a marker written over the tail
+    // of a full field drops that whole unit rather than its last byte — which
+    // would leave `%0A` as the undecodable `%0~`.
+    if (truncated && capacity != 0) {
+        if (encoded.size() == capacity) encoded.resize(encoded.size() - last_unit_size);
+        encoded.push_back('~');
+    }
+    return encoded;
+}
+
+// Renders the timestamp/thread/level prefix, the caller's message, and an
+// optional trailing newline into `buffer`, and returns the length of the whole
+// record. A return value of `capacity` or more means `buffer` holds only a
+// truncated prefix and the caller must re-render into that many bytes.
+size_t format_record(
+    char *buffer, size_t capacity, const char *ts, unsigned long tid, const char *level_tag, const char *func,
+    const char *fmt, va_list args, bool append_newline
+) {
+    size_t length = 0;
+    auto tail = [&]() -> char * {
+        return length < capacity ? buffer + length : nullptr;
+    };
+    auto remaining = [&]() -> size_t {
+        return length < capacity ? capacity - length : 0;
+    };
+
+    const int prefix = snprintf(tail(), remaining(), "[%s][T0x%lx][%s] %s: ", ts, tid, level_tag, func);
+    if (prefix < 0) {
+        return 0;
+    }
+    length += static_cast<size_t>(prefix);
+
+    va_list formatting_args;
+    va_copy(formatting_args, args);
+    const int body = vsnprintf(tail(), remaining(), fmt, formatting_args);
+    va_end(formatting_args);
+    if (body > 0) {
+        length += static_cast<size_t>(body);
+    }
+
+    if (append_newline) {
+        if (length + 1 < capacity) {
+            buffer[length] = '\n';
+            buffer[length + 1] = '\0';
+        }
+        length += 1;
+    }
+    return length;
+}
+
+void write_stderr(const char *record, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t written = ::write(STDERR_FILENO, record + offset, size - offset);
+        if (written > 0) {
+            offset += static_cast<size_t>(written);
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+long host_trace_tid() {
+#if defined(__linux__) && defined(SYS_gettid)
+    return static_cast<long>(syscall(SYS_gettid));
+#else
+    return static_cast<long>(getpid());
+#endif
+}
+
+}  // namespace
 
 HostLogger &HostLogger::get_instance() {
     static HostLogger instance;
@@ -83,13 +209,27 @@ void HostLogger::emit(const char *level_tag, const char *func, const char *fmt, 
 
     auto tid = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(pthread_self()));
 
-    std::scoped_lock lock(mutex_);
-    fprintf(stderr, "[%s][T0x%lx][%s] %s: ", ts, tid, level_tag, func);
-    vfprintf(stderr, fmt, args);
-    if (fmt[0] != '\0' && fmt[strlen(fmt) - 1] != '\n') {
-        fputc('\n', stderr);
+    const bool append_newline = fmt[0] != '\0' && fmt[strlen(fmt) - 1] != '\n';
+
+    // One write per record avoids thread interleaving under mutex_. On a shared
+    // pipe, only records no larger than that pipe's PIPE_BUF are indivisible
+    // across forked writers. Machine-readable host spans are separately
+    // budgeted to the portable _POSIX_PIPE_BUF floor (512 bytes); longer human
+    // log records use this same best-effort write path without that promise.
+    char stack_buffer[kRecordStackCapacity];
+    const size_t length =
+        format_record(stack_buffer, sizeof(stack_buffer), ts, tid, level_tag, func, fmt, args, append_newline);
+    if (length < sizeof(stack_buffer)) {
+        std::scoped_lock lock(mutex_);
+        write_stderr(stack_buffer, length);
+        return;
     }
-    fflush(stderr);
+
+    std::vector<char> heap_buffer(length + 1);
+    const size_t heap_length =
+        format_record(heap_buffer.data(), heap_buffer.size(), ts, tid, level_tag, func, fmt, args, append_newline);
+    std::scoped_lock lock(mutex_);
+    write_stderr(heap_buffer.data(), heap_length < heap_buffer.size() ? heap_length : length);
 }
 
 void HostLogger::vlog(LogLevel level, const char *func, const char *fmt, va_list args) {
@@ -125,4 +265,21 @@ extern "C" int simpler_log_init(int log_level) {
     }
     HostLogger::get_instance().set_level(static_cast<LogLevel>(log_level));
     return 0;
+}
+
+extern "C" void simpler_log_emit_host_span(const SimplerHostSpan *span) {
+    if (span == nullptr || span->abi_version != SIMPLER_HOST_SPAN_ABI_VERSION ||
+        span->struct_size < sizeof(SimplerHostSpan) || span->name == nullptr) {
+        return;
+    }
+    const std::string name = encode_host_span_field(span->name, kHostSpanNameCapacity, false);
+    const std::string attributes =
+        encode_host_span_field(span->attributes == nullptr ? "" : span->attributes, kHostSpanAttributesCapacity, true);
+    HostLogger::get_instance().log(
+        LogLevel::TIMING, "emit_host_span",
+        "[STRACE] v=1 pid=%d tid=%ld inv=%llu hid=%llx depth=%d name=%s ts=%lld dur=%lld %s",
+        static_cast<int>(getpid()), host_trace_tid(), static_cast<unsigned long long>(span->invocation_id),
+        static_cast<unsigned long long>(span->callable_hash), span->depth, name.c_str(),
+        static_cast<long long>(span->timestamp_ns), static_cast<long long>(span->duration_ns), attributes.c_str()
+    );
 }

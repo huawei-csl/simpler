@@ -35,8 +35,10 @@ Outputs:
     * a per-callable TPOT table (each invocation's simpler_run dur + the mean
       of each sub-stage across invocations), and
     * optionally a Chrome-trace / Perfetto JSON (``--trace-out``): one ``ph:"X"``
-      event per span, lane = pid, so the host call tree renders as nested
-      slices (L3 parent and each L2 child get their own pid lane).
+      event per span on a synthetic per-invocation lane, so each host call tree
+      renders as nested slices, or
+    * a host scheduler swimlane (``--swimlane``) whose host lanes retain the
+      real OS pid/tid and whose cross-thread handoffs are Chrome flow events.
 """
 
 from __future__ import annotations
@@ -48,11 +50,38 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 
+# The host-log record prefix `HostLogger::emit` writes ahead of every message.
+# Its func segment excludes ':' because `LOG_TIMING` passes `__FUNCTION__`, an
+# unqualified name; a qualified name containing '::' would stop this alternative
+# from matching, leaving the `[STRACE]` alternative to bound the record instead.
+_HOST_LOG_PREFIX = (
+    r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}\]"
+    r"\[T0x[0-9a-fA-F]+\]\[[A-Z]+\]\s+[^:\r\n]+:\s+"
+)
+# MULTILINE anchors the `$` alternative at every line end, so a caller passing a
+# multi-line blob rather than one line per item keeps every record but the last.
 _STRACE_RE = re.compile(
     r"\[STRACE\]\s+v=(?P<v>\d+)\s+pid=(?P<pid>\d+)\s+tid=(?P<tid>\d+)\s+"
     r"inv=(?P<inv>\d+)\s+hid=(?P<hid>[0-9a-fA-F]+)\s+depth=(?P<depth>\d+)\s+"
-    r"name=(?P<name>\S+)\s+ts=(?P<ts>\d+)\s+dur=(?P<dur>\d+)(?P<attrs>.*)"
+    r"name=(?P<name>\S+)\s+ts=(?P<ts>\d+)\s+dur=(?P<dur>\d+)(?P<attrs>.*?)"
+    rf"(?={_HOST_LOG_PREFIX}|\[STRACE\]|\r?$)",
+    re.MULTILINE,
 )
+# A record start, matched independently of whether the rest of that record
+# survived the write that emitted it.
+_STRACE_HEAD_RE = re.compile(r"\[STRACE\]\s+v=\d+")
+# The emitter percent-encodes any byte that would otherwise be record grammar —
+# see `encode_host_span_field` in src/common/log/host_log.cpp.
+_PERCENT_ESCAPE_RE = re.compile(r"%([0-9A-Fa-f]{2})")
+
+
+def decode_field(text):
+    """Reverse the emitter's percent-encoding of a name or attribute value.
+
+    A field the emitter truncated ends in ``~``, which is left in place: it is a
+    marker that the value is incomplete, not an encoded byte.
+    """
+    return _PERCENT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
 @dataclass
@@ -91,27 +120,49 @@ class Invocation:
     def by_name(self):
         m = {}
         for s in self.spans:
-            m.setdefault(s.name, s)
+            previous = m.get(s.name)
+            if previous is None or s.ts < previous.ts:
+                m[s.name] = s
         return m
 
 
+def count_record_heads(lines):
+    """Count ``[STRACE]`` record starts, torn ones included.
+
+    Pairs with :func:`parse_spans`, which yields only records that survived
+    intact. A shortfall between the two counts is instrumentation loss, and
+    without it a torn record is indistinguishable from a real measurement.
+    """
+    return sum(len(_STRACE_HEAD_RE.findall(line)) for line in lines)
+
+
 def parse_spans(lines):
-    """Yield Span for every matching [STRACE] line."""
+    """Yield every complete span, including adjacent records on one line."""
     for line in lines:
-        m = _STRACE_RE.search(line)
-        if not m:
-            continue
-        yield Span(
-            pid=int(m["pid"]),
-            tid=int(m["tid"]),
-            inv=int(m["inv"]),
-            hid=m["hid"].lower(),
-            depth=int(m["depth"]),
-            name=m["name"],
-            ts=int(m["ts"]),
-            dur=int(m["dur"]),
-            attrs=m["attrs"].strip(),
-        )
+        for m in _STRACE_RE.finditer(line):
+            yield Span(
+                pid=int(m["pid"]),
+                tid=int(m["tid"]),
+                inv=int(m["inv"]),
+                hid=m["hid"].lower(),
+                depth=int(m["depth"]),
+                name=decode_field(m["name"]),
+                ts=int(m["ts"]),
+                dur=int(m["dur"]),
+                attrs=m["attrs"].strip(),
+            )
+
+
+def legacy_spans(spans):
+    """Return spans belonging to the established ``simpler_run`` views.
+
+    L3/L4 host-scheduler markers share the STRACE grammar but answer a
+    different question. Keeping them out of invocation grouping preserves the
+    TPOT, rounds, tree, and ``--trace-out`` contracts when a log contains both
+    marker families. Filter only the newly introduced namespace so existing
+    marker families such as ``simpler_prewarm`` retain their old behavior.
+    """
+    return [span for span in spans if not span.name.startswith("l3.")]
 
 
 def group_invocations(spans):
@@ -373,6 +424,206 @@ def to_chrome_trace(invocations, buckets=None):
     return {"traceEvents": events, "displayTimeUnit": "ms"}
 
 
+def _parsed_attrs(span):
+    attrs = {}
+    for attribute in span.attrs.split():
+        key, separator, value = attribute.partition("=")
+        if not separator:
+            continue
+        if re.fullmatch(r"-?\d+", value):
+            attrs[key] = int(value)
+        else:
+            attrs[key] = decode_field(value)
+    return attrs
+
+
+# Highest-precedence match wins. One OS thread emits spans of several roles: the
+# scheduler loop is the sole caller of both `dispatch_ready` and
+# `manager->progress`, so it emits `l3.dispatch` (role=scheduler) alongside
+# `l3.frame_submit` / `l3.activate` / `l3.complete`, whose `role=worker` names
+# the worker a dispatch targets rather than the thread doing the work.
+_HOST_THREAD_ROLES = ("facade", "scheduler", "worker")
+
+
+def _host_thread_name(entries):
+    """Name one OS thread's lane from every span it emitted.
+
+    `entries` are that thread's (span, parsed attributes) pairs.
+    """
+    roles = set()
+    worker_ids = set()
+    for span, attrs in entries:
+        role = attrs.get("role")
+        if role == "facade" or span.name in {"l3.graph_build", "l3.submit"}:
+            roles.add("facade")
+        elif role in ("scheduler", "worker"):
+            roles.add(role)
+        elif span.name.startswith("l3."):
+            roles.add("worker")
+        if role == "worker":
+            worker_ids.add(attrs.get("worker_id"))
+
+    for role in _HOST_THREAD_ROLES:
+        if role not in roles:
+            continue
+        if role == "facade":
+            return "orchestrator / facade"
+        if role == "scheduler":
+            return "scheduler"
+        worker_id = worker_ids.pop() if len(worker_ids) == 1 else None
+        return f"worker {worker_id}" if worker_id is not None else "worker"
+
+    if any(span.name == "simpler_run" or span.name.startswith("simpler_run.") for span, _ in entries):
+        return "chip child"
+    return f"tid {entries[0][0].tid}"
+
+
+def _flow_key(span, attrs):
+    run_id = attrs.get("run_id")
+    task_slot = attrs.get("task_slot", attrs.get("slot"))
+    if run_id is None or task_slot is None:
+        return None
+    return span.pid, run_id, task_slot
+
+
+def to_host_swimlane(spans):
+    """Build a real-pid/tid host scheduling timeline for Perfetto.
+
+    Host timestamps remain on their shared CLOCK_MONOTONIC axis. Chrome Trace
+    JSON has one timestamp axis, so raw ``clk=dev`` events cannot be rendered
+    alongside host events without either a false clock alignment or a huge
+    empty interval. Keep those raw events in ``unalignedDeviceSpans`` for
+    inspection, but do not add them to Perfetto's visible ``traceEvents``.
+    """
+    # (span, parsed attributes) pairs, so the attributes travel with their span
+    # through every partition below. `Span` is an unhashable dataclass, so a
+    # side table would have to be keyed on identity.
+    entries = [(span, _parsed_attrs(span)) for span in spans]
+    events = []
+
+    host_entries = [entry for entry in entries if not entry[0].is_device]
+    device_entries = [entry for entry in entries if entry[0].is_device]
+    host_pids = sorted({span.pid for span, _ in host_entries})
+    host_threads = sorted({(span.pid, span.tid) for span, _ in host_entries})
+
+    for pid in host_pids:
+        process_spans = [span for span, _ in host_entries if span.pid == pid]
+        role = "host" if any(span.name.startswith("l3.") for span in process_spans) else "chip child"
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": pid,
+                "tid": 0,
+                "args": {"name": f"simpler {role} (pid={pid})"},
+            }
+        )
+    for pid, tid in host_threads:
+        on_thread = [entry for entry in host_entries if entry[0].pid == pid and entry[0].tid == tid]
+        events.append(
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": pid,
+                "tid": tid,
+                "args": {"name": _host_thread_name(on_thread)},
+            }
+        )
+    for span, parsed in sorted(host_entries, key=lambda item: (item[0].ts, item[0].pid, item[0].tid, item[0].name)):
+        event_args = {"inv": span.inv, "hid": span.hid, "depth": span.depth, "attrs": span.attrs, **parsed}
+        events.append(
+            {
+                "name": span.name,
+                "ph": "X",
+                "ts": span.ts / 1000.0,
+                "dur": span.dur / 1000.0,
+                "pid": span.pid,
+                "tid": span.tid,
+                "args": event_args,
+            }
+        )
+
+    submits = defaultdict(list)
+    for span, attrs in host_entries:
+        if span.name != "l3.submit":
+            continue
+        key = _flow_key(span, attrs)
+        if key is not None:
+            submits[key].append(span)
+    for candidates in submits.values():
+        candidates.sort(key=lambda item: item.ts)
+
+    dispatches = []
+    for span, attrs in host_entries:
+        if span.name != "l3.dispatch":
+            continue
+        key = _flow_key(span, attrs)
+        source = None
+        if key is not None:
+            for candidate in submits.get(key, []):
+                if candidate.ts > span.ts:
+                    break
+                source = candidate
+        if source is None:
+            continue
+        dispatches.append((source, span, attrs))
+
+    for flow_id, (source, destination, attrs) in enumerate(sorted(dispatches, key=lambda item: item[1].ts), start=1):
+        dispatch_key = (
+            f"dispatch:{source.pid}:{attrs['run_id']}:{attrs.get('task_slot', attrs.get('slot'))}:"
+            f"{attrs.get('group_index', -1)}:{attrs.get('worker_id', -1)}:{attrs.get('dispatch_id', 0)}"
+        )
+        flow_args = {"dispatch_key": dispatch_key}
+        events.append(
+            {
+                "name": "task dispatch",
+                "cat": "host.scheduler",
+                "ph": "s",
+                "id": flow_id,
+                "ts": min(source.ts + source.dur, destination.ts) / 1000.0,
+                "pid": source.pid,
+                "tid": source.tid,
+                "args": flow_args,
+            }
+        )
+        events.append(
+            {
+                "name": "task dispatch",
+                "cat": "host.scheduler",
+                "ph": "f",
+                "id": flow_id,
+                "ts": destination.ts / 1000.0,
+                "pid": destination.pid,
+                "tid": destination.tid,
+                "args": flow_args,
+            }
+        )
+
+    unaligned_device_spans = []
+    for span, attrs in sorted(
+        device_entries, key=lambda item: (item[0].pid, item[0].inv, item[0].ts, item[0].tid, item[0].name)
+    ):
+        unaligned_device_spans.append(
+            {
+                "name": span.name,
+                "ts_ns": span.ts,
+                "dur_ns": span.dur,
+                "pid": span.pid,
+                "tid": span.tid,
+                "inv": span.inv,
+                "hid": span.hid,
+                "depth": span.depth,
+                "attrs": {"raw": span.attrs, **attrs},
+            }
+        )
+
+    return {
+        "traceEvents": events,
+        "displayTimeUnit": "ms",
+        "unalignedDeviceSpans": unaligned_device_spans,
+    }
+
+
 def _print_agg_tree(invs, stream=sys.stdout):
     """Print a callable's spans as a nested tree built from the dotted span
     names (so e.g. ``simpler_run.bind.args`` nests under ``simpler_run.bind``),
@@ -473,6 +724,10 @@ def main(argv=None):
         "--trace-out", help="write a Chrome-trace/Perfetto JSON here (load in chrome://tracing or perfetto)"
     )
     ap.add_argument(
+        "--swimlane",
+        help="write a real-pid/tid L3/L4 host swimlane JSON here (load in chrome://tracing or perfetto)",
+    )
+    ap.add_argument(
         "--rounds-table",
         action="store_true",
         help="print a per-round Host/Device/Orch/Sched table (the format tools/benchmark_rounds.sh "
@@ -493,7 +748,15 @@ def main(argv=None):
             lines = f.readlines()
 
     spans = list(parse_spans(lines))
-    invocations = group_invocations(spans)
+    heads = count_record_heads(lines)
+    if heads > len(spans):
+        print(
+            f"warning: {heads - len(spans)} of {heads} [STRACE] records are incomplete and are "
+            "excluded from the timing below",
+            file=sys.stderr,
+        )
+    legacy = legacy_spans(spans)
+    invocations = group_invocations(legacy)
     buckets = bucket_by_hid(invocations)
 
     if args.rounds_table:
@@ -506,7 +769,16 @@ def main(argv=None):
     if args.trace_out:
         with open(args.trace_out, "w", encoding="utf-8") as f:
             json.dump(to_chrome_trace(invocations, buckets), f)
-        print(f"Wrote Chrome trace: {args.trace_out} ({len(spans)} spans)")
+        print(f"Wrote Chrome trace: {args.trace_out} ({len(legacy)} spans)")
+
+    if args.swimlane:
+        with open(args.swimlane, "w", encoding="utf-8") as f:
+            json.dump(to_host_swimlane(spans), f)
+        host_count = sum(not span.is_device for span in spans)
+        print(
+            f"Wrote host swimlane: {args.swimlane} "
+            f"({host_count} host spans, {len(spans) - host_count} unaligned device spans)"
+        )
 
     return 0
 

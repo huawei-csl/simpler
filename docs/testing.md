@@ -46,11 +46,23 @@ ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on
 # Scene tests (pytest, @scene_test classes)
 pytest examples tests/st                          # all sim platforms (auto-parametrized)
 pytest examples tests/st --platform a2a3sim       # specific sim
-pytest examples tests/st --platform a2a3          # hardware
-pytest examples tests/st --platform a2a3 --device 4-7  # hardware with device pool
+pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4          # hardware
+pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4 --device 4-7  # hardware with device pool
+
+# Compile the selected hardware batch without creating a Worker or using an NPU
+python -m simpler_setup.tools.scene_test_compile examples tests/st \
+    -m "not sdma" --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 8
+
+# SDMA cases run separately, as they do in CI: they are quarantined by
+# @pytest.mark.sdma so no fault-injection case shares a device with a
+# provisioned SDMA workspace (issue #1425)
+pytest examples tests/st -m sdma --platform a2a3 --device 4-5
+
+# A5 runs the non-pod corpus, including SDMA tests, on both host architectures
+pytest examples tests/st --platform a5 --exclude-level 4 --device 0-7
 
 # Single scene test (standalone)
-python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim
+python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim --manual include
 
 # Benchmark mode (100 rounds, skip golden comparison)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
@@ -58,7 +70,7 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 
 # Profiling (first round only)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
-    -p a2a3 --enable-l2-swimlane
+    -p a2a3 --enable-chip-swimlane
 
 # Args dump
 python tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py \
@@ -82,16 +94,43 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cp
 
 ## Scene Test CLI Options
 
+### Lock-free kernel warm-up
+
+`python -m simpler_setup.tools.scene_test_compile` accepts the same pytest
+paths and selection arguments as the subsequent scene-test command. It runs
+pytest collection, compiles each selected `SceneTestCase` class once, and
+stores the resulting `ChipCallable` under `build/cache/kernels/`. It does not
+create a `Worker` or access an NPU. Compilation is serial by default so callers
+with large models do not unexpectedly overload the host. Pass
+`--compile-workers N` to opt into compiling up to `N` test classes concurrently
+— each worker starts its own compiler process, so only raise it on a host whose
+CPU is yours. simpler's two onboard CI jobs (a2a3, a5) use eight; the sim jobs
+have no warm-up step.
+
+A class that fails to compile is reported and skipped rather than aborting the
+pass, so the run that follows still recompiles it and reports the error against
+the case that owns it.
+
+Pass the same paths, `-m`, `--platform`, `--runtime`, `--level`, and
+`--exclude-level` selections to warm-up and execution. A normal pytest or
+standalone run loads matching
+artifacts from the persistent cache; changed orchestration, incore, or included
+source content, compiler identity, fixed compilation flags, compilation logic,
+or compilation schema produces a new cache entry automatically. Entries unused
+for 14 days are pruned. When `build/` is not writable — a wheel installed into
+a read-only `site-packages` — the cache is skipped with a warning and every
+callable is compiled in-process, exactly as before the cache existed.
+
 Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
 
-> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-args` (unified argument dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
+> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-chip-swimlane` (chip swimlane), `--dump-args` (unified argument dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
 
 ### pytest
 
 ```bash
 pytest --platform a2a3sim                                        # default: 1 round + golden
 pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
-pytest --platform a2a3 --enable-l2-swimlane                             # L2 swimlane (first round)
+pytest --platform a2a3 --enable-chip-swimlane                             # chip swimlane (first round)
 pytest --platform a2a3 --enable-pmu                              # PMU CSV
 pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
 ```
@@ -101,7 +140,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 ```bash
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
-python test_xxx.py -p a2a3 --enable-l2-swimlane                         # L2 swimlane (first round)
+python test_xxx.py -p a2a3 --enable-chip-swimlane                         # chip swimlane (first round)
 python test_xxx.py -p a2a3 --dump-args                         # dump unified argument artifacts
 python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
@@ -115,11 +154,12 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
 | `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
 | `--runtime NAME` | | (all) | Restrict to one runtime (also used internally as the child-mode marker) |
-| `--level {2,3}` | | (all) | Restrict to one SceneTestCase level (also the child-mode marker) |
+| `--level {2,3,4}` | | (all) | Restrict to one scene-test level. Level 4 selects pod wrappers. |
+| `--exclude-level {2,3,4}` | | (none) | Exclude tests explicitly carrying that scene-test level. Ordinary onboard lanes use `--exclude-level 4`. |
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
-| `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
+| `--manual` | | `exclude` | `exclude`/`include`/`only` for manual scene-test cases and standalone pytest tests |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_swimlane_records.json` lands; parallel runs never collide. |
+| `--enable-chip-swimlane [PERF_LEVEL]` | | `0` | Enable chip swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/chip-swimlane-profiling.md](dfx/chip-swimlane-profiling.md#31-enable-chip-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `chip_swimlane_records.json` lands; parallel runs never collide. |
 | `--dump-args` | | `0` | Dump tensors plus scalar args into unified runtime artifacts (bare flag = `1`; supports `0/1/2/3`) |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
@@ -213,7 +253,7 @@ Worked examples:
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
 | `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
-| `--skip-golden`, `--enable-l2-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
+| `--skip-golden`, `--enable-chip-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
 
@@ -320,13 +360,13 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 
 Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
 
-- `outputs/<case>_<ts>/l2_swimlane_records.json` — swimlane (`--enable-l2-swimlane`)
+- `outputs/<case>_<ts>/chip_swimlane_records.json` — swimlane (`--enable-chip-swimlane`)
 - `outputs/<case>_<ts>/args_dump/` — args dump (`--dump-args`)
 - `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
 
 Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
 
-Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/l2_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
+Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/chip_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
 
 ### Dispatcher skip conditions (normal pytest runs)
 
@@ -578,7 +618,7 @@ Create a `test_*.py` file using the `@scene_test` decorator:
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -605,8 +645,8 @@ class TestMyKernel(SceneTestCase):
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("x", torch.ones(1024, dtype=torch.float32)),
-            Tensor("y", torch.zeros(1024, dtype=torch.float32)),
+            TensorArg("x", torch.ones(1024, dtype=torch.float32)),
+            TensorArg("y", torch.zeros(1024, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -625,8 +665,8 @@ pytest examples tests/st --platform a2a3sim
 # Standalone (single case)
 python test_my_kernel.py -p a2a3sim
 
-# On hardware
-pytest examples tests/st --platform a2a3
+# On hardware (SDMA cases quarantined by marker; run them with -m sdma)
+pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4
 ```
 
 Key fields:
@@ -680,7 +720,27 @@ still gets checked, whereas a skipped case only proves the run didn't crash.
 | `--case ClassA::` | all cases in `ClassA` |
 | `--case A::x --case B::y` | multiple selectors (repeatable) |
 
-`--manual exclude` (default) skips `manual: True` cases; `--manual include` runs them alongside normal cases; `--manual only` runs only manual cases. These compose orthogonally with `--case`: explicit selectors still respect the manual filter — to run a manual case by name, pass `--manual include`.
+`--manual exclude` (default) skips `manual: True` cases and standalone tests
+marked `@pytest.mark.manual`; `--manual include` runs them alongside normal
+tests; `--manual only` runs only manual tests. The `only` filter applies to the
+entire pytest session, so it also deselects ordinary standalone tests without a
+`manual` marker. These compose orthogonally with `--case`: explicit selectors
+still respect the manual filter — to run a manual case by name, pass
+`--manual include`.
+
+The separate `daily.yml` workflow runs the full corpus with `--manual include`
+once per day on A2/A3 and A5, simulation and onboard. Mark a whole standalone
+pytest test with `@pytest.mark.manual`; mark only one case in a `SceneTestCase`
+by setting `"manual": True` on that `CASES` entry. Per-PR excludes those tests,
+while Daily runs them together with the regular corpus. The A2/A3 Pod cases run
+in the same Daily workflow through their existing two-machine job.
+
+To move only selected platforms, pass the platform list to the same marker:
+use `@pytest.mark.manual(["a2a3sim", "a5sim"])` (or the equivalent
+`@pytest.mark.manual(platforms=["a2a3sim", "a5sim"])`) for a standalone test,
+or `"manual": ["a2a3sim", "a5sim"]` for a scene-test case. Do not mix the two
+standalone marker forms. The onboard execution then remains in the default
+Per-PR sweep.
 
 ### Sharing an Example Between examples/ and tests/st/
 

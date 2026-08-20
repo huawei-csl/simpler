@@ -25,19 +25,18 @@
 #include "pto_runtime_c_api.h"
 
 #include "common/unified_log.h"
+#include "host/file_marker_handshake.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -84,10 +83,17 @@ struct DomainAllocation {
 
     int rank = 0;
     int nranks = 0;
+    bool release_failed = false;
     VmmWindow local_window;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
+
+static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
+static_assert(
+    sizeof(aclrtMemFabricHandle) <= COMM_GLOBAL_DOMAIN_HANDLE_BYTES, "Fabric handle exceeds global descriptor"
+);
+static std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> global_domain_allocations;
 
 struct CommHandle_ {
     int rank;
@@ -154,25 +160,11 @@ static uint64_t make_run_token(int rank) {
 
 static std::string
 barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const std::string &tag, int rank) {
-    return handshake_dir(rootinfo_path) + "/barrier_" + handshake_prefix(rootinfo_path) + "_" + tag + "_" +
-           run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
+    return file_marker_handshake::marker_path(rootinfo_path, run_token, tag, rank);
 }
 
 static void cleanup_handshake_files(const std::string &rootinfo_path) {
-    std::error_code ec;
-    std::filesystem::remove(rootinfo_path, ec);
-
-    const std::string prefix = "barrier_" + handshake_prefix(rootinfo_path) + "_";
-    const std::string dir = handshake_dir(rootinfo_path);
-    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file(ec)) continue;
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) continue;
-        if (name.size() < 6 || name.substr(name.size() - 6) != ".ready") continue;
-        std::filesystem::remove(entry.path(), ec);
-        ec.clear();
-    }
+    (void)file_marker_handshake::cleanup(rootinfo_path);
 }
 
 static bool
@@ -1533,14 +1525,205 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 }
 
+extern "C" int comm_global_domain_prepare(
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+) try {
+    if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
+        window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor_out == nullptr ||
+        local_window_base_out == nullptr || global_domain_allocations.count(domain_id) != 0) {
+        return -1;
+    }
+
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
+        return -1;
+    }
+    auto allocation = std::make_unique<DomainAllocation>();
+    aclError status = create_local_fabric_window(device_id, window_size, &allocation->local_window);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] create local Fabric window -> %d", domain_rank, static_cast<int>(status));
+        return -1;
+    }
+
+    aclrtMemFabricHandle fabric_handle{};
+    status = export_fabric_window(allocation->local_window, &fabric_handle);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] export Fabric handle -> %d", domain_rank, static_cast<int>(status));
+        release_domain_windows(allocation.get());
+        return -1;
+    }
+    status =
+        aclrtMemset(allocation->local_window.base, allocation->local_window.size, 0, allocation->local_window.size);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] zero local Fabric window -> %d", domain_rank, static_cast<int>(status));
+        release_domain_windows(allocation.get());
+        return -1;
+    }
+
+    allocation->rank = static_cast<int>(domain_rank);
+    allocation->nranks = static_cast<int>(rank_count);
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC;
+    descriptor.domain_rank = domain_rank;
+    descriptor.rank_count = rank_count;
+    descriptor.mapping_size = allocation->local_window.size;
+    descriptor.handle_size = sizeof(fabric_handle);
+    std::memcpy(descriptor.handle, &fabric_handle, sizeof(fabric_handle));
+
+    *descriptor_out = descriptor;
+    *local_window_base_out = reinterpret_cast<uint64_t>(allocation->local_window.base);
+    global_domain_allocations.emplace(domain_id, std::move(allocation));
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] prepare exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] prepare unknown exception");
+    return -1;
+}
+
+extern "C" int comm_global_domain_import(
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
+        return -1;
+    }
+    auto &allocation = it->second;
+    if (descriptor_count != static_cast<size_t>(allocation->nranks) || allocation->device_ctx != nullptr) {
+        return -1;
+    }
+
+    std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
+    for (size_t i = 0; i < descriptor_count; ++i) {
+        const auto &descriptor = descriptors[i];
+        if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC ||
+            descriptor.rank_count != static_cast<uint32_t>(allocation->nranks) ||
+            descriptor.domain_rank >= static_cast<uint32_t>(allocation->nranks) ||
+            descriptor.mapping_size != allocation->local_window.size ||
+            descriptor.handle_size != sizeof(aclrtMemFabricHandle) || rank_order[descriptor.domain_rank] != nullptr) {
+            return -1;
+        }
+        rank_order[descriptor.domain_rank] = &descriptor;
+    }
+
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
+        return -1;
+    }
+    CommContext ctx{};
+    ctx.rankId = static_cast<uint32_t>(allocation->rank);
+    ctx.rankNum = static_cast<uint32_t>(allocation->nranks);
+    ctx.winSize = allocation->local_window.size;
+    std::vector<VmmWindow> peer_windows;
+    peer_windows.reserve(descriptor_count - 1);
+    for (uint32_t rank = 0; rank < static_cast<uint32_t>(allocation->nranks); ++rank) {
+        const auto *descriptor = rank_order[rank];
+        if (descriptor == nullptr) {
+            return -1;
+        }
+        uint64_t window_addr = reinterpret_cast<uint64_t>(allocation->local_window.base);
+        if (rank != static_cast<uint32_t>(allocation->rank)) {
+            aclrtMemFabricHandle fabric_handle{};
+            std::memcpy(&fabric_handle, descriptor->handle, sizeof(fabric_handle));
+            VmmWindow peer_window;
+            aclError status = import_fabric_window(device_id, fabric_handle, descriptor->mapping_size, &peer_window);
+            if (status != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[global domain rank %d] import peer rank %u -> %d", allocation->rank, rank,
+                    static_cast<int>(status)
+                );
+                return -1;
+            }
+            window_addr = reinterpret_cast<uint64_t>(peer_window.base);
+            peer_windows.push_back(std::move(peer_window));
+        }
+        ctx.windowsIn[rank] = window_addr;
+        ctx.windowsOut[rank] = window_addr;
+    }
+
+    void *device_ctx = nullptr;
+    aclError status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) {
+        return -1;
+    }
+    status = aclrtMemcpy(device_ctx, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) {
+        aclrtFree(device_ctx);
+        return -1;
+    }
+    allocation->peer_windows = std::move(peer_windows);
+    allocation->device_ctx = static_cast<CommContext *>(device_ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(device_ctx);
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] import exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] import unknown exception");
+    return -1;
+}
+
+extern "C" int comm_global_domain_release(uint64_t domain_id) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) {
+        return 0;
+    }
+    auto &allocation = it->second;
+    if (allocation->release_failed) {
+        LOG_ERROR(
+            "[global domain] domain %llu previously failed a partial release",
+            static_cast<unsigned long long>(domain_id)
+        );
+        return -1;
+    }
+    int rc = 0;
+    if (allocation->device_ctx != nullptr) {
+        if (aclrtFree(allocation->device_ctx) != ACL_SUCCESS) {
+            rc = -1;
+        }
+        allocation->device_ctx = nullptr;
+    }
+    if (release_domain_windows(allocation.get()) != ACL_SUCCESS) {
+        rc = -1;
+    }
+    if (rc != 0) {
+        // The release helpers are destructive: some fields may already be
+        // cleared before a later ACL operation fails. Keep a terminal failure
+        // record so a repeated call cannot falsely report success.
+        allocation->release_failed = true;
+        LOG_ERROR(
+            "[global domain] domain %llu entered terminal partial-release state",
+            static_cast<unsigned long long>(domain_id)
+        );
+        return rc;
+    }
+    global_domain_allocations.erase(it);
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] release exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] release unknown exception");
+    return -1;
+}
+
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
-    if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "destroy", h->run_token)) {
-        LOG_WARN("[comm rank %d] comm_destroy: final barrier timed out; releasing local state anyway", h->rank);
+    const auto destroy_handshake =
+        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+    if (!destroy_handshake.ok()) {
+        LOG_WARN(
+            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
+            h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
+        );
         rc = -1;
     }
 
@@ -1579,13 +1762,23 @@ extern "C" int comm_destroy(CommHandle h) try {
     // lifecycle belongs to DeviceRunner, whose finalize() releases all
     // device memory before resetting the device and running aclFinalize.
 
-    // Only rank 0 sweeps the on-disk handshake markers, and only if the
-    // final barrier succeeded.  Deleting them after a timeout would strand
-    // any peer that hasn't observed our marker yet, and leak that peer
-    // into the next run with no rootinfo to discover.  Letting cleanup
-    // ride on the next rank-0 init is the safer recovery path.
-    if (h->rank == 0 && rc == 0) {
-        cleanup_handshake_files(h->rootinfo_path);
+    // Do not let a faster follower return and reuse this path while rank 0
+    // can still sweep the old generation. Rank 0 first retires rootinfo and
+    // best-effort sweeps its token-scoped barrier markers, then publishes a
+    // per-follower release outside the sweep namespace; each follower
+    // consumes its own release before return.
+    // This post phase runs after HcclCommDestroy, so waiting cannot hold a
+    // communicator resource needed by rank 0's teardown.
+    if (destroy_handshake.ok()) {
+        const auto destroy_release =
+            file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+        if (!destroy_release.ok()) {
+            LOG_WARN(
+                "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,
+                file_marker_handshake::stage_name(destroy_release.stage), destroy_release.rank
+            );
+            rc = -1;
+        }
     }
 
     delete h;

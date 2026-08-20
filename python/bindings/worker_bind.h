@@ -245,6 +245,7 @@ inline void bind_worker(nb::module_ &m) {
     // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
         .value("FREE", TaskState::FREE)
+        .value("BUILDING", TaskState::BUILDING)
         .value("PENDING", TaskState::PENDING)
         .value("READY", TaskState::READY)
         .value("RUNNING", TaskState::RUNNING)
@@ -308,50 +309,35 @@ inline void bind_worker(nb::module_ &m) {
             "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."
         )
         .def(
-            "malloc",
-            [](Orchestrator &self, int worker_id, size_t size) {
-                return self.malloc(worker_id, size);
+            "await_run_admission",
+            [](Orchestrator &self, uint64_t run_id) {
+                self.await_run_admission(static_cast<RunId>(run_id));
             },
-            nb::arg("worker_id"), nb::arg("size"), "Allocate memory on next-level worker."
+            nb::arg("run_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Block until run_id holds the whole-run FIFO head, or is terminal. Releases "
+            "the GIL: the wait is unbounded, and holding it would stop the very threads "
+            "that let the active run finish."
         )
         .def(
             "committed_device_memory",
             [](Orchestrator &self, int worker_id) {
                 return self.committed_device_memory(worker_id);
             },
-            nb::arg("worker_id"),
+            nb::arg("worker_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Total device HBM (bytes) committed by next-level worker's MemoryAllocator "
             "(tensors + pooled arenas + runtime buffers)."
         )
         .def(
-            "free",
-            [](Orchestrator &self, int worker_id, uint64_t ptr) {
-                self.free(worker_id, ptr);
-            },
-            nb::arg("worker_id"), nb::arg("ptr"), "Free memory on next-level worker."
-        )
-        .def(
-            "copy_to",
-            [](Orchestrator &self, int worker_id, uint64_t dst, uint64_t src, size_t size) {
-                self.copy_to(worker_id, dst, src, size);
-            },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy host src to worker dst."
-        )
-        .def(
-            "copy_from",
-            [](Orchestrator &self, int worker_id, uint64_t dst, uint64_t src, size_t size) {
-                self.copy_from(worker_id, dst, src, size);
-            },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy worker src to host dst."
-        )
-        .def(
             "alloc",
-            [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
-                return self.alloc(shape, dtype);
+            [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype,
+               const CanonicalIdentity &identity) {
+                return self.alloc(shape, dtype, identity);
             },
-            nb::arg("shape"), nb::arg("dtype"),
-            "Allocate an intermediate Tensor from the orchestrator's MAP_SHARED "
-            "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
+            nb::arg("shape"), nb::arg("dtype"), nb::arg("identity"),
+            "Managed HeapRing intermediate (MAP_SHARED, visible to forked children) registered under the "
+            "identity's canonical hash; returns its heap VA. The caller wraps the VA as a FORK_SHM "
+            "Buffer carrying `identity` so a ref dependency-wires to this slot (the alloc->Tensor "
+            "bridge). Backs Worker.alloc_shared_tensor / Orchestrator.alloc (Python)."
         )
         .def(
             "scope_begin", &Orchestrator::scope_begin, "Open a nested scope. Max nesting depth = MAX_SCOPE_DEPTH (64)."
@@ -359,7 +345,7 @@ inline void bind_worker(nb::module_ &m) {
         .def("scope_end", &Orchestrator::scope_end, "Close the innermost scope. Non-blocking.")
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
-        .def("_begin_run", &Orchestrator::begin_run)
+        .def("_begin_run", &Orchestrator::begin_run, nb::call_guard<nb::gil_scoped_release>())
         .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
             "_fail_run_submission",
@@ -402,10 +388,12 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
-                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid);
+            [](Worker &self, uint64_t mailbox_ptr, int child_pid, uint32_t task_frame_count) {
+                self.add_worker(
+                    WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid, task_frame_count
+                );
             },
-            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
+            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("task_frame_count") = 1,
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop). `child_pid` is that "
@@ -413,11 +401,17 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "add_next_level_worker_at",
-            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, int child_pid) {
-                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr), child_pid);
+            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, int child_pid, uint32_t task_frame_count) {
+                self.add_next_level_worker(
+                    worker_id, reinterpret_cast<void *>(mailbox_ptr), child_pid, task_frame_count
+                );
             },
-            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
+            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("task_frame_count") = 1,
             "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+        )
+        .def(
+            "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
+            "Set run admission depth from the minimum direct-chip runtime capability before init."
         )
         .def(
             "add_sub_worker",
@@ -429,6 +423,41 @@ inline void bind_worker(nb::module_ &m) {
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
+        )
+        .def(
+            "malloc",
+            [](Worker &self, int worker_id, size_t size) {
+                return self.malloc(worker_id, size);
+            },
+            nb::arg("worker_id"), nb::arg("size"), nb::call_guard<nb::gil_scoped_release>(),
+            "Allocate device memory on next-level worker."
+        )
+        .def(
+            "free",
+            [](Worker &self, int worker_id, uint64_t ptr) {
+                self.free(worker_id, ptr);
+            },
+            nb::arg("worker_id"), nb::arg("ptr"), nb::call_guard<nb::gil_scoped_release>(),
+            "Free device memory on next-level worker."
+        )
+        .def(
+            "copy_to",
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+                self.copy_to(worker_id, dst, src, nbytes);
+            },
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "H2D copy: host `src` into device `dst`, both named by descriptor. The child resolves each "
+            "through its ImportRegistry, so neither end is an address minted in this process."
+        )
+        .def(
+            "copy_from",
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+                self.copy_from(worker_id, dst, src, nbytes);
+            },
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "D2H copy: device `src` into host `dst`, both named by descriptor."
         )
         .def(
             "add_remote_l3_socket",
@@ -460,7 +489,7 @@ inline void bind_worker(nb::module_ &m) {
 
         // --- Mailbox control plane (parent side) ---
         // These hold the per-WorkerThread mailbox_mu_ inside C++, so they
-        // serialize against dispatch_process without any Python-side lock.
+        // serialize against task-frame publication without any Python-side lock.
         // Release the GIL during the spin-poll wait so other Python threads
         // (e.g. a concurrent Worker.run) can keep running.
         .def(
@@ -702,6 +731,25 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("import_id"), "Release an imported remote buffer mapping."
         )
         .def(
+            "remote_domain_control",
+            [](Worker &self, int worker_id, uint32_t control_name, nb::bytes command) {
+                std::vector<uint8_t> command_bytes(
+                    reinterpret_cast<const uint8_t *>(command.c_str()),
+                    reinterpret_cast<const uint8_t *>(command.c_str()) + command.size()
+                );
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.remote_domain_control(
+                        worker_id, static_cast<remote_l3::ControlName>(control_name), command_bytes
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_id"), nb::arg("control_name"), nb::arg("command"),
+            "Send one Global CommDomain control to a remote L3 endpoint."
+        )
+        .def(
             "broadcast_unregister_all",
             [](Worker &self, nb::object digest) {
                 std::string digest_bytes = bytes_from_digest_arg(digest);
@@ -743,6 +791,25 @@ inline void bind_worker(nb::module_ &m) {
             "into the mailbox. Returns per-child ControlResult entries."
         )
         .def(
+            "control_payload",
+            [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object payload,
+               nb::object timeout_s) {
+                std::string payload_bytes = buffer_to_string(payload, "payload");
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.control_payload(
+                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("payload"),
+            nb::arg("timeout_s") = nb::none(),
+            "Drive one local worker control with a mutable staged payload and return its final bytes."
+        )
+        .def(
             "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),
             nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_ALLOC_DOMAIN.  Holds mailbox_mu_ "
@@ -761,20 +828,49 @@ inline void bind_worker(nb::module_ &m) {
             "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
         )
         .def(
-            "control_l3_l2_region_create", &Worker::control_l3_l2_region_create, nb::arg("worker_id"),
+            "control_worker_chip_region_create", &Worker::control_worker_chip_region_create, nb::arg("worker_id"),
             nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_CREATE."
+            "Drive one NEXT_LEVEL chip child through CTRL_WORKER_CHIP_REGION_CREATE."
         )
         .def(
-            "control_l3_l2_region_release", &Worker::control_l3_l2_region_release, nb::arg("worker_id"),
+            "control_worker_chip_region_release", &Worker::control_worker_chip_region_release, nb::arg("worker_id"),
             nb::arg("region_id"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_RELEASE."
+            "Drive one NEXT_LEVEL chip child through CTRL_WORKER_CHIP_REGION_RELEASE."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
     m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
+    // The MailboxState values as the C++ side defines them, keyed by
+    // enumerator name. They are a cross-process wire contract: the word at
+    // MAILBOX_OFF_STATE is written by a parent and read by its forked child,
+    // so a Python constant that disagrees with this table is a protocol
+    // mismatch between two live processes, not a compile error. simpler.worker
+    // declares its own constants for use in hot paths and checks them against
+    // this table at import.
+    nb::dict mailbox_states;
+    mailbox_states["IDLE"] = static_cast<int32_t>(MailboxState::IDLE);
+    mailbox_states["TASK_READY"] = static_cast<int32_t>(MailboxState::TASK_READY);
+    mailbox_states["TASK_DONE"] = static_cast<int32_t>(MailboxState::TASK_DONE);
+    mailbox_states["SHUTDOWN"] = static_cast<int32_t>(MailboxState::SHUTDOWN);
+    mailbox_states["CONTROL_REQUEST"] = static_cast<int32_t>(MailboxState::CONTROL_REQUEST);
+    mailbox_states["CONTROL_DONE"] = static_cast<int32_t>(MailboxState::CONTROL_DONE);
+    mailbox_states["INIT_READY"] = static_cast<int32_t>(MailboxState::INIT_READY);
+    mailbox_states["INIT_FAILED"] = static_cast<int32_t>(MailboxState::INIT_FAILED);
+    mailbox_states["FRAME_STAGED"] = static_cast<int32_t>(MailboxState::FRAME_STAGED);
+    mailbox_states["TASK_LAUNCHED"] = static_cast<int32_t>(MailboxState::TASK_LAUNCHED);
+    mailbox_states["TASK_FAILED"] = static_cast<int32_t>(MailboxState::TASK_FAILED);
+    mailbox_states["ACTIVATE"] = static_cast<int32_t>(MailboxState::ACTIVATE);
+    mailbox_states["PREPARE_READY"] = static_cast<int32_t>(MailboxState::PREPARE_READY);
+    m.attr("MAILBOX_STATE_VALUES") = mailbox_states;
+    nb::dict mailbox_dispositions;
+    mailbox_dispositions["NONE"] = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
+    mailbox_dispositions["VALIDATED_ONLY"] = static_cast<int32_t>(MailboxPreparationDisposition::VALIDATED_ONLY);
+    mailbox_dispositions["NATIVE_PREPARED"] = static_cast<int32_t>(MailboxPreparationDisposition::NATIVE_PREPARED);
+    m.attr("MAILBOX_PREPARATION_DISPOSITION_VALUES") = mailbox_dispositions;
+    m.attr("PTO_PIPELINE_MAX_DEPTH") = static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 
@@ -794,5 +890,15 @@ inline void bind_worker(nb::module_ &m) {
             mailbox_store_i32(addr, value);
         },
         nb::arg("addr"), nb::arg("value"), "Release-store a 32-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_read_control_copy_request",
+        [](uint64_t frame_addr) {
+            ControlCopyRequest request = read_control_copy_request(reinterpret_cast<const char *>(frame_addr));
+            return nb::make_tuple(request.dst, request.src, request.nbytes);
+        },
+        nb::arg("frame_addr"),
+        "Decode the CTRL_COPY_TO / CTRL_COPY_FROM payload on the control frame at `frame_addr` into "
+        "`(dst_descriptor, src_descriptor, nbytes)`. Both descriptors are validated on the way out."
     );
 }

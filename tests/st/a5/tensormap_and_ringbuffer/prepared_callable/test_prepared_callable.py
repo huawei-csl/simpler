@@ -27,7 +27,7 @@ import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 
 _VECTOR_KERNELS = "../../../../../examples/a5/tensormap_and_ringbuffer/vector_example/kernels"
@@ -72,14 +72,12 @@ class TestPreparedCallable(SceneTestCase):
         ],
     }
 
-    _COMMON_CONFIG = {"aicpu_thread_num": 4}
     _PLATFORMS = ["a5sim", "a5"]
 
     CASES = [
         {
             "name": "prepare_run_twice",
             "platforms": _PLATFORMS,
-            "config": _COMMON_CONFIG,
             "params": {"a": 2.0, "b": 3.0},
         },
     ]
@@ -88,9 +86,9 @@ class TestPreparedCallable(SceneTestCase):
         size = 128 * 128
         a, b = params["a"], params["b"]
         return TaskArgsBuilder(
-            Tensor("a", torch.full((size,), a, dtype=torch.float32)),
-            Tensor("b", torch.full((size,), b, dtype=torch.float32)),
-            Tensor("f", torch.zeros(size, dtype=torch.float32)),
+            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
+            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -108,7 +106,7 @@ class TestPreparedCallable(SceneTestCase):
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=False,
+        enable_chip_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -164,7 +162,7 @@ class TestPreparedCallable(SceneTestCase):
         """Common fixture: build callable + config, return (callable, config, case)."""
         case = self.CASES[0]
         callable_obj = self.build_callable(st_platform)
-        config = self._build_config(case["config"])
+        config = self._build_config(case.get("config", {}))
         return callable_obj, config, case
 
     def _run_one(self, worker, slot, config, case):
@@ -248,7 +246,7 @@ class TestPreparedCallable(SceneTestCase):
 
         MissingEntryCallable.CALLABLE["orchestration"]["function_name"] = "missing_aicpu_orchestration_entry"
         bad_callable = MissingEntryCallable().build_callable(st_platform)
-        config = self._build_config(self.CASES[0]["config"])
+        config = self._build_config(self.CASES[0].get("config", {}))
         case = self.CASES[0]
         baseline = st_worker.aicpu_dlopen_count
         chip_worker = self._chip_worker(st_worker)

@@ -1,6 +1,6 @@
-# Profiling & Debug Tools (shipped in the wheel)
+# Tools shipped in the wheel
 
-End-user CLIs for analyzing simpler profiling data and args dumps.
+End-user CLIs for preparing scene tests and analyzing profiling data or args dumps.
 All are invokable as Python modules once the `simpler` wheel is installed —
 no repo checkout required.
 
@@ -9,27 +9,51 @@ no repo checkout required.
 
 ## Tool list
 
+- **[scene_test_compile](#scene_test_compile)** — collect and compile selected Scene Test callables without an NPU
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[critical_path](#critical_path)** — L2 swimlane critical-path compute/stall analysis
+- **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
 For CLIs that allow an omitted input, auto-detection paths
-(`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
+(`outputs/*/chip_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
 relative to the **current working directory** — run these from the directory
 that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; those tools auto-pick the latest by mtime.
 
 ---
 
+## scene_test_compile
+
+Populate the persistent Scene Test kernel cache without creating a `Worker` or
+accessing an NPU. Arguments after the module name are passed to pytest
+collection, so the warm-up can use the same paths and selection filters as the
+later device run.
+
+```bash
+python -m simpler_setup.tools.scene_test_compile examples tests/st \
+    -m "not sdma" --platform a2a3 --require-pto-isa --compile-workers 8
+```
+
+Compiled `ChipCallable` blobs are stored under `build/cache/kernels/`. A normal
+pytest or standalone scene-test run loads a matching blob from that directory;
+source, transitive-include, compiler, or compilation-logic changes produce a
+different content key, and entries unused for 14 days are pruned. Cache misses
+compile serially by default; pass `--compile-workers N` to opt into compiling
+up to `N` test classes concurrently, one compiler process per worker. A class
+that fails to compile is reported without aborting the rest of the pass. The
+warm-up does not inspect or access NPU devices.
+
+---
+
 ## critical_path
 
-Post-processing analysis over an L2-swimlane run. Given a run directory, it
+Post-processing analysis over an chip-swimlane run. Given a run directory, it
 recursively discovers every directory containing all three required artifacts:
 
-- `l2_swimlane_records.json` (or legacy `l2_perf_records.json`)
+- `chip_swimlane_records.json` (or legacy `l2_perf_records.json`)
 - `deps.json`
 - `name_map*.json` (the newest matching sibling is used when several exist)
 
@@ -52,7 +76,7 @@ This supports both simpler directories such as `outputs/<case>_<ts>/` and
 PyPTO directories such as `build_output/<case>/dfx_outputs/`, including nested
 rank/device layouts. Each discovered artifact directory is analyzed separately,
 and its `critical_path_report.md` is written beside
-`l2_swimlane_records.json`. Pointing the command at a whole run therefore
+`chip_swimlane_records.json`. Pointing the command at a whole run therefore
 creates one local report per rank/device rather than one combined report at the
 scan root.
 
@@ -82,7 +106,7 @@ python -m simpler_setup.tools.critical_path <run-dir> \
 ```
 
 `--report` accepts a filename, not a path, so the report cannot be redirected
-away from the directory containing its source `l2_swimlane_records.json`.
+away from the directory containing its source `chip_swimlane_records.json`.
 
 ---
 
@@ -92,7 +116,7 @@ Convert performance profiling JSON files into Chrome Trace Event format for visu
 
 ### Overview
 
-Converts simpler profiling data (`l2_swimlane_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>) and prints a per-function task-execution summary. With `--overhead` (needs `deps.json`) it also adds an **Overhead Analysis** counter group under the AICPU Scheduler track — 8 lines (`oh_{aic,aiv}_{idle,ready,overhead}` + `oh_all_overhead` / `oh_has_overhead`) you can overlay on the task bars. See [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md) for the model.
+Converts simpler profiling data (`chip_swimlane_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>) and prints a per-function task-execution summary. With `--overhead` (needs `deps.json`) it also adds an **Overhead Analysis** counter group under the AICPU Scheduler track — 8 lines (`oh_{aic,aiv}_{idle,ready,overhead}` + `oh_all_overhead` / `oh_has_overhead`) you can overlay on the task bars. See [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md) for the model.
 
 ### Basic Usage
 
@@ -101,25 +125,25 @@ Converts simpler profiling data (`l2_swimlane_records_*.json`) into the format u
 python -m simpler_setup.tools.swimlane_converter
 
 # Specify an input file
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json
 
 # A unique sibling name_map*.json is loaded automatically.
 # Override it explicitly when needed:
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json \
     --func-names outputs/<case>_<ts>/name_map_<case>.json
 
 # Specify an output file
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -o custom_output.json
 
 # Load function name mapping from kernel_config.py
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # Verbose mode (for debugging)
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -v
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -v
 
 # Reuse a deps.json captured in an earlier dep_gen run (different output dir)
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json \
     --deps-json outputs/<case>_<earlier_ts>/deps.json
 ```
 
@@ -127,7 +151,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 > replay). The device hot path no longer records fanout, so the typical
 > workflow is **two runs**: a one-time `--enable-dep-gen` capture per
 > topology to produce `deps.json`, then any number of
-> `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
+> `--enable-chip-swimlane` runs that consume it. If no `deps.json` is found
 > alongside the perf JSON (and `--deps-json` isn't passed), the trace
 > still renders but has no arrows; the converter prints a warning.
 
@@ -143,7 +167,7 @@ arrows anchor on representative subtask rows on physical core lanes
 (not a dedicated block-level track). SPMD tasks use the minimum-`core_id`
 subtask row per `core_type` as the dependency anchor; MIX-type SPMD
 tasks pick the minimum separately for AIC and AIV. See
-[docs/dfx/l2-swimlane-profiling.md §3.5](../../docs/dfx/l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen).
+[docs/dfx/chip-swimlane-profiling.md §3.5](../../docs/dfx/chip-swimlane-profiling.md#35-dependency-arrows-from-dep_gen).
 
 Each logical `(pred, succ)` edge emits flows for the Cartesian product
 of pred/succ anchor rows (`|pred_anchors| × |succ_anchors|`), not a
@@ -161,7 +185,7 @@ SPMD tasks are present.
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
-| `input` | | Input JSON file (l2_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
+| `input` | | Input JSON file (chip_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping |
@@ -189,8 +213,8 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-The table prints the source `l2_swimlane_level` recorded in
-`l2_swimlane_records.json`. At level 1, only AICore timing is captured, so
+The table prints the source `chip_swimlane_level` recorded in
+`chip_swimlane_records.json`. At level 1, only AICore timing is captured, so
 Latency, Exec%, Head/Tail OH, and Propagation render as `-`, including total
 latency in the TOTAL row. Count, Exec, and Local Setup remain available. The
 `Total Test Time` line is omitted and replaced by an `AICore Observed Span`
@@ -213,12 +237,12 @@ When running a test with profiling enabled, the converter is invoked automatical
 python examples/scripts/run_example.py \
     -k examples/host_build_graph/vector_example/kernels \
     -g examples/host_build_graph/vector_example/golden.py \
-    --enable-l2-swimlane
+    --enable-chip-swimlane
 ```
 
 After the test passes, the tool will:
 
-1. Auto-detect the latest `l2_swimlane_records_*.json` in outputs/
+1. Auto-detect the latest `chip_swimlane_records_*.json` in outputs/
 2. Load function names from the kernel_config.py specified via `-k`
 3. Produce `merged_swimlane_*.json` for visualization
 4. Print the task statistics and scheduler overhead deep-dive report to the console
@@ -237,8 +261,8 @@ model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md
 `sched_overhead_analysis` needs **two artifacts, captured in SEPARATE runs**
 (co-running the flags perturbs timing — `dep_gen` adds per-submit overhead):
 
-1. **Perf profiling data** (`l2_swimlane_records_*.json`, level >= 3) from a
-   `--enable-l2-swimlane` run — per-task dispatch/start/end/finish +
+1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 3) from a
+   `--enable-chip-swimlane` run — per-task dispatch/start/end/finish +
    `aicpu_scheduler_phases`.
 2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
    drives `ready(C) = max(producer.end)`, which is what separates scheduler
@@ -249,11 +273,11 @@ model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md
 ```bash
 # Capture once (two separate runs of the same case):
 pytest <case> --platform a2a3 --device N --enable-dep-gen        # -> deps.json
-pytest <case> --platform a2a3 --device N --enable-l2-swimlane    # -> l2_swimlane_records.json (clean timing)
+pytest <case> --platform a2a3 --device N --enable-chip-swimlane    # -> chip_swimlane_records.json (clean timing)
 
 # Analyze:
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json outputs/<swimlane case>/l2_swimlane_records.json \
+    --chip-swimlane-records-json outputs/<swimlane case>/chip_swimlane_records.json \
     --deps-json outputs/<dep_gen case>/deps.json
 ```
 
@@ -265,7 +289,7 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 
 | Option | Description |
 | ------ | ----------- |
-| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
+| `--chip-swimlane-records-json` | Path to the chip_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
 | `--deps-json` | Path to deps.json from a `--enable-dep-gen` run. **Required.** Falls back to a `deps.json` sibling of the perf JSON if present. |
 
 ### Outputs
@@ -278,7 +302,7 @@ Emitted in six parts:
 - **Part 5: AICPU scheduler loop breakdown** — per-thread loops, ns/loop, complete/dispatch/idle phase ratios, pop_hit / pop_miss, fanout / fanin, + the tail-vs-loop cause analysis.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
-The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+The perf JSON must be captured at chip_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-chip-swimlane` if the tool reports the field is missing).
 
 ---
 
@@ -304,6 +328,9 @@ python -m simpler_setup.tools.strace_timing path/to/log --tree
 # Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
 # separate host and device(clk=dev) tracks; nested by span containment)
 python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
+
+# L3/L4 host scheduler timeline (real OS pid/tid lanes + cross-thread flows)
+python -m simpler_setup.tools.strace_timing path/to/log --swimlane host_swimlane.json
 ```
 
 Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
@@ -328,6 +355,15 @@ to a file (`python test_*.py … --rounds N > run.log 2>&1`) and pass `run.log`
 here. Because grouping is per `(pid, inv)`, this captures **L3 multi-round**
 (every chip-child invocation), not just round 0.
 
+`--swimlane` consumes both the `l3.*` scheduler markers and child
+`simpler_run` markers. Host lanes retain their OS pid/tid. Because Chrome Trace
+JSON has one visible timestamp axis, raw device-domain `clk=dev` slices are
+stored in the top-level `unalignedDeviceSpans` array rather than placed beside
+the unrelated host clock and stretching Perfetto into an empty-looking
+multi-day viewport. Their ns timestamps remain unchanged; no clock offset is
+invented. This does not alter the established per-invocation `--trace-out`
+view.
+
 ---
 
 ## deps_viewer
@@ -347,7 +383,7 @@ this is the structural view.
     - `tasks`: number of rendered task ids
     - `unique_task_edges`: number of unique `(pred, succ)` pairs
     - `annotated_edges`: total number of annotated edge rows
-    - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
+    - `perf_sidecar`: `yes` when `chip_swimlane_records.json` was successfully loaded
     - `func_name_map`: `yes` when at least one task name resolved to a named
       `func_name` from `--func-names` or an auto-discovered `name_map*.json`.
       `func_name_map` stays `no` unless a real human-readable name was resolved.
@@ -508,11 +544,11 @@ python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump/ --index
 
 ### Input File Format
 
-The analysis tools share the same input format - the `l2_swimlane_records_*.json` files generated by the simpler runtime:
+The analysis tools share the same input format - the `chip_swimlane_records_*.json` files generated by the simpler runtime:
 
 ```json
 {
-  "l2_swimlane_level": 4,
+  "chip_swimlane_level": 4,
   "tasks": [
     {
       "task_id": 0,
@@ -545,9 +581,9 @@ The analysis tools share the same input format - the `l2_swimlane_records_*.json
 Dependency edges come from `deps.json` (dep_gen replay) at post-process time —
 not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_converter).
 
-Top-level layout depends on `l2_swimlane_level`:
+Top-level layout depends on `chip_swimlane_level`:
 
-- All levels: `l2_swimlane_level`, `tasks[]` (per-task fields above).
+- All levels: `chip_swimlane_level`, `tasks[]` (per-task fields above).
 - `>= 3`: also `aicpu_scheduler_phases[]` (per-thread phase records:
   scan / complete / dispatch / idle) and `core_to_thread[]` (core_id →
   scheduler thread index).
@@ -602,7 +638,7 @@ The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 
 ```bash
 # 1. Run the test to produce both timing + structural data
-pytest tests/st/... --enable-l2-swimlane --enable-dep-gen
+pytest tests/st/... --enable-chip-swimlane --enable-dep-gen
 
 # 2. Perfetto timeline (automatic via SceneTest)
 # -> outputs/<case>_<ts>/merged_swimlane.json
@@ -625,9 +661,9 @@ For batch-run hardware regression, see the dev-only script
 
 ## Troubleshooting
 
-### Error: cannot find l2_swimlane_records_*.json file
+### Error: cannot find chip_swimlane_records_*.json file
 
-- Make sure the test was run with the `--enable-l2-swimlane` flag
+- Make sure the test was run with the `--enable-chip-swimlane` flag
 - Check that the outputs/ directory exists and contains profiling data
 
 ### Warning: Kernel entry missing 'func_id' or 'name'
@@ -635,18 +671,18 @@ For batch-run hardware regression, see the dev-only script
 - Check the kernel_config.py file format
 - Make sure every KERNELS entry has a 'func_id' and 'name' field
 
-### Error: Unsupported l2_swimlane_level
+### Error: Unsupported chip_swimlane_level
 
-- The tools accept l2_swimlane_level 1–4 (the integer captured at runtime
-  via `--enable-l2-swimlane <N>`)
+- The tools accept chip_swimlane_level 1–4 (the integer captured at runtime
+  via `--enable-chip-swimlane <N>`)
 - Regenerate the profiling data with a supported level
 
 ### Error: Perf JSON missing required fields for scheduler overhead analysis
 
-- This error means the input `l2_swimlane_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
+- This error means the input `chip_swimlane_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
 - The basic conversion in `swimlane_converter` can still succeed, but the deep-dive will be skipped or fail
 - Remediation:
-  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/*/l2_swimlane_records.json`
+  1. Re-run with `--enable-chip-swimlane` to produce a new `outputs/*/chip_swimlane_records.json`
   2. Re-run `swimlane_converter` or `sched_overhead_analysis`
   3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 
@@ -663,7 +699,7 @@ For batch-run hardware regression, see the dev-only script
 
 | File | Tool | Purpose | Format |
 | ---- | ---- | ------- | ------ |
-| `l2_swimlane_records_*.json` | Runtime | Raw timing profiling data | JSON |
+| `chip_swimlane_records_*.json` | Runtime | Raw timing profiling data | JSON |
 | `merged_swimlane_*.json` | swimlane_converter | Perfetto visualization | Chrome Trace Event JSON |
 | `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON |
 | `deps_viewer.txt` | deps_viewer | Grep-friendly dependency graph view | Plain text |

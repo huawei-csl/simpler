@@ -59,7 +59,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
@@ -73,6 +73,7 @@ list(APPEND HOST_RUNTIME_SOURCES
 # Add common/platform/onboard/host sources (shared between a2a3 / a5 onboard).
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_phase_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
 )

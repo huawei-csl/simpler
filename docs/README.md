@@ -40,10 +40,12 @@ changing simpler's own internals.
 | [Chip-Level Architecture (L2)](chip-level-arch.md) | Three-program model (host / AICPU / AICore), API layers, handshake |
 | [Hierarchical Level Runtime](hierarchical-level-runtime.md) | The L0–L6 level model and component composition |
 | [Task Flow](task-flow.md) | Callable / TaskArgs / CallConfig pass-through, `IWorker` |
+| [Buffer Memory Model](buffer-abi.md) | How L3+ tasks name data: canonical identity, backend descriptor, strided view |
 | [Orchestrator](orchestrator.md) | DAG submission: TensorMap, Scope, Ring, task state machine |
 | [Scheduler](scheduler.md) | DAG dispatch: wiring / ready / completion queues, dispatch loop |
+| [`tensormap_and_ringbuffer`: A2/A3 vs A5](tensormap-and-ringbuffer-a2a3-vs-a5.md) | Per-file comparison split into hardware/PTO-ISA architecture differences and implementation differences |
 | [Worker Manager](worker-manager.md) | Worker pool, THREAD/PROCESS modes, fork + mailbox mechanics |
-| [hardware/](hardware/) | Hardware substrate: chip architecture, cache coherency, MMIO performance, CANN source references |
+| [hardware/](hardware/README.md) | Hardware substrate: chip architecture, cache coherency, MMIO performance, CANN source references |
 
 ## Kernels and task authoring
 
@@ -70,18 +72,17 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [Communication Domains](comm-domain.md) | Dynamic `CommDomain` allocation and the symmetric window |
-| [a5 SDMA Workspace Overlay](a5-sdma-overlay.md) | a5 SDMA overlay isolation status and the CANN-version gates |
 | [L3-L2 Orchestrator Communication](l3-l2-orch-comm.md) | Host-side L3 talking directly to the L2 AICPU orchestrator |
 | [L3-L2 Message Queue](l3-l2-message-queue.md) | The queue channel between an L3 host and L2 |
 | [Directed NEXT_LEVEL Scheduling](directed-next-level-scheduling.md) | Targeting a specific next-level child instead of any free one |
 | [Remote L3 Worker Design](remote-l3-worker-design.md) | L4 host-to-host workers — protocol, transports, status |
-| [remote-l3-worker-design/](remote-l3-worker-design/) | Full design set: protocol, buffers and transports, implementation plan and record |
+| [remote-l3-worker-design/](remote-l3-worker-design/README.md) | Full design set: protocol, buffers and transports, implementation plan and record |
 
 ## Profiling, logging, and DFX
 
 | Document | What it covers |
 | -------- | -------------- |
-| **[dfx/](dfx/README.md)** | **Every profiling and diagnostics reference**, indexed: framework and naming rules, L2/L0 swimlanes, PMU, host trace, device phases, scheduler-overhead model, args dump, dep_gen, scope stats, backpressure, buffer-capacity audit |
+| **[dfx/](dfx/README.md)** | **Every profiling and diagnostics reference**, indexed: framework and naming rules, L2/core swimlanes, PMU, host trace, device phases, scheduler-overhead model, args dump, dep_gen, scope stats, backpressure, buffer-capacity audit |
 | [Log System](logging.md) | Log levels, sinks, and the host/device logging split |
 
 ## Building, testing, and packaging
@@ -98,5 +99,5 @@ changing simpler's own internals.
 
 | Document | What it covers |
 | -------- | -------------- |
-| [troubleshooting/](troubleshooting/) | Device error codes, local timeout defaults, AICPU shared-SO faults, sim oversubscription hangs, macOS build issues, cpput ABI issues |
+| [troubleshooting/](troubleshooting/README.md) | Device error codes, local timeout defaults, AICPU shared-SO faults, sim oversubscription hangs, macOS build issues, cpput ABI issues |
 | [investigations/](investigations/README.md) | Considered-and-dropped proposals and measured dead ends. **Check here before proposing an optimization or refactor** |

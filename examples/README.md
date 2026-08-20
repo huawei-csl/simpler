@@ -17,13 +17,13 @@ on both simulators:
 
 ```bash
 pytest examples --platform a2a3sim
-pytest examples --platform a2a3 --device 0-1        # hardware
+pytest examples -m "not sdma" --platform a2a3 --exclude-level 4 --device 0-1        # hardware (SDMA/pod quarantined; pod runs in the two-machine job)
 ```
 
 A single example:
 
 ```bash
-pytest examples/a2a3/tensormap_and_ringbuffer/vector_example --platform a2a3sim
+pytest examples/a2a3/tensormap_and_ringbuffer/vector_example --platform a2a3sim --manual include
 ```
 
 Most `workers/` examples are also plain scripts, which is the quickest way to
@@ -48,8 +48,10 @@ examples/
 ├── workers/                      # raw Worker API, organized by level
 │   ├── l2/                       #   one chip
 │   └── l3/                       #   one host, several chips (+ SubWorkers)
-├── a2a3/tensormap_and_ringbuffer/   # @scene_test kernels, a2a3
-└── a5/tensormap_and_ringbuffer/     # @scene_test kernels, a5
+├── a2a3/
+│   ├── host_build_graph/            # @scene_test host-built graphs, a2a3
+│   └── tensormap_and_ringbuffer/    # @scene_test device orchestration, a2a3
+└── a5/tensormap_and_ringbuffer/     # @scene_test device orchestration, a5
 ```
 
 An example directory holds its test file, a `kernels/` tree (`aic/`, `aiv/`,
