@@ -17,7 +17,7 @@
  * (and spins), leaving the 24 AIC cores idle. When the require_sync_start MIX
  * consumer pre-stages as an early-dispatch candidate, EVERY one of its 24 clusters
  * is mixed — the AIC lands on an idle running slot, both AIVs on the producer's busy
- * cores' gated pending slots (drain_stage_cores takes the to_pending=true split path,
+ * cores' gated pending slots (stage_sync_start_cores takes the to_pending=true split path,
  * mix_cluster_idle_core_count = 1 per cluster). The rendezvous seed then counts only
  * the 24 running AICs while staged_core_mask counts all 72 cores; the 48 pending AIVs
  * must promote to close the gap. If the seed/mask counting diverges on this MIX
@@ -49,7 +49,8 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 2,
@@ -69,8 +70,8 @@ static MixedKernels mix_kernels() {
     return mk;
 }
 
-static PTO2TaskId submit_aiv_producer(const Tensor &out, int16_t block_num, int64_t base_cl) {
-    L0TaskArgs args;
+static PTO2TaskId submit_aiv_producer(const ChipTensor &out, int16_t block_num, int64_t base_cl) {
+    CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(PRODUCER_SPIN_ITERS);
@@ -79,8 +80,8 @@ static PTO2TaskId submit_aiv_producer(const Tensor &out, int16_t block_num, int6
     return rt_submit_aiv_task(FUNC_SPMD_WRITE_AIV, args).task_id();
 }
 
-static void submit_mix_sync_consumer(const Tensor &out, int16_t block_num, int64_t base_cl, PTO2TaskId dep) {
-    L0TaskArgsWithDeps<4> args;
+static void submit_mix_sync_consumer(const ChipTensor &out, int16_t block_num, int64_t base_cl, PTO2TaskId dep) {
+    CoreTaskArgsWithDeps<4> args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(0);  // consumer does not spin
@@ -90,9 +91,9 @@ static void submit_mix_sync_consumer(const Tensor &out, int16_t block_num, int64
     rt_submit_task(mix_kernels(), args);
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
-    const Tensor &ext_output = orch_args.tensor(0).ref();
-    const Tensor &layout = orch_args.tensor(1).ref();
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
+    const ChipTensor &ext_output = orch_args.tensor(0).ref();
+    const ChipTensor &layout = orch_args.tensor(1).ref();
 
     // The spill this case exercises needs the producer on EVERY AIV core and the
     // consumer on EVERY cluster, so both widths are the device's own counts
@@ -109,7 +110,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     idx[0] = 1;
     set_tensor_data<int32_t>(layout, 1, idx, consumer_blocks);
 
-    LOG_INFO_V9(
+    LOG_INFO(
         "[spmd_sync_start_mix_spill] flagged AIV producer (%d) + sync_start MIX consumer (%d) submitted",
         producer_blocks, consumer_blocks
     );

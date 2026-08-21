@@ -30,8 +30,8 @@ Analysis CLIs that consume these outputs are documented in
 
 | Document | What it covers |
 | -------- | -------------- |
-| [L2 Swimlane Profiling](l2-swimlane-profiling.md) | Per-task timing and scheduler phases across cores |
-| [L0 Swimlane Profiling](l0-swimlane-profiling.md) | Intra-core AICore pipeline trace for a single task |
+| [Chip Swimlane Profiling](chip-swimlane-profiling.md) | Per-task timing and scheduler phases across cores |
+| [Core Swimlane Profiling](core-swimlane-profiling.md) | Intra-core AICore pipeline trace for a single task |
 | [PMU Profiling](pmu-profiling.md) | Per-task AICore hardware counters |
 
 ## Data and dependencies
@@ -39,7 +39,7 @@ Analysis CLIs that consume these outputs are documented in
 | Document | What it covers |
 | -------- | -------------- |
 | [Args Dump](args-dump.md) | Per-task argument capture, and replaying a task from it |
-| [dep_gen](dep_gen.md) | Complete per-submit dependency graph, tensor-annotated |
+| [dep_gen](dep-gen.md) | Complete per-submit dependency graph, tensor-annotated |
 | [Scope Stats](scope-stats.md) | Per-scope resource-usage peaks (ring fill, dep pool) |
 
 ## Related, outside this directory
@@ -47,4 +47,4 @@ Analysis CLIs that consume these outputs are documented in
 | Document | What it covers |
 | -------- | -------------- |
 | [Log System](../logging.md) | Log levels and sinks — the host/device logging path, distinct from profiling collectors |
-| [troubleshooting/](../troubleshooting/) | Device error codes and timeout defaults, for when a run fails rather than runs slowly |
+| [troubleshooting/](../troubleshooting/README.md) | Device error codes and timeout defaults, for when a run fails rather than runs slowly |

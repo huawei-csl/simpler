@@ -24,7 +24,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
@@ -32,7 +32,7 @@
 #include "spin_hint.h"
 
 // Performance profiling headers
-#include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 
@@ -47,7 +47,7 @@ static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR
 static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
 static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_OFFSET);
 static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_OFFSET);
-static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
+static_assert(sizeof(ChipTensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
 
 // =============================================================================
 // Dispatch helpers
@@ -100,22 +100,22 @@ int SchedulerContext::pop_ready_tasks_batch(
     PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
 ) {
 #if SIMPLER_DFX
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
+    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #if SIMPLER_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
         queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
-    l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
+    chip_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
     int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
-            l2_swimlane.pop_hit += count;
+            chip_swimlane.pop_hit += count;
         } else {
-            l2_swimlane.pop_miss++;
+            chip_swimlane.pop_miss++;
         }
     }
 #else
@@ -229,14 +229,14 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // record on this runtime. `reg_task_id` is passed as that ACK gate. Gated on
     // the same enable bit as flush so level=1 (AICORE_TIMING-only) participates.
 #if SIMPLER_DFX
-    if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
+    if (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED) {
+        chip_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
     }
 #endif
 
     uint64_t *dispatch_timestamp_slot = nullptr;
 #if SIMPLER_DFX
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
         dispatch_timestamp_slot =
             to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
     }
@@ -270,7 +270,7 @@ int SchedulerContext::prepare_block_for_dispatch(
         int n = 0;
         // Per-core slot placement (#1308): an idle used core takes its running slot
         // (tracked by the completion poller), a busy used core takes its gated pending slot
-        // (promoted on completion). The sync_start drain relies on this — it passes
+        // (promoted on completion). Gated sync_start staging relies on this — it passes
         // to_pending=true so every busy core opts into a pending slot; the non-zero
         // src_payload gate keeps the whole cohort waiting for the rendezvous.
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
@@ -295,7 +295,7 @@ int SchedulerContext::prepare_block_for_dispatch(
             );
         }
 #if SIMPLER_DFX
-        sched_l2_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(cmask);
+        sched_chip_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(cmask);
 #endif
         return n;
     } else if (shape == PTO2ResourceShape::AIC) {
@@ -303,7 +303,7 @@ int SchedulerContext::prepare_block_for_dispatch(
             thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx, force_gate
         );
 #if SIMPLER_DFX
-        sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
+        sched_chip_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     } else {
@@ -311,7 +311,7 @@ int SchedulerContext::prepare_block_for_dispatch(
             thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx, force_gate
         );
 #if SIMPLER_DFX
-        sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
+        sched_chip_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     }
@@ -322,7 +322,7 @@ void SchedulerContext::dispatch_shape(
     CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if SIMPLER_SCHED_PROFILING
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
+    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #endif
     if (entered_drain) return;
 
@@ -389,7 +389,7 @@ void SchedulerContext::dispatch_shape(
             wmb();
             uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
                 dispatch_ts = get_sys_cnt_aicpu();
             }
 #endif
@@ -445,7 +445,10 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 flush_publish();
-                disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                // These came off this queue and no other owner holds them, so a
+                // drop would lose them: retry until the space they vacated is
+                // free again.
+                while (!disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi)) {}
                 break;
             }
 
@@ -496,7 +499,7 @@ void SchedulerContext::dispatch_shape(
             sched_->propagate_dispatch_fanin(*published_list[i]);
         }
 #if SIMPLER_SCHED_PROFILING
-        l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+        chip_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
 
         if (!dispatched_any) break;
@@ -770,7 +773,15 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         }
         int32_t freecores = bucket.has_value() ? bucket.count() : 0;
         if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
-            sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi);
+            // A dropped candidate keeps its STAGING claim and is recovered by the
+            // producer release: try_early_dispatch_release rings whatever is staged
+            // and routes the unstaged remainder to the ready queue, because it
+            // returns on next_block_idx rather than on the claim state.
+            if (!sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi))
+                LOG_DEBUG(
+                    "[EARLY_DISPATCH] queue full on batch re-push, dropping %d candidate(s) to normal dispatch",
+                    got - bi
+                );
             break;
         }
         int32_t start = 0;
@@ -796,9 +807,9 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
 
 // Early-dispatch drain (idle pass) — the EARLY source's analog of dispatch_ready_tasks.
 // Both sources share run_staging_order for the shape order (MIX strict priority, IDLE
-// before PENDING, cross-thread idle gating: MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND) and
-// both drain their sync_start cohort FIRST as the highest occupancy tier (Tier 0), via the
-// same all-or-nothing drain barrier. This one owns its own gating and progress flags.
+// before PENDING, cross-thread idle gating: MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND).
+// Each handles its sync_start cohort FIRST as Tier 0: an exact local fit stages on
+// one owner, while a capacity-short cohort falls back to the global drain.
 // Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
 int32_t SchedulerContext::try_early_dispatch(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
@@ -818,16 +829,15 @@ int32_t SchedulerContext::try_early_dispatch(
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
 
+    int32_t total_staged = 0;
+
     // ===== Tier 0: sync_start cohorts (highest occupancy tier, all-or-nothing) =====
     // sync_start candidates park in their own shape-agnostic queue. They cannot ride
-    // early_dispatch_shape's per-thread partial range-claim (a partial claim strands gated
-    // cohort blocks nobody rings, so the rendezvous never reaches block_num). Instead arm the
-    // drain barrier: it takes exclusive tracker access and only stages when global
-    // idle+pending >= block_num, guaranteeing all-or-nothing. Win => the dispatch loop runs
-    // the gated drain next iteration; lose (a drain is already armed, or capacity <
-    // block_num) => cancel the owner and re-push or transfer its final ready route. A
-    // non-STAGING pop was already released and is dropped. Staging happens inside the drain,
-    // so this arms at most one drain and adds no blocks to total_staged here.
+    // early_dispatch_shape's per-thread partial range-claim: a partial cohort would strand
+    // gated blocks nobody can ring. After claiming the per-task owner, first use the local
+    // tracker when it can hold the entire cohort; only the capacity-short case arms the
+    // stop-the-world drain. Both paths force-gate every block even if producer release races
+    // STAGING -> DISPATCHED. A non-STAGING pop was already released and is dropped.
     uint64_t sync_task_id_snapshot = 0;
     if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
         bool current_sync_task =
@@ -835,6 +845,25 @@ int32_t SchedulerContext::try_early_dispatch(
         if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
+            } else if (drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0 &&
+                       tracker.count_available_blocks(
+                           c->active_mask.to_shape(), c->active_mask.core_mask(), /*include_pending=*/true
+                       ) >= c->logical_block_num) {
+                // From this point onward the operation is all-or-nothing. Only this
+                // scheduler mutates its tracker, and global drain coordinators must
+                // wait for this scheduler's generation-tagged ack before inspecting it.
+                PTO2SchedulerState::mark_early_sync_drain_armed(*c->payload);
+                always_assert(c->next_block_idx.load(std::memory_order_seq_cst) == 0);
+                SyncStartStageResult staged = stage_sync_start_cores(
+                    c, c->logical_block_num, thread_idx, /*gated=*/true, /*record_drain_phases=*/false
+                );
+                always_assert(staged.staged_blocks == c->logical_block_num);
+                c->payload->running_slot_count.store(
+                    static_cast<int16_t>(staged.running_cores), std::memory_order_seq_cst
+                );
+                sched_->retry_sync_start_rendezvous_after_staging(*c);
+                PTO2SchedulerState::finish_early_sync_drain(*c->payload);
+                total_staged += staged.staged_blocks;
             } else if (enter_drain_mode(c, c->logical_block_num)) {
                 PTO2SchedulerState::mark_early_sync_drain_armed(*c->payload);
             } else {
@@ -846,7 +875,6 @@ int32_t SchedulerContext::try_early_dispatch(
     // Regular early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch,
     // via the shared skeleton. early_dispatch_shape stages a gated block range and never
     // enters drain, so the stage callback always reports "no stop".
-    int32_t total_staged = 0;
     run_staging_order(
         thread_idx, pmu_active,
         [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
@@ -883,7 +911,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
     Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
 
-    LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
+    LOG_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
     // Non-zero once a scheduler-hang timeout latches; returned in place of the
     // completed count so the caller still sees the negative error rc while the
@@ -892,9 +920,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if SIMPLER_DFX
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
-    l2_swimlane.reset();
-    l2_swimlane.l2_swimlane_enabled = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
+    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
+    chip_swimlane.reset();
+    chip_swimlane.chip_swimlane_enabled = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
 #endif
 
     PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
@@ -914,7 +942,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #ifdef INDEP_ORCH
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
-    LOG_INFO_V9(
+    LOG_INFO(
         "[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx,
         g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed)
     );
@@ -924,7 +952,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
 #if SIMPLER_DFX
-    l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
+    chip_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
 #if SIMPLER_DFX
@@ -933,7 +961,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // snapshot so the next phase's "at_start" equals the previous phase's
     // "at_end".
     //
-    // L2SWIMLANE_NUM_QUEUE_SHAPES (3) matches PTO2_NUM_RESOURCE_SHAPES: AIC/AIV/MIX.
+    // CHIP_SWIMLANE_NUM_QUEUE_SHAPES (3) matches PTO2_NUM_RESOURCE_SHAPES: AIC/AIV/MIX.
     //
     // **Hot-path cost discipline.** Shared depth (PTO2ReadyQueue::size) is two
     // atomic relaxed loads against cache lines that all peer sched threads also
@@ -944,11 +972,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // complete-emit and dispatch-emit in the same iter both reuse the same
     // shared sample.
     static_assert(
-        L2SWIMLANE_NUM_QUEUE_SHAPES == PTO2_NUM_RESOURCE_SHAPES,
+        CHIP_SWIMLANE_NUM_QUEUE_SHAPES == PTO2_NUM_RESOURCE_SHAPES,
         "queue snapshot width must match runtime resource shape count"
     );
-    int16_t phase_start_shared[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
-    int16_t iter_shared_snapshot[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+    int16_t phase_start_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+    int16_t iter_shared_snapshot[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
     bool iter_shared_sampled = false;
     auto get_or_sample_shared = [&]() -> const int16_t * {
         if (!iter_shared_sampled) {
@@ -957,7 +985,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // scaling — without clamp, sizes above 32767 wrap to negatives
             // and silently corrupt the snapshot.
             constexpr size_t kMax = static_cast<size_t>(std::numeric_limits<int16_t>::max());
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+            for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                 // Total normal-source ready depth of shape `s` = regular ready lane + the
                 // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
                 const size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
@@ -967,9 +995,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
         return iter_shared_snapshot;
     };
-    auto capture_phase_end = [&](int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+    auto capture_phase_end = [&](int16_t shared_out[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
         const int16_t *shared_cached = get_or_sample_shared();
-        for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+        for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
             shared_out[s] = shared_cached[s];
     };
     // Queue-mutating phases (Complete / Dummy) push newly-ready consumers
@@ -977,11 +1005,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // so their end-of-phase shared depth differs from their start. Force a fresh
     // re-sample for those emits — this also refreshes the per-iter cache so the
     // next phase's start snapshot is not stale.
-    auto capture_phase_end_fresh = [&](int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+    auto capture_phase_end_fresh = [&](int16_t shared_out[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
         iter_shared_sampled = false;
         capture_phase_end(shared_out);
     };
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         capture_phase_end(phase_start_shared);
     }
 #endif
@@ -1009,7 +1037,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool made_progress = false;
 #if SIMPLER_DFX
         CYCLE_COUNT_START();
-        l2_swimlane.sched_loop_count++;
+        chip_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
         // Release is the only "no Complete/Dispatch bar" attribution we keep —
         // emitted with its own span in the idle branch below. Iterations that
@@ -1029,7 +1057,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 
 #if SIMPLER_DFX
-        CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+        CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
 #endif
 
         // Phase 1: Check running cores for completion
@@ -1053,7 +1081,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (thread_idx == 0 && task_count > 0) {
                 if (new_total <= PROGRESS_VERBOSE_THRESHOLD ||
                     new_total / PROGRESS_LOG_INTERVAL != prev / PROGRESS_LOG_INTERVAL || new_total >= task_count) {
-                    LOG_INFO_V9(
+                    LOG_INFO(
                         "PTO2 progress: completed=%d total=%d (%.1f%%)", new_total, task_count,
                         100.0 * new_total / task_count
                     );
@@ -1069,24 +1097,24 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // surfaces the SPMD harvest tail; on a pure-retire iteration
         // phase_complete_count is 0).
         if (!try_completed) {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+            CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES &&
-                (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
+            CYCLE_COUNT_LAP(chip_swimlane.sched_complete_cycle);
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES &&
+                (chip_swimlane.phase_complete_count > 0 || chip_swimlane.phase_subretire_count > 0)) {
                 // Complete's release_fanin pushes newly-ready consumers into the
                 // shared ready_queues[], so the end depth differs from the start.
-                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 capture_phase_end_fresh(phase_end_shared);
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                    l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count, /*pop_hit=*/0,
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, chip_swimlane.sched_loop_count,
+                    chip_swimlane.phase_complete_count + chip_swimlane.phase_subretire_count, /*pop_hit=*/0,
                     /*pop_miss=*/0, phase_start_shared, phase_end_shared
                 );
-                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
                     phase_start_shared[s] = phase_end_shared[s];
-                l2_swimlane.phase_complete_count = 0;
-                l2_swimlane.phase_subretire_count = 0;
+                chip_swimlane.phase_complete_count = 0;
+                chip_swimlane.phase_subretire_count = 0;
             }
             // Advance past the completion check even when no Complete bar was
             // emitted (both counts 0). Otherwise its wall time folds into the
@@ -1130,24 +1158,24 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // zero-completion poll so its polling cost stays visible rather than
             // folding into the next bar. tasks_processed = async subtasks
             // completed this iter.
-            CYCLE_COUNT_LAP(l2_swimlane.sched_async_cycle);
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+            CYCLE_COUNT_LAP(chip_swimlane.sched_async_cycle);
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
                 // A completing poll runs on_task_complete, which pushes
                 // newly-ready consumers into the shared ready_queues[] — so the
                 // end depth then differs from the start; a zero-completion poll
                 // leaves the queues untouched and the cached start sample holds.
-                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 if (poll_result.completed > 0) {
                     capture_phase_end_fresh(phase_end_shared);
                 } else {
                     capture_phase_end(phase_end_shared);
                 }
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::AsyncPoll, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::AsyncPoll, _t0_phase, _t1, chip_swimlane.sched_loop_count,
                     static_cast<uint32_t>(poll_result.completed), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared,
                     phase_end_shared
                 );
-                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
                     phase_start_shared[s] = phase_end_shared[s];
                 _t0_phase = _t1;
             }
@@ -1164,17 +1192,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
             // the sync_start stop-the-world window shows on the scheduler lane (one bar per
             // iteration that enters the drain; retries appear as multiple bars).
-            uint64_t drain_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
             uint64_t drain_stage_wall = 0;  // set by handle_drain_mode ONLY if this thread staged
-            handle_drain_mode(thread_idx, &drain_stage_wall);
+            int32_t drain_staged_blocks = 0;
+            handle_drain_mode(thread_idx, &drain_stage_wall, &drain_staged_blocks);
             // Record a Drain bar only when this thread actually did drain work (reached
-            // drain_stage_cores). The many no-op entries — ack + availability-insufficient
-            // reset, stale-elected, non-elected bail before stage_go — never stage, so they
+            // stage_sync_start_cores). The many no-op entries — ack + availability-insufficient
+            // reset or follower bail before stage_go — never stage, so they
             // would otherwise clutter the lane with zero-work drain(0) bars.
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
+                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(drain_staged_blocks)
                 );
             }
 #else
@@ -1190,7 +1219,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // signalled inline here. The ready queue is MPMC, and the fanout path
         // uses per-slot locks/atomics, so multiple scheduler threads can share
         // the dependency-only resolve work.
-        if (thread_idx < 3) {
+        if (thread_idx < PLATFORM_MAX_AICPU_THREADS - 1) {
             constexpr int DUMMY_DRAIN_BATCH = 8;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
@@ -1206,7 +1235,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // this bar. Resolve emits below DO land on the sched lane and nest
             // under this Dummy outer by time containment.
             uint64_t dummy_outer_t0 =
-                (dummy_got > 0 && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+                (dummy_got > 0 && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
 
             for (int di = 0; di < dummy_got; di++) {
@@ -1217,7 +1246,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // dummies whose consumer release runs sub-microsecond.
 #if SIMPLER_DFX
                 uint64_t dummy_resolve_t0 =
-                    (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+                    (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
                 // [[maybe_unused]] silences -Werror=unused-but-set-variable on
                 // the profiling-flags-smoke build path where SIMPLER_DFX is
@@ -1233,19 +1262,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     uint64_t dummy_resolve_t1 = get_sys_cnt_aicpu();
                     constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;  // 1 µs
                     if (dummy_resolve_t1 - dummy_resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
-                        l2_swimlane_aicpu_record_sched_phase(
-                            thread_idx, L2SwimlaneSchedPhaseKind::Resolve, dummy_resolve_t0, dummy_resolve_t1,
-                            sched_l2_swimlane_[thread_idx].sched_loop_count, dummy_consumers
+                        chip_swimlane_aicpu_record_sched_phase(
+                            thread_idx, ChipSwimlaneSchedPhaseKind::Resolve, dummy_resolve_t0, dummy_resolve_t1,
+                            sched_chip_swimlane_[thread_idx].sched_loop_count, dummy_consumers
                         );
                     }
                     if (dummy_slot.task_attrs.has_predicate()) {
-                        l2_swimlane_aicpu_record_predicated_skip(
-                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                        chip_swimlane_aicpu_record_predicated_skip(
+                            thread_idx, dummy_resolve_t0, sched_chip_swimlane_[thread_idx].sched_loop_count,
                             dummy_slot.task->task_id.raw
                         );
                     } else {
-                        l2_swimlane_aicpu_record_dummy_task(
-                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                        chip_swimlane_aicpu_record_dummy_task(
+                            thread_idx, dummy_resolve_t0, sched_chip_swimlane_[thread_idx].sched_loop_count,
                             dummy_slot.task->task_id.raw
                         );
                     }
@@ -1281,14 +1310,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // at this end.
             if (dummy_outer_t0 != 0) {
                 uint64_t dummy_outer_t1 = get_sys_cnt_aicpu();
-                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 capture_phase_end_fresh(phase_end_shared);
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Dummy, dummy_outer_t0, dummy_outer_t1,
-                    l2_swimlane.sched_loop_count, static_cast<uint32_t>(dummy_got), /*pop_hit=*/0,
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Dummy, dummy_outer_t0, dummy_outer_t1,
+                    chip_swimlane.sched_loop_count, static_cast<uint32_t>(dummy_got), /*pop_hit=*/0,
                     /*pop_miss=*/0, phase_start_shared, phase_end_shared
                 );
-                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
                     phase_start_shared[s] = phase_end_shared[s];
                 _t0_phase = dummy_outer_t1;
                 // We do NOT re-sync _t0/_t1 — the dummy span will be absorbed
@@ -1304,7 +1333,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
 
 #if SIMPLER_DFX
-        uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+        uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
@@ -1314,26 +1343,27 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // end with span extending past the second poll, which made finish_time
         // events from the second poll fall under the Dispatch bar rather than
         // a Complete bar of their own — confusing for trace consumers.)
-        if (dispatch_t0 != 0 && l2_swimlane.phase_dispatch_count > 0) {
+        if (dispatch_t0 != 0 && chip_swimlane.phase_dispatch_count > 0) {
             uint64_t dispatch_t1 = get_sys_cnt_aicpu();
-            uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
-            uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
+            uint64_t pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
+            uint64_t pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
             debug_assert(pop_hit_delta < (1ULL << 32));
             debug_assert(pop_miss_delta < (1ULL << 32));
-            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
             capture_phase_end(phase_end_shared);
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, _t0_phase, dispatch_t1, l2_swimlane.sched_loop_count,
-                l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
-                static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
+            chip_swimlane_aicpu_record_sched_phase(
+                thread_idx, ChipSwimlaneSchedPhaseKind::Dispatch, _t0_phase, dispatch_t1,
+                chip_swimlane.sched_loop_count, chip_swimlane.phase_dispatch_count,
+                static_cast<uint32_t>(pop_hit_delta), static_cast<uint32_t>(pop_miss_delta), phase_start_shared,
+                phase_end_shared
             );
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+            for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                 phase_start_shared[s] = phase_end_shared[s];
             }
             _t0_phase = dispatch_t1;
-            l2_swimlane.phase_dispatch_count = 0;
-            l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
-            l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
+            chip_swimlane.phase_dispatch_count = 0;
+            chip_swimlane.pop_hit_at_last_emit = chip_swimlane.pop_hit;
+            chip_swimlane.pop_miss_at_last_emit = chip_swimlane.pop_miss;
         }
 #endif
 
@@ -1343,7 +1373,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // made_progress / try_pushed, so this is a single unconditional call — it
         // returns 0 without staging when gated out.
 #if SIMPLER_DFX
-        bool early_dispatch_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
+        bool early_dispatch_record = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
         [[maybe_unused]] int32_t staged_count =
@@ -1353,14 +1383,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // to early-dispatch rather than disappearing into a blank gap.
         if (early_dispatch_record && staged_count > 0) {
             uint64_t early_dispatch_t1 = get_sys_cnt_aicpu();
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
-                sched_l2_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
+            chip_swimlane_aicpu_record_sched_phase(
+                thread_idx, ChipSwimlaneSchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
+                sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
             );
             // prepare_block_for_dispatch bumped phase_dispatch_count while staging;
             // those blocks belong to this EarlyDispatch bar, so clear the counter
             // before it leaks into the next Dispatch bar.
-            sched_l2_swimlane_[thread_idx].phase_dispatch_count = 0;
+            sched_chip_swimlane_[thread_idx].phase_dispatch_count = 0;
             // Advance _t0_phase so the next phase bar starts at the EarlyDispatch
             // end, not before it (otherwise their spans overlap and the
             // outer-phase mutual-exclusion breaks).
@@ -1372,9 +1402,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier
         // (see Phase 4 above) so this branch only routes the time accumulator.
         if (!try_pushed) {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+            CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(l2_swimlane.sched_dispatch_cycle);
+            CYCLE_COUNT_LAP(chip_swimlane.sched_dispatch_cycle);
         }
 #endif
 
@@ -1388,7 +1418,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
 #if SIMPLER_DFX
-            uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
+            uint64_t rel_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
                                   get_sys_cnt_aicpu() :
                                   0;
             // Snapshot the slot count before the drain loop decrements it to 0,
@@ -1410,69 +1440,80 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // run by time-containment) rather than competing with poll for one
             // per-iteration label.
             if (rel_t0 != 0) {
-                l2_swimlane_aicpu_record_sched_phase(
-                    thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, released_count
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, ChipSwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
+                    chip_swimlane.sched_loop_count, released_count
                 );
             }
 #endif
-            idle_iterations++;
-
-            if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
-                LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
-                if (action == LoopAction::BREAK_LOOP) break;
-            }
-
-            if (idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
-            }
-            // Wall-clock budget gate, with two fatal-latch branches:
-            //
-            // 1. Self owns a RUNNING task — first-hand evidence the
-            //    dispatch is stuck. Latch.
-            // 2. No thread anywhere owns a RUNNING task AND tasks remain
-            //    unfinished — the system is in a pre-dispatch / WAIT-only
-            //    deadlock (e.g. dependency cycle). Ownerless idle threads
-            //    are the only observers; let this one latch on the global
-            //    evidence (`completed_tasks_ < total_tasks_` and
-            //    `no_thread_owns_running_task()`).
-            //
-            // Otherwise: a sibling thread owns a RUNNING task but hasn't
-            // hit its own budget yet (typical distributed startup-skew
-            // case) — refresh last_progress_ts and keep spinning. The
-            // STALL diagnostic above still fires periodically so
-            // observability is preserved.
-            if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
-                bool self_owns = self_owns_running_task(thread_idx);
-                bool global_stuck = !self_owns && total_tasks_ > 0 &&
-                                    completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
-                                    no_thread_owns_running_task();
-                if (self_owns || global_stuck) {
-                    // Latch the error + emergency_shutdown, then break to the
-                    // shared end-of-loop cleanup so the diagnostic buffers get
-                    // flushed to the host. An early return here would strand the
-                    // stuck task's already-dumped inputs and every completed
-                    // task's in/out records in the unflushed per-thread dump
-                    // buffer — exactly the state we need to triage the hang.
-                    timeout_rc = handle_timeout_exit(
-                        thread_idx, header, runtime, idle_iterations, last_progress_count
-#if SIMPLER_DFX
-                        ,
-                        l2_swimlane.sched_start_ts
-#endif
-                    );
-                    break;
-                }
+            // Deferred consumed-head advances retry from the no-progress path.
+            // During a ring-heap stall, a CONSUMED head with its pending bit
+            // still set means no retry has acquired advance_lock and cleared
+            // the request yet. If the bit clears and the watermark remains
+            // pinned, the stall is outside this deferred-advance path.
+            bool advanced_reclaim = sched_->drain_pending_ring_advances();
+            if (advanced_reclaim) {
+                idle_iterations = 0;
                 last_progress_ts = get_sys_cnt_aicpu();
+            } else {
+                idle_iterations++;
+
+                if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
+                    LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
+                    if (action == LoopAction::BREAK_LOOP) break;
+                }
+
+                if (idle_iterations % STALL_LOG_INTERVAL == 0) {
+                    log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
+                }
+                // Wall-clock budget gate, with two fatal-latch branches:
+                //
+                // 1. Self owns a RUNNING task — first-hand evidence the
+                //    dispatch is stuck. Latch.
+                // 2. No thread anywhere owns a RUNNING task AND tasks remain
+                //    unfinished — the system is in a pre-dispatch / WAIT-only
+                //    deadlock (e.g. dependency cycle). Ownerless idle threads
+                //    are the only observers; let this one latch on the global
+                //    evidence (`completed_tasks_ < total_tasks_` and
+                //    `no_thread_owns_running_task()`).
+                //
+                // Otherwise: a sibling thread owns a RUNNING task but hasn't
+                // hit its own budget yet (typical distributed startup-skew
+                // case) — refresh last_progress_ts and keep spinning. The
+                // STALL diagnostic above still fires periodically so
+                // observability is preserved.
+                if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
+                    bool self_owns = self_owns_running_task(thread_idx);
+                    bool global_stuck = !self_owns && total_tasks_ > 0 &&
+                                        completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
+                                        no_thread_owns_running_task();
+                    if (self_owns || global_stuck) {
+                        // Latch the error + emergency_shutdown, then break to the
+                        // shared end-of-loop cleanup so the diagnostic buffers get
+                        // flushed to the host. An early return here would strand the
+                        // stuck task's already-dumped inputs and every completed
+                        // task's in/out records in the unflushed per-thread dump
+                        // buffer — exactly the state we need to triage the hang.
+                        timeout_rc = handle_timeout_exit(
+                            thread_idx, header, runtime, idle_iterations, last_progress_count
+#if SIMPLER_DFX
+                            ,
+                            chip_swimlane.sched_start_ts
+#endif
+                        );
+                        break;
+                    }
+                    last_progress_ts = get_sys_cnt_aicpu();
+                }
             }
             SPIN_WAIT_HINT();
 #if SIMPLER_DFX
-            CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
+            CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
             // _t0_phase advances through idle laps so the next emitted
             // COMPLETE/DISPATCH bar starts at the iter it actually ran in, not
             // at the start of the preceding idle stretch. The idle/poll time
             // itself is attributed by the activity-fill below — no blanks.
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
                 _t0_phase = _t1;
             }
 #endif
@@ -1499,34 +1540,34 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // sum(record.pop_*) reconciles with the run-cumulative counter.
     // Gate on SCHED_PHASES — at lower levels the phase buffer is never
     // flushed (see below), so writing this record would be wasted work.
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        uint64_t final_pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
-        uint64_t final_pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+        uint64_t final_pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
+        uint64_t final_pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
         debug_assert(final_pop_hit_delta < (1ULL << 32));
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
             capture_phase_end(phase_end_shared);
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, t_now, t_now, l2_swimlane.sched_loop_count, 0,
+            chip_swimlane_aicpu_record_sched_phase(
+                thread_idx, ChipSwimlaneSchedPhaseKind::Dispatch, t_now, t_now, chip_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta),
                 phase_end_shared, phase_end_shared
             );
-            l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
-            l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
+            chip_swimlane.pop_hit_at_last_emit = chip_swimlane.pop_hit;
+            chip_swimlane.pop_miss_at_last_emit = chip_swimlane.pop_miss;
         }
     }
-    log_l2_swimlane_summary(thread_idx, cur_thread_completed);
+    log_chip_swimlane_summary(thread_idx, cur_thread_completed);
 #endif
 
 #if SIMPLER_DFX
-    if (l2_swimlane.l2_swimlane_enabled) {
-        l2_swimlane_aicpu_flush(
+    if (chip_swimlane.chip_swimlane_enabled) {
+        chip_swimlane_aicpu_flush(
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            l2_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+            chip_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
         }
     }
 #endif

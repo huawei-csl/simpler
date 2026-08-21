@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -355,6 +356,10 @@ void validate_owner_buffer_handle(const RemoteBufferHandle &handle, size_t reque
 
 }  // namespace
 
+void RemoteL3Transport::submit_group_progress_frame(const std::vector<uint8_t> &frame, uint64_t, int32_t, int32_t) {
+    submit_progress_frame(frame);
+}
+
 RemoteL3SocketTransport::RemoteL3SocketTransport(
     std::string host, uint16_t port, std::string health_host, uint16_t health_port, double attach_timeout_s,
     double runtime_timeout_s
@@ -453,16 +458,16 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
         };
 
         try {
-            static constexpr size_t HEADER_BYTES = 40;
             while (!health_stop_.load(std::memory_order_acquire)) {
-                std::vector<uint8_t> frame(HEADER_BYTES);
-                if (!read_exact(frame.data(), HEADER_BYTES)) return;
+                std::vector<uint8_t> frame(remote_l3::FRAME_HEADER_BYTES);
+                if (!read_exact(frame.data(), remote_l3::FRAME_HEADER_BYTES)) return;
                 uint32_t payload_bytes = read_le_u32(frame.data() + 32);
                 if (payload_bytes > remote_l3::MAX_FRAME_PAYLOAD_BYTES) {
                     throw std::runtime_error("HEALTH payload exceeds maximum");
                 }
-                frame.resize(HEADER_BYTES + payload_bytes);
-                if (payload_bytes != 0 && !read_exact(frame.data() + HEADER_BYTES, payload_bytes)) return;
+                frame.resize(remote_l3::FRAME_HEADER_BYTES + payload_bytes);
+                if (payload_bytes != 0 && !read_exact(frame.data() + remote_l3::FRAME_HEADER_BYTES, payload_bytes))
+                    return;
                 auto decoded = remote_l3::decode_frame(frame);
                 if (decoded.header.frame_type != remote_l3::FrameType::HEALTH) {
                     throw std::runtime_error("non-HEALTH frame on health lane");
@@ -536,12 +541,11 @@ void RemoteL3SocketTransport::write_all(
 }
 
 std::vector<uint8_t> RemoteL3SocketTransport::read_frame(std::chrono::steady_clock::time_point deadline) {
-    static constexpr size_t HEADER_BYTES = 40;
-    std::vector<uint8_t> frame(HEADER_BYTES);
+    std::vector<uint8_t> frame(remote_l3::FRAME_HEADER_BYTES);
     size_t off = 0;
-    while (off < HEADER_BYTES) {
+    while (off < remote_l3::FRAME_HEADER_BYTES) {
         wait_readable(deadline);
-        ssize_t n = ::recv(fd_, frame.data() + off, HEADER_BYTES - off, 0);
+        ssize_t n = ::recv(fd_, frame.data() + off, remote_l3::FRAME_HEADER_BYTES - off, 0);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             throw std::runtime_error(
@@ -555,8 +559,8 @@ std::vector<uint8_t> RemoteL3SocketTransport::read_frame(std::chrono::steady_clo
     if (payload_bytes > remote_l3::MAX_FRAME_PAYLOAD_BYTES) {
         throw std::runtime_error("RemoteL3SocketTransport: frame payload exceeds maximum");
     }
-    frame.resize(HEADER_BYTES + payload_bytes);
-    off = HEADER_BYTES;
+    frame.resize(remote_l3::FRAME_HEADER_BYTES + payload_bytes);
+    off = remote_l3::FRAME_HEADER_BYTES;
     while (off < frame.size()) {
         wait_readable(deadline);
         ssize_t n = ::recv(fd_, frame.data() + off, frame.size() - off, 0);
@@ -596,12 +600,18 @@ void RemoteL3SocketTransport::expect_hello_ready(
 
 void RemoteL3SocketTransport::submit_frame(const std::vector<uint8_t> &frame) {
     if (fd_ < 0) throw std::runtime_error("RemoteL3SocketTransport: socket is closed");
+    if (progress_command_active_) {
+        throw std::logic_error("RemoteL3SocketTransport: progress command is active");
+    }
     // Each runtime command gets a fresh runtime-timeout budget, independent of
     // the (already-spent) attach deadline.
     write_all(frame.data(), frame.size(), deadline_from_now(runtime_timeout_s_));
 }
 
 std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) {
+    if (progress_command_active_) {
+        throw std::logic_error("RemoteL3SocketTransport: progress command is active");
+    }
     auto frame_bytes = read_frame(deadline_from_now(runtime_timeout_s_));
     auto frame = remote_l3::decode_frame(frame_bytes);
     if (frame.header.frame_type != frame_type || frame.header.sequence != sequence) {
@@ -610,17 +620,622 @@ std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameTyp
     return frame_bytes;
 }
 
+void RemoteL3SocketTransport::submit_progress_frame(const std::vector<uint8_t> &frame) {
+    if (fd_ < 0) throw std::runtime_error("RemoteL3SocketTransport: socket is closed");
+    if (progress_command_active_) {
+        throw std::logic_error("RemoteL3SocketTransport: progress command is already active");
+    }
+    progress_write_ = frame;
+    progress_write_offset_ = 0;
+    progress_read_.assign(remote_l3::FRAME_HEADER_BYTES, 0);
+    progress_read_offset_ = 0;
+    progress_read_size_ = remote_l3::FRAME_HEADER_BYTES;
+    progress_deadline_ = deadline_from_now(runtime_timeout_s_);
+    progress_command_active_ = true;
+}
+
+bool RemoteL3SocketTransport::poll_progress_reply(
+    remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply
+) {
+    if (!progress_command_active_) {
+        throw std::logic_error("RemoteL3SocketTransport: no progress command is active");
+    }
+    try {
+        check_health();
+        if (std::chrono::steady_clock::now() >= progress_deadline_) {
+            throw std::runtime_error("RemoteL3SocketTransport: progress command timed out");
+        }
+
+        while (progress_write_offset_ < progress_write_.size()) {
+            ssize_t n = send_no_sigpipe(
+                fd_, progress_write_.data() + progress_write_offset_, progress_write_.size() - progress_write_offset_
+            );
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+                throw std::runtime_error(
+                    std::string("RemoteL3SocketTransport: progress send failed: ") + std::strerror(errno)
+                );
+            }
+            if (n == 0) throw std::runtime_error("RemoteL3SocketTransport: socket closed while writing progress frame");
+            progress_write_offset_ += static_cast<size_t>(n);
+        }
+
+        while (progress_read_offset_ < progress_read_size_) {
+            ssize_t n = ::recv(
+                fd_, progress_read_.data() + progress_read_offset_, progress_read_size_ - progress_read_offset_, 0
+            );
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+                throw std::runtime_error(
+                    std::string("RemoteL3SocketTransport: progress recv failed: ") + std::strerror(errno)
+                );
+            }
+            if (n == 0) throw std::runtime_error("RemoteL3SocketTransport: socket closed while reading progress frame");
+            progress_read_offset_ += static_cast<size_t>(n);
+            if (progress_read_offset_ == remote_l3::FRAME_HEADER_BYTES &&
+                progress_read_size_ == remote_l3::FRAME_HEADER_BYTES) {
+                uint32_t payload_bytes = read_le_u32(progress_read_.data() + 32);
+                if (payload_bytes > remote_l3::MAX_FRAME_PAYLOAD_BYTES) {
+                    throw std::runtime_error("RemoteL3SocketTransport: progress frame payload exceeds maximum");
+                }
+                progress_read_size_ += payload_bytes;
+                progress_read_.resize(progress_read_size_);
+            }
+        }
+
+        auto decoded = remote_l3::decode_frame(progress_read_);
+        if (decoded.header.frame_type != frame_type || decoded.header.sequence != sequence) {
+            throw std::runtime_error("RemoteL3SocketTransport: progress reply frame type or sequence mismatch");
+        }
+        reply = std::move(progress_read_);
+        reset_progress_command();
+        return true;
+    } catch (...) {
+        reset_progress_command();
+        throw;
+    }
+}
+
+void RemoteL3SocketTransport::reset_progress_command() noexcept {
+    progress_write_.clear();
+    progress_write_offset_ = 0;
+    progress_read_.clear();
+    progress_read_offset_ = 0;
+    progress_read_size_ = remote_l3::FRAME_HEADER_BYTES;
+    progress_command_active_ = false;
+}
+
 void RemoteL3SocketTransport::shutdown() { close_socket(); }
 
+MpiGroupMailboxChannel::MpiGroupMailboxChannel(
+    void *mailbox, size_t mailbox_bytes, int32_t world_size, int mpirun_pid, double runtime_timeout_s
+) :
+    mailbox_(static_cast<uint8_t *>(mailbox)),
+    mailbox_bytes_(mailbox_bytes),
+    world_size_(world_size),
+    mpirun_pid_(mpirun_pid),
+    runtime_timeout_s_(runtime_timeout_s) {
+    using namespace mpi_group_mailbox;
+    if (mailbox_ == nullptr) throw std::invalid_argument("MpiGroupMailboxChannel: null mailbox");
+    if (mailbox_bytes_ < MAILBOX_BYTES) throw std::invalid_argument("MpiGroupMailboxChannel: mailbox is too small");
+    if (world_size_ <= 0) throw std::invalid_argument("MpiGroupMailboxChannel: world_size must be positive");
+    if (!(runtime_timeout_s_ > 0.0)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: runtime_timeout_s must be positive");
+    }
+    if (std::memcmp(mailbox_ + OFF_MAGIC, MAGIC, sizeof(MAGIC)) != 0) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox magic mismatch");
+    }
+    if (read_u32(OFF_PROTOCOL_VERSION) != PROTOCOL_VERSION || read_u32(OFF_HEADER_BYTES) != HEADER_BYTES) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox protocol mismatch");
+    }
+    if (read_u64(OFF_MAILBOX_BYTES) != MAILBOX_BYTES ||
+        read_u32(OFF_WORLD_SIZE) != static_cast<uint32_t>(world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: mailbox layout or world size mismatch");
+    }
+    for (size_t offset = RESERVED_OFFSET; offset < HEADER_BYTES; ++offset) {
+        if (mailbox_[offset] != 0) {
+            throw std::invalid_argument("MpiGroupMailboxChannel: reserved header bytes must be zero");
+        }
+    }
+}
+
+int32_t MpiGroupMailboxChannel::load_i32(size_t offset) const {
+    int32_t value = 0;
+    __atomic_load(reinterpret_cast<const int32_t *>(mailbox_ + offset), &value, __ATOMIC_ACQUIRE);
+    return value;
+}
+
+void MpiGroupMailboxChannel::store_i32(size_t offset, int32_t value) {
+    __atomic_store(reinterpret_cast<int32_t *>(mailbox_ + offset), &value, __ATOMIC_RELEASE);
+}
+
+void MpiGroupMailboxChannel::wake_request_waiter() {
+    mpi_group_mailbox::wake_word(reinterpret_cast<int32_t *>(mailbox_ + mpi_group_mailbox::OFF_REQUEST_STATE));
+}
+
+uint32_t MpiGroupMailboxChannel::read_u32(size_t offset) const {
+    uint32_t value = 0;
+    std::memcpy(&value, mailbox_ + offset, sizeof(value));
+    return value;
+}
+
+uint64_t MpiGroupMailboxChannel::read_u64(size_t offset) const {
+    uint64_t value = 0;
+    std::memcpy(&value, mailbox_ + offset, sizeof(value));
+    return value;
+}
+
+void MpiGroupMailboxChannel::write_u32(size_t offset, uint32_t value) {
+    std::memcpy(mailbox_ + offset, &value, sizeof(value));
+}
+
+void MpiGroupMailboxChannel::write_u64(size_t offset, uint64_t value) {
+    std::memcpy(mailbox_ + offset, &value, sizeof(value));
+}
+
+std::string MpiGroupMailboxChannel::terminal_reason() const {
+    using namespace mpi_group_mailbox;
+    const size_t size = std::min(static_cast<size_t>(read_u32(OFF_ERROR_BYTES)), ERROR_BYTES);
+    return std::string(reinterpret_cast<const char *>(mailbox_ + ERROR_OFFSET), size);
+}
+
+void MpiGroupMailboxChannel::mark_terminal(const std::string &reason) {
+    using namespace mpi_group_mailbox;
+    const size_t size = std::min(reason.size(), ERROR_BYTES);
+    if (size > 0) std::memcpy(mailbox_ + ERROR_OFFSET, reason.data(), size);
+    write_u32(OFF_ERROR_BYTES, static_cast<uint32_t>(size));
+    store_i32(OFF_GROUP_STATE, static_cast<int32_t>(GroupState::TERMINAL));
+    store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::TASK_FAILED));
+    wake_request_waiter();
+}
+
+void MpiGroupMailboxChannel::kill_mpirun_group() const {
+    if (mpirun_pid_ <= 0) return;
+    (void)::kill(-mpirun_pid_, SIGKILL);
+    (void)::kill(mpirun_pid_, SIGKILL);
+}
+
+bool MpiGroupMailboxChannel::terminal() const {
+    return load_i32(mpi_group_mailbox::OFF_GROUP_STATE) ==
+           static_cast<int32_t>(mpi_group_mailbox::GroupState::TERMINAL);
+}
+
+std::vector<std::vector<uint8_t>> MpiGroupMailboxChannel::run_exchange(
+    const std::vector<std::vector<uint8_t>> &frames, mpi_group_mailbox::Opcode opcode, mpi_group_mailbox::Target target,
+    int32_t target_rank
+) {
+    using namespace mpi_group_mailbox;
+    if (frames.empty()) throw std::invalid_argument("MpiGroupMailboxChannel: request requires a payload");
+    if (target == Target::PER_RANK && frames.size() != static_cast<size_t>(world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: per-rank request must include every rank");
+    }
+    if (target != Target::PER_RANK && frames.size() != 1) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: rank/group request requires one payload");
+    }
+    size_t encoded_request_bytes = 4 + 4 * frames.size();
+    for (const auto &frame : frames) {
+        if (frame.size() > UINT32_MAX || frame.size() > PAYLOAD_BYTES ||
+            encoded_request_bytes > PAYLOAD_BYTES - frame.size()) {
+            throw std::invalid_argument("MpiGroupMailboxChannel: request frame vector exceeds mailbox capacity");
+        }
+        encoded_request_bytes += frame.size();
+    }
+    if (target == Target::RANK && (target_rank < 0 || target_rank >= world_size_)) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: target rank is outside the group");
+    }
+    const auto group_state = static_cast<GroupState>(load_i32(OFF_GROUP_STATE));
+    if (group_state == GroupState::TERMINAL) {
+        throw std::runtime_error("MpiGroupMailboxChannel: group is terminal: " + terminal_reason());
+    }
+    if (group_state != GroupState::READY) {
+        throw std::runtime_error("MpiGroupMailboxChannel: group is not ready");
+    }
+    if (static_cast<RequestState>(load_i32(OFF_REQUEST_STATE)) != RequestState::IDLE) {
+        throw std::runtime_error("MpiGroupMailboxChannel: request lane is not idle");
+    }
+
+    const uint64_t sequence = next_sequence_++;
+    const uint32_t count = static_cast<uint32_t>(frames.size());
+    std::memcpy(mailbox_ + REQUEST_OFFSET, &count, sizeof(count));
+    size_t request_offset = REQUEST_OFFSET + 4;
+    for (const auto &frame : frames) {
+        const uint32_t frame_size = static_cast<uint32_t>(frame.size());
+        std::memcpy(mailbox_ + request_offset, &frame_size, sizeof(frame_size));
+        request_offset += 4;
+    }
+    for (const auto &frame : frames) {
+        if (!frame.empty()) std::memcpy(mailbox_ + request_offset, frame.data(), frame.size());
+        request_offset += frame.size();
+    }
+    write_u64(OFF_SEQUENCE_ID, sequence);
+    write_u32(OFF_OPCODE, static_cast<uint32_t>(opcode));
+    write_u32(OFF_TARGET, static_cast<uint32_t>(target));
+    std::memcpy(mailbox_ + OFF_TARGET_RANK, &target_rank, sizeof(target_rank));
+    write_u32(OFF_REQUEST_COUNT, count);
+    write_u32(OFF_REQUEST_BYTES, static_cast<uint32_t>(encoded_request_bytes));
+    write_u32(OFF_RESPONSE_COUNT, 0);
+    write_u32(OFF_RESPONSE_BYTES, 0);
+    write_u32(OFF_ERROR_BYTES, 0);
+    const RequestState ready_state =
+        opcode == Opcode::SHUTDOWN ? RequestState::SHUTDOWN_READY : RequestState::REQUEST_READY;
+    store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(ready_state));
+    wake_request_waiter();
+
+    const Deadline deadline = deadline_from_now(runtime_timeout_s_);
+    while (true) {
+        const auto state = static_cast<RequestState>(load_i32(OFF_REQUEST_STATE));
+        if (state == RequestState::TASK_DONE) {
+            const uint32_t response_count = read_u32(OFF_RESPONSE_COUNT);
+            const size_t response_bytes = read_u32(OFF_RESPONSE_BYTES);
+            const uint32_t expected_count = target == Target::PER_RANK ? static_cast<uint32_t>(world_size_) : 1U;
+            const size_t prefix_bytes = 4 + 4 * static_cast<size_t>(response_count);
+            if (response_count != expected_count || response_bytes < prefix_bytes || response_bytes > PAYLOAD_BYTES) {
+                mark_terminal("MPI group mailbox returned an invalid response vector");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: invalid response vector");
+            }
+            uint32_t encoded_count = 0;
+            std::memcpy(&encoded_count, mailbox_ + RESPONSE_OFFSET, sizeof(encoded_count));
+            if (encoded_count != response_count) {
+                mark_terminal("MPI group mailbox response vector length mismatch");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: response vector length mismatch");
+            }
+            std::vector<uint32_t> payload_sizes(response_count);
+            size_t total_payload_bytes = 0;
+            for (uint32_t i = 0; i < response_count; ++i) {
+                std::memcpy(
+                    &payload_sizes[i], mailbox_ + RESPONSE_OFFSET + 4 + 4 * static_cast<size_t>(i),
+                    sizeof(payload_sizes[i])
+                );
+                total_payload_bytes += payload_sizes[i];
+            }
+            if (prefix_bytes + total_payload_bytes != response_bytes) {
+                mark_terminal("MPI group mailbox response vector length mismatch");
+                kill_mpirun_group();
+                throw std::runtime_error("MpiGroupMailboxChannel: response vector length mismatch");
+            }
+            std::vector<std::vector<uint8_t>> responses;
+            responses.reserve(response_count);
+            size_t response_offset = RESPONSE_OFFSET + prefix_bytes;
+            for (uint32_t payload_size : payload_sizes) {
+                std::vector<uint8_t> response(payload_size);
+                if (payload_size > 0) {
+                    std::memcpy(response.data(), mailbox_ + response_offset, payload_size);
+                }
+                response_offset += payload_size;
+                responses.push_back(std::move(response));
+            }
+            store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            return responses;
+        }
+        if (state == RequestState::SHUTDOWN_DONE) {
+            store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            return {{}};
+        }
+        if (state == RequestState::TASK_FAILED || terminal()) {
+            const std::string reason = terminal_reason();
+            if (!terminal()) store_i32(OFF_REQUEST_STATE, static_cast<int32_t>(RequestState::IDLE));
+            throw std::runtime_error(
+                "MpiGroupMailboxChannel: MPI group request failed" + (reason.empty() ? std::string() : ": " + reason)
+            );
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            mark_terminal("MPI group mailbox request timed out at sequence " + std::to_string(sequence));
+            kill_mpirun_group();
+            throw std::runtime_error("MpiGroupMailboxChannel: request timed out");
+        }
+    }
+}
+
+std::vector<uint8_t> MpiGroupMailboxChannel::exchange(const std::vector<uint8_t> &frame, int32_t target_rank) {
+    std::lock_guard<std::mutex> lock(lane_mu_);
+    const auto decoded = remote_l3::decode_frame(frame);
+    mpi_group_mailbox::Opcode opcode = mpi_group_mailbox::Opcode::CONTROL;
+    mpi_group_mailbox::Target target = mpi_group_mailbox::Target::RANK;
+    if (decoded.header.frame_type == remote_l3::FrameType::TASK) {
+        opcode = mpi_group_mailbox::Opcode::TASK;
+    } else if (decoded.header.frame_type == remote_l3::FrameType::HEALTH) {
+        opcode = mpi_group_mailbox::Opcode::PING;
+        target = mpi_group_mailbox::Target::GROUP;
+        target_rank = -1;
+    } else if (decoded.header.frame_type == remote_l3::FrameType::CONTROL) {
+        if ((decoded.header.flags & remote_l3::FRAME_FLAG_GROUP_TARGET) != 0) {
+            target = mpi_group_mailbox::Target::GROUP;
+            target_rank = -1;
+        }
+    } else {
+        throw std::runtime_error("MpiGroupMailboxChannel: unsupported request frame type");
+    }
+    auto responses = run_exchange({frame}, opcode, target, target_rank);
+    return std::move(responses.front());
+}
+
+std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
+    const std::vector<uint8_t> &frame, int32_t target_rank, uint64_t task_slot, int32_t group_size
+) {
+    if (group_size != world_size_) {
+        // Existing submit_next_level_group permits subsets. Keep that behavior
+        // as ordered rank-targeted requests; only a full MPI group is batched
+        // into one PER_RANK mailbox envelope.
+        return exchange(frame, target_rank);
+    }
+    if (target_rank < 0 || target_rank >= world_size_) {
+        throw std::invalid_argument("MpiGroupMailboxChannel: group task target rank is outside the group");
+    }
+
+    // Rendezvous timeouts fail only the waiting task: an incomplete arrival
+    // means the L4 dispatched an inconsistent group, not that a rank is
+    // wedged. Killing the mpirun process group is reserved for the mailbox
+    // round trip itself (run_exchange), which runs under lane_mu_.
+    const Deadline deadline = deadline_from_now(runtime_timeout_s_);
+    bool leader = false;
+    std::vector<std::vector<uint8_t>> frames;
+    {
+        std::unique_lock<std::mutex> lock(group_mu_);
+        while (group_active_ && group_task_slot_ != task_slot) {
+            if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                throw std::runtime_error("MpiGroupMailboxChannel: timed out waiting for the prior group task batch");
+            }
+        }
+        if (!group_active_) {
+            group_active_ = true;
+            group_done_ = false;
+            group_leader_running_ = false;
+            group_task_slot_ = task_slot;
+            group_arrived_ = 0;
+            group_departed_ = 0;
+            group_frames_.assign(static_cast<size_t>(world_size_), {});
+            group_replies_.clear();
+            group_error_ = nullptr;
+        }
+        if (group_frames_.size() != static_cast<size_t>(world_size_)) {
+            throw std::runtime_error("MpiGroupMailboxChannel: group task batch already dispatched for this slot");
+        }
+        auto &rank_frame = group_frames_[static_cast<size_t>(target_rank)];
+        if (!rank_frame.empty()) {
+            throw std::runtime_error("MpiGroupMailboxChannel: duplicate rank in one MPI group task");
+        }
+        rank_frame = frame;
+        ++group_arrived_;
+        if (group_arrived_ == world_size_) {
+            leader = true;
+            group_leader_running_ = true;
+            frames = std::move(group_frames_);
+            group_frames_.clear();
+        }
+    }
+
+    if (leader) {
+        try {
+            std::lock_guard<std::mutex> lane_lock(lane_mu_);
+            auto replies =
+                run_exchange(frames, mpi_group_mailbox::Opcode::TASK, mpi_group_mailbox::Target::PER_RANK, -1);
+            std::lock_guard<std::mutex> group_lock(group_mu_);
+            group_replies_ = std::move(replies);
+            group_done_ = true;
+            group_leader_running_ = false;
+        } catch (...) {
+            std::lock_guard<std::mutex> group_lock(group_mu_);
+            group_error_ = std::current_exception();
+            group_done_ = true;
+            group_leader_running_ = false;
+        }
+        group_cv_.notify_all();
+    }
+
+    std::unique_lock<std::mutex> lock(group_mu_);
+    while (!group_done_) {
+        if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (!group_leader_running_) {
+                // No leader formed: withdraw this rank's frame so a later,
+                // correctly-targeted batch starts from a clean slate.
+                auto &rank_frame = group_frames_[static_cast<size_t>(target_rank)];
+                rank_frame.clear();
+                --group_arrived_;
+                if (group_arrived_ == 0) {
+                    group_active_ = false;
+                    group_done_ = false;
+                    group_replies_.clear();
+                    group_error_ = nullptr;
+                }
+            } else {
+                ++group_departed_;
+                if (group_departed_ == world_size_) {
+                    group_active_ = false;
+                    group_done_ = false;
+                    group_frames_.clear();
+                    group_replies_.clear();
+                    group_error_ = nullptr;
+                }
+            }
+            lock.unlock();
+            group_cv_.notify_all();
+            throw std::runtime_error("MpiGroupMailboxChannel: group task batching timed out waiting for all ranks");
+        }
+    }
+    std::exception_ptr error = group_error_;
+    std::vector<uint8_t> reply;
+    if (error == nullptr) {
+        if (group_replies_.size() != static_cast<size_t>(world_size_)) {
+            error = std::make_exception_ptr(
+                std::runtime_error("MpiGroupMailboxChannel: MPI group task reply count mismatch")
+            );
+        } else {
+            reply = std::move(group_replies_[static_cast<size_t>(target_rank)]);
+        }
+    }
+    ++group_departed_;
+    if (group_departed_ == world_size_) {
+        group_active_ = false;
+        group_done_ = false;
+        group_frames_.clear();
+        group_replies_.clear();
+        group_error_ = nullptr;
+        group_cv_.notify_all();
+    }
+    lock.unlock();
+    if (error != nullptr) std::rethrow_exception(error);
+    return reply;
+}
+
+void MpiGroupMailboxChannel::shutdown(const std::vector<uint8_t> &frame) {
+    std::lock_guard<std::mutex> lock(lane_mu_);
+    if (shutdown_sent_ || terminal()) return;
+    shutdown_sent_ = true;
+    (void)run_exchange({frame}, mpi_group_mailbox::Opcode::SHUTDOWN, mpi_group_mailbox::Target::GROUP, -1);
+}
+
+MpiGroupMailboxTransport::MpiGroupMailboxTransport(
+    std::shared_ptr<MpiGroupMailboxChannel> channel, int32_t target_rank
+) :
+    channel_(std::move(channel)),
+    target_rank_(target_rank) {
+    if (!channel_) throw std::invalid_argument("MpiGroupMailboxTransport: null channel");
+    if (target_rank_ < 0) throw std::invalid_argument("MpiGroupMailboxTransport: target rank must be non-negative");
+}
+
+MpiGroupMailboxTransport::~MpiGroupMailboxTransport() {
+    {
+        std::lock_guard<std::mutex> lock(progress_mu_);
+        progress_stop_ = true;
+    }
+    progress_cv_.notify_all();
+    if (progress_thread_.joinable()) progress_thread_.join();
+}
+
+void MpiGroupMailboxTransport::submit_frame(const std::vector<uint8_t> &frame) {
+    if (pending_) throw std::runtime_error("MpiGroupMailboxTransport: a request is already pending");
+    pending_frame_ = frame;
+    pending_ = true;
+}
+
+std::vector<uint8_t> MpiGroupMailboxTransport::wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) {
+    if (!pending_) throw std::runtime_error("MpiGroupMailboxTransport: no request is pending");
+    auto frame = std::move(pending_frame_);
+    pending_frame_.clear();
+    pending_ = false;
+    auto reply = channel_->exchange(frame, target_rank_);
+    auto decoded = remote_l3::decode_frame(reply);
+    if (decoded.header.frame_type != frame_type || decoded.header.sequence != sequence) {
+        throw std::runtime_error("MpiGroupMailboxTransport: reply frame type or sequence mismatch");
+    }
+    return reply;
+}
+
+void MpiGroupMailboxTransport::start_progress(ProgressRequest request) {
+    std::lock_guard<std::mutex> lock(progress_mu_);
+    if (progress_stop_) throw std::runtime_error("MpiGroupMailboxTransport: transport is shut down");
+    if (progress_active_) throw std::logic_error("MpiGroupMailboxTransport: progress command is already active");
+    if (!progress_thread_.joinable()) {
+        progress_thread_ = std::thread([this]() {
+            progress_worker();
+        });
+    }
+    progress_request_ = std::move(request);
+    progress_reply_.clear();
+    progress_error_ = nullptr;
+    progress_done_ = false;
+    progress_active_ = true;
+    progress_cv_.notify_all();
+}
+
+void MpiGroupMailboxTransport::progress_worker() {
+    for (;;) {
+        ProgressRequest request;
+        {
+            std::unique_lock<std::mutex> lock(progress_mu_);
+            progress_cv_.wait(lock, [this]() {
+                return progress_stop_ || (progress_active_ && !progress_done_);
+            });
+            if (progress_stop_) return;
+            request = progress_request_;
+        }
+        std::vector<uint8_t> reply;
+        std::exception_ptr error;
+        try {
+            reply =
+                request.group ?
+                    channel_->exchange_group_task(request.frame, target_rank_, request.task_slot, request.group_size) :
+                    channel_->exchange(request.frame, target_rank_);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lock(progress_mu_);
+            progress_reply_ = std::move(reply);
+            progress_error_ = error;
+            progress_done_ = true;
+        }
+        progress_cv_.notify_all();
+    }
+}
+
+void MpiGroupMailboxTransport::submit_progress_frame(const std::vector<uint8_t> &frame) {
+    ProgressRequest request;
+    request.frame = frame;
+    start_progress(std::move(request));
+}
+
+void MpiGroupMailboxTransport::submit_group_progress_frame(
+    const std::vector<uint8_t> &frame, uint64_t task_slot, int32_t, int32_t group_size
+) {
+    ProgressRequest request;
+    request.frame = frame;
+    request.group = true;
+    request.task_slot = task_slot;
+    request.group_size = group_size;
+    start_progress(std::move(request));
+}
+
+bool MpiGroupMailboxTransport::poll_progress_reply(
+    remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply
+) {
+    std::exception_ptr error;
+    {
+        std::lock_guard<std::mutex> lock(progress_mu_);
+        if (!progress_active_) throw std::logic_error("MpiGroupMailboxTransport: no progress command is active");
+        if (!progress_done_) return false;
+        progress_active_ = false;
+        progress_done_ = false;
+        error = progress_error_;
+        progress_error_ = nullptr;
+        reply = std::move(progress_reply_);
+        progress_reply_.clear();
+    }
+    if (error != nullptr) std::rethrow_exception(error);
+    const auto decoded = remote_l3::decode_frame(reply);
+    if (decoded.header.frame_type != frame_type || decoded.header.sequence != sequence) {
+        throw std::runtime_error("MpiGroupMailboxTransport: reply frame type or sequence mismatch");
+    }
+    return true;
+}
+
+void MpiGroupMailboxTransport::shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(progress_mu_);
+        progress_stop_ = true;
+    }
+    progress_cv_.notify_all();
+    if (!pending_) return;
+    auto frame = std::move(pending_frame_);
+    pending_frame_.clear();
+    pending_ = false;
+    channel_->shutdown(frame);
+}
+
 RemoteL3Endpoint::RemoteL3Endpoint(
-    int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport
+    int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport,
+    WorkerEndpointKind endpoint_kind
 ) :
     session_id_(session_id),
     transport_(std::move(transport)) {
     if (worker_id < 0) throw std::invalid_argument("RemoteL3Endpoint: worker_id must be non-negative");
     if (session_id == 0) throw std::invalid_argument("RemoteL3Endpoint: session_id must be non-zero");
     if (!transport_) throw std::invalid_argument("RemoteL3Endpoint: null transport");
-    caps_.kind = WorkerEndpointKind::REMOTE_L3;
+    caps_.kind = endpoint_kind;
     caps_.worker_id = worker_id;
     caps_.remote = true;
     caps_.supports_task_dispatch = true;
@@ -628,96 +1243,187 @@ RemoteL3Endpoint::RemoteL3Endpoint(
     caps_.transport = std::move(transport_name);
 }
 
+MpiGroupMailboxEndpoint::MpiGroupMailboxEndpoint(
+    int32_t worker_id, uint64_t session_id, int32_t rank, std::shared_ptr<MpiGroupMailboxChannel> channel
+) :
+    RemoteL3Endpoint(
+        worker_id, session_id, "mpi-group-mailbox",
+        std::make_unique<MpiGroupMailboxTransport>(std::move(channel), rank), WorkerEndpointKind::MPI_GROUP_MAILBOX
+    ) {}
+
 remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotState &slot, int32_t group_index) const {
     remote_l3::TaskPayloadWire payload;
     payload.callable_digest = slot.callable.digest;
     payload.config = slot.config;
 
-    TaskArgsView view = slot.args_view(group_index);
+    const TaskArgs &a = slot.args(group_index);
     const RemoteTaskArgsSidecar &sidecar = slot.remote_sidecar_for(group_index);
-    if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(view.tensor_count)) {
-        throw std::runtime_error("RemoteL3Endpoint::run: remote sidecar tensor count does not match TaskArgs");
+    if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(a.tensor_count())) {
+        throw std::runtime_error(
+            "RemoteL3Endpoint::build_task_payload: remote sidecar tensor count does not match TaskArgs"
+        );
     }
     payload.args.inline_payload = sidecar.inline_payload;
-    payload.args.tensor_metadata.reserve(static_cast<size_t>(view.tensor_count));
-    payload.args.remote_desc.reserve(static_cast<size_t>(view.tensor_count));
+    payload.args.tensors.reserve(static_cast<size_t>(a.tensor_count()));
+    payload.args.remote_desc.reserve(static_cast<size_t>(a.tensor_count()));
 
-    for (int32_t i = 0; i < view.tensor_count; ++i) {
-        Tensor tensor = view.tensors(i);
+    for (int32_t i = 0; i < a.tensor_count(); ++i) {
+        const Tensor &ref = a.tensor(i);
         RemoteTensorSidecar tensor_sidecar{};
         if (!sidecar.tensors.empty()) tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-        if (tensor.buffer.addr != 0 && !tensor_sidecar.present) {
-            throw std::runtime_error("RemoteL3Endpoint::run: bare host pointer submitted without remote sidecar");
+        // The sidecar is the sole authority for a remote argument's backing, so the sender's own
+        // backing never crosses: an arg bound for a remote worker is a REMOTE_SIDECAR placeholder
+        // whose identity names the remote buffer. Orchestrator::validate_remote_sidecars rejects a
+        // local backing alongside a sidecar at submit; this is the encoder's own guard.
+        if (ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR)) {
+            throw std::runtime_error(
+                "RemoteL3Endpoint::build_task_payload: a remote task arg must carry no local backing"
+            );
         }
-        if (tensor.is_child_memory() && !tensor_sidecar.present) {
-            throw std::runtime_error("RemoteL3Endpoint::run: child-memory tensor submitted without remote sidecar");
+        // Every argument's backing is named by its own sidecar, so an absent one leaves the
+        // placeholder naming nothing the runner could resolve.
+        if (!tensor_sidecar.present) {
+            throw std::runtime_error("RemoteL3Endpoint::build_task_payload: tensor submitted without remote sidecar");
         }
-        if (!tensor_sidecar.present && tensor.nbytes() != 0) {
-            throw std::runtime_error("RemoteL3Endpoint::run: tensor payload submitted without remote sidecar");
-        }
-        tensor.buffer.addr = 0;
-        payload.args.tensor_metadata.push_back(tensor);
+        payload.args.tensors.push_back(ref);
         payload.args.remote_desc.push_back(tensor_sidecar);
     }
-    payload.args.scalars.reserve(static_cast<size_t>(view.scalar_count));
-    for (int32_t i = 0; i < view.scalar_count; ++i)
-        payload.args.scalars.push_back(view.scalars[i]);
+    payload.args.scalars.reserve(static_cast<size_t>(a.scalar_count()));
+    for (int32_t i = 0; i < a.scalar_count(); ++i)
+        payload.args.scalars.push_back(a.scalar(i));
     return payload;
 }
 
-WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatch) {
-    if (ring == nullptr) throw std::invalid_argument("RemoteL3Endpoint::run: null ring");
-    TaskSlotState &slot = *ring->slot_state(dispatch.task_slot);
+void RemoteL3Endpoint::finish_progress_command(uint64_t sequence) {
+    if (sequence != 0 && command_lane_.in_flight()) command_lane_.finish_reply(sequence);
+    pending_task_ = {};
+    command_cv_.notify_all();
+}
 
-    WorkerCompletion completion;
-    completion.task_slot = dispatch.task_slot;
-    completion.group_index = dispatch.group_index;
+void RemoteL3Endpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatch) {
+    if (ring == nullptr) throw std::invalid_argument("RemoteL3Endpoint::submit_progress: null ring");
+    TaskSlotState *slot = ring->slot_state(dispatch.task_slot);
+    if (slot == nullptr) throw std::out_of_range("RemoteL3Endpoint::submit_progress: invalid task slot");
+    auto payload = remote_l3::encode_task_payload(build_task_payload(*slot, dispatch.group_index));
 
-    uint64_t sequence = 0;
-    std::unique_lock<std::mutex> command_lk(command_mu_);
+    std::lock_guard<std::mutex> command_lk(command_mu_);
+    if (pending_task_.occupied || command_lane_.in_flight()) {
+        throw std::runtime_error("RemoteL3Endpoint::submit_progress: command lane is occupied");
+    }
+    uint64_t sequence = command_lane_.begin_command();
     try {
-        sequence = command_lane_.begin_command();
-        auto payload = remote_l3::encode_task_payload(build_task_payload(slot, dispatch.group_index));
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::TASK;
         header.session_id = session_id_;
         header.worker_id = caps_.worker_id;
         header.sequence = sequence;
-        transport_->submit_frame(remote_l3::encode_frame(header, payload));
-
-        auto reply_bytes = transport_->wait_for_reply(remote_l3::FrameType::COMPLETION, sequence);
-        auto reply = remote_l3::decode_frame(reply_bytes);
-        if (reply.header.frame_type != remote_l3::FrameType::COMPLETION) {
-            throw std::runtime_error("RemoteL3Endpoint::run: expected COMPLETION reply");
-        }
-        if (reply.header.session_id != session_id_ || reply.header.worker_id != caps_.worker_id) {
-            throw std::runtime_error("RemoteL3Endpoint::run: completion session or worker mismatch");
-        }
-        auto decoded = remote_l3::decode_completion(reply.payload.data(), reply.payload.size(), sequence);
-        command_lane_.finish_reply(sequence);
-
-        if (decoded.error_code == 0) {
-            completion.outcome = EndpointOutcome::SUCCESS;
+        auto frame = remote_l3::encode_frame(header, payload);
+        if (slot->is_group() && transport_->supports_group_batch()) {
+            transport_->submit_group_progress_frame(
+                frame, static_cast<uint64_t>(dispatch.task_slot), dispatch.group_index, slot->group_size()
+            );
         } else {
-            completion.outcome = EndpointOutcome::TASK_FAILURE;
-            completion.error_message = decoded.error_message;
+            transport_->submit_progress_frame(frame);
         }
-    } catch (const std::exception &e) {
-        if (sequence != 0 && command_lane_.in_flight()) {
-            try {
-                command_lane_.finish_reply(sequence);
-            } catch (...) {}
-        }
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message =
-            std::string("RemoteL3Endpoint::run(worker_id=") + std::to_string(caps_.worker_id) + "): " + e.what();
+        pending_task_.occupied = true;
+        pending_task_.dispatch = dispatch;
+        pending_task_.sequence = sequence;
+    } catch (...) {
+        try {
+            command_lane_.finish_reply(sequence);
+        } catch (...) {}
+        throw;
     }
-    return completion;
 }
 
-remote_l3::ControlReplyPayload
-RemoteL3Endpoint::run_control(remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes) {
+bool RemoteL3Endpoint::poll_progress(WorkerEndpointProgress &progress) {
+    std::lock_guard<std::mutex> command_lk(command_mu_);
+    if (!pending_task_.occupied) return false;
+
+    const WorkerDispatch dispatch = pending_task_.dispatch;
+    const uint64_t sequence = pending_task_.sequence;
+    progress.kind = WorkerProgressKind::COMPLETED;
+    progress.dispatch = dispatch;
+    progress.completion.task_slot = dispatch.task_slot;
+    progress.completion.group_index = dispatch.group_index;
+    if (progress_stop_requested_) {
+        progress.completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+        progress.completion.error_message =
+            progress_stop_reason_.empty() ? "RemoteL3Endpoint progress stopped" : progress_stop_reason_;
+        finish_progress_command(sequence);
+        return true;
+    }
+
+    try {
+        std::vector<uint8_t> reply_bytes;
+        if (!transport_->poll_progress_reply(remote_l3::FrameType::COMPLETION, sequence, reply_bytes)) return false;
+        auto reply = remote_l3::decode_frame(reply_bytes);
+        if (reply.header.session_id != session_id_ || reply.header.worker_id != caps_.worker_id) {
+            throw std::runtime_error("completion session or worker mismatch");
+        }
+        auto decoded = remote_l3::decode_completion(reply.payload.data(), reply.payload.size(), sequence);
+        if (decoded.error_code == 0) {
+            progress.completion.outcome = EndpointOutcome::SUCCESS;
+        } else {
+            progress.completion.outcome = EndpointOutcome::TASK_FAILURE;
+            progress.completion.error_message = decoded.error_message;
+        }
+    } catch (const std::exception &e) {
+        progress.completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+        progress.completion.error_message =
+            std::string("RemoteL3Endpoint progress(worker_id=") + std::to_string(caps_.worker_id) + "): " + e.what();
+    }
+    finish_progress_command(sequence);
+    return true;
+}
+
+void RemoteL3Endpoint::request_progress_stop() noexcept {
+    try {
+        std::lock_guard<std::mutex> command_lk(command_mu_);
+        progress_stop_requested_ = true;
+        progress_stop_reason_ = "RemoteL3Endpoint progress stopped";
+        command_cv_.notify_all();
+        transport_->shutdown();
+    } catch (...) {}
+}
+
+void RemoteL3Endpoint::report_progress_error(const std::string &reason) noexcept {
+    try {
+        std::lock_guard<std::mutex> command_lk(command_mu_);
+        progress_stop_requested_ = true;
+        progress_stop_reason_ = "RemoteL3Endpoint progress driver failed: " + reason;
+        command_cv_.notify_all();
+        transport_->shutdown();
+    } catch (...) {}
+}
+
+bool RemoteL3Endpoint::report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) noexcept {
+    try {
+        std::lock_guard<std::mutex> command_lk(command_mu_);
+        const bool endpoint_owned =
+            pending_task_.occupied && pending_task_.dispatch.dispatch_id == dispatch.dispatch_id;
+        progress_stop_requested_ = true;
+        progress_stop_reason_ = "RemoteL3Endpoint submission failed: " + reason;
+        command_cv_.notify_all();
+        transport_->shutdown();
+        return endpoint_owned;
+    } catch (...) {
+        return false;
+    }
+}
+
+remote_l3::ControlReplyPayload RemoteL3Endpoint::run_control(
+    remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target
+) {
     std::unique_lock<std::mutex> command_lk(command_mu_);
+    command_cv_.wait(command_lk, [this] {
+        return !pending_task_.occupied || progress_stop_requested_;
+    });
+    if (progress_stop_requested_) {
+        throw std::runtime_error(
+            progress_stop_reason_.empty() ? "RemoteL3Endpoint progress stopped" : progress_stop_reason_
+        );
+    }
     uint64_t sequence = 0;
     try {
         sequence = command_lane_.begin_command();
@@ -730,6 +1436,7 @@ RemoteL3Endpoint::run_control(remote_l3::ControlName control_name, const std::ve
         header.session_id = session_id_;
         header.worker_id = caps_.worker_id;
         header.sequence = sequence;
+        if (group_target) header.flags |= remote_l3::FRAME_FLAG_GROUP_TARGET;
         transport_->submit_frame(remote_l3::encode_frame(header, remote_l3::encode_control(control)));
 
         auto reply_bytes = transport_->wait_for_reply(remote_l3::FrameType::CONTROL_REPLY, sequence);
@@ -934,10 +1641,23 @@ void RemoteL3Endpoint::control_remote_release_import(const RemoteBufferHandle &h
     run_control(remote_l3::ControlName::RELEASE_IMPORT, remote_l3::encode_release_import_request(request));
 }
 
+std::vector<uint8_t> RemoteL3Endpoint::control_remote_domain(
+    remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target
+) {
+    return run_control(control_name, command_bytes, group_target).result_bytes;
+}
+
 void RemoteL3Endpoint::shutdown_child() {
     if (!transport_) return;
     try {
         std::lock_guard<std::mutex> command_lk(command_mu_);
+        if (pending_task_.occupied) {
+            progress_stop_requested_ = true;
+            progress_stop_reason_ = "RemoteL3Endpoint shut down with a task in flight";
+            command_cv_.notify_all();
+            transport_->shutdown();
+            return;
+        }
         uint64_t sequence = command_lane_.begin_command();
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::SHUTDOWN;

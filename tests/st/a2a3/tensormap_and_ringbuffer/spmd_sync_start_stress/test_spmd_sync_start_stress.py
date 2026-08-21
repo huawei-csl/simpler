@@ -18,7 +18,7 @@ reported widths; `output` is sized for the widest device the platform allows.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 ROUNDS = 6
@@ -100,15 +100,15 @@ class TestSpmdSyncStartStress(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
+            "manual": ["a2a3sim"],
             "params": {},
         }
     ]
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            Tensor("layout", torch.zeros(4, dtype=torch.int32)),
+            TensorArg("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
+            TensorArg("layout", torch.zeros(4, dtype=torch.int32)),
         )
 
     def compute_golden(self, args, params):

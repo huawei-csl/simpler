@@ -32,13 +32,14 @@
 #define PTO2_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define PTO2_ERROR_EXPLICIT_ORCH_FATAL 9
 #define PTO2_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
-#define PTO2_ERROR_TENSORMAP_OVERFLOW 11    // tensormap entry pool wedged (last_task_alive not advancing)
+#define PTO2_ERROR_TENSORMAP_OVERFLOW 11    // graph registers more outputs than the tensormap entry pool holds
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100
 #define PTO2_ERROR_ASYNC_COMPLETION_INVALID 101
 #define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
+#define PTO2_ERROR_READY_QUEUE_OVERFLOW 104  // push into a ready queue found no free slot (full, or window > capacity)
 
 static inline int32_t runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
     if (orch_error_code != PTO2_ERROR_NONE) {

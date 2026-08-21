@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for CallConfig and ChipWorker state machine."""
 
+import threading
+
 import pytest
 from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: ignore[reportMissingImports]
 
@@ -19,29 +21,28 @@ from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: igno
 class TestCallConfig:
     def test_defaults(self):
         config = CallConfig()
-        # 0 is the "auto" sentinel — DeviceRunner resolves it at run() time
-        # to the max the AICore stream allows.
-        assert config.aicpu_thread_num == 3
-        assert config.enable_l2_swimlane == 0
+        # 0 is the "auto" sentinel for the per-architecture runtime default.
+        assert config.aicpu_thread_num == 0
+        assert config.enable_chip_swimlane == 0
         assert config.enable_dump_args == 0
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
 
     def test_setters(self):
-        # enable_l2_swimlane accepts both an int perf_level (0-4) and a Python
+        # enable_chip_swimlane accepts both an int perf_level (0-4) and a Python
         # bool. `True` maps to level 4 (preserves the pre-perf_level "fully on"
         # semantics for legacy callers); explicit ints select a specific level.
         config = CallConfig()
         config.aicpu_thread_num = 4
-        config.enable_l2_swimlane = True
+        config.enable_chip_swimlane = True
         assert config.aicpu_thread_num == 4
-        assert config.enable_l2_swimlane == 4
-        config.enable_l2_swimlane = 2
-        assert config.enable_l2_swimlane == 2
-        config.enable_l2_swimlane = False
-        assert config.enable_l2_swimlane == 0
+        assert config.enable_chip_swimlane == 4
+        config.enable_chip_swimlane = 2
+        assert config.enable_chip_swimlane == 2
+        config.enable_chip_swimlane = False
+        assert config.enable_chip_swimlane == 0
         # enable_dump_args is likewise a level (0=off, 1=partial, 2=full,
-        # 3=full_json_only): `True` maps to level 1 (partial), explicit ints
+        # 3=hybrid): `True` maps to level 1 (partial), explicit ints
         # select the level.
         config.enable_dump_args = True
         assert config.enable_dump_args == 1
@@ -56,16 +57,16 @@ class TestCallConfig:
         # Guard against drift: the four diagnostics sub-features under the
         # profiling umbrella must all round-trip through the nanobind surface.
         config = CallConfig()
-        config.enable_l2_swimlane = True
+        config.enable_chip_swimlane = True
         config.enable_dump_args = True
         config.enable_pmu = 2
         config.enable_dep_gen = True
-        assert config.enable_l2_swimlane == 4
+        assert config.enable_chip_swimlane == 4
         assert config.enable_dump_args == 1
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
         r = repr(config)
-        assert "enable_l2_swimlane=4" in r
+        assert "enable_chip_swimlane=4" in r
         assert "enable_dump_args=1" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
@@ -73,7 +74,7 @@ class TestCallConfig:
     def test_repr(self):
         config = CallConfig()
         r = repr(config)
-        assert "enable_l2_swimlane=0" in r
+        assert "enable_chip_swimlane=0" in r
         # Ring sizing only shows in repr when set.
         assert "ring_heap" not in r
 
@@ -296,7 +297,51 @@ class TestChipWorkerPython:
 
         worker = ChipWorker()
         with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.register_callable"):
-            worker.run(0, ChipStorageTaskArgs(), CallConfig())
+            worker.run(0, ChipStorageTaskArgs(), CallConfig())  # pyright: ignore[reportArgumentType]
+
+    def test_public_wrapper_rejects_cross_thread_finalize(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def finalize(self):
+                raise AssertionError("foreign thread reached native finalize")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._init_owner_thread = threading.current_thread()
+        result = []
+
+        def finalize_from_foreign_thread():
+            try:
+                worker.finalize()
+            except BaseException as exc:  # noqa: BLE001
+                result.append(exc)
+
+        thread = threading.Thread(target=finalize_from_foreign_thread)
+        thread.start()
+        thread.join()
+
+        assert len(result) == 1 and isinstance(result[0], RuntimeError)
+        assert "thread that called ChipWorker.init" in str(result[0])
+
+    def test_public_wrapper_rejects_finalize_during_init(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            initialized = False
+            device_id = 0
+
+            def finalize(self):
+                raise AssertionError("finalize ran while init was in progress")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._init_in_progress = True
+        with pytest.raises(RuntimeError, match=r"while ChipWorker\.init\(\) is in progress"):
+            worker.finalize()
 
 
 # ============================================================================
@@ -318,7 +363,7 @@ class TestMailboxConfigRoundtrip:
 
         cfg = CallConfig()
         cfg.aicpu_thread_num = 2
-        cfg.enable_l2_swimlane = 3
+        cfg.enable_chip_swimlane = 3
         cfg.enable_dump_args = 2
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
@@ -333,7 +378,7 @@ class TestMailboxConfigRoundtrip:
             buf,
             _OFF_CONFIG,
             cfg.aicpu_thread_num,
-            cfg.enable_l2_swimlane,
+            cfg.enable_chip_swimlane,
             int(cfg.enable_dump_args),
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
@@ -346,7 +391,7 @@ class TestMailboxConfigRoundtrip:
 
         decoded = _read_config_from_mailbox(memoryview(buf))
         assert decoded.aicpu_thread_num == 2
-        assert decoded.enable_l2_swimlane == 3
+        assert decoded.enable_chip_swimlane == 3
         assert decoded.enable_dump_args == 2
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True

@@ -12,7 +12,7 @@
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -52,41 +52,36 @@ class TestBenchmarkBgemm(SceneTestCase):
         {
             "name": "Case0",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"matmul_add_task_num": 500, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
             "name": "Case1",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
             "name": "Case2",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"matmul_add_task_num": 256, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
             "name": "Case3",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 16, "grid_k": 2},
         },
         {
             "name": "Case4",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 4},
         },
         {
             "name": "Bgemm64",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
+            "manual": ["a2a3sim"],
             "params": {"matmul_add_task_num": 32, "incore_data_size": 64, "incore_loop": 1, "grid_k": 4},
         },
     ]
@@ -101,7 +96,10 @@ class TestBenchmarkBgemm(SceneTestCase):
         C = torch.zeros(incore_loop * num_groups, tile_size, tile_size, dtype=torch.float32)
         config = torch.tensor([tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64)
         return TaskArgsBuilder(
-            Tensor("A", A.flatten()), Tensor("B", B.flatten()), Tensor("C", C.flatten()), Tensor("config", config)
+            TensorArg("A", A.flatten()),
+            TensorArg("B", B.flatten()),
+            TensorArg("C", C.flatten()),
+            TensorArg("config", config),
         )
 
     def compute_golden(self, args, params):

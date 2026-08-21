@@ -31,7 +31,7 @@ Two host behaviours are exercised, because they genuinely differ:
 import os
 
 import pytest
-from simpler.task_interface import ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs, CoreCallable
+from simpler.task_interface import ArgDirection, CallConfig, ChipCallable, CoreCallable
 from simpler.worker import Worker
 
 from simpler_setup.elf_parser import extract_text_section
@@ -218,6 +218,15 @@ CASES = {
     # tensor_wait_timeout case.
 }
 
+_PER_PR_SIM_CASES = {"async_completion_invalid", "explicit_fatal"}
+assert _PER_PR_SIM_CASES <= CASES.keys(), f"unknown Per-PR Sim cases: {_PER_PR_SIM_CASES - CASES.keys()}"
+_SIM_CASE_PARAMS = [
+    case_name
+    if case_name in _PER_PR_SIM_CASES
+    else pytest.param(case_name, marks=pytest.mark.manual(["a2a3sim", "a5sim"]), id=case_name)
+    for case_name in CASES
+]
+
 
 def _assert_annotated(log: str, case: dict) -> None:
     """The failure line must be followed by what the code *means*, not just the number.
@@ -288,7 +297,7 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
 @pytest.mark.platforms(["a5sim", "a2a3sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("case_name", list(CASES))
+@pytest.mark.parametrize("case_name", _SIM_CASE_PARAMS)
 def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monkeypatch, capfd):
     """sim: the runtime status (``code -N``) reaches the host directly."""
     configure_logging("error")
@@ -298,7 +307,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
-            worker.run(handle, ChipStorageTaskArgs(), config)
+            worker.run(handle, None, config)
         captured = capfd.readouterr()
         log = captured.err + captured.out
         assert case["marker"] in log, f"missing '{case['marker']}' in host log"
@@ -322,7 +331,7 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         # CANN 507xxx instead of the runtime's own -N; we only require that the
         # run fails. The point of the test is the device-classified host LOG.
         with pytest.raises(RuntimeError):
-            worker.run(handle, ChipStorageTaskArgs(), config)
+            worker.run(handle, None, config)
         captured = capfd.readouterr()
         log = captured.err + captured.out
         assert case["marker"] in log, f"device error class '{case['marker']}' not in host log"

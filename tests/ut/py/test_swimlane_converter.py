@@ -125,12 +125,12 @@ def test_task_statistics_level_one_hides_aicpu_metrics(capsys):
         }
     ]
 
-    sc.print_task_statistics(tasks, {"0": "kernel"}, l2_swimlane_level=1)
+    sc.print_task_statistics(tasks, {"0": "kernel"}, chip_swimlane_level=1)
 
     output = capsys.readouterr().out
     row = next(line for line in output.splitlines() if line.startswith("0        kernel"))
     total = next(line for line in output.splitlines() if line.startswith("TOTAL"))
-    assert "Source l2_swimlane_level: 1 (AICore timing only; recorded in l2_swimlane_records.json)" in output
+    assert "Source chip_swimlane_level: 1 (AICore timing only; recorded in chip_swimlane_records.json)" in output
     assert row.split() == ["0", "kernel", "1", "5.00", "-", "-", "-", "-", "-", "0.50"]
     assert total.split() == ["TOTAL", "1", "5.00", "-"]
     assert "AICore Observed Span: 5.50 us (from earliest AICore receive to latest AICore end)" in output
@@ -138,7 +138,7 @@ def test_task_statistics_level_one_hides_aicpu_metrics(capsys):
 
 
 def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
-    input_path = tmp_path / "l2_swimlane_records.json"
+    input_path = tmp_path / "chip_swimlane_records.json"
     name_map_path = tmp_path / "name_map_case.json"
     name_map_path.write_text(
         json.dumps(
@@ -161,6 +161,387 @@ def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
     func_names, _ = sc._load_func_names(explicit_args, input_path)
 
     assert func_names == {"0": "explicit"}
+
+
+def test_host_orchestrator_phases_without_anchors_are_marked_unaligned(tmp_path):
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 4,
+                "metadata": {
+                    "clock_freq_hz": 1_000_000,
+                    "num_cores": 1,
+                    "core_types": ["aiv"],
+                    "core_to_thread": [0],
+                    "orchestrator_source": "host",
+                    "orchestrator_clock_domain": "host_monotonic_ns",
+                    "host_orchestration_origin_ns": 1_000,
+                    "timeline_relation": "host_orchestration_precedes_device",
+                    "host_capture": {
+                        "status": "complete",
+                        "expected_records": 1,
+                        "recorded_records": 1,
+                        "dropped_records": 0,
+                        "error": None,
+                    },
+                },
+                "aicore_tasks": [[0, 7, 1, 100, 110, 0]],
+                "aicpu_tasks": [[0, 1, 90, 120]],
+                "aicpu_scheduler_phases": [
+                    [{"kind": "dispatch", "start_cycles": 80, "end_cycles": 85, "tasks_processed": 1}]
+                ],
+                "host_orchestrator_phases": [
+                    [{"submit_idx": 0, "task_id": 7, "start_host_ns": 1_000, "end_host_ns": 3_000}]
+                ],
+            }
+        )
+    )
+
+    data = sc.read_perf_data(raw)
+
+    assert data["orchestrator_source"] == "host"
+    assert data["aicpu_orchestrator_phases"][0][0]["start_time_us"] == 0.0
+    assert data["aicpu_orchestrator_phases"][0][0]["end_time_us"] == 2.0
+    assert data["aicpu_scheduler_phases"][0][0]["start_time_us"] == 2.0
+    assert data["tasks"][0]["dispatch_time_us"] == 12.0
+    assert data["timeline_metadata"] == {
+        "layout": "causal_composite",
+        "trace_status": "complete",
+        "relation": "host_orchestration_precedes_device",
+        "clock_alignment": {
+            "status": "unaligned",
+            "method": "nominal_frequency_offset_interp_v1",
+            "anchor_uncertainty_ns": None,
+            "host_timestamp_quantization_ns": 0,
+            "max_uncertainty_ns": None,
+            "reason": "missing_clock_anchors",
+        },
+        "host_capture": {
+            "status": "complete",
+            "expected_records": 1,
+            "recorded_records": 1,
+            "dropped_records": 0,
+            "error": None,
+        },
+        "host_records_complete": True,
+        "cross_domain_gap_unknown": True,
+        "cross_domain_latency_available": False,
+        "logical_seam_us": 2.0,
+    }
+
+    trace_path = tmp_path / "merged_swimlane.json"
+    sc.generate_chrome_trace_json(
+        data["tasks"],
+        str(trace_path),
+        scheduler_phases=data["aicpu_scheduler_phases"],
+        orchestrator_phases=data.get("aicpu_orchestrator_phases"),
+        orchestrator_source=data["orchestrator_source"],
+        timeline_metadata=data["timeline_metadata"],
+        core_to_thread=data["core_to_thread"],
+    )
+    trace = json.loads(trace_path.read_text())
+    assert trace["metadata"]["clock_alignment"]["status"] == "unaligned"
+    assert any(
+        event.get("ph") == "M"
+        and event.get("name") == "process_name"
+        and event.get("args", {}).get("name") == "Host Orchestrator"
+        for event in trace["traceEvents"]
+    )
+    assert not any(
+        event.get("cat") == "flow" and event.get("name") == "submit→dispatch" for event in trace["traceEvents"]
+    )
+
+
+def test_host_capture_is_complete_when_the_pool_holds_more_than_the_submit_projection(tmp_path):
+    """A pool record count above the projected one is normal, not incomplete.
+
+    The producer records every timed host operation — bind segments and the
+    sub-operations of a submit — while this file carries only the ones that
+    submit a task. Completeness therefore compares `expected_records` (the pass's
+    task count) against the projection, and `pool_records` is context.
+    """
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 4,
+                "metadata": {
+                    "clock_freq_hz": 1_000_000,
+                    "num_cores": 1,
+                    "core_types": ["aiv"],
+                    "core_to_thread": [0],
+                    "orchestrator_source": "host",
+                    "orchestrator_clock_domain": "host_monotonic_ns",
+                    "host_orchestration_origin_ns": 1_000,
+                    "timeline_relation": "host_orchestration_precedes_device",
+                    "host_capture": {
+                        "status": "complete",
+                        "expected_records": 2,
+                        "recorded_records": 2,
+                        "pool_records": 339,
+                        "dropped_records": 0,
+                        "error": None,
+                    },
+                },
+                "aicore_tasks": [[0, 7, 1, 100, 110, 0]],
+                "aicpu_tasks": [[0, 1, 90, 120]],
+                "host_orchestrator_phases": [
+                    [
+                        {"submit_idx": 0, "task_id": 7, "start_host_ns": 1_000, "end_host_ns": 3_000},
+                        {"submit_idx": 1, "task_id": 8, "start_host_ns": 3_000, "end_host_ns": 4_000},
+                    ]
+                ],
+            }
+        )
+    )
+
+    data = sc.read_perf_data(raw)
+
+    assert data["timeline_metadata"]["host_records_complete"] is True
+    assert data["timeline_metadata"]["host_capture"]["status"] == "complete"
+    assert data["timeline_metadata"]["host_capture"]["pool_records"] == 339
+    assert "converter_validation_errors" not in data["timeline_metadata"]["host_capture"]
+
+
+def test_host_and_device_timestamps_use_calibrated_clock_alignment(tmp_path):
+    raw = tmp_path / "chip_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "chip_swimlane_level": 4,
+                "metadata": {
+                    "clock_freq_hz": 1_000_000_000,
+                    "num_cores": 1,
+                    "core_types": ["aiv"],
+                    "core_to_thread": [0],
+                    "orchestrator_source": "host",
+                    "orchestrator_clock_domain": "host_monotonic_ns",
+                    "host_orchestration_origin_ns": 1_500,
+                    "timeline_relation": "host_orchestration_precedes_device",
+                    "host_capture": {
+                        "status": "complete",
+                        "expected_records": 1,
+                        "recorded_records": 1,
+                        "dropped_records": 0,
+                        "error": None,
+                    },
+                    "clock_anchors": {
+                        "device_timestamp_unit": "syscnt_cycles",
+                        "samples": [
+                            {
+                                "position": "pre_host_orchestration",
+                                "sample_idx": 0,
+                                "host_before_ns": 990,
+                                "device_cycles": 100,
+                                "host_after_ns": 1_010,
+                                "error": None,
+                            },
+                            {
+                                "position": "post_device_execution",
+                                "sample_idx": 0,
+                                "host_before_ns": 5_080,
+                                "device_cycles": 4_100,
+                                "host_after_ns": 5_120,
+                                "error": None,
+                            },
+                        ],
+                    },
+                },
+                "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+                "aicpu_tasks": [[0, 1, 2_000, 2_300]],
+                "aicpu_scheduler_phases": [
+                    [{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950, "tasks_processed": 1}]
+                ],
+                "host_orchestrator_phases": [
+                    [{"submit_idx": 0, "task_id": 7, "start_host_ns": 1_500, "end_host_ns": 1_800}]
+                ],
+            }
+        )
+    )
+
+    data = sc.read_perf_data(raw)
+
+    assert data["aicpu_orchestrator_phases"][0][0]["start_time_us"] == 0.0
+    assert data["aicpu_orchestrator_phases"][0][0]["end_time_us"] == 0.3
+    assert data["tasks"][0]["dispatch_time_us"] == 1.447
+    assert data["tasks"][0]["start_time_us"] == 1.55
+    assert data["timeline_metadata"] == {
+        "layout": "clock_aligned",
+        "trace_status": "complete",
+        "relation": "host_orchestration_precedes_device",
+        "clock_alignment": {
+            "status": "calibrated",
+            "method": "nominal_frequency_offset_interp_v1",
+            "anchor_uncertainty_ns": 20,
+            "host_timestamp_quantization_ns": 0,
+            "max_uncertainty_ns": 20,
+            "selected_sample_idx": {
+                "pre_host_orchestration": 0,
+                "post_device_execution": 0,
+            },
+        },
+        "host_capture": {
+            "status": "complete",
+            "expected_records": 1,
+            "recorded_records": 1,
+            "dropped_records": 0,
+            "error": None,
+        },
+        "host_records_complete": True,
+        "cross_domain_latency_available": True,
+    }
+
+
+def test_dropped_host_capture_is_visible_and_disables_cross_domain_flows(tmp_path):
+    for case_name, host_phases, capture_status, dropped_records, capture_error in (
+        (
+            "partial",
+            [[{"submit_idx": 0, "task_id": 7, "start_host_ns": 1_500, "end_host_ns": 1_800}]],
+            "dropped",
+            1,
+            "record_allocation_failed",
+        ),
+        ("all_dropped", [], "dropped", 1, "record_allocation_failed"),
+        ("silent_missing", [], "complete", 0, None),
+    ):
+        raw = tmp_path / f"{case_name}.json"
+        raw.write_text(
+            json.dumps(
+                {
+                    "chip_swimlane_level": 4,
+                    "metadata": {
+                        "clock_freq_hz": 1_000_000_000,
+                        "num_cores": 1,
+                        "core_types": ["aiv"],
+                        "core_to_thread": [0],
+                        "orchestrator_source": "host",
+                        "host_orchestration_origin_ns": 1_500 if host_phases else 0,
+                        "timeline_relation": "host_orchestration_precedes_device",
+                        "host_timestamp_quantization_ns": 0,
+                        "host_capture": {
+                            "status": capture_status,
+                            "expected_records": sum(len(records) for records in host_phases) + 1,
+                            "recorded_records": sum(len(records) for records in host_phases),
+                            "dropped_records": dropped_records,
+                            "error": capture_error,
+                        },
+                        "clock_anchors": {
+                            "device_timestamp_unit": "syscnt_cycles",
+                            "samples": [
+                                {
+                                    "position": "pre_host_orchestration",
+                                    "sample_idx": 0,
+                                    "host_before_ns": 990,
+                                    "device_cycles": 100,
+                                    "host_after_ns": 1_010,
+                                    "error": None,
+                                },
+                                {
+                                    "position": "post_device_execution",
+                                    "sample_idx": 0,
+                                    "host_before_ns": 5_080,
+                                    "device_cycles": 4_100,
+                                    "host_after_ns": 5_120,
+                                    "error": None,
+                                },
+                            ],
+                        },
+                    },
+                    "aicore_tasks": [[0, 7, 1, 2_100, 2_200, 0]],
+                    "aicpu_tasks": [[0, 1, 2_000, 2_300]],
+                    "aicpu_scheduler_phases": [[{"kind": "dispatch", "start_cycles": 1_900, "end_cycles": 1_950}]],
+                    "host_orchestrator_phases": host_phases,
+                }
+            )
+        )
+
+        data = sc.read_perf_data(raw)
+
+        assert data["timeline_metadata"]["layout"] == "clock_aligned"
+        assert data["timeline_metadata"]["trace_status"] == "partial"
+        assert data["timeline_metadata"]["clock_alignment"]["status"] == "calibrated"
+        assert data["timeline_metadata"]["host_capture"]["status"] == capture_status
+        assert data["timeline_metadata"]["host_records_complete"] is False
+        assert data["timeline_metadata"]["cross_domain_latency_available"] is False
+        assert data["timeline_metadata"].get("host_records_missing", False) is (not host_phases)
+        if case_name == "silent_missing":
+            assert data["timeline_metadata"]["host_capture"]["converter_validation_errors"] == [
+                "expected_record_count_mismatch"
+            ]
+
+        trace_path = tmp_path / f"{case_name}_trace.json"
+        sc.generate_chrome_trace_json(
+            data["tasks"],
+            str(trace_path),
+            scheduler_phases=data["aicpu_scheduler_phases"],
+            orchestrator_phases=data.get("aicpu_orchestrator_phases"),
+            orchestrator_source=data["orchestrator_source"],
+            timeline_metadata=data["timeline_metadata"],
+            core_to_thread=data["core_to_thread"],
+        )
+        trace = json.loads(trace_path.read_text())
+        assert not any(
+            event.get("cat") == "flow" and event.get("name") == "submit→dispatch" for event in trace["traceEvents"]
+        )
+
+
+def test_graph_prepare_phases_create_graph_execution_envelopes(tmp_path):
+    out = tmp_path / "trace.json"
+    outer_a = 3
+    outer_b = 7
+    node_a0 = (1 << 32) | (outer_a << 10)
+    node_a1 = (1 << 32) | ((outer_a << 10) | 1)
+    node_b0 = (1 << 32) | (outer_b << 10)
+    scheduler_phases = [
+        [
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_a,
+                "start_time_us": 1.0,
+                "end_time_us": 1.4,
+                "tasks_processed": 1,
+            },
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_a,
+                "start_time_us": 1.5,
+                "end_time_us": 1.8,
+                "tasks_processed": 1,
+            },
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_b,
+                "start_time_us": 5.0,
+                "end_time_us": 5.2,
+                "tasks_processed": 1,
+            },
+        ]
+    ]
+    tasks = [
+        _task_row(node_a0, 0, dispatch=2.0, start=2.2, end=3.0, receive=2.1),
+        _task_row(node_a1, 1, dispatch=3.2, start=3.4, end=4.0, receive=3.3),
+        _task_row(node_b0, 0, dispatch=5.3, start=5.5, end=6.0, receive=5.4),
+    ]
+
+    sc.generate_chrome_trace_json(tasks, str(out), scheduler_phases=scheduler_phases, core_to_thread=[0, 0])
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    assert any(
+        event.get("ph") == "M" and event.get("pid") == 5 and event.get("args", {}).get("name") == "Graph Execution"
+        for event in events
+    )
+    graph_events = [event for event in events if event.get("cat") == "graph_execution"]
+    assert [event["args"]["outer_task_id"] for event in graph_events] == [outer_a, outer_b]
+    assert graph_events[0]["args"]["visible_node_count"] == 2
+    assert graph_events[0]["args"]["prepare_slice_count"] == 2
+    assert graph_events[0]["ts"] == 1.0
+    assert graph_events[0]["dur"] == 4.0
+    assert (
+        sum(event.get("cat") == "scheduler" and event.get("name", "").startswith("graph_prepare(") for event in events)
+        == 3
+    )
 
 
 def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):
@@ -422,6 +803,42 @@ def test_complete_flow_uses_independent_view_anchors(tmp_path):
     finishes = [e for e in flows if e.get("ph") == "f"]
     assert len(finishes) == 2
     assert len({(e["pid"], e["tid"], e["ts"]) for e in finishes}) == 1
+
+
+def test_complete_phase_preserves_runtime_fin_count(tmp_path):
+    task_id = 101
+    tasks = [
+        _task_row(task_id, 0, start=1.0, end=2.0),
+        _task_row(task_id, 1, start=1.5, end=2.5),
+    ]
+    scheduler_phases = [
+        [
+            {
+                "phase": "complete",
+                "start_time_us": 2.5,
+                "end_time_us": 3.5,
+                # A5/a2a3 runtime count: two AICore FINs, one of which may
+                # be a non-final SPMD sub-block retire.
+                "tasks_processed": 2,
+            }
+        ]
+    ]
+
+    out = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json(
+        tasks,
+        str(out),
+        scheduler_phases=scheduler_phases,
+        core_to_thread=[0, 0],
+        deps_edges={},
+        deps_block_map={task_id: 2},
+    )
+
+    with out.open() as f:
+        events = json.load(f)["traceEvents"]
+    complete = next(e for e in events if e.get("cat") == "scheduler" and e.get("name") == "complete(2)")
+    assert complete["args"]["finishes_processed"] == 2
+    assert complete["args"]["finish_rows_attributed"] == 2
 
 
 def test_complete_flow_worker_view_only_without_scheduler_phases(tmp_path):

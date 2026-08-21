@@ -30,42 +30,36 @@ instead of hanging CI.
 """
 
 import os
-import signal
 import struct
 import threading
 import time
-from contextlib import contextmanager
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from simpler.task_interface import CallConfig, TaskArgs
-from simpler.worker import RunHandle, Worker
+from simpler.worker import RemoteCallable, RemoteWorkerSpec, RunHandle, Worker
 
-# Hard wall budget for a single failure scenario — comfortably above the
-# injected startup_timeout_s values below, well under any real hang.
-_TEST_WALL_BUDGET_S = 30.0
+from ._harness import (
+    CHIP_INIT_FAILURE,
+    TEST_WALL_BUDGET_S,
+    chip_callable,
+    fake_chip_l3,
+    hard_timeout,
+    install_fake_chip,
+    requires_sim_binaries,
+)
+
+_TEST_WALL_BUDGET_S = TEST_WALL_BUDGET_S
+_hard_timeout = hard_timeout
 
 
-@contextmanager
-def _hard_timeout(seconds: float, msg: str = "startup did not return within the hard test budget"):
-    """Abort the body with TimeoutError if it runs longer than ``seconds``.
+def _raiser(exc: BaseException):
+    """A stand-in whose call always raises ``exc``."""
 
-    A backstop against a regression that reintroduces an unbounded startup
-    spin: instead of hanging CI, the test fails with TimeoutError. Uses SIGALRM
-    (pytest runs on the main thread), which interrupts the barrier's
-    ``time.sleep`` poll.
-    """
+    def _fn(*_a, **_k):
+        raise exc
 
-    def _handler(_signum, _frame):
-        raise TimeoutError(msg)
-
-    old = signal.signal(signal.SIGALRM, _handler)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, old)
+    return _fn
 
 
 def _run_catch(fn):
@@ -651,10 +645,10 @@ class TestApiLinearizationDuringInit:
             proceed.set()
             it.join(10.0)
 
-    def test_close_during_initializing_fails_fast(self, monkeypatch):
-        # close() does not cancel an in-progress init: it fails fast so the
-        # INITIALIZING epoch is never torn down under its owner. The owner
-        # completes init and closes the READY tree itself.
+    def test_close_during_initializing_cancels_init(self, monkeypatch):
+        # close() on a non-owner thread during INITIALIZING cooperatively
+        # cancels the in-progress init and reaches CLOSED. Run close() in
+        # a thread so release.set() can fire while close() awaits init unwind.
         import simpler.worker as worker_mod  # noqa: PLC0415
 
         entered = threading.Event()
@@ -663,43 +657,30 @@ class TestApiLinearizationDuringInit:
 
         w = Worker(level=3, num_sub_workers=1, startup_timeout_s=30.0)
         w.register(lambda args: None)
-        proceed = threading.Event()
 
         def owner_body():
             _run_catch(w.init)
-            proceed.wait(10.0)
-            _run_catch(w.close)  # owner closes the READY tree
 
         it = threading.Thread(target=owner_body)
         it.start()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
                 assert entered.wait(3.0)
-                # A concurrent close() while INITIALIZING is rejected outright.
-                with pytest.raises(RuntimeError, match="in progress"):
-                    w.close()
-                assert w._lifecycle is worker_mod._Lifecycle.INITIALIZING
-                release.set()  # let init finish -> READY
+
+                close_result: list = []
+                ct = threading.Thread(target=lambda: close_result.append(_run_catch(w.close)))
+                ct.start()
+                # Wait for cancel token to latch, then release the init thread.
+                while not w._cancel_token:
+                    time.sleep(0.001)
+                release.set()
+                ct.join(10.0)
+                it.join(10.0)
+                assert close_result == [None]
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED
         finally:
             release.set()
-            proceed.set()
             it.join(10.0)
-
-
-class _FakeChipOk:
-    """Stand-in for a ChipWorker whose init succeeds — no NPU touched."""
-
-    def init(self, *_a, **_k):
-        pass
-
-    def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
-        pass
-
-    def _run_slot(self, *_a, **_k):
-        pass
-
-    def finalize(self):
-        pass
 
 
 # Module-level (picklable-by-reference) probe for the callable-__del__-reenters-
@@ -734,8 +715,6 @@ class TestLevel2Lifecycle:
     """
 
     def _make_l2(self, monkeypatch):
-        import simpler.worker as worker_mod  # noqa: PLC0415
-
         import simpler_setup.runtime_builder as rb_mod  # noqa: PLC0415
 
         class _FakeBuilder:
@@ -747,7 +726,7 @@ class TestLevel2Lifecycle:
 
         # Mock the device/runtime layer so this stays device-free (no sim
         # binaries required) — the regression is purely the lifecycle state.
-        monkeypatch.setattr(worker_mod, "ChipWorker", _FakeChipOk)
+        install_fake_chip(monkeypatch)
         monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
         return Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
 
@@ -761,7 +740,7 @@ class TestLevel2Lifecycle:
             # A second close is a clean no-op (does not re-block on the epoch cv).
             w.close()
 
-    def test_l2_submit_returns_completed_handle(self, monkeypatch):
+    def test_l2_submit_returns_live_handle(self, monkeypatch):
         from simpler.task_interface import ChipCallable  # noqa: PLC0415
 
         w = self._make_l2(monkeypatch)
@@ -771,9 +750,125 @@ class TestLevel2Lifecycle:
             w.init()
             run_handle = w.submit(callable_handle)
             assert isinstance(run_handle, RunHandle)
+            # The handle is backed by a live lane run rather than born terminal:
+            # a fake chip reaches its fence immediately, so `done` says nothing
+            # here, but the run must be registered and waiting must reach it.
+            run_id = run_handle._run_id
+            assert run_id is not None
+            assert w._chip_run_for(run_id) is not None
+            assert run_handle.wait() is None
+            # Waiting retires the lane entry; the handle stays terminal and
+            # waiting again is idempotent rather than a second submit.
+            assert w._chip_run_for(run_id) is None
             assert run_handle.done
             assert run_handle.wait() is None
             w.close()
+
+    @pytest.mark.parametrize("timeout", [float("nan"), float("inf")])
+    def test_l2_wait_rejects_unrepresentable_timeout_before_the_binding(self, monkeypatch, timeout):
+        """A timeout the steady clock cannot express never reaches ``duration_cast``.
+
+        ``_ChipRun.wait`` converts a ``double`` to the clock's integral
+        representation, and converting NaN or an infinity that way is
+        undefined. The public surface never gets there: ``RunHandle._deadline``
+        rejects both as non-finite first, so this pins the outer gate that makes
+        the binding's own check defence in depth rather than the only guard.
+        """
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)
+        callable_handle = w.register(ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[]))
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            handle = w.submit(callable_handle)
+            with pytest.raises(ValueError, match="non-negative finite"):
+                handle.wait(timeout)
+            handle.wait()
+            w.close()
+
+    def test_l2_run_equals_submit_then_wait(self, monkeypatch):
+        """``run`` is the blocking composition of ``submit`` and ``wait``."""
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)
+        callable = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+        callable_handle = w.register(callable)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._chip_worker is not None
+            impl = w._chip_worker._impl
+            w.run(callable_handle)
+            w.submit(callable_handle).wait()
+            # Both forms admit through the same lane entry point, so the direct
+            # path has one authority rather than a blocking bypass beside it.
+            assert len(impl.submitted) == 2
+            assert all(run.wait_count >= 1 for _cid, run in impl.submitted)
+            w.close()
+
+    def test_l2_unwaited_handle_is_drained_by_close(self, monkeypatch):
+        """A handle the caller drops still owns device work until close drains it."""
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)
+        callable = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+        callable_handle = w.register(callable)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._chip_worker is not None
+            impl = w._chip_worker._impl
+            w.submit(callable_handle)  # deliberately never waited
+            assert not impl.lane_closed
+            w.close()
+            # close() drives the lane's own drain, where a failure is reported
+            # through the cleanup journal instead of being swallowed by the
+            # lane destructor — and it does so while the device is still up,
+            # since draining after finalize would wait on a device that is gone.
+            assert impl.lane_closed
+            assert impl.lane_closed_before_finalize is True
+
+    def test_l2_close_reports_lane_failure_only_when_undelivered(self, monkeypatch):
+        """Close re-raises the lane's poison only if no wait already delivered it.
+
+        The lane rethrows its poison on every close. A run whose handle was
+        waited on has already raised that error at the wait, so repeating it at
+        close would turn a failure the caller handled into an unhandled one —
+        which is what the onboard fault-injection scene tests do: they assert
+        ``run()`` raises and then close in a ``finally``.
+        """
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        callable = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+        boom = RuntimeError("chip run lane is poisoned")
+
+        # Waited: the error reached the caller at wait(), so close is silent.
+        w = self._make_l2(monkeypatch)
+        handle = w.register(callable)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._chip_worker is not None
+            impl = w._chip_worker._impl
+            # The run itself fails, so waiting on the handle raises boom — the
+            # lane's poison and the caller's error are the same failure, which
+            # is what makes the close below a repeat rather than news.
+            impl.run_error = boom
+            monkeypatch.setattr(impl, "_close_chip_run_lane", _raiser(boom))
+            with pytest.raises(RuntimeError, match="poisoned"):
+                w.submit(handle).wait()
+            assert not w._chip_runs
+            w.close()
+
+        # Never waited: nobody has been told, so close is the first report.
+        w2 = self._make_l2(monkeypatch)
+        handle2 = w2.register(callable)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w2.init()
+            assert w2._chip_worker is not None
+            impl2 = w2._chip_worker._impl
+            monkeypatch.setattr(impl2, "_close_chip_run_lane", _raiser(boom))
+            w2.submit(handle2)
+            assert w2._chip_runs
+            with pytest.raises(RuntimeError, match="poisoned"):
+                w2.close()
 
     def test_l2_close_without_init_is_noop(self, monkeypatch):
         w = self._make_l2(monkeypatch)
@@ -925,6 +1020,119 @@ class TestLevel2Lifecycle:
             w._hierarchical_start_cv = real_cv
             assert _run_catch(w.close) is None
 
+    def test_close_outcome_retries_an_interrupt_before_publication(self, monkeypatch):
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        interrupt = SystemExit("before close outcome publication")
+        entered = threading.Event()
+        release = threading.Event()
+        attempt_type = worker_mod._CloseAttempt
+
+        class _InterruptBeforeOutcome(attempt_type):
+            __slots__ = ("_armed",)
+
+            def __init__(self):
+                super().__init__()
+                object.__setattr__(self, "_armed", True)
+
+            def publish(self, error, incomplete):
+                if self._armed:
+                    object.__setattr__(self, "_armed", False)
+                    entered.set()
+                    assert release.wait(10.0)
+                    raise interrupt
+                return super().publish(error, incomplete)
+
+        monkeypatch.setattr(worker_mod, "_CloseAttempt", _InterruptBeforeOutcome)
+        w = self._make_l2(monkeypatch)
+        owner_result: list = []
+        joiner_result: list = []
+
+        def owner():
+            w.init()
+            owner_result.append(_run_catch(w.close))
+
+        owner_thread = threading.Thread(target=owner)
+        joiner_thread = threading.Thread(target=lambda: joiner_result.append(_run_catch(w.close)))
+        owner_thread.start()
+        try:
+            assert entered.wait(5.0)
+            joiner_thread.start()
+            time.sleep(0.1)
+            assert joiner_thread.is_alive()
+            release.set()
+            owner_thread.join(5.0)
+            joiner_thread.join(5.0)
+
+            assert not owner_thread.is_alive()
+            assert not joiner_thread.is_alive()
+            assert owner_result == [interrupt]
+            assert joiner_result == [interrupt]
+            assert w._close_completion is not None and w._close_completion.done
+            assert w._close_completion.error is interrupt
+            assert _run_catch(w.close) is interrupt
+        finally:
+            release.set()
+            owner_thread.join(5.0)
+            if joiner_thread.ident is not None:
+                joiner_thread.join(5.0)
+
+    def test_close_outcome_survives_an_interrupt_after_publication(self, monkeypatch):
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        interrupt = SystemExit("after close outcome publication")
+        entered = threading.Event()
+        release = threading.Event()
+        attempt_type = worker_mod._CloseAttempt
+
+        class _InterruptAfterOutcome(attempt_type):
+            __slots__ = ("_armed",)
+
+            def __init__(self):
+                super().__init__()
+                object.__setattr__(self, "_armed", True)
+
+            def __setattr__(self, name, value):
+                if name == "_outcome" and value is not None and self._armed:
+                    super().__setattr__(name, value)
+                    object.__setattr__(self, "_armed", False)
+                    entered.set()
+                    assert release.wait(10.0)
+                    raise interrupt
+                return super().__setattr__(name, value)
+
+        monkeypatch.setattr(worker_mod, "_CloseAttempt", _InterruptAfterOutcome)
+        w = self._make_l2(monkeypatch)
+        owner_result: list = []
+        joiner_result: list = []
+
+        def owner():
+            w.init()
+            owner_result.append(_run_catch(w.close))
+
+        owner_thread = threading.Thread(target=owner)
+        joiner_thread = threading.Thread(target=lambda: joiner_result.append(_run_catch(w.close)))
+        owner_thread.start()
+        try:
+            assert entered.wait(5.0)
+            assert w._close_completion is not None and w._close_completion.done
+            joiner_thread.start()
+            joiner_thread.join(5.0)
+            assert not joiner_thread.is_alive()
+            assert joiner_result == [None]
+
+            release.set()
+            owner_thread.join(5.0)
+            assert not owner_thread.is_alive()
+            assert owner_result == [interrupt]
+            assert w._close_completion.error is None
+            assert _run_catch(w.close) is None
+        finally:
+            release.set()
+            owner_thread.join(5.0)
+            if joiner_thread.ident is not None:
+                joiner_thread.join(5.0)
+
     def test_reap_deadline_starts_after_shutdown_broadcast(self, monkeypatch):
         # The child-reap grace must be measured from when SHUTDOWN is broadcast,
         # not from teardown entry: a slow pre-child cleanup step must not consume
@@ -938,7 +1146,7 @@ class TestLevel2Lifecycle:
         w._worker = types.SimpleNamespace(close=lambda: None)  # look "started" for the L3 branch
 
         # A slow pre-child cleanup step (runs before the SHUTDOWN broadcast).
-        monkeypatch.setattr(Worker, "_release_all_host_buffers", lambda self: time.sleep(0.6))
+        monkeypatch.setattr(Worker, "_release_all_buffers", lambda self: time.sleep(0.6))
         captured: dict = {}
 
         def capture_reap(groups, deadline):
@@ -1263,16 +1471,16 @@ class TestLevel2Lifecycle:
             proceed.set()
             t1.join(5.0)
 
-    def test_l2_close_during_initializing_fails_fast(self, monkeypatch):
-        # close() cannot cancel an in-progress L2 init: it fails fast, the owner
-        # finishes init to READY, and the owner then finalizes the device
-        # same-thread. No cross-thread finalize, no resurrected epoch.
+    def test_l2_close_during_initializing_cancels_init(self, monkeypatch):
+        # close() on a non-owner thread during an L2 INITIALIZING cooperatively
+        # cancels the in-progress ChipWorker.init. The device is finalized by
+        # init's cleanup, and close reaches CLOSED. Run close() in a thread so
+        # release.set() fires while close() awaits init unwind.
         import simpler.worker as worker_mod  # noqa: PLC0415
 
         entered = threading.Event()
         release = threading.Event()
         finalized = {"n": 0}
-        proceed = threading.Event()
 
         class _PausingChip:
             def init(self, *_a, **_k):
@@ -1290,58 +1498,31 @@ class TestLevel2Lifecycle:
 
         def owner_body():
             init_err.append(_run_catch(w.init))
-            proceed.wait(10.0)
-            _run_catch(w.close)  # owner finalizes the device same-thread
 
         t1 = threading.Thread(target=owner_body)
         t1.start()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
                 assert entered.wait(3.0)
-                with pytest.raises(RuntimeError, match="in progress"):
-                    w.close()
-                assert w._lifecycle is worker_mod._Lifecycle.INITIALIZING
-                release.set()  # init completes -> READY
-                proceed.set()  # owner then closes
+
+                close_result: list = []
+                ct = threading.Thread(target=lambda: close_result.append(_run_catch(w.close)))
+                ct.start()
+                # Wait for cancel token to latch, then release init.
+                while not w._cancel_token:
+                    time.sleep(0.001)
+                release.set()
+                ct.join(10.0)
                 t1.join(10.0)
-                assert init_err[0] is None
+                assert close_result == [None]
                 assert w._lifecycle is worker_mod._Lifecycle.CLOSED
-                assert finalized["n"] == 1  # device finalized once, same-thread
+                assert finalized["n"] == 1  # device finalized by init cleanup
         finally:
             release.set()
-            proceed.set()
             t1.join(5.0)
 
 
-class _FakeChipRaises:
-    """Stand-in for ChipWorker whose init raises — no NPU touched."""
-
-    def init(self, *_a, **_k):
-        raise RuntimeError("injected chip init failure")
-
-    def finalize(self):  # pragma: no cover - never reached (init raises)
-        pass
-
-
-class _FakeChipHangs:
-    def init(self, *_a, **_k):
-        time.sleep(3600)
-
-    def finalize(self):  # pragma: no cover
-        pass
-
-
-def _sim_binaries_available() -> bool:
-    try:
-        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        RuntimeBuilder("a2a3sim").get_binaries("tensormap_and_ringbuffer")
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-@pytest.mark.skipif(not _sim_binaries_available(), reason="a2a3sim runtime binaries not built")
+@requires_sim_binaries
 class TestChipStartupFailure:
     """Chip (L2) startup failure — device-free via a faked ChipWorker on a2a3sim.
 
@@ -1353,41 +1534,18 @@ class TestChipStartupFailure:
     the former ``while ... != INIT_DONE`` was on this chip path).
     """
 
-    def _make_l3(self, timeout_s):
-        return Worker(
-            level=3,
-            device_ids=[0],
-            platform="a2a3sim",
-            runtime="tensormap_and_ringbuffer",
-            num_sub_workers=0,
-            startup_timeout_s=timeout_s,
-        )
-
     def test_chip_init_failure_raises_bounded(self, monkeypatch):
-        import simpler.worker as worker_mod  # noqa: PLC0415
-
-        monkeypatch.setattr(worker_mod, "ChipWorker", _FakeChipRaises)
-        l3 = self._make_l3(timeout_s=10.0)  # chip-only; the chip forks from device_ids
-        try:
-            with _hard_timeout(_TEST_WALL_BUDGET_S):
-                with pytest.raises(RuntimeError, match="injected chip init failure"):
-                    l3.init()
-        finally:
-            l3.close()
+        # chip-only L3; the chip forks from device_ids
+        with fake_chip_l3(monkeypatch, script="raises", init=False, startup_timeout_s=10.0) as l3:
+            with pytest.raises(RuntimeError, match=CHIP_INIT_FAILURE):
+                l3.init()
 
     def test_chip_init_hang_trips_deadline(self, monkeypatch):
-        import simpler.worker as worker_mod  # noqa: PLC0415
-
-        monkeypatch.setattr(worker_mod, "ChipWorker", _FakeChipHangs)
-        l3 = self._make_l3(timeout_s=1.5)  # chip-only; the chip forks from device_ids
         start = time.monotonic()
-        try:
-            with _hard_timeout(_TEST_WALL_BUDGET_S):
-                with pytest.raises(RuntimeError, match="deadline"):
-                    l3.init()
+        with fake_chip_l3(monkeypatch, script="hangs", init=False, startup_timeout_s=1.5) as l3:
+            with pytest.raises(RuntimeError, match="deadline"):
+                l3.init()
             assert 1.5 <= time.monotonic() - start < _TEST_WALL_BUDGET_S
-        finally:
-            l3.close()
 
 
 class TestEligibleTargetPrecheck:
@@ -1448,6 +1606,83 @@ class TestEligibleTargetPrecheck:
             assert w._initialized is True
             w.close()
 
+    @requires_sim_binaries
+    def test_chip_backed_l3_with_chip_callable_inits(self, monkeypatch):
+        # LOCAL_CHIP positive: the chip child resolves the ChipCallable and
+        # prepares it before publishing INIT_READY, so the tree comes up READY.
+        with fake_chip_l3(monkeypatch, init=False) as w:
+            w.register(chip_callable())
+            w.init()
+            assert w._initialized is True
+
+    def test_chipless_l3_with_chip_callable_rejected_at_init(self):
+        # LOCAL_CHIP negative: a ChipCallable is installed only into chip child
+        # loops, so a sub-backed but chipless L3 has no resolver for it.
+        w = Worker(level=3, num_sub_workers=1)
+        w.register(chip_callable())
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                with pytest.raises(
+                    RuntimeError, match=r"LOCAL_CHIP callable .* \(needs a chip device \(device_ids\)\)"
+                ):
+                    w.init()
+                assert w._chip_pids == []
+        finally:
+            w.close()
+
+    def test_post_init_chip_callable_on_chipless_l3_rejected(self):
+        # The same LOCAL_CHIP rule, one epoch later: an L3 that came up without
+        # a chip child cannot resolve a ChipCallable handed to it post-init
+        # either, so register() must reject it instead of returning an inert
+        # handle.
+        w = Worker(level=3, num_sub_workers=1)
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                w.init()
+                with pytest.raises(ValueError, match=r"\(needs a chip device \(device_ids\)\)"):
+                    w.register(chip_callable())
+        finally:
+            w.close()
+
+    def test_remote_callable_naming_its_own_remote_passes_init_gate(self):
+        # REMOTE_TASK_DISPATCHER positive: the callable names a worker id that
+        # add_remote_worker returned, so the gate init() runs over the startup
+        # snapshot accepts it. Driven directly rather than through init(), which
+        # would additionally attach a live remote L3 session.
+        w = Worker(level=4, num_sub_workers=0)
+        worker_id = w.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = w.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
+        try:
+            assert w._resolve_handle(handle).target_namespace == "REMOTE_TASK_DISPATCHER"
+            w._validate_eligible_targets()
+        finally:
+            w.close()
+
+    def test_remote_callable_naming_unknown_worker_is_rejected(self):
+        # REMOTE_TASK_DISPATCHER negative: naming an id that add_remote_worker
+        # never returned is refused at register, i.e. before the registration
+        # can reach the startup snapshot that _validate_eligible_targets scans.
+        w = Worker(level=4, num_sub_workers=0)
+        worker_id = w.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        try:
+            with pytest.raises(ValueError, match="workers must name remote worker ids"):
+                w.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id + 1])
+        finally:
+            w.close()
+
+    def test_remote_need_is_the_unmet_named_workers(self):
+        # The init-time rule behind both cases above: a REMOTE_TASK_DISPATCHER
+        # registration is eligible exactly when every id it names is a live
+        # remote worker. Driven directly because register() refuses to build the
+        # ineligible registration in the first place.
+        w = Worker(level=4, num_sub_workers=0)
+        worker_id = w.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        try:
+            assert w._eligible_target_need("REMOTE_TASK_DISPATCHER", (worker_id,)) is None
+            assert "add_remote_worker" in w._eligible_target_need("REMOTE_TASK_DISPATCHER", (worker_id + 1,))
+        finally:
+            w.close()
+
 
 class TestTerminalStateContract:
     """CLOSED is terminal: no later API reopens the epoch."""
@@ -1501,6 +1736,37 @@ class TestTerminalStateContract:
                     parent.add_worker(child)
             finally:
                 child.close()
+
+    def test_add_worker_freezes_child_before_topology_publication(self):
+        parent = Worker(level=4, num_sub_workers=0)
+        child = Worker(level=3, num_sub_workers=0)
+        parent.add_worker(child)
+
+        with child._hierarchical_start_cv:
+            assert child._topology_parent is parent
+        with pytest.raises(RuntimeError, match="attached as a child"):
+            child.init()
+
+    def test_add_worker_rejects_self_attachment(self):
+        worker = Worker(level=4, num_sub_workers=0)
+        with pytest.raises(ValueError, match="cannot add a Worker to itself"):
+            worker.add_worker(worker)
+
+    def test_add_worker_rejects_already_attached_child(self):
+        first_parent = Worker(level=4, num_sub_workers=0)
+        second_parent = Worker(level=4, num_sub_workers=0)
+        child = Worker(level=3, num_sub_workers=0)
+        first_parent.add_worker(child)
+        with pytest.raises(RuntimeError, match="already attached to another parent"):
+            second_parent.add_worker(child)
+
+    def test_add_worker_rejects_attached_parent(self):
+        root = Worker(level=5, num_sub_workers=0)
+        middle = Worker(level=4, num_sub_workers=0)
+        leaf = Worker(level=3, num_sub_workers=0)
+        root.add_worker(middle)
+        with pytest.raises(RuntimeError, match="already attached as a child"):
+            middle.add_worker(leaf)
 
 
 class TestFailureSurfacing:

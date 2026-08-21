@@ -21,7 +21,7 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar as SScalar
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
-from simpler_setup import Tensor as STensor
+from simpler_setup import TensorArg as STensor
 
 from .._helpers import (
     COUNT_PER_RANK,
@@ -96,6 +96,7 @@ class TestBroadcastP2(SceneTestCase):
         {
             "name": "p2",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2},
         }
@@ -117,6 +118,7 @@ class TestBroadcastP4(SceneTestCase):
         {
             "name": "p4",
             "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "manual": True,
             "config": {"device_count": 4},
             "params": {"nranks": 4},
         }

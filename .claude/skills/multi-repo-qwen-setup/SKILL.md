@@ -45,8 +45,9 @@ styles**. They measure different things; don't confuse them:
   .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
   task-submit --device auto --device-num 1 --run "\
     python -m pytest examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode \
-      --platform a2a3 --device \$TASK_DEVICE"
-  # standalone: python .../qwen3_14b_decode/test_qwen3_14b_decode.py -p a2a3 -d \$TASK_DEVICE
+      --platform a2a3 --device \$TASK_DEVICE --manual include"
+  # standalone: python .../qwen3_14b_decode/test_qwen3_14b_decode.py \
+  #   -p a2a3 -d \$TASK_DEVICE --manual include
   ```
 
   This is **not** a cross-repo path, so the rest of this skill (§1 setup,
@@ -63,7 +64,7 @@ styles**. They measure different things; don't confuse them:
 - **Path B — `decode_fwd` kernel (pypto-lib).** A single JIT case, not the
   engine. Entry `models/qwen3/14b/decode_fwd.py`, flags `-p <platform> -d
   <device>` plus `--validate-fwd --fwd-layers N --decode-steps M --max-seq`
-  (device TPOT) and `--enable-dep-gen` / `--enable-l2-swimlane <1-4>` (DFX,
+  (device TPOT) and `--enable-dep-gen` / `--enable-chip-swimlane <1-4>` (DFX,
   two separate rounds). Measures **per-step device decode cost + scheduler
   timeline** (per-op / Orch/Sched breakdown); read via
   `sched_overhead_analysis` / `swimlane_converter` (§6). Use it to dig into
@@ -125,8 +126,8 @@ task-submit --timeout 2400 --max-time 2400 --device auto --device-num 1 --run "\
   host wall, per-step layer breakdown) plus `strace_timing --rounds-table`
   (§2–§5).
 - Decode dispatches through the **L3 `DistributedWorker`**, which forks a
-  **chip-child (L2)** that runs `run_prepared`. The per-step timing lives at
-  **L2**: `run_prepared` computes both host (`host_wall`) and device
+  **chip-child (L2)** that runs `simpler_run`. The per-step timing lives at
+  **L2**: `simpler_run` computes both host (`host_wall`) and device
   (`device_wall` = the fused-decode orchestrator wall, ~40 ms at 3.5k context —
   nonzero) plus the device orch/sched markers. The L3 parent's `Worker.run`
   returns `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3
@@ -214,7 +215,7 @@ makespan** = the "kernel run time" layer.
 For layers ②③④ — the host↔device and bind/validate spans — parse the
 `[STRACE]` host-trace markers with `strace_timing.py` (landed in
 [simpler #1177](https://github.com/hw-native-sys/simpler/pull/1177)). The
-markers are emitted at `LOG_INFO_V9` under `SIMPLER_DFX` (no new flag),
+markers are emitted at `LOG_TIMING` under `SIMPLER_DFX` (no new flag),
 so the same log captured above carries them:
 
 ```bash
@@ -236,14 +237,14 @@ The full per-token decomposition (what each layer means / how to get it):
 | ④ attach+bind+validate | `host_wall − runner_run` | `strace_timing` (`bind`/`validate` spans) |
 | ⑤ python/executor wrap | `end-to-end − host_wall` | `npu_generate --profile` |
 
-②③④ come from the **L2 chip-child** `run_prepared`'s `host_wall` /
+②③④ come from the **L2 chip-child** `simpler_run`'s `host_wall` /
 `runner_run` / `device_wall`. `host_wall` and `device_wall` are already
 computed there (and `device_wall` is nonzero, ~40 ms at 3.5k context — it is the
 L2 orchestrator wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3
 parent drops the child's `RunTiming`, so they never reach a return value.
 
 Simpler surfaces them instead as **`[STRACE]` host-trace markers** — one
-line per `run_prepared` stage
+line per `chip.run` stage
 (`bind`/`bind.args`/`bind.prebuilt`/`runner_run`/`validate`) plus the AICPU
 device-phase subdivision (`preamble`/`so_load`/`graph_build` — with
 `config_validate`/`arena_wire`/`sm_reset` prep sub-phases — /`post_orch`,
@@ -310,17 +311,17 @@ layer — enough to read per-op / scheduler structure.
 
 ```bash
 python models/qwen3/14b/decode_fwd.py -p a2a3 -d $DEV --validate-fwd --fwd-layers 2 --max-seq --enable-dep-gen        # topology -> deps.json
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d $DEV --validate-fwd --fwd-layers 2 --max-seq --enable-l2-swimlane 4  # 1=AICore 2=+dispatch 3=+sched 4=+orch
+python models/qwen3/14b/decode_fwd.py -p a2a3 -d $DEV --validate-fwd --fwd-layers 2 --max-seq --enable-chip-swimlane 4  # 1=AICore 2=+dispatch 3=+sched 4=+orch
 ```
 
 Both write `build_output/_jit_*/dfx_outputs/`: `deps.json`,
-`l2_swimlane_records.json`, and a ready-to-load **`merged_swimlane_*.json`**
+`chip_swimlane_records.json`, and a ready-to-load **`merged_swimlane_*.json`**
 (Perfetto — drag into ui.perfetto.dev). Analyze from the simpler worktree
 (its `simpler_setup/tools` wins by cwd precedence):
 
 ```bash
 $PY -m simpler_setup.tools.swimlane_converter RECORDS.json --deps-json DEPS.json [--overhead] -o swim.json
-$PY -m simpler_setup.tools.sched_overhead_analysis --l2-swimlane-records-json RECORDS.json --deps-json DEPS.json
+$PY -m simpler_setup.tools.sched_overhead_analysis --chip-swimlane-records-json RECORDS.json --deps-json DEPS.json
 $PY -m simpler_setup.tools.deps_viewer DEPS.json --format html --func-names NAME_MAP.json -o deps.html
 ```
 
@@ -368,9 +369,9 @@ strings "$BD/$SO" | grep -m1 '<your-new-log-string>'   # confirm it baked in
 
 (`.venv/lib64` is a symlink to `lib`, so the `find` covers both.) AICPU device
 logs land in `ASCEND_PROCESS_LOG_PATH/.../device-*/device-*.log` — set that var
-per run (see `running-onboard`) and note AICPU `LOG_INFO_V*` uses **inverted**
-verbosity: `v=9` is must-see (default threshold 5), `v=0` is filtered — use
-`LOG_INFO_V9` for a diagnostic you need to read back.
+per run (see `running-onboard`). Use `--log-level info` to capture `LOG_INFO`
+diagnostics, or `--log-level debug` when the more detailed `LOG_DEBUG` stream is
+also needed.
 
 ## Anti-patterns
 

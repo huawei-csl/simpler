@@ -54,8 +54,8 @@ static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPR
 
 static bool g_enable_dump_args = false;
 // Dump level latched from the header in dump_args_init(). The selective
-// (PARTIAL) and json-only (FULL_JSON_ONLY) modes are derived from it rather
-// than tracked as separate flags — mirrors g_l2_swimlane_level.
+// (PARTIAL) and metadata-first (HYBRID) modes are derived from it rather
+// than tracked as separate flags — mirrors g_chip_swimlane_level.
 static DumpArgsLevel g_dump_args_level = DumpArgsLevel::OFF;
 
 extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dump_base = dump_data_base; }
@@ -210,6 +210,10 @@ extern "C" bool is_dump_args_enabled() { return g_enable_dump_args; }
 
 extern "C" bool is_dump_args_selective_mode() { return g_dump_args_level == DumpArgsLevel::PARTIAL; }
 
+extern "C" bool should_load_dump_args_task_masks() {
+    return g_dump_args_level == DumpArgsLevel::PARTIAL || g_dump_args_level == DumpArgsLevel::HYBRID;
+}
+
 extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags) {
     if (mask == ARGS_DUMP_ARG_MASK_NONE) {
         return;
@@ -356,6 +360,21 @@ struct DumpDeviceModule {
     static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
 
     static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        DumpBufferState *state = s_dump_states[ctx.thread_idx];
+        auto *buffer = reinterpret_cast<DumpMetaBuffer *>(buffer_ptr);
+        uint64_t payload_count = 0;
+        uint32_t record_count = buffer->count;
+        if (record_count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
+            record_count = PLATFORM_DUMP_RECORDS_PER_BUFFER;
+        }
+        for (uint32_t i = 0; i < record_count; i++) {
+            const ArgsDumpRecord &record = buffer->records[i];
+            if (record.kind == static_cast<uint8_t>(ArgsDumpKind::TENSOR) && record.payload_size > 0) {
+                payload_count++;
+            }
+        }
+        state->published_payload_count += payload_count;
+        wmb();
         ctx.header->queues[ctx.thread_idx][tail].thread_index = static_cast<uint32_t>(ctx.thread_idx);
         ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
@@ -424,6 +443,49 @@ static int switch_dump_meta_buffer(int thread_idx) {
     }
     DumpEngine::switch_buffer(dump_context(thread_idx), state);
     return 0;
+}
+
+static bool ensure_dump_arena_capacity(int thread_idx, DumpBufferState *state, uint64_t copy_bytes) {
+    if (copy_bytes == 0) {
+        return true;
+    }
+    if (state == nullptr || copy_bytes > state->arena_size) {
+        return false;
+    }
+
+    const uint64_t physical_offset = state->arena_write_offset % state->arena_size;
+    const bool arena_full = state->arena_write_offset != 0 && physical_offset == 0;
+    const bool crosses_arena_end = copy_bytes > state->arena_size - physical_offset;
+    if (!arena_full && !crosses_arena_end) {
+        return true;
+    }
+
+    DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
+    if (buf != nullptr && buf->count > 0) {
+        uint32_t seq = state->current_buf_seq;
+        if (switch_dump_meta_buffer(thread_idx) != 0 || state->current_buf_seq == seq) {
+            return false;
+        }
+    }
+
+    const uint64_t target_payload_count = state->published_payload_count;
+    const uint64_t wait_start = get_sys_cnt_aicpu();
+    bool signalled = false;
+    dfx_backpressure::mark_fq_contended(s_dump_header, &signalled);
+    if (!dfx_backpressure::wait_for_release(s_dump_header, wait_start, kDumpQueueBackpressureWaitCycles)) {
+        return false;
+    }
+    while (state->completed_payload_count < target_payload_count) {
+        if (get_sys_cnt_aicpu() - wait_start >= kDumpQueueBackpressureWaitCycles) {
+            return false;
+        }
+        SPIN_WAIT_HINT();
+    }
+    rmb();
+    if (physical_offset != 0) {
+        state->arena_write_offset += state->arena_size - physical_offset;
+    }
+    return true;
 }
 
 struct CircularArenaWriter {
@@ -543,10 +605,11 @@ void dump_args_init(int num_dump_threads) {
 
     // Latch dump level from the host-written header before any task is dumped.
     // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
-    // FULL_JSON_ONLY → every task, metadata only (no payload copied into arena).
+    // HYBRID → every task's metadata; payload is copied only for
+    // arguments selected through the same per-task mask as PARTIAL.
     g_dump_args_level = static_cast<DumpArgsLevel>(s_dump_header->dump_args_level);
 
-    LOG_INFO_V0("Initializing args dump for %d threads", num_dump_threads);
+    LOG_INFO("Initializing args dump for %d threads", num_dump_threads);
 
     // Pop initial metadata buffer from free_queue for each thread
     for (int t = 0; t < num_dump_threads; t++) {
@@ -617,15 +680,27 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
     bool truncated = false;
     bool is_contiguous = dump_arg_is_contiguous(info);
     bool is_scalar = kind == ArgsDumpKind::SCALAR;
+    bool capture_payload = info.capture_payload != 0;
 
-    if (is_scalar || g_dump_args_level == DumpArgsLevel::FULL_JSON_ONLY) {
-        // JSON-only level captures full metadata but no payload, so the
-        // record carries shape/dtype/strides with payload_size == 0.
+    if (is_scalar || (g_dump_args_level == DumpArgsLevel::HYBRID && !capture_payload)) {
         copy_bytes = 0;
     } else if (bytes > state->arena_size) {
-        // Tensor larger than entire arena — copy a partial sample
+        // ChipTensor larger than entire arena — copy a partial sample
         copy_bytes = state->arena_size / 2;
         truncated = true;
+    }
+
+    if (!ensure_dump_arena_capacity(thread_idx, state, copy_bytes)) {
+        account_dropped_records(state, 1);
+        return -1;
+    }
+    buf = s_current_dump_buf[thread_idx];
+    if (buf == nullptr) {
+        buf = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
+        if (buf == nullptr) {
+            account_dropped_records(state, 1);
+            return -1;
+        }
     }
 
     uint64_t offset = state->arena_write_offset;
@@ -713,7 +788,7 @@ void dump_args_flush(int thread_idx) {
 
     s_buffers_flushed[thread_idx]++;
     uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->dropped_record_count : 0;
-    LOG_INFO_V0(
+    LOG_INFO(
         "Thread %d: dump_args_flush (records=%u, buf_switches=%u, flushes=%u, dropped=%u)", thread_idx,
         s_records_written[thread_idx], s_buffers_switched[thread_idx], s_buffers_flushed[thread_idx], dropped
     );

@@ -38,20 +38,19 @@ namespace {
 constexpr int kElems = 128 * 128;
 
 template <typename T>
-static inline __aicore__ __gm__ T *tensor_data(__gm__ Tensor *tensor) {
+static inline __aicore__ __gm__ T *tensor_data(__gm__ ChipTensor *tensor) {
     return reinterpret_cast<__gm__ T *>(tensor->buffer.addr) + tensor->start_offset;
 }
 
 }  // namespace
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
+    __gm__ ChipTensor *out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
-    // workSpace == 0 means the URMA overlay is not built in
-    // (SIMPLER_ENABLE_PTO_URMA_WORKSPACE=OFF, see docs/a5-sdma-overlay.md
-    // #1315): self-skip rather than dereferencing a null workspace.
+    // A null workspace means the host runtime was not built with the URMA
+    // backend; self-skip rather than dereferencing it.
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
         comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         pipe_barrier(PIPE_ALL);

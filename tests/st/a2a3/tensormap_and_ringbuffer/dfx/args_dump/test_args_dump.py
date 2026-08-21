@@ -18,6 +18,7 @@ use the unified schema, and no legacy args-only manifest is emitted.
 """
 
 import json
+import struct
 import subprocess
 import sys
 import time
@@ -25,7 +26,7 @@ import time
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
 KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
@@ -36,7 +37,7 @@ class TestArgsDump(SceneTestCase):
     """args_dump capture smoke, level-aware on the ``--dump-args`` level.
 
     Uses ``partial_dump_orch`` (5 tasks; four carry ``dump(...)`` markers) so a
-    single orchestration exercises both modes:
+    single orchestration exercises all three enabled levels:
 
     - ``--dump-args 1`` (partial): only marked args are captured — task
       ``0x..00`` via no-arg ``dump()`` (all tensor + scalar args), task
@@ -46,6 +47,9 @@ class TestArgsDump(SceneTestCase):
       Mode is latched host-side before dispatch, so it is race-free regardless
       of submission order.
     - ``--dump-args 2`` (full): markers are ignored, every task is dumped.
+    - ``--dump-args 3`` (hybrid): every task is present in JSON, while
+      only tensors selected by those same ``dump(...)`` markers contribute
+      payload bytes to ``args.bin``.
 
     The dump level comes straight from the CLI ``--dump-args`` value
     (no per-case override).
@@ -83,7 +87,7 @@ class TestArgsDump(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
+            "manual": ["a2a3sim"],
             "params": {},
         },
     ]
@@ -91,9 +95,9 @@ class TestArgsDump(SceneTestCase):
     def generate_args(self, params):
         SIZE = 128 * 128
         return TaskArgsBuilder(
-            Tensor("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
-            Tensor("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
-            Tensor("f", torch.zeros(SIZE, dtype=torch.float32)),
+            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
+            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(SIZE, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -103,11 +107,17 @@ class TestArgsDump(SceneTestCase):
         # Marker taken before the run so we bind to this invocation's output dir
         # rather than a stale same-label leftover from a prior run/session.
         run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
-        super().test_run(st_platform, st_worker, request)
         level = int(request.config.getoption("--dump-args", default=0))
+        if level:
+            matched = self._matching_cases(st_platform, request)
+            assert len(matched) <= 1, (
+                "args-dump artifact assertions describe one case; add a case-specific "
+                "validator before extending TestArgsDump.CASES"
+            )
+        super().test_run(st_platform, st_worker, request)
         if not level:
             return
-        safe_label = _sanitize_for_filename("TestArgsDump_default")
+        safe_label = _sanitize_for_filename(f"TestArgsDump_{matched[0]['name']}")
         matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
         assert matches, "no args dump output directory created this run"
         out_dir = max(matches, key=lambda p: p.stat().st_mtime)
@@ -120,16 +130,12 @@ class TestArgsDump(SceneTestCase):
         bin_name = data.get("bin_file")
         tensors = data.get("args", [])
         assert tensors, f"args_dump.json has no entries: {data}"
-        if level == 3:
-            # full_json_only: metadata only, no payload and no .bin file.
-            assert bin_name is None, f"level 3 manifest should have bin_file=null: {data}"
-            assert not (dump_dir / "args.bin").exists(), "level 3 must not write args.bin"
-            assert all(t.get("bin_size") == 0 for t in tensors), tensors
-        else:
-            assert bin_name, f"manifest missing bin_file field: {data}"
-            bin_path = dump_dir / bin_name
-            assert bin_path.exists(), f"manifest names bin_file={bin_name!r} but {bin_path} not found"
-            assert bin_path.stat().st_size > 0, "args.bin is empty"
+        assert data.get("dump_args_level") == level
+        assert "payload_filter" not in data
+        assert bin_name, f"manifest missing bin_file field: {data}"
+        bin_path = dump_dir / bin_name
+        assert bin_path.exists(), f"manifest names bin_file={bin_name!r} but {bin_path} not found"
+        assert bin_path.stat().st_size > 0, "args.bin is empty"
 
         # Unified manifest (#792): tensors and scalar args share one
         # args_dump.json keyed by a "kind" field; no separate legacy sidecar files.
@@ -180,7 +186,7 @@ class TestArgsDump(SceneTestCase):
             # 0 + 2, not arg 1 (e).
             t02 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000002")
             assert t02 == [0, 2]
-            # Tensor-only task granularity: dump() captured all three tensor args.
+            # TensorArg-only task granularity: dump() captured all three tensor args.
             t03 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000003")
             assert t03 == [0, 1, 2]
             scalar_by_task = {
@@ -197,8 +203,34 @@ class TestArgsDump(SceneTestCase):
             ]
             assert ambiguous_scalars == [("0x0000000100000002", 3)]
         else:
-            # Full (level 2 or 3): markers ignored — every one of the 5 tasks is dumped.
-            assert len(task_ids) >= 5, f"full dump should cover all 5 tasks, got {sorted(task_ids)}"
+            # Full and hybrid both record every task; hybrid still uses the
+            # markers above to select tensor payload.
+            assert len(task_ids) >= 5, f"level {level} should cover all 5 tasks, got {sorted(task_ids)}"
+            if level == 3:
+                selected_tensor_slots = {
+                    ("0x0000000100000000", 0),
+                    ("0x0000000100000000", 1),
+                    ("0x0000000100000002", 0),
+                    ("0x0000000100000002", 2),
+                    ("0x0000000100000003", 0),
+                    ("0x0000000100000003", 1),
+                    ("0x0000000100000003", 2),
+                }
+                for entry in tensor_entries:
+                    selected = (entry["task_id"], entry["arg_index"]) in selected_tensor_slots
+                    assert (entry.get("bin_size", 0) > 0) == selected, entry
+
+                restored_input = next(
+                    entry
+                    for entry in tensor_entries
+                    if entry["task_id"] == "0x0000000100000000"
+                    and entry["arg_index"] == 0
+                    and entry["stage"] == "before_dispatch"
+                )
+                with bin_path.open("rb") as payload_file:
+                    payload_file.seek(restored_input["bin_offset"])
+                    payload = payload_file.read(restored_input["bin_size"])
+                assert payload == struct.pack("<f", 5.0) * (128 * 128)
 
         # ---- Tool smoke: dump_viewer ----
         # Exit-code-only check; the no-filter default lists every captured

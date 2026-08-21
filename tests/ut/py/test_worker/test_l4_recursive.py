@@ -12,16 +12,39 @@ L4 Worker dispatches to L3 Worker children (PROCESS mode). Each L3 Worker
 has its own SubWorkers. Verifies the full DAG completes and sub callables
 at L3 level see correct data.
 
-No NPU device required — L3 children use SubWorkers only (no ChipWorker).
+No NPU device required: the dataflow tests give their L3 children SubWorkers
+only, and the chip-callable cascade gives them a fake chip (``_harness``).
 """
+
+from __future__ import annotations
 
 import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+from _task_interface import DataType
+from simpler.buffer import mint_owner_instance_id, wrap_device_malloc
 from simpler.callable_identity import CallableHandle
 from simpler.task_interface import CallConfig, TaskArgs
 from simpler.worker import Worker
+
+from ._harness import (
+    SIM_PLATFORM,
+    SIM_RUNTIME,
+    TEST_WALL_BUDGET_S,
+    chip_callable,
+    hard_timeout,
+    install_fake_chip,
+    requires_sim_binaries,
+)
+
+_OID = mint_owner_instance_id()
+_HOSTBUF = bytearray(64)
+
+
+def _dev_handle(ptr: int, *, wid: int = 0):
+    return wrap_device_malloc(ptr, 64, _OID, buffer_id=ptr, owner_worker_id=wid)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,75 +151,96 @@ class TestL4Validation:
         with pytest.raises(RuntimeError, match="cannot be combined with device_ids"):
             w4.add_worker(child)
 
-    def test_malloc_on_l4_raises_index_error(self):
-        # L4 has no chip mailboxes — `Worker.malloc` must surface IndexError
-        # rather than silently dispatch CTRL_MALLOC to a next_level (L3 worker)
-        # child whose `_child_worker_loop` doesn't recognise CTRL_MALLOC and
-        # would return a garbage pointer from an uninitialised mailbox result
-        # slot.
+    def test_device_mem_on_l4_rejected(self):
+        # L4 has no chip mailboxes — device memory ops must be rejected rather than silently dispatch
+        # CTRL_MALLOC/FREE/COPY to a next_level (L3 worker) child whose `_child_worker_loop` doesn't
+        # recognise them and would return a garbage pointer from an uninitialised mailbox result slot.
+        # `malloc` is L2-only (TypeError); the child-device ops guard the worker id (IndexError).
         l3_child = Worker(level=3, num_sub_workers=0)
         w4 = Worker(level=4, num_sub_workers=0)
         w4.add_worker(l3_child)
         w4.init()
         try:
+            with pytest.raises(TypeError, match="L2-only"):
+                w4.malloc(1024)
             with pytest.raises(IndexError, match="out of range"):
-                w4.malloc(1024, worker_id=0)
+                w4.alloc_child_tensor(0, (256,), DataType.FLOAT32)
             with pytest.raises(IndexError, match="out of range"):
-                w4.free(0xDEADBEEF, worker_id=0)
+                w4.free(_dev_handle(0xDEADBEEF, wid=0))
             with pytest.raises(IndexError, match="out of range"):
-                w4.copy_to(0xDEAD, 0xBEEF, 64, worker_id=0)
+                w4.copy_to(_dev_handle(0xDEAD, wid=0), _HOSTBUF)
             with pytest.raises(IndexError, match="out of range"):
-                w4.copy_from(0xDEAD, 0xBEEF, 64, worker_id=0)
+                w4.copy_from(_HOSTBUF, _dev_handle(0xBEEF, wid=0))
         finally:
             w4.close()
 
 
+@requires_sim_binaries
 class TestL4DynamicRegister:
     """Cascade of CTRL_REGISTER / CTRL_UNREGISTER through an L4 → L3 worker tree.
 
-    The L3 child is sub-only (no chip device) so the cascade hits zero
-    chip mailboxes inside the L3 child — but exercises the full path
-    from L4 parent → next_level mailbox → ``_child_worker_loop`` CONTROL
-    handler → ``inner_worker._register_child_chip`` recursively. NPU not required.
+    The L3 child carries a fake chip, so the cascade runs the whole path from
+    L4 parent → next_level mailbox → ``_child_worker_loop`` CONTROL handler →
+    ``inner_worker._register_child_chip`` → the L3's own chip mailbox → the
+    chip child's native register. The fake crosses both forks, so no NPU is
+    required.
     """
 
-    def test_l4_register_chip_callable_after_init_succeeds(self):
-        from simpler.task_interface import ChipCallable  # noqa: PLC0415
-
-        l3 = Worker(level=3, num_sub_workers=1)
+    @staticmethod
+    def _l4_over_chip_backed_l3(monkeypatch, *, register_error: str | None = None) -> Worker:
+        install_fake_chip(monkeypatch, register_error=register_error)
+        l3 = Worker(
+            level=3,
+            device_ids=[0],
+            platform=SIM_PLATFORM,
+            runtime=SIM_RUNTIME,
+            num_sub_workers=1,
+            startup_timeout_s=10.0,
+        )
         l3.register(lambda args: None)  # at least one registered callable so L3 init is happy
 
-        w4 = Worker(level=4, num_sub_workers=0)
+        w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=10.0)
         w4.register(lambda orch, args, config: None)
         w4.add_worker(l3)
-        w4.init()
+        return w4
+
+    def test_l4_register_chip_callable_after_init_succeeds(self, monkeypatch):
+        w4 = self._l4_over_chip_backed_l3(monkeypatch)
         try:
-            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            handle = w4.register(callable_obj)
-            assert isinstance(handle, CallableHandle)
-            assert _slot_for(w4, handle) >= 0
+            with hard_timeout(TEST_WALL_BUDGET_S):
+                w4.init()
+                handle = w4.register(chip_callable())
+                assert isinstance(handle, CallableHandle)
+                assert _slot_for(w4, handle) >= 0
         finally:
             w4.close()
 
-    def test_l4_register_then_unregister_recycles_cid(self):
-        from simpler.task_interface import ChipCallable  # noqa: PLC0415
-
-        l3 = Worker(level=3, num_sub_workers=1)
-        l3.register(lambda args: None)
-
-        w4 = Worker(level=4, num_sub_workers=0)
-        w4.register(lambda orch, args, config: None)
-        w4.add_worker(l3)
-        w4.init()
+    def test_l4_register_then_unregister_recycles_cid(self, monkeypatch):
+        w4 = self._l4_over_chip_backed_l3(monkeypatch)
         try:
-            callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
-            handle_a = w4.register(callable_obj)
-            slot_a = _slot_for(w4, handle_a)
-            w4.unregister(handle_a)
-            assert slot_a not in w4._callable_registry
-            # Slot is freed; the next register reuses it.
-            handle_b = w4.register(callable_obj)
-            assert _slot_for(w4, handle_b) == slot_a
+            with hard_timeout(TEST_WALL_BUDGET_S):
+                w4.init()
+                callable_obj = chip_callable()
+                handle_a = w4.register(callable_obj)
+                slot_a = _slot_for(w4, handle_a)
+                w4.unregister(handle_a)
+                assert slot_a not in w4._callable_registry
+                # Slot is freed; the next register reuses it.
+                handle_b = w4.register(callable_obj)
+                assert _slot_for(w4, handle_b) == slot_a
+        finally:
+            w4.close()
+
+    def test_l4_register_surfaces_grandchild_chip_register_failure(self, monkeypatch):
+        # The cascade terminates at the chip child two forks down, not at the
+        # L3 child: a native register that raises there travels back up as the
+        # L4's REGISTER_PARTIAL_FAILURE.
+        w4 = self._l4_over_chip_backed_l3(monkeypatch, register_error="injected chip register failure")
+        try:
+            with hard_timeout(TEST_WALL_BUDGET_S):
+                w4.init()
+                with pytest.raises(RuntimeError, match="REGISTER_PARTIAL_FAILURE"):
+                    w4.register(chip_callable())
         finally:
             w4.close()
 

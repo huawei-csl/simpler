@@ -14,86 +14,171 @@
  * Mirrors the onboard DeviceRunnerBase pattern: shared lifecycle / callable
  * registry / arena / tensor-copy methods live here once; per-arch DeviceRunner
  * subclasses (in src/{a2a3,a5}/platform/sim/host/) implement the arch-specific
- * run() / finalize() / init_* / ensure_binaries_loaded path with their own
- * dlsym'd function-pointer table.
+ * enqueue/poll/drain / finalize / init_* / ensure_binaries_loaded path with
+ * their own dlsym'd function-pointer table.
  *
  * Polymorphism keeps the c_api shared glue (c_api_shared.cpp) arch-agnostic —
- * it works through SimDeviceRunnerBase* and dispatches run() / finalize() /
- * set_dep_gen_enabled() through virtuals.
+ * it works through SimDeviceRunnerBase* and dispatches the execution lifecycle,
+ * finalize(), and set_dep_gen_enabled() through virtuals.
  */
 
-#ifndef SRC_COMMON_PLATFORM_SIM_HOST_DEVICE_RUNNER_BASE_H_
-#define SRC_COMMON_PLATFORM_SIM_HOST_DEVICE_RUNNER_BASE_H_
+#pragma once
 
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include "pto_runtime_c_api.h"
+#include "native_run_execution.h"
+
 #include "callable.h"
+#include "call_config.h"
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/memory_allocator.h"
-#include "host/l2_swimlane_collector.h"
+#include "host/chip_swimlane_collector.h"
+#include "host/host_phase_records.h"
 #include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
 
-struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
-struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
+struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
 // Width sim resolves the CallConfig "auto" sentinel to, deliberately below
 // PLATFORM_MAX_BLOCKDIM (24 on a2a3, 36 on a5). The simulator runs one OS
 // thread per AICore, so taking the whole modelled chip would be 72-108 threads
 // per case; under xdist that is several hundred threads for no added coverage.
-// It is not a ceiling: an explicit block_dim is still honoured up to
-// PLATFORM_MAX_BLOCKDIM. Onboard is unaffected — it auto-resolves from the real
-// per-stream core limits.
+// CallConfig exposes no block_dim knob, so this is what a sim run takes.
+// Onboard is unaffected — it auto-resolves from the real per-stream core
+// limits.
 constexpr int SIM_AUTO_BLOCKDIM = 8;
 
 class SimDeviceRunnerBase {
 public:
-    SimDeviceRunnerBase() :
-        gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-        gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-        runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+    SimDeviceRunnerBase() {
+        for (auto &bank : arena_banks_) {
+            bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+        }
+    }
+
+    uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
+
+    /**
+     * Retained temporary-buffer address held for one pipeline slot, or 0 while
+     * that slot holds none. Two slots that have both staged arguments hold
+     * distinct buffers; tests read this to prove the split is real.
+     */
+    uint64_t retained_temp_addr(uint32_t slot_id) const;
 
     // Public virtual dtor so c_api_shared can `delete` a SimDeviceRunnerBase *
     // (destroy_device_context entrypoint).
     virtual ~SimDeviceRunnerBase() = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
-    virtual int run(Runtime &runtime, const CallConfig &config) = 0;
+    struct PreparedExecution {
+        PreparedExecution(
+            const NativeRunIdentity &identity_in, Runtime &runtime_in, const CallConfig &config_in,
+            uint32_t pipeline_slot_in
+        ) :
+            identity(identity_in),
+            runtime(&runtime_in),
+            config(config_in),
+            pipeline_slot(pipeline_slot_in) {}
+        virtual ~PreparedExecution() = default;
+        PreparedExecution(const PreparedExecution &) = delete;
+        PreparedExecution &operator=(const PreparedExecution &) = delete;
+        PreparedExecution(PreparedExecution &&other) noexcept :
+            identity(other.identity),
+            runtime(std::exchange(other.runtime, nullptr)),
+            config(other.config),
+            pipeline_slot(other.pipeline_slot),
+            num_aicore(other.num_aicore),
+            launch_aicpu_num(other.launch_aicpu_num) {}
+        PreparedExecution &operator=(PreparedExecution &&) = delete;
+
+        NativeRunIdentity identity{};
+        Runtime *runtime{nullptr};
+        CallConfig config{};
+        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        int num_aicore{0};
+        int launch_aicpu_num{0};
+    };
+
+    struct ActiveExecution {
+        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
+            prepared(std::move(prepared_in)),
+            progress(progress_in) {}
+        ActiveExecution(const ActiveExecution &) = delete;
+        ActiveExecution &operator=(const ActiveExecution &) = delete;
+        ActiveExecution(ActiveExecution &&) noexcept = default;
+        ActiveExecution &operator=(ActiveExecution &&) noexcept = default;
+        std::unique_ptr<PreparedExecution> prepared;
+        LaunchProgress progress{LaunchProgress::NotStarted};
+    };
+
+    struct LaunchOutcome {
+        int rc{-1};
+        LaunchProgress progress{LaunchProgress::NotStarted};
+        std::unique_ptr<PreparedExecution> prepared{};
+        std::unique_ptr<ActiveExecution> active{};
+        LaunchReceipt receipt{};
+
+        bool poisoned() const { return progress == LaunchProgress::Partial; }
+    };
+    /** Submit a Runtime and retain all state needed to query and drain it. */
+    virtual int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *prepared
+    ) = 0;
+    virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
+    virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
+    /** Return one of the SIMPLER_NATIVE_RUN_POLL_* values without waiting. */
+    virtual int poll_execution(const ActiveExecution &active) = 0;
+    /** Wait for completion, publish DFX, and release per-run resources. */
+    virtual int drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
     // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
 
+    /** Reserve the runner's single active native execution through finalize. */
+    bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
+    void release_native_run(const void *owner);
+    bool native_run_active() const;
+    bool native_run_owned_by(const void *owner) const;
+    bool can_accept_run() const { return !launch_poisoned_.load(std::memory_order_acquire); }
+    void poison_launch() { launch_poisoned_.store(true, std::memory_order_release); }
+
     // --- Shared methods --------------------------------------------------
 
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
-    void *acquire_pooled_gm_heap();
-    void *acquire_pooled_gm_sm();
-    void *acquire_pooled_runtime_arena();
+    void *acquire_pooled_gm_heap(uint32_t arena_bank);
+    void *acquire_pooled_gm_sm(uint32_t arena_bank);
+    void *acquire_pooled_runtime_arena(uint32_t arena_bank);
     bool lookup_prebuilt_runtime_arena_cache(
-        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
         void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
     ) const;
     void mark_prebuilt_runtime_arena_cached(
-        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     );
 
@@ -101,12 +186,15 @@ public:
     int attach_current_thread(int device_id);
 
     void *allocate_tensor(size_t bytes);
+    /** Total device memory (bytes) currently committed by this runner's MemoryAllocator. */
+    size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
     int device_memset(void *dev_ptr, int value, size_t bytes);
-    void get_retained_temp_buffer(void **addr, size_t *size);
-    void set_retained_temp_buffer(void *addr, size_t size);
+    void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
+    void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
+    void *acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -131,7 +219,7 @@ public:
     bool has_callable(int32_t callable_id) const;
     // One-step bind: replay CallableState (kernel addrs + active_callable_id)
     // then run the per-run bind_callable_to_runtime_impl with the state's
-    // host_orch_func_ptr + signature. `api` is g_host_api; `orch_args` is a
+    // host_orch_func_ptr + signature. `api` is bound to this run; `orch_args` is a
     // const ChipStorageTaskArgs* (void* keeps task_interface headers out of this
     // header). Returns 0 on success, non-zero on failure.
     int bind_callable_to_runtime(
@@ -175,10 +263,19 @@ public:
     uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
     uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
-    void set_l2_swimlane_enabled(int level) {
-        l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
-        enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
+    void set_chip_swimlane_enabled(int level) {
+        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
+        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
+    uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        host_phase_records_.finish(submitted_tasks, invocation_id);
+    }
+    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this pass's records to the swimlane reader, just before its export. */
+    void publish_host_phase_records_to_swimlane();
+    void finish_clock_correlation_session(bool capture_device_complete) noexcept;
     void set_dump_args_enabled(int level) {
         dump_args_level_ = static_cast<DumpArgsLevel>(level);
         enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
@@ -194,8 +291,8 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
     // Latch this run's per-run diagnostic config onto the runner's enable_*_
-    // members before run() uses them. Each arch's run() calls this at entry; the
-    // c_api threads the CallConfig through instead of calling set_*_enabled.
+    // members before prepare_execution() uses them. Each arch calls this at prepare;
+    // the c_api threads the CallConfig through instead of calling setters.
     // Defined in the .cpp so this header does not need the full CallConfig.
     void apply_call_config(const CallConfig &config);
 
@@ -203,7 +300,7 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
 protected:
-    // --- Helpers usable by subclass run() / finalize() -------------------
+    // --- Helpers usable by subclass execution / finalize -----------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
     // Hand the orch-SO descriptor to the sim AICPU register entry. Built
@@ -216,8 +313,9 @@ protected:
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
     void release_callable_state();
+    void release_graph_definition_buffers();
 
-    // --- Shared state (protected so subclass run() / init_* / finalize()
+    // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
 
     // Configuration. device_id_ is set once in attach_current_thread() during
@@ -234,29 +332,54 @@ protected:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     MemoryAllocator mem_alloc_;
-    void *retained_temp_addr_ = nullptr;
-    size_t retained_temp_size_ = 0;
+    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
+    std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    // One retained device block: the raw allocation plus the aligned address
+    // handed out. Backs the Graph Definition cache below.
+    struct RetainedGraphBuffer {
+        void *allocation{nullptr};
+        void *aligned_addr{nullptr};
+        size_t capacity{0};
+    };
+    // Graph Definition storage, one retained block per (pipeline slot,
+    // definition key) — see HostApi acquire_graph_definition_buffer.
+    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
+    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
 
-    // Three independent per-Worker arenas, each backing a single pooled
-    // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime
-    // arena). Split out from a single backing allocation because the
-    // combined size can exceed the device allocator's largest contiguous
-    // block. Released explicitly in finalize() before mem_alloc_.finalize().
+    // Each arena bank backs the three pooled regions (PTO2 GM heap / PTO2
+    // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
+    // are separate allocations because the combined size can exceed the device
+    // allocator's largest contiguous block. Released explicitly in finalize()
+    // before mem_alloc_.finalize().
     //
-    // runtime_arena_pool_ stays unreserved when setup_static_arena was
+    // A bank's runtime pool stays unreserved when setup_static_arena was
     // invoked with runtime_arena_size == 0 (hbg path).
     static void *arena_alloc_trampoline(void *ctx, size_t size) {
         return static_cast<MemoryAllocator *>(ctx)->alloc(size);
     }
     static void arena_free_trampoline(void *ctx, void *p) { static_cast<MemoryAllocator *>(ctx)->free(p); }
-    DeviceArena gm_heap_arena_;
-    DeviceArena gm_sm_arena_;
-    DeviceArena runtime_arena_pool_;
-    // Cached sizes for setup_static_arena's "fits" check — avoids re-allocating
-    // a buffer when a later worker init asks for an equal-or-smaller layout.
-    size_t cached_gm_heap_size_{0};
-    size_t cached_gm_sm_size_{0};
-    size_t cached_runtime_arena_size_{0};
+    // One independently committed set of the three pooled regions per pipeline
+    // slot, so preparing one bank never mutates a region the active run is
+    // executing out of. `cached_*` back setup_static_arena's "fits" check —
+    // avoids re-allocating when a later worker init asks for an equal-or-
+    // smaller layout. Held by pointer because DeviceArena is neither copyable
+    // nor movable, so the array cannot be brace-initialised without naming
+    // every bank.
+    struct ArenaBank {
+        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
+            gm_heap(alloc, free_fn, ctx),
+            gm_sm(alloc, free_fn, ctx),
+            runtime_pool(alloc, free_fn, ctx) {}
+
+        DeviceArena gm_heap;
+        DeviceArena gm_sm;
+        DeviceArena runtime_pool;
+        size_t cached_gm_heap_size{0};
+        size_t cached_gm_sm_size{0};
+        size_t cached_runtime_arena_size{0};
+    };
+    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -266,7 +389,7 @@ protected:
     size_t prebuilt_runtime_arena_cache_runtime_off_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_image_;
 
-    // Simulation state — written by run() / init_* and read by the AICPU /
+    // Simulation state — written by enqueue/init and read by the AICPU /
     // AICore execute functions via the platform-regs setter functions.
     KernelArgs kernel_args_;
 
@@ -274,7 +397,7 @@ protected:
     // address rides on KernelArgs.device_wall_data_base. AICPU writes the
     // run wall (ns) through that pointer; this DeviceRunner pulls it back
     // via copy_from_device after stream sync and caches it for
-    // last_device_wall_ns(). Allocated lazily in run(), freed in finalize().
+    // last_device_wall_ns(). Allocated lazily at enqueue, freed in finalize().
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
     uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
@@ -327,6 +450,9 @@ protected:
 
     Runtime *last_runtime_{nullptr};
 
+    std::atomic<const void *> active_native_run_{nullptr};
+    std::atomic<bool> launch_poisoned_{false};
+
     // Dynamically loaded executor libraries (shared infra; the dlsym'd function-
     // pointer table itself lives on the subclass since signatures diverge
     // per-arch — a2a3 vs a5 differ on aicore_execute and several setters).
@@ -336,20 +462,25 @@ protected:
     std::string aicore_so_path_;
 
     // Performance / diagnostics collectors shared across arches.
-    L2SwimlaneCollector l2_swimlane_collector_;
+    ChipSwimlaneCollector chip_swimlane_collector_;
+    // Not a collector: the pool the runtime's prepare path writes into, read by
+    // whichever per-event views the run enabled. Its two readers are gated
+    // independently, so it belongs to neither.
+    simpler::dfx::HostPhaseRecordStore host_phase_records_;
+    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
-    // Enablement flags. Written via setters before run(); read inside run().
-    bool enable_l2_swimlane_{false};
+    // Enablement flags. Written before enqueue and read by execution helpers.
+    bool enable_chip_swimlane_{false};
     bool enable_dump_args_{false};
     DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
-    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                   // diagnostic artifact root directory
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
 
 namespace simpler::common::sim_host {
@@ -360,5 +491,3 @@ namespace simpler::common::sim_host {
 bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path);
 
 }  // namespace simpler::common::sim_host
-
-#endif  // SRC_COMMON_PLATFORM_SIM_HOST_DEVICE_RUNNER_BASE_H_

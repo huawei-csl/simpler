@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 KERNEL_DIR = Path(__file__).resolve().parent / "kernels"
 sys.path.insert(0, str(KERNEL_DIR))
@@ -174,7 +174,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             # producer-side DdrBarrierBeforeFfts cross-core DDR fence, validated
             # over 19 st-onboard-a2a3 rounds.
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 32,
@@ -190,7 +189,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b4_h32_kv8_s512_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 4,
                 "num_heads": 32,
@@ -206,7 +204,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b1_h32_kv8_s16384_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 32,
@@ -222,7 +219,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b1_h32_kv8_s4096_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 32,
@@ -238,7 +234,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b1_h32_kv8_s6144_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 32,
@@ -254,7 +249,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b1_h32_kv8_s8192_bs128_fp16",
             # enabled in CI to guard the long-sequence fix onboard.
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 32,
@@ -270,7 +264,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b2_h32_kv8_s4096_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 2,
                 "num_heads": 32,
@@ -286,7 +279,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b2_h32_kv8_s8192_bs128_fp16",
             "manual": True,
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 2,
                 "num_heads": 32,
@@ -336,21 +328,21 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
         ws = workspace_sizes(batch, num_heads, head_dim, head_dim, block_dim)
 
         return TaskArgsBuilder(
-            Tensor("query", q),
-            Tensor("key_cache", k_page),
-            Tensor("value_cache", v_page),
-            Tensor("block_table", block_table),
-            Tensor("out", torch.zeros(batch, num_heads, head_dim, dtype=dtype)),
-            Tensor("s_gm", torch.zeros(ws["s"], dtype=torch.uint8)),
-            Tensor("p_gm", torch.zeros(ws["p"], dtype=torch.uint8)),
-            Tensor("o_tmp_gm", torch.zeros(ws["o_tmp"], dtype=torch.uint8)),
-            Tensor("go_gm", torch.zeros(ws["go"], dtype=torch.uint8)),
-            Tensor("o_core_tmp_gm", torch.zeros(ws["o_core_tmp"], dtype=torch.uint8)),
-            Tensor("l_gm", torch.zeros(ws["l"], dtype=torch.uint8)),
-            Tensor("gm_k16", torch.zeros(ws["k16"], dtype=torch.uint8)),
-            Tensor("gm_v16", torch.zeros(ws["v16"], dtype=torch.uint8)),
-            Tensor("tiling", tiling),
-            Tensor("null", torch.zeros(1, dtype=torch.uint8)),
+            TensorArg("query", q),
+            TensorArg("key_cache", k_page),
+            TensorArg("value_cache", v_page),
+            TensorArg("block_table", block_table),
+            TensorArg("out", torch.zeros(batch, num_heads, head_dim, dtype=dtype)),
+            TensorArg("s_gm", torch.zeros(ws["s"], dtype=torch.uint8)),
+            TensorArg("p_gm", torch.zeros(ws["p"], dtype=torch.uint8)),
+            TensorArg("o_tmp_gm", torch.zeros(ws["o_tmp"], dtype=torch.uint8)),
+            TensorArg("go_gm", torch.zeros(ws["go"], dtype=torch.uint8)),
+            TensorArg("o_core_tmp_gm", torch.zeros(ws["o_core_tmp"], dtype=torch.uint8)),
+            TensorArg("l_gm", torch.zeros(ws["l"], dtype=torch.uint8)),
+            TensorArg("gm_k16", torch.zeros(ws["k16"], dtype=torch.uint8)),
+            TensorArg("gm_v16", torch.zeros(ws["v16"], dtype=torch.uint8)),
+            TensorArg("tiling", tiling),
+            TensorArg("null", torch.zeros(1, dtype=torch.uint8)),
             Scalar("effective_block_dim", ctypes.c_int64(effective_block_dim)),
         )
 

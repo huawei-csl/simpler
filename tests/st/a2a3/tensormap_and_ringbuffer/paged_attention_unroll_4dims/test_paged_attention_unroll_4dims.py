@@ -17,7 +17,7 @@ Orchestration with N_UNROLL=64, 4 tasks per group, online softmax accumulation.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
 
@@ -67,7 +67,6 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -82,7 +81,6 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 64,
                 "num_heads": 64,
@@ -98,7 +96,6 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
         {
             "name": "Case3",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 64,
                 "num_heads": 64,
@@ -123,7 +120,7 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
             if isinstance(val, torch.Tensor):
                 if name in ("query", "out"):
                     val = val.reshape(batch, 1, num_heads, head_dim)
-                specs.append(Tensor(name, val))
+                specs.append(TensorArg(name, val))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)
@@ -132,7 +129,7 @@ class TestPagedAttentionUnroll4dims(SceneTestCase):
         batch = params["batch"]
         num_heads = params["num_heads"]
         head_dim = params["head_dim"]
-        tensors = {s.name: s.value for s in args.specs if isinstance(s, Tensor)}
+        tensors = {s.name: s.value for s in args.specs if isinstance(s, TensorArg)}
         # Reshape 4D out to 3D for shared golden, then restore
         out_4d = tensors["out"]
         tensors["out"] = out_4d.reshape(batch, num_heads, head_dim)

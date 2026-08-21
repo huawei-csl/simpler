@@ -2,7 +2,7 @@
 
 ## How to Find Device Logs
 
-AICPU logs (via `LOG_INFO_V9`) are written by CANN's **dlog** subsystem and do **not** appear in the `python test_*.py` / pytest terminal output. They are written to CANN's device log directory:
+AICPU logs (via `LOG_INFO`) are written by CANN's **dlog** subsystem and do **not** appear in the `python test_*.py` / pytest terminal output. They are written to CANN's device log directory:
 
 ```text
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
@@ -140,7 +140,7 @@ Divide each thread's phase times by its `completed` count to get per-task schedu
 
 ## Cross-Referencing with Host Profiling
 
-When `--enable-l2-swimlane` is used, the host terminal prints a **Task Statistics by Function** table with `Total_Exec` (total AICore kernel execution time). Combined with device log data:
+When `--enable-chip-swimlane` is used, the host terminal prints a **Task Statistics by Function** table with `Total_Exec` (total AICore kernel execution time). Combined with device log data:
 
 | Metric | Source | Description |
 | ------ | ------ | ----------- |

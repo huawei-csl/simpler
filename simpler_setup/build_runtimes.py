@@ -42,6 +42,34 @@ from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noq
 
 logger = logging.getLogger(__name__)
 
+_PROFILING_DEFAULTS = {
+    "SIMPLER_DFX": 1,
+    "SIMPLER_ORCH_PROFILING": 0,
+    "SIMPLER_SCHED_PROFILING": 0,
+    "SIMPLER_TENSORMAP_PROFILING": 0,
+}
+
+
+def _profiling_config(values: dict[str, Optional[int]]) -> Optional[dict[str, str]]:
+    """Return a complete, validated profiling configuration when requested."""
+    if all(value is None for value in values.values()):
+        return None
+
+    config = {name: _PROFILING_DEFAULTS[name] if value is None else value for name, value in values.items()}
+    if config["SIMPLER_ORCH_PROFILING"] and not config["SIMPLER_DFX"]:
+        raise ValueError("SIMPLER_ORCH_PROFILING requires SIMPLER_DFX=1")
+    if config["SIMPLER_SCHED_PROFILING"] and not config["SIMPLER_DFX"]:
+        raise ValueError("SIMPLER_SCHED_PROFILING requires SIMPLER_DFX=1")
+    if config["SIMPLER_TENSORMAP_PROFILING"] and not config["SIMPLER_ORCH_PROFILING"]:
+        raise ValueError("SIMPLER_TENSORMAP_PROFILING requires SIMPLER_ORCH_PROFILING=1")
+    return {name: str(value) for name, value in config.items()}
+
+
+def _validate_profiling_platforms(platforms: list[str], config: Optional[dict[str, str]]) -> None:
+    """Reject generated profiling configurations for unsupported targets."""
+    if config and any(parse_platform(platform)[1] != "sim" for platform in platforms):
+        raise ValueError("generated profiling configurations currently support sim platforms only")
+
 
 def detect_buildable_platforms() -> list:
     """Detect which platforms can be built with available toolchains.
@@ -76,6 +104,7 @@ def build_all(
     cache_dir: Path,
     platforms: Optional[list] = None,
     sanitizer: str = "none",
+    profiling_config: Optional[dict[str, str]] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -86,6 +115,8 @@ def build_all(
         sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
+        profiling_config: Complete profiling macro configuration for sim
+            runtime targets. None keeps the source defaults.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -108,6 +139,8 @@ def build_all(
         logger.warning("No buildable platforms detected (missing gcc/g++?)")
         return
 
+    _validate_profiling_platforms(platforms, profiling_config)
+
     logger.info(f"Building for platforms: {', '.join(platforms)}")
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
@@ -123,17 +156,10 @@ def build_all(
 
         pto_isa_root_for_metadata = ensure_pto_isa_root(verbose=True)
 
-    # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
-    # host toolchain, not per arch/variant) — build them once before iterating
-    # platforms. cpu_sim_context is only needed when building any sim platform.
+    # libcpu_sim_context.so is process-global (not per arch/variant), so build
+    # it once before iterating platforms. Under a sanitizer, RuntimeCompiler
+    # pins every host consumer to GCC 15. It is needed only for sim platforms.
     if platforms:
-        logger.info("Building simpler_log (process-global)...")
-        try:
-            RuntimeBuilder(platform=platforms[0]).ensure_simpler_log(build=True)
-        except Exception as e:
-            logger.error(f"Failed to build simpler_log: {e}")
-            raise
-
         sim_platforms = [p for p in platforms if parse_platform(p)[1] == "sim"]
         if sim_platforms:
             logger.info("Building cpu_sim_context (process-global)...")
@@ -168,7 +194,13 @@ def build_all(
             return
 
         logger.info(f"  Building {platform}/{runtime_name}...")
-        builder.get_binaries(runtime_name, build=True)
+        # Process-global helper libraries are pre-built before runtime tasks.
+        builder.get_binaries(
+            runtime_name,
+            build=True,
+            build_shared=False,
+            profiling_config=profiling_config,
+        )
 
     with ThreadPoolExecutor(max_workers=len(tasks) or 1) as executor:
         futures = {executor.submit(_build_runtime, p, r): (p, r) for p, r in tasks}
@@ -226,6 +258,10 @@ def main():
             "Default: none. asan/tsan are mutually exclusive (separate builds)."
         ),
     )
+    parser.add_argument("--profiling-dfx", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--profiling-orch", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--profiling-sched", type=int, choices=(0, 1), default=None)
+    parser.add_argument("--profiling-tensormap", type=int, choices=(0, 1), default=None)
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -250,6 +286,14 @@ def main():
         cache_dir=args.cache_dir,
         platforms=args.platforms,
         sanitizer=args.sanitizer,
+        profiling_config=_profiling_config(
+            {
+                "SIMPLER_DFX": args.profiling_dfx,
+                "SIMPLER_ORCH_PROFILING": args.profiling_orch,
+                "SIMPLER_SCHED_PROFILING": args.profiling_sched,
+                "SIMPLER_TENSORMAP_PROFILING": args.profiling_tensormap,
+            }
+        ),
     )
 
 

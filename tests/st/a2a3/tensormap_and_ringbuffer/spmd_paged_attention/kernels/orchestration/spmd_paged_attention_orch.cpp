@@ -54,14 +54,15 @@ static constexpr uint32_t FIFO_DEPTH = 2;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
     uint64_t batch = orch_args.tensor(0).ref().shapes[0];
     uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
     uint64_t head_dim = orch_args.tensor(0).ref().shapes[2];
@@ -77,7 +78,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     int64_t total_logical_blocks = static_cast<int64_t>(batch * q_loop);
 
-    LOG_INFO_V0(
+    LOG_INFO(
         "SPMD PA TPUSH/TPOP: batch=%" PRIu64 " heads=%" PRIu64 " hd=%" PRIu64 " bs=%" PRIu64 " q_tile=%" PRIu64
         " q_loop=%" PRIu64 " hw_blocks=%d logical_blocks=%" PRId64,
         batch, num_heads, head_dim, block_size, q_tile, q_loop, SPMD_BLOCK_NUM, total_logical_blocks
@@ -96,16 +97,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     uint32_t kv_shapes[2] = {static_cast<uint32_t>(kv_total_rows), static_cast<uint32_t>(head_dim)};
     uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
 
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(kc_ptr, kv_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(vc_ptr, kv_shapes, 2, data_type);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    ChipTensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    ChipTensor key_cache = make_tensor_external(kc_ptr, kv_shapes, 2, data_type);
+    ChipTensor value_cache = make_tensor_external(vc_ptr, kv_shapes, 2, data_type);
+    ChipTensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(max_num_blocks_per_req)};
-    Tensor block_table =
+    ChipTensor block_table =
         make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
-    Tensor context_lens =
+    ChipTensor context_lens =
         make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // GM FIFO buffers for TPUSH/TPOP (one set of slots per hardware block)
@@ -114,16 +115,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     uint32_t oi_fifo_total = static_cast<uint32_t>(SPMD_BLOCK_NUM) * OI_SLOT_SIZE * FIFO_DEPTH;
 
     // Allocate as 1D byte tensors (using INT32 for 4-byte alignment, divide by 4)
-    uint32_t sij_fifo_shapes[1] = {sij_fifo_total / sizeof(int32_t)};
-    uint32_t pij_fifo_shapes[1] = {pij_fifo_total / sizeof(int32_t)};
-    uint32_t oi_fifo_shapes[1] = {oi_fifo_total / sizeof(int32_t)};
+    uint32_t sij_fifo_shapes[1] = {static_cast<uint32_t>(sij_fifo_total / sizeof(int32_t))};
+    uint32_t pij_fifo_shapes[1] = {static_cast<uint32_t>(pij_fifo_total / sizeof(int32_t))};
+    uint32_t oi_fifo_shapes[1] = {static_cast<uint32_t>(oi_fifo_total / sizeof(int32_t))};
 
     TensorCreateInfo sij_fifo_ci(sij_fifo_shapes, 1, DataType::INT32);
     TensorCreateInfo pij_fifo_ci(pij_fifo_shapes, 1, DataType::INT32);
     TensorCreateInfo oi_fifo_ci(oi_fifo_shapes, 1, DataType::INT32);
 
     PTO2_SCOPE() {
-        L0TaskArgs args;
+        CoreTaskArgs args;
         args.add_input(query);
         args.add_input(key_cache);
         args.add_input(value_cache);
@@ -150,7 +151,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         rt_submit_task(mk, args);
     }
 
-    LOG_INFO_V0(
+    LOG_INFO(
         "SPMD PA TPUSH/TPOP: submitted 1 MixedKernels task, hw_blocks=%d logical=%" PRId64,
         static_cast<int>(SPMD_BLOCK_NUM), total_logical_blocks
     );

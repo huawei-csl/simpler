@@ -30,7 +30,6 @@
 #pragma once
 
 #include <atomic>
-
 #include "common/core_type.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
@@ -123,10 +122,15 @@ struct alignas(64) PTO2ReadyQueue {
 
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
-    void push_batch(PTO2TaskSlotState **items, int count) { push_batch_tagged(items, nullptr, count); }
+    // Returns false without publishing anything when the queue cannot take all
+    // `count` items. A target slot holding an older generation means full and
+    // ends the call; a slot a peer has reserved but not yet published is
+    // transient and retries, so this only spins while a peer is mid-publish.
+    bool push_batch(PTO2TaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
-    void push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
-        if (count == 0) return;
+    bool push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
+        if (count == 0) return true;
+        if (static_cast<uint64_t>(count) > capacity) return false;
 
         uint64_t pos;
         while (true) {
@@ -136,7 +140,10 @@ struct alignas(64) PTO2ReadyQueue {
                 PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
                 int64_t diff = seq - static_cast<int64_t>(pos + i);
-                if (diff != 0) {
+                if (diff < 0) {
+                    return false;  // Queue full
+                }
+                if (diff > 0) {
                     ready = false;
                     break;
                 }
@@ -157,6 +164,7 @@ struct alignas(64) PTO2ReadyQueue {
             slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
+        return true;
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
@@ -386,8 +394,8 @@ struct alignas(64) PTO2ReadyQueue {
 // as non-member so PTO2ReadyQueue stays a POD-like struct with cache-line
 // alignment. Storage is owned by the caller-supplied arena.
 //   reserve_layout: declare the slots[] region on the arena (must precede commit)
-//   init_from_layout: bind slots pointer from arena.region_ptr(off) and
-//                     initialize sequence counters
+//   init_data_from_layout: initialize sequence counters and queue metadata
+//   wire_arena_pointers: bind slots pointer from arena.region_ptr(off)
 //   destroy: forget the slots pointer (arena owns the buffer)
 size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity);
 // Writes everything *except* the arena-internal `slots` pointer field
@@ -413,7 +421,7 @@ struct CompletionStats {
 /**
  * Layout descriptor produced by PTO2SchedulerState::reserve_layout(). Holds
  * the arena offsets of every sub-region the scheduler needs plus the
- * capacities used at layout time (init_from_layout reuses them).
+ * capacities used at layout time (init_data_from_layout reuses them).
  */
 struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
@@ -501,6 +509,8 @@ struct PTO2SchedulerState {
         }
     } ring_sched_states[PTO2_MAX_RING_DEPTH];
 
+    alignas(64) std::atomic<uint32_t> advance_pending_mask;
+
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
@@ -543,6 +553,45 @@ struct PTO2SchedulerState {
         }
     }
 
+    static uint32_t ring_advance_pending_bit(int32_t ring_id) {
+        static_assert(PTO2_MAX_RING_DEPTH <= 32, "advance_pending_mask uses one uint32_t bit per ring");
+        return 1u << static_cast<uint32_t>(ring_id);
+    }
+
+    // A failed consumed-head advance is a deferred reclaim publication request.
+    // The mask keeps one coalesced request per ring. Later successful advances
+    // may cover it before the scheduler no-progress path drains the final
+    // missed edge.
+    void mark_ring_advance_pending(int32_t ring_id) {
+        advance_pending_mask.fetch_or(ring_advance_pending_bit(ring_id), std::memory_order_release);
+    }
+
+    bool drain_pending_ring_advances() {
+        uint32_t pending = advance_pending_mask.load(std::memory_order_acquire);
+        if (pending == 0) return false;
+
+        bool advanced = false;
+        for (int32_t ring_id = 0; ring_id < PTO2_MAX_RING_DEPTH; ring_id++) {
+            uint32_t bit = ring_advance_pending_bit(ring_id);
+            if ((pending & bit) == 0) continue;
+
+            auto &ring_sched = ring_sched_states[ring_id];
+            int32_t expected_lock = 0;
+            if (!ring_sched.advance_lock.compare_exchange_strong(
+                    expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
+                )) {
+                continue;
+            }
+
+            advance_pending_mask.fetch_and(~bit, std::memory_order_acq_rel);
+            int32_t before = ring_sched.last_task_alive;
+            ring_sched.advance_ring_pointers();
+            advanced = advanced || ring_sched.last_task_alive != before;
+            ring_sched.advance_lock.store(0, std::memory_order_release);
+        }
+        return advanced;
+    }
+
     bool try_claim_ready_once(PTO2TaskSlotState &slot_state) {
         uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
         for (;;) {
@@ -581,16 +630,15 @@ struct PTO2SchedulerState {
 #endif
 
         int32_t ring_id = slot_state.ring_id;
-        // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
-        // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
-        // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
+        // Runs outside fanout_lock: reset_for_reuse stores fanout_lock=0.
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
             ring_sched_states[ring_id].advance_ring_pointers();
             ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
+        } else {
+            mark_ring_advance_pending(ring_id);
         }
     }
 
@@ -620,9 +668,7 @@ struct PTO2SchedulerState {
 #endif
 
         int32_t ring_id = slot_state.ring_id;
-        // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
-        // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
+        // Runs outside fanout_lock: reset_for_reuse stores fanout_lock=0.
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
@@ -631,7 +677,8 @@ struct PTO2SchedulerState {
             ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
             atomic_count += 2;  // try-lock CAS + unlock store
         } else {
-            atomic_count += 1;  // failed try-lock CAS
+            mark_ring_advance_pending(ring_id);
+            atomic_count += 2;  // failed try-lock CAS + pending mark
         }
     }
 #endif
@@ -642,10 +689,7 @@ struct PTO2SchedulerState {
     }
 
     // Scope-end release: sets bit31 (PTO2_FANOUT_SCOPE_BIT) instead of bumping a
-    // consumer ref. Called exactly once per task from on_scope_end. Keeping it a
-    // distinct add lets the deadlock detector tell "waiting only on scope_end"
-    // (head COMPLETED, refcount == fanout_count & ~SCOPE_BIT) apart from
-    // "waiting on a consumer".
+    // consumer ref. Called exactly once per task from on_scope_end.
     void release_producer_scope(PTO2TaskSlotState &slot_state) {
         slot_state.fanout_refcount.fetch_add(PTO2_FANOUT_SCOPE_BIT, std::memory_order_acq_rel);
         check_and_handle_consumed(slot_state);
@@ -706,21 +750,26 @@ struct PTO2SchedulerState {
     // onto ITS OWN cores (range-claim via next_block_idx), and re-pushes if blocks
     // remain — exactly mirroring how a partially-dispatched SPMD task is re-pushed to
     // the ready queue (scheduler_dispatch: pop -> claim -> re-push). A stale/released
-    // entry fails the STAGING check on pop and is dropped; a push that overflows is
-    // logged and the consumer's blocks fall back to normal dispatch.
+    // entry fails the STAGING check on pop and is dropped. Overflow at any push is
+    // safe and costs only the pre-staging: the producer release routes on
+    // next_block_idx rather than on the claim state, so it rings whatever is already
+    // staged and sends the rest to ready_queues. An initial push that overflows also
+    // rolls STAGING back to NONE, since nothing is staged yet and a task with no
+    // claim should not read as speculatively claimed.
     PTO2ReadyQueue early_dispatch_queues[PTO2_NUM_RESOURCE_SHAPES];
 
     // sync_start early-dispatch candidates park here instead of early_dispatch_queues[]:
-    // they need an atomic all-or-nothing stage via the drain barrier, not
-    // early_dispatch_shape's per-thread partial range-claim. Shape-agnostic (the
-    // rendezvous counts cores, not blocks), so a single queue serves all shapes; drained
-    // as the highest occupancy tier at the top of try_early_dispatch.
+    // they need an atomic all-or-nothing owner stage, not early_dispatch_shape's
+    // per-thread partial range-claim. Shape-agnostic (the rendezvous counts cores,
+    // not blocks), so a single queue serves all shapes. The owner stages locally
+    // when its tracker fits and falls back to the global drain otherwise.
     //
     // Deliberately single, vs the normal source's per-shape ready_sync_queues[]: a READY
     // sync cohort (producer done) can dispatch inline when it fits, so it reuses the
-    // per-shape dispatch_shape; an EARLY sync cohort always carries a non-zero
-    // src_payload gate and therefore always drains. The shape-agnostic rendezvous
-    // makes one queue sufficient. Same drain, two sources.
+    // per-shape dispatch_shape. An EARLY sync cohort always carries a non-zero
+    // src_payload gate; it stages directly when one owner tracker can hold the whole
+    // cohort and falls back to the global drain otherwise. The shape-agnostic
+    // rendezvous makes one queue sufficient.
     PTO2ReadyQueue early_sync_start_queue;
 
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
@@ -771,8 +820,8 @@ struct PTO2SchedulerState {
     }
 
     // Ring one sync_start cohort from its stable staged_core_mask. The caller owns
-    // the NONE->RINGING launch latch and invokes this exactly once after drain
-    // staging completes, while the corresponding per-core table entries are live.
+    // the NONE->RINGING launch latch and invokes this exactly once after local or
+    // global staging completes, while the corresponding per-core table entries are live.
     inline void ring_all_staged_doorbells(PTO2TaskSlotState &slot_state) {
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
             uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
@@ -841,12 +890,17 @@ struct PTO2SchedulerState {
     // wins the launch latch and rings exactly once. Returns true only to that winner,
     // which may then expose the cohort to its fanout.
     inline bool maybe_rendezvous_ring(PTO2TaskSlotState &slot_state) {
+        // running_slot_count is the publication seed: every staged_core_mask OR
+        // happens-before its final store. Read the seed first, then the mask, so
+        // observing the final count cannot be paired with a partially published
+        // mask when producer release races staging.
+        int32_t running_cores = slot_state.payload->running_slot_count.load(std::memory_order_seq_cst);
         int32_t staged_cores = 0;
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_cores +=
                 __builtin_popcountll(slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst));
         if (staged_cores == 0) return false;
-        if (slot_state.payload->running_slot_count.load(std::memory_order_seq_cst) != staged_cores) return false;
+        if (running_cores != staged_cores) return false;
         if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_DISPATCHED)
             return false;
         if (!try_claim_early_dispatch_launch(*slot_state.payload)) return false;
@@ -858,7 +912,7 @@ struct PTO2SchedulerState {
         return true;
     }
 
-    inline bool retry_sync_start_rendezvous_after_drain(PTO2TaskSlotState &slot_state) {
+    inline bool retry_sync_start_rendezvous_after_staging(PTO2TaskSlotState &slot_state) {
         if (!maybe_rendezvous_ring(slot_state)) return false;
         propagate_dispatch_fanin(slot_state);
         return true;
@@ -883,24 +937,32 @@ struct PTO2SchedulerState {
         }
 
         uint64_t task_id = static_cast<uint64_t>(consumer.task->task_id.raw);
-        // A sync-start cohort uses one shape-agnostic queue so only the
-        // all-or-nothing drain path can claim and stage it.
-        if (consumer.task_attrs.requires_sync_start()) {
-            early_sync_start_queue.push_tagged(&consumer, task_id);
-        } else {
-            early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
+        // A sync-start cohort uses one shape-agnostic queue so one owner can
+        // choose an all-or-nothing local stage or the global-drain fallback.
+        bool queued = consumer.task_attrs.requires_sync_start() ?
+                          early_sync_start_queue.push_tagged(&consumer, task_id) :
+                          early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
+        if (!queued) {
+            // The candidate was never published to an early-dispatch drain, so
+            // drop the speculative claim and let readiness take the ordinary
+            // queue path. A concurrent producer release may already have moved
+            // STAGING to DISPATCHED; that path then owns the transition.
+            expected = PTO2_EARLY_DISPATCH_STAGING;
+            consumer.payload->early_dispatch_state.compare_exchange_strong(
+                expected, PTO2_EARLY_DISPATCH_NONE, std::memory_order_seq_cst, std::memory_order_seq_cst
+            );
         }
     }
 
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Called after a
-    // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or the
-    // sync_start drain), but no-ops until every logical block is launch-visible. Only then
+    // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or
+    // sync_start staging), but no-ops until every logical block is launch-visible. Only then
     // does it walk p's fanout and bump each consumer's
     // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_actual_count (= every
     // producer is flagged-and-fully-dispatched, or was already complete when the consumer was
     // wired) is an early-dispatch candidate: CAS NONE->STAGING (exactly-once) and push to
     // early_dispatch_queues[shape] (or early_sync_start_queue for a require_sync_start cohort)
-    // for the drain to pre-stage. The full-publication gate is load-bearing: a consumer that
+    // for its owner to pre-stage. The full-publication gate is load-bearing: a consumer that
     // pre-occupies cores off a producer whose later blocks are not yet launch-visible would gate the
     // very cores those blocks need, starving the producer so it never completes and the
     // rendezvous never rings — a resource deadlock. published_block_count advances after
@@ -1262,7 +1324,8 @@ struct PTO2SchedulerState {
 
     /**
      * Cold path: release producers (fanin traversal) + check self for CONSUMED.
-     * Returns fanin edge count for profiling.
+     * Returns the number of retained (DEP_RETAIN) producers actually released —
+     * ordering-only edges dropped their pin at wiring and are skipped here.
      */
 
 #if SIMPLER_SCHED_PROFILING
@@ -1277,7 +1340,16 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        int32_t released = 0;
+        // Only DEP_RETAIN edges still hold a fanout pin at completion: an
+        // ordering-only edge released its submit->wire pin at wiring, so releasing
+        // it again here would over-count fanout_refcount against fanout_count and
+        // break the rc == fc consume invariant.
+        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state, DepFlags flags) {
+            if (!dep_has_retain(flags)) {
+                return;
+            }
+            released++;
 #if SIMPLER_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else
@@ -1299,7 +1371,7 @@ struct PTO2SchedulerState {
 #else
         check_and_handle_consumed(slot_state);
 #endif
-        return payload->fanin_actual_count;
+        return released;
     }
 
     // === Cold-path API (defined in pto_scheduler.cpp) ===
@@ -1311,10 +1383,6 @@ struct PTO2SchedulerState {
     static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
     static PTO2SchedulerLayout
     reserve_layout(DeviceArena &arena, const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]);
-    static PTO2SchedulerLayout reserve_layout(
-        DeviceArena &arena, const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH],
-        const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH]
-    );
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never

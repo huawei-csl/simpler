@@ -36,6 +36,7 @@
 
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
+#include "graph_cache.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
@@ -65,9 +66,10 @@ enum PTO2RuntimeMode {
  * dependencies on runtime .cpp files.
  */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
+class HostTensorAccessor;
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -77,23 +79,27 @@ struct PTO2RuntimeOps {
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
     void (*log_warn)(const char *func, const char *fmt, ...);
+    void (*log_timing)(const char *func, const char *fmt, ...);
+    void (*log_info)(const char *func, const char *fmt, ...);
     void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
     void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
-
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const CoreTaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const CoreTaskArgs &args);
     // This-run core geometry from runtime_finalize_after_wire: MIX clusters
     // (one AIC each) and standalone AIV cores.
     int32_t (*available_cluster_count)(PTO2Runtime *rt);
     int32_t (*available_aiv_count)(PTO2Runtime *rt);
+    GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const GraphTaskArgs &args);
+    bool (*graph_prepare)(PTO2Runtime *rt, const GraphTaskArgs &args);
+    void (*graph_abort)(PTO2Runtime *rt);
+    bool (*graph_end)(PTO2Runtime *rt);
+    void (*graph_commit)(PTO2Runtime *rt);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
@@ -111,8 +117,26 @@ struct PTO2RuntimeArenaLayout {
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
+    size_t off_scheduler{0};
     size_t off_runtime{0};
     size_t off_mailbox{0};
+    // The arena is reserved in three zones and the offsets above land in exactly
+    // one of them:
+    //
+    //   host-only    the orchestrator block. Dep-computation scratch the AICPU
+    //                never reads, so it is never copied.
+    //   copied       [off_copied_begin, off_copied_end). Every byte carries this
+    //                run's own content, so bind ships the whole zone as one
+    //                contiguous range.
+    //   device-only  sm_handle, the scheduler state and its queue slot arrays.
+    //                Reachable storage whose content is a function of the layout,
+    //                not of the run, so the device writes it at boot instead of
+    //                receiving an initialization pattern over PCIe.
+    //
+    // Placing the copied zone in the middle is what keeps the upload a single
+    // range: the two zones that are not copied sit on either side of it.
+    size_t off_copied_begin{0};
+    size_t off_copied_end{0};
 
     // Cached parameters (re-used by init_data + wire stages).
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
@@ -137,7 +161,9 @@ struct PTO2Runtime {
     // Components
     PTO2SharedMemoryHandle *sm_handle;
     PTO2OrchestratorState orchestrator;
-    PTO2SchedulerState scheduler;
+    // Device-only zone: the scheduler state holds no per-run content, so it is
+    // addressed through the arena rather than carried inside this header.
+    PTO2SchedulerState *scheduler;
     AICoreCompletionMailbox *aicore_mailbox;
 
     // GM Heap for output buffers
@@ -150,6 +176,16 @@ struct PTO2Runtime {
 
     // Statistics
     int64_t total_cycles;
+    // Graph definitions are process-local host cache entries. The callable
+    // identity prevents two orchestration DSOs from sharing the same key.
+    uint64_t active_callable_hash;
+
+    // Host views of the tensors this run staged, owned by the run that
+    // registered them. Null on the AICPU path, which loads device addresses
+    // directly; get_tensor_data / set_tensor_data then fail closed rather than
+    // dereferencing one. Lives past the first two fields, so the orchestration
+    // .so's partial PTO2Runtime definition neither sees nor needs it.
+    HostTensorAccessor *tensor_access;
 
     // Prebuilt-arena fast path metadata. Carries every offset
     // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
@@ -192,7 +228,10 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
  * Returns the PTO2Runtime* that sits at layout.off_runtime within the arena.
  * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
  * AICore-side count fields are left untouched and must be filled by the
- * AICPU at boot.
+ * AICPU at boot. Initializes the scheduler only: the orchestrator is left
+ * zeroed for the host-orch path (run_host_orchestration) to initialize
+ * against the host SM, since initializing it here would be overwritten and
+ * is never uploaded to the device.
  */
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
@@ -272,14 +311,16 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+uint64_t get_tensor_data(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
  * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
  * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+void set_tensor_data(
+    PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

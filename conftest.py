@@ -28,15 +28,14 @@ import tempfile
 import time
 import typing
 
-# Make simpler's V0..V9 and NUL acceptable to pytest's `--log-level` validator.
+# Make simpler's TIMING and NUL levels acceptable to pytest's `--log-level` validator.
 # pytest does `int(getattr(logging, level.upper(), level))`, so the value must
 # exist as a module attribute on `logging` (not just registered via
 # `addLevelName`). Set both — the addLevelName side gives nice formatter output
-# (`%(levelname)s` shows `V3` instead of `Level 18`); the setattr side is what
+# (`%(levelname)s` shows `TIMING` instead of `Level 25`); the setattr side is what
 # pytest's CLI parser actually consumes.
-for _v in range(10):
-    logging.addLevelName(15 + _v, f"V{_v}")
-    setattr(logging, f"V{_v}", 15 + _v)
+logging.addLevelName(25, "TIMING")
+setattr(logging, "TIMING", 25)
 logging.addLevelName(60, "NUL")
 setattr(logging, "NUL", 60)
 # `pytest --log-level null` upcases to "NULL" before the getattr lookup, so
@@ -54,12 +53,13 @@ import pytest  # noqa: E402
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
+from simpler_setup.scene_test import SceneTestLevel, clear_compile_cache, is_manual_for_platform  # noqa: E402
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
 # failures.
 TIMEOUT_EXIT_CODE = 124
+_SCENE_LEVEL_CHOICES = [int(level) for level in SceneTestLevel]
 
 
 def _parse_device_range(s: str) -> list[int]:
@@ -70,6 +70,25 @@ def _parse_device_range(s: str) -> list[int]:
     ``0-7``, ``0,2,5``, and mixed ``0,2-4,7``).
     """
     return _ps.device_range_to_list(s)
+
+
+def _normalize_cli_scene_level(level: int | None) -> SceneTestLevel | None:
+    if level is None:
+        return None
+    return SceneTestLevel(level)
+
+
+def _item_scene_level(item) -> SceneTestLevel | None:
+    cls = getattr(item, "cls", None)
+    if cls is not None:
+        level = getattr(cls, "_st_level", None)
+        if level is not None:
+            return SceneTestLevel(level)
+    function = getattr(item, "function", None)
+    level = getattr(function, "_st_level", None)
+    if level is not None:
+        return SceneTestLevel(level)
+    return None
 
 
 class DevicePool:
@@ -96,6 +115,13 @@ class DevicePool:
 _device_pool: DevicePool | None = None
 
 
+class Network1Peer(typing.NamedTuple):
+    endpoint: str
+    remote_device_ids: tuple[int, ...]
+    session_timeout_s: float
+    session_listen_host: str
+
+
 def pytest_addoption(parser):
     """Register CLI options."""
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
@@ -111,7 +137,7 @@ def pytest_addoption(parser):
         action="store",
         choices=["exclude", "include", "only"],
         default="exclude",
-        help="Manual case handling: exclude (default), include, only",
+        help="Manual test handling: exclude (default), include, only",
     )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
     parser.addoption(
@@ -119,8 +145,16 @@ def pytest_addoption(parser):
         action="store",
         type=int,
         default=None,
-        choices=[2, 3],
-        help="Only run tests for this SceneTestCase level (2 or 3); default: all levels",
+        choices=_SCENE_LEVEL_CHOICES,
+        help="Only run tests for this scene-test level (2, 3, or 4); default: all levels",
+    )
+    parser.addoption(
+        "--exclude-level",
+        action="store",
+        type=int,
+        default=None,
+        choices=_SCENE_LEVEL_CHOICES,
+        help="Exclude tests carrying this scene-test level (2, 3, or 4)",
     )
     parser.addoption(
         "--max-parallel",
@@ -140,13 +174,13 @@ def pytest_addoption(parser):
         "--skip-golden", action="store_true", default=False, help="Skip golden comparison (benchmark mode)"
     )
     parser.addoption(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         nargs="?",
         const=4,
         default=0,
         type=int,
         metavar="PERF_LEVEL",
-        help="Enable L2 swimlane. Bare flag=level 4 (full). "
+        help="Enable chip swimlane. Bare flag=level 4 (full). "
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
@@ -156,14 +190,15 @@ def pytest_addoption(parser):
         type=int,
         default=0,
         help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
-        "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks), "
-        "3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
+        "args selected via Arg::dump(...), default when given without a value), 2=full (all args), "
+        "3=hybrid (all tasks' JSON metadata; args marked via Arg::dump(...) also write payload; "
+        "used by simpler_setup.tools.core_swimlane for Core swimlane simulator replay).",
     )
     parser.addoption(
         "--enable-dep-gen",
         action="store_true",
         default=False,
-        help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+        help="Enable dep_gen capture (disabled when --rounds > 1)",
     )
     parser.addoption(
         "--enable-pmu",
@@ -179,7 +214,8 @@ def pytest_addoption(parser):
         "--enable-scope-stats",
         action="store_true",
         default=False,
-        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+        help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
+        "(per-scope ring-fill peaks).",
     )
     parser.addoption(
         "--enable-swimlane-overhead",
@@ -187,7 +223,7 @@ def pytest_addoption(parser):
         default=False,
         help="Add the 8 Overhead Analysis counter tracks (per-engine "
         "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
-        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
+        "Requires --enable-chip-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
     )
     parser.addoption(
         "--sanitizer",
@@ -266,6 +302,27 @@ def _collect_descendant_pids(pid: int) -> list[int]:
     return out
 
 
+def _drain_until_quiet(state: object, max_wait_s: float = 10.0) -> None:
+    """Wait until the pump's output stops growing (bounded), so a signaled
+    process's faulthandler dump lands before the next signal or the SIGTERM.
+    A fixed sleep races slow signal delivery: a starved process can take
+    longer than a few seconds to run its dump, and the dump then dies with
+    the SIGTERM. Called from the session-timeout handler between signals."""
+    drain_deadline = time.monotonic() + max_wait_s
+    quiet_rounds = 0
+    prev_lines = -1
+    while time.monotonic() < drain_deadline:
+        cur_lines = sum(len(rj.output_lines) for rj in state.running.values())
+        if cur_lines == prev_lines:
+            quiet_rounds += 1
+            if quiet_rounds >= 5:  # ~1 s of no new output
+                break
+        else:
+            quiet_rounds = 0
+            prev_lines = cur_lines
+        time.sleep(0.2)
+
+
 def _install_session_timeout(timeout_s: int) -> None:
     # Module-level `_ps` import is intentional (rather than a function-local
     # one): doing `from simpler_setup import parallel_scheduler` inside a
@@ -300,24 +357,25 @@ def _install_session_timeout(timeout_s: int) -> None:
                     continue
                 # Signal the dispatched pytest itself, then every descendant
                 # (in BFS order — closer kin first is fine, ordering doesn't
-                # affect the dump).
+                # affect the dump). Each signal is followed by a drain until
+                # the output settles: concurrent faulthandler dumps to the
+                # same pipe interleave at the byte level, splitting frame
+                # names, so a signaled process must finish dumping before the
+                # next one starts.
                 for target_pid in (p.pid, *kin):
                     try:
                         os.kill(target_pid, signal.SIGUSR1)
                     except (ProcessLookupError, OSError):
                         pass
-
-            time.sleep(2.0)
+                    _drain_until_quiet(state)
 
             now = time.monotonic()
             for p, rj in list(state.running.items()):
                 elapsed = now - rj.start_time
-                # The pump thread runs continuously and is the actual drain;
-                # the 2 s sleep above already gave faulthandler bytes time to
-                # land in ``output_lines``. ``join`` here only yields the GIL
-                # so the pump's pending ``output_lines.append`` lands before
-                # we read the list. Short timeout — pump will block on the
-                # next ``readline()`` since the child is still alive.
+                # ``join`` here only yields the GIL so the pump's pending
+                # ``output_lines.append`` lands before we read the list. Short
+                # timeout — pump will block on the next ``readline()`` since
+                # the child is still alive.
                 pump = getattr(rj, "pump_thread", None)
                 if pump is not None:
                     pump.join(timeout=0.05)
@@ -403,17 +461,62 @@ def _configure_sanitizer(config):
         )
 
 
+def _validate_diagnostic_flags(config) -> None:
+    # Imported by full path: `simpler_setup.scene_test` as an attribute is the
+    # @scene_test decorator, not this module.
+    from simpler_setup.scene_test import _validate_diagnostic_flags as validate  # noqa: PLC0415
+
+    try:
+        validate(
+            chip_swimlane=config.getoption("--enable-chip-swimlane", default=0),
+            swimlane_overhead=config.getoption("--enable-swimlane-overhead", default=False),
+        )
+    except ValueError as e:
+        raise pytest.UsageError(str(e)) from e
+
+
+def _validate_level_filters(config) -> None:
+    if config.getoption("--level", default=None) is not None and (
+        config.getoption("--exclude-level", default=None) is not None
+    ):
+        raise pytest.UsageError("--level and --exclude-level cannot be used together")
+
+
 def pytest_configure(config):
     """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
     config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
     config.addinivalue_line(
+        "markers", "manual(platforms=None): test runs only when --manual is include or only on selected platforms"
+    )
+    config.addinivalue_line(
+        "markers",
+        "network1_remote_device_count(n): number of remote NPU devices needed on the peer machine",
+    )
+    config.addinivalue_line(
+        "markers",
+        "sdma: the test exercises PTO-ISA async SDMA. SceneTestCase pytest "
+        "fixtures and standalone runners build its Worker with enable_sdma=True "
+        "unless worker_workspace=False selects a platform-provisioned "
+        "communication-domain workspace. "
+        "Worker-global provisioning creates 48 "
+        "device-only STARS streams that sit in the device fault domain, which "
+        "makes a later AICore fault on that device cost minutes instead of "
+        "~0.3 s (#1425). Two consequences follow from the one marker: such a "
+        "test never shares an L2 Worker (the pool key carries the flag) and it "
+        "sorts after every ordinary test, so fault-injection cases run on a "
+        "device that has never provisioned. The a2a3 CI additionally runs them "
+        "in a step of their own via -m sdma until #1425 is fixed",
+    )
+    config.addinivalue_line(
         "markers",
         "runtime(name): runtime this standalone test targets; used by runtime-isolation subprocess "
         "filtering so non-@scene_test tests only run under their matching runtime",
     )
 
+    _validate_level_filters(config)
+    _validate_diagnostic_flags(config)
     _configure_sanitizer(config)
 
     # Configure logging unconditionally (not only when --log-level is passed) so
@@ -477,8 +580,36 @@ def pytest_configure(config):
     # filenames or rename dance.
 
 
+def _manual_mode_matches(is_manual: bool, manual_mode: str) -> bool:
+    return manual_mode == "include" or is_manual == (manual_mode == "only")
+
+
+def _manual_marker_applies(marker, platform: str | None) -> bool:
+    if marker is None:
+        return False
+
+    unknown_kwargs = set(marker.kwargs) - {"platforms"}
+    if unknown_kwargs:
+        names = ", ".join(sorted(unknown_kwargs))
+        raise pytest.UsageError(f"@pytest.mark.manual got unsupported keyword argument(s): {names}")
+    if marker.args and "platforms" in marker.kwargs:
+        raise pytest.UsageError(
+            "@pytest.mark.manual platforms must be passed either positionally or by keyword, not both"
+        )
+
+    if "platforms" in marker.kwargs:
+        platforms = marker.kwargs["platforms"]
+    elif marker.args:
+        platforms = marker.args[0] if len(marker.args) == 1 else marker.args
+    else:
+        return True
+    if platforms is None or platform is None:
+        return True
+    return is_manual_for_platform(platforms, platform)
+
+
 def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
-    """Filter ST tests by --platform / --runtime / --level; order L3 before L2.
+    """Filter ST tests by --platform / --runtime / level axes; order L3 before L2.
 
     Static filter mismatches (wrong level, wrong runtime, wrong platform)
     are **deselected** rather than marked ``pytest.skip`` so they don't
@@ -494,7 +625,9 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     """
     platform = config.getoption("--platform")
     runtime_filter = config.getoption("--runtime")
-    level_filter = config.getoption("--level")
+    level_filter = _normalize_cli_scene_level(config.getoption("--level"))
+    exclude_level_filter = _normalize_cli_scene_level(config.getoption("--exclude-level"))
+    manual_mode = config.getoption("--manual", default="exclude")
 
     keep: list = []
     deselected: list = []
@@ -508,13 +641,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
         cls = getattr(item, "cls", None)
 
-        # Under --level, non-SceneTestCase items don't participate in
-        # level-based dispatch at all. Resource phase collects them
-        # separately in the parent; in a level-filtered child they're
-        # simply not this phase's concern.
-        if level_filter is not None and cls is None:
-            deselected.append(item)
-            continue
+        item_level = _item_scene_level(item)
 
         if cls is not None and hasattr(cls, "CASES") and isinstance(cls.CASES, list):
             # SceneTestCase class item.
@@ -523,19 +650,31 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
                 item.add_marker(pytest.mark.skip(reason="--platform required"))
                 keep.append(item)
                 continue
-            if not any(platform in c.get("platforms", []) for c in cls.CASES):
+            if not any(
+                platform in case.get("platforms", [])
+                and _manual_mode_matches(is_manual_for_platform(case.get("manual"), platform), manual_mode)
+                for case in cls.CASES
+            ):
                 deselected.append(item)
                 continue
             if runtime_filter and getattr(cls, "_st_runtime", None) != runtime_filter:
                 deselected.append(item)
                 continue
-            if level_filter is not None and getattr(cls, "_st_level", None) != level_filter:
+            if level_filter is not None and item_level != level_filter:
+                deselected.append(item)
+                continue
+            if exclude_level_filter is not None and item_level == exclude_level_filter:
                 deselected.append(item)
                 continue
             keep.append(item)
             continue
 
-        # Non-class pytest function (standalone resource tests and such).
+        # Standalone pytest test (resource functions and ordinary tests).
+        is_manual = _manual_marker_applies(item.get_closest_marker("manual"), platform)
+        if not _manual_mode_matches(is_manual, manual_mode):
+            deselected.append(item)
+            continue
+
         platforms_marker = item.get_closest_marker("platforms")
         if platforms_marker:
             if not platform:
@@ -556,6 +695,13 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             deselected.append(item)
             continue
 
+        if level_filter is not None and item_level != level_filter:
+            deselected.append(item)
+            continue
+        if exclude_level_filter is not None and item_level == exclude_level_filter:
+            deselected.append(item)
+            continue
+
         keep.append(item)
 
     if deselected:
@@ -565,31 +711,35 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
     # Sort: L3 tests first (they fork child processes that inherit main process CANN state,
     # so they must run before L2 tests pollute the CANN context).
     def sort_key(item):
-        cls = getattr(item, "cls", None)
-        level = getattr(cls, "_st_level", 0) if cls else 0
-        return (0 if level >= 3 else 1, item.nodeid)
+        level = _item_scene_level(item) or 0
+        # SDMA last, for the same class of reason L3 goes first: provisioning
+        # the workspace leaves 48 STARS streams in the device's fault domain,
+        # so every fault-injection case must have already run on a device that
+        # never provisioned (#1425). Keyed off the marker, not the class, since
+        # the fault-injection tests are plain functions with no _st_level.
+        sdma_last = 1 if item.get_closest_marker("sdma") else 0
+        return (sdma_last, 0 if level >= 3 else 1, item.nodeid)
 
     items.sort(key=sort_key)
 
     # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
-    # that all write l2_swimlane_records_<ts>.json to the same directory with
+    # that all write chip_swimlane_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
-    if config.getoption("--enable-l2-swimlane", default=0):
+    if config.getoption("--enable-chip-swimlane", default=0) and config.getoption("--rounds", default=1) <= 1:
         l3_items = [
             i
             for i in items
-            if getattr(getattr(i, "cls", None), "_st_level", None) == 3
-            and not any(m.name == "skip" for m in i.iter_markers())
+            if _item_scene_level(i) == SceneTestLevel.NODE and not any(m.name == "skip" for m in i.iter_markers())
         ]
         if l3_items:
             sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
             more = "" if len(l3_items) <= 3 else f" (+{len(l3_items) - 3} more)"
             raise pytest.UsageError(
-                f"--enable-l2-swimlane is not supported for L3 tests yet — "
+                f"--enable-chip-swimlane is not supported for L3 tests yet — "
                 f"multi-chip-process filename collision unresolved. "
                 f"L3 items in this session: {sample}{more}. "
-                f"Either drop --enable-l2-swimlane or scope to L2 with --level 2."
+                f"Either drop --enable-chip-swimlane or scope to L2 with --level 2."
             )
 
 
@@ -631,14 +781,14 @@ def _collect_st_runtimes(items, level=None):
     return sorted(runtimes)
 
 
-def _collect_resource_jobs(items, platform):
+def _collect_resource_jobs(items, platform, manual_mode="exclude"):
     """Collect every item that needs a dedicated device-allocating subprocess.
 
     Two job kinds share one phase:
 
       - ``l3``:         one per L3 ``SceneTestCase`` class.
         ``device_count`` is the max across the class's platform-matching
-        non-manual cases.
+        cases selected by ``manual_mode``.
       - ``standalone``: one per non-class pytest function that declares its
         resource needs via ``@pytest.mark.device_count(n)`` +
         ``@pytest.mark.runtime("...")`` (and optional
@@ -666,7 +816,7 @@ def _collect_resource_jobs(items, platform):
         for case in getattr(cls, "CASES", []):
             if platform and platform not in case.get("platforms", []):
                 continue
-            if case.get("manual"):
+            if not _manual_mode_matches(is_manual_for_platform(case.get("manual"), platform), manual_mode):
                 continue
             saw_case = True
             max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
@@ -705,10 +855,47 @@ def _collect_resource_jobs(items, platform):
     return jobs
 
 
-def _base_pytest_argv(session):
+def _strip_value_options(args, options):
+    stripped = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        text = str(arg)
+        if text in options:
+            skip_next = True
+            continue
+        if any(text.startswith(f"{option}=") for option in options):
+            continue
+        stripped.append(text)
+    return stripped
+
+
+def _resource_child_command(spec, device_ids, platform, manual_mode):
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        spec.nodeid,
+        "--runtime",
+        spec.runtime,
+        "--device",
+        _ps.format_device_range(device_ids),
+    ]
+    if spec.kind == "l3":
+        command.extend(["--level", "3"])
+    if platform:
+        command.extend(["--platform", platform])
+    command.extend(["--manual", manual_mode])
+    return command
+
+
+def _base_pytest_argv(session, *, strip_options=()):
     """Inherit the user's original pytest invocation args."""
     base = [sys.executable, "-m", "pytest"]
-    for arg in session.config.invocation_params.args:
+    args = _strip_value_options(session.config.invocation_params.args, set(strip_options))
+    for arg in args:
         base.append(str(arg))
     return base
 
@@ -792,9 +979,10 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     # pytest registers -x as an alias of --exitfirst; both resolve via this name.
     fail_fast = bool(cfg.getoption("--exitfirst", default=False))
     platform = cfg.getoption("--platform")
+    manual_mode = cfg.getoption("--manual", default="exclude")
     max_parallel = _resolve_max_parallel(cfg, platform or "", device_ids)
 
-    base_args = _base_pytest_argv(session)
+    base_args = _base_pytest_argv(session, strip_options=("--exclude-level",))
     cwd = session.config.invocation_params.dir
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
@@ -805,31 +993,14 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         for spec in resource_specs:
             label = f"{spec.kind} {spec.label} (rt={spec.runtime}, dev={spec.device_count})"
 
-            def _build(ids, _nodeid=spec.nodeid, _rt=spec.runtime, _kind=spec.kind):
+            def _build(ids, _spec=spec):
                 # Narrow the child to the specific nodeid, not the inherited
                 # directory args (examples tests/st). Passing the directories
                 # would re-collect every SceneTestCase and run them alongside
                 # this job in the same subprocess, which has only this job's
                 # allocated devices — e.g. TestL3Group (needs 2) would fail
                 # inside TestL3ChildMemory's 1-device subprocess.
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    _nodeid,
-                    "--runtime",
-                    _rt,
-                    "--device",
-                    _ps.format_device_range(ids),
-                ]
-                if _kind == "l3":
-                    # L3 jobs run inside --level 3 child mode; standalone jobs
-                    # are non-SceneTestCase functions and do not participate
-                    # in level-based dispatch.
-                    cmd.extend(["--level", "3"])
-                if platform:
-                    cmd.extend(["--platform", platform])
-                return cmd
+                return _resource_child_command(_spec, ids, platform, manual_mode)
 
             jobs.append(
                 _ps.Job(
@@ -970,16 +1141,19 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 def pytest_runtestloop(session):
     """Dispatch Resource + L2 phases unless caller is already in child mode.
 
-    Child mode (both --runtime and --level set, or --collect-only) skips the
-    dispatcher and falls through to pytest's default runtestloop.
+    Child mode (runtime-filtered runs, L2/L3 level-filtered runs, or
+    --collect-only) skips the dispatcher and falls through to pytest's
+    default runtestloop. Level 4 network1 selection is not child mode; it still
+    uses the Resource dispatcher.
     """
     runtime_filter = session.config.getoption("--runtime")
     level_filter = session.config.getoption("--level")
 
-    # Child mode: if the caller filters by runtime or level, it wants direct
-    # control — don't re-enter the multi-phase dispatcher (which would cause
-    # nested dispatch, device pool exhaustion, and timeout).
-    if runtime_filter is not None or level_filter is not None:
+    # Child mode: if the caller filters by runtime, or by the SceneTestCase
+    # levels the dispatcher itself uses for children, it wants direct control.
+    if runtime_filter is not None:
+        return
+    if _normalize_cli_scene_level(level_filter) in (SceneTestLevel.CHIP, SceneTestLevel.NODE):
         return
 
     # User explicitly asked for collect-only / scoped-run — don't orchestrate.
@@ -998,8 +1172,9 @@ def pytest_runtestloop(session):
     # dispatcher to avoid walking ``session.items`` twice.
     level_filter_explicit = level_filter is not None
     platform = session.config.getoption("--platform")
+    manual_mode = session.config.getoption("--manual", default="exclude")
     runtimes_all = _collect_st_runtimes(session.items)
-    resource_specs = _collect_resource_jobs(session.items, platform)
+    resource_specs = _collect_resource_jobs(session.items, platform, manual_mode)
     if not resource_specs and len(runtimes_all) <= 1 and not level_filter_explicit:
         return
 
@@ -1204,6 +1379,61 @@ def st_platform(request):
 
 
 @pytest.fixture(scope="session")
+def st_network1_peer():
+    """Network1 endpoint and remote device pool from the network1 runner environment."""
+    endpoint = os.environ.get("NETWORK1_REMOTE_ENDPOINT")
+    if not endpoint:
+        pytest.skip("NETWORK1_REMOTE_ENDPOINT is required for network1 tests")
+    remote_devices = os.environ.get("NETWORK1_REMOTE_DEVICES")
+    if not remote_devices:
+        pytest.skip("NETWORK1_REMOTE_DEVICES is required for network1 tests")
+    try:
+        session_timeout_s = float(os.environ.get("NETWORK1_L3_SESSION_TIMEOUT_S", "120"))
+    except ValueError as e:
+        pytest.fail(f"NETWORK1_L3_SESSION_TIMEOUT_S must be a float: {e}")
+    # The remote peer connects back to the parent session runner.
+    return Network1Peer(
+        endpoint=endpoint,
+        remote_device_ids=tuple(_parse_device_range(remote_devices)),
+        session_timeout_s=session_timeout_s,
+        session_listen_host=os.environ.get("NETWORK1_L3_SESSION_LISTEN_HOST", "0.0.0.0"),  # noqa: S104
+    )
+
+
+@pytest.fixture()
+def st_network1_remote_device_ids(request, st_network1_peer):
+    """Allocate remote device IDs from the network1 peer's default device pool.
+
+    Every network1 test gets the same leading slice, so this is collision-free only
+    while the network1 job serializes the sweep with ``--max-parallel 1``.
+    """
+    marker = request.node.get_closest_marker("network1_remote_device_count")
+    n = marker.args[0] if marker else 1
+    if n > len(st_network1_peer.remote_device_ids):
+        available = len(st_network1_peer.remote_device_ids)
+        pytest.fail(f"need {n} remote devices but NETWORK1_REMOTE_DEVICES only has {available} entries")
+    return list(st_network1_peer.remote_device_ids[:n])
+
+
+@pytest.fixture()
+def st_network1_logs(request, monkeypatch):
+    """Per-test parent log directory for network1 scene tests."""
+    if _item_scene_level(request.node) != SceneTestLevel.NETWORK1:
+        pytest.fail("st_network1_logs requires SceneTestLevel.NETWORK1")
+    run_dir = os.environ.get("RUN_DIR")
+    if not run_dir:
+        if not os.environ.get("NETWORK1_REMOTE_ENDPOINT") or not os.environ.get("NETWORK1_REMOTE_DEVICES"):
+            pytest.skip("network1 runner environment is required for network1 tests")
+        pytest.fail("RUN_DIR is required for network1 tests")
+    machine = os.environ.get("NETWORK1_MACHINE", "parent")
+    nodeid = re.sub(r"[^A-Za-z0-9_.-]+", "_", request.node.nodeid)
+    log_path = os.path.join(run_dir, "pytest", f"parent-{machine}", "ascend", nodeid)
+    os.makedirs(log_path, exist_ok=True)
+    monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", log_path)
+    return log_path
+
+
+@pytest.fixture(scope="session")
 def _l2_worker_pool(request, st_platform):
     """Session-scoped L2 worker pool keyed by (runtime, device_id).
 
@@ -1339,6 +1569,9 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
     level = cls._st_level
     runtime = cls._st_runtime
+    from simpler_setup.scene_test import _class_wants_sdma  # noqa: PLC0415
+
+    wants_sdma = _class_wants_sdma(cls)
 
     if level == 2:
         # A prior test on this runtime poisoned the device and the rebuild below
@@ -1362,9 +1595,15 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         # st_device_ids) that also draw from it; retaining the id would drain
         # the pool and break any non-st_worker test that runs afterward on the
         # same xdist worker.
-        for (rt, dev_id), existing in _l2_worker_pool.items():
-            if rt == runtime:
-                _register_l2_pool_recycle(request, _l2_worker_pool, (rt, dev_id), _l2_poisoned)
+        # The SDMA capability is part of the Worker's identity, not a per-run
+        # option: an enable_sdma Worker holds 48 STARS streams for its whole
+        # life, so it must never be handed to a test that did not ask for them,
+        # nor a plain Worker to one that did. It therefore takes a slot in the
+        # pool key and gates reuse. Ordering puts every sdma test after the
+        # rest, so the swap happens once, at the end.
+        for (rt, dev_id, pooled_sdma), existing in _l2_worker_pool.items():
+            if rt == runtime and pooled_sdma == wants_sdma:
+                _register_l2_pool_recycle(request, _l2_worker_pool, (rt, dev_id, pooled_sdma), _l2_poisoned)
                 yield existing
                 return
 
@@ -1373,7 +1612,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             pytest.fail(f"no devices available in --device pool (requested 1, pool has {len(device_pool._available)})")
         dev_id = ids[0]
         device_pool.release(ids)
-        key = (runtime, dev_id)
+        key = (runtime, dev_id, wants_sdma)
 
         # At most one runtime-specific Worker may own a device: finalization
         # resets resources that would invalidate every other Worker on it.
@@ -1388,7 +1627,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
+        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, enable_sdma=wants_sdma)
         w._st_device_id = dev_id
         # First rebuild after a poison-and-heal lands here. On arches where the
         # device re-inits cleanly this just works; on a5 the op-timeout poison
@@ -1435,6 +1674,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
             num_sub_workers=max_subs,
             platform=st_platform,
             runtime=runtime,
+            enable_sdma=wants_sdma,
         )
         w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 
@@ -1452,7 +1692,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 )
 
                 name = entry["name"]
-                cache_key = l3_compile_cache_key(cls.__qualname__, name, st_platform, runtime)
+                cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, st_platform, runtime)
                 chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
                 handle = w.register(chip)
                 chip_handles[name] = handle

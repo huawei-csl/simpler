@@ -1,0 +1,89 @@
+name: NPU Scene Tests (a5)
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      include_dfx_smokes:
+        required: false
+        default: false
+        type: boolean
+      manual_mode:
+        description: exclude for Per-PR, include for the Daily full sweep.
+        required: false
+        default: exclude
+        type: string
+
+jobs:
+  run:
+    name: st-onboard-a5
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 60
+    env:
+      MANUAL_MODE: ${{ inputs.manual_mode }}
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Validate manual mode
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
+      - name: Restore scene-test kernel cache (a5)
+        uses: actions/cache@v5
+        with:
+          path: build/cache/kernels
+          key: scene-kernels-a5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
+          restore-keys: |
+            scene-kernels-a5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind cmake>=3.15"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_a5 .[test]"
+          install-torch: "false"
+          system-site-packages: "true"
+          source-cann: "false"
+
+      - name: Compile scene-test kernels (a5)
+        run: |
+          .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
+            --platform a5 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
+            --manual "$MANUAL_MODE"
+
+      - name: Run pytest scene tests (a5)
+        run: |
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+
+      - name: DFX smokes (a5)
+        if: inputs.include_dfx_smokes
+        uses: ./.github/actions/run-onboard-dfx-smokes
+        with:
+          platform: a5

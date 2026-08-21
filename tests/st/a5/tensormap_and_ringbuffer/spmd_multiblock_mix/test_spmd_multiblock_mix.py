@@ -16,7 +16,7 @@ Output tensor: 282 cache lines = 4512 float32.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
@@ -64,13 +64,12 @@ class TestSpmdMultiblockMix(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4},
             "params": {},
         }
     ]
 
     def generate_args(self, params):
-        return TaskArgsBuilder(Tensor("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
+        return TaskArgsBuilder(TensorArg("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)))
 
     def compute_golden(self, args, params):
         out = args.output

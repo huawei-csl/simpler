@@ -9,18 +9,43 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_COMMON_WORKER_CHIP_WORKER_H_
-#define SRC_COMMON_WORKER_CHIP_WORKER_H_
+#pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "../platform_comm/comm.h"
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "pipeline_slot_pool.h"
 #include "pto_runtime_c_api.h"
 #include "types.h"
+
+/** Opaque identity for one prepared native run owned by a ChipWorker. */
+struct ChipWorkerNativeRun {
+    uint32_t slot_id{0};
+    // Generation of the externally minted pipeline lease. One lease may
+    // dispatch several runs, so this is not sufficient run identity alone.
+    uint64_t generation{0};
+    // Process-unique identity for exactly one prepare attempt.
+    uint64_t run_epoch{0};
+    // Optional L3 mailbox identity. Direct L2 callers leave these as zero.
+    uint64_t run_id{0};
+    uint64_t dispatch_id{0};
+};
+
+class ChipRun;
+class ChipRunLane;
+struct ChipRunLaneState;
 
 class ChipWorker {
 public:
@@ -34,13 +59,10 @@ public:
     /// calling thread to `device_id`. Can only be called once per lifetime —
     /// the runtime and device cannot be changed after init.
     ///
-    /// The process-wide RTLD_GLOBAL bootstrap loads (libsimpler_log.so, and on
-    /// sim libcpu_sim_context.so — plus seeding HostLogger via simpler_log_init)
-    /// are the caller's responsibility and must already have happened before
-    /// this call: host_runtime.so resolves its undefined HostLogger /
-    /// unified_log_* (and, on sim, sim_context_*) symbols against those
-    /// globals. The Python `ChipWorker` wrapper does this with `ctypes.CDLL(...,
-    /// mode=RTLD_GLOBAL)`.
+    /// Every host module contains its own logger implementation and binds it to
+    /// the process-owned state before use. On sim, libcpu_sim_context.so is
+    /// retained in a process-wide registry because host_runtime.so resolves PTO
+    /// simulator hooks from its RTLD_GLOBAL symbol scope.
     /// `prewarm_config`, when non-null, builds + caches the prebuilt
     /// runtime-arena for its ring sizing right after the device comes up (the
     /// sizing is fork-constant, delivered by COW into init). A no-op for
@@ -52,27 +74,78 @@ public:
     /// platform/runtime that does not support a requested engine. The mask stays
     /// a raw integer here so this platform-agnostic worker needs no platform
     /// headers; the binding derives it from the DmaWorkspaceKind enum.
+    /// `sdma_warmup_path`, when non-empty, is the vector-only ELF that walks the
+    /// SDMA control path once per channel during that provisioning, moving the
+    /// cold-start cost off the first TPREFETCH_ASYNC. Optional: an empty path (or
+    /// an arch that builds no such ELF) only costs that first-call latency.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
-        uint32_t dma_workspace_mask = 0
+        uint32_t dma_workspace_mask = 0, const std::string &sim_context_path = "",
+        const std::string &sdma_warmup_path = ""
     );
 
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // Launch a cid previously staged via register_callable.
-    // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
-    // into a stack POD), then delegates to the overload below. Per-stage timing
-    // (host wall, on-NPU device wall + AICPU phase breakdown) is emitted by the
-    // platform as `[STRACE]` log markers — see src/common/log/.../strace.h — not
-    // returned, so the L3 dispatcher and L2 child are observed uniformly.
-    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
-    // Same launch, but the caller already holds the runtime.so-ABI POD —
-    // skip the view→storage memcpy and hand the pointer straight to the C ABI.
-    // Used by the ChipStorageTaskArgs path in the nanobind binding.
+    // Launch a cid previously staged via register_callable. `args` is the runtime.so-ABI POD, which
+    // every caller already holds: the wire blob is materialized into one before it gets here.
+    // Per-stage timing (host wall, on-NPU device wall + AICPU phase breakdown) is emitted by the
+    // platform as `[STRACE]` log markers — see src/common/log/.../strace.h — not returned, so the
+    // L3 dispatcher and L2 child are observed uniformly.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    void
+    run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config,
+        volatile int32_t *accepted_state, int32_t accepted_value);
+    void run_with_lease(
+        int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+    );
+
+    /**
+     * Progressable native-run lifecycle.
+     *
+     * prepare_native_run performs per-run Runtime construction and binding but
+     * does not launch device work. launch_native_run returns only after the
+     * backend crosses its launch fence (or terminates with an error), while
+     * poll/wait observe completion and finalize owns validation, copy-back,
+     * diagnostics, and Runtime destruction. The blocking run() overloads are
+     * the compatibility composition of these phases. A successful prepare
+     * transfers cleanup ownership to the caller: launch failure does not consume
+     * the token, and the caller must still finalize it. The blocking composition
+     * performs that cleanup internally on every exit.
+     *
+     * Onboard HBG may prepare one distinct-slot successor while another run
+     * owns the execution claim. Diagnostics and backends without the explicit
+     * capability remain depth-one. Lease generation gates admission; after a
+     * successful prepare, the slot plus process-unique run epoch prevents a
+     * delayed phase call from touching reused storage, including another run
+     * under the same pipeline lease or on another ChipWorker.
+     */
+    ChipWorkerNativeRun prepare_native_run(
+        int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
+        uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
+        int32_t accepted_value = 0
+    );
+    void launch_native_run(const ChipWorkerNativeRun &run);
+    bool poll_native_run(const ChipWorkerNativeRun &run);
+    void wait_native_run(const ChipWorkerNativeRun &run);
+    void finalize_native_run(const ChipWorkerNativeRun &run);
+
+    ChipRun submit_chip_run(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
+        uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
+        bool activated = true
+    );
+    // Direct submission: no pipeline lease, so the lane admits at capacity one
+    // by draining its predecessor before this run enters the FIFO. run() is the
+    // blocking composition of this call and ChipRun::wait_until.
+    ChipRun submit_chip_run(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+    );
+    void close_chip_run_lane();
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -90,11 +163,11 @@ public:
     /// `aicpu_dlopen_count` for the trb path; returns 0 on device-orch variants.
     size_t host_dlopen_count() const;
 
-    /// Number of run stream sets the bound runner has created. A set belongs
-    /// to a pipeline slot and is reused for every run on that slot, so a
-    /// runner that has served any number of runs on one slot reports 1;
-    /// platforms whose runs use the persistent bootstrap pair report 0. Used
-    /// by tests to assert that repeated runs do not rebuild the set per run.
+    /// Number of AICore run streams the bound runner has created. One AICPU +
+    /// AICore pair serves every run for the runner's lifetime. The AICPU stream
+    /// persists; the AICore stream is recreated when a new code upload makes it
+    /// stale, and destroyed when an unproven completion retires it. Platforms
+    /// using the persistent bootstrap pair report 0.
     size_t run_stream_set_create_count() const;
 
     uint64_t malloc(size_t size);
@@ -141,6 +214,11 @@ public:
     /// inside the backend's per-allocation record).
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+    std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
+        uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
+    );
+    uint64_t comm_global_domain_import(uint64_t domain_id, const std::vector<uint8_t> &descriptors);
+    void comm_global_domain_release(uint64_t domain_id);
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
@@ -148,6 +226,22 @@ public:
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
+    size_t runtime_slot_count() const { return runtime_bufs_.size(); }
+    bool supports_concurrent_native_prepare() const;
+
+    /// Opaque host native-run storage address for every slot the contract
+    /// asked for. Two slots hold distinct storage; tests read this to prove
+    /// per-run state is not one buffer under two slot ids.
+    std::vector<uint64_t> runtime_buffer_addrs() const;
+
+    /// Committed GM heap base of one arena bank on the bound runner, or 0 when
+    /// that bank has never been committed or the platform shares one arena set.
+    uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
+
+    /// Retained temporary-buffer address the bound runner holds for one
+    /// pipeline slot, or 0 while that slot holds none.
+    uint64_t retained_temp_addr(uint32_t slot_id) const;
+    size_t committed_device_memory() const;
 
 private:
     using CreateDeviceContextFn = void *(*)();
@@ -157,18 +251,23 @@ private:
     using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
+    using GetRuntimeAlignmentFn = size_t (*)();
+    using GetCommittedDeviceMemoryFn = size_t (*)(void *);
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
     // CANN dlog sync. Reads the current log level off HostLogger itself.
-    using SimplerInitFn = int (*)(
-        void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *
-    );
+    using SimplerInitFn = decltype(&simpler_init);
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
-    using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using SimplerRunFn = decltype(&simpler_run);
+    using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
+    using SimplerNativeRunFn = decltype(&simpler_launch_run);
+    using SupportsConcurrentNativePrepareFn = int (*)(void *);
+    using GetArenaBankGmHeapBaseFn = uint64_t (*)(void *, uint32_t);
+    using GetRetainedTempAddrFn = uint64_t (*)(void *, uint32_t);
     using GetPipelineContractFn = const PipelineContract *(*)();
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
-    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
+    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t, const void *, uint64_t);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -181,6 +280,10 @@ private:
     using CommAllocDomainWindowsFn =
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
+    using CommGlobalDomainPrepareFn =
+        int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
+    using CommGlobalDomainImportFn = int (*)(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *);
+    using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
 
@@ -209,9 +312,19 @@ private:
     CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
+    GetRuntimeAlignmentFn get_runtime_alignment_fn_ = nullptr;
+    GetCommittedDeviceMemoryFn device_committed_memory_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SimplerPrepareRunFn prepare_run_fn_ = nullptr;
+    SimplerNativeRunFn launch_run_fn_ = nullptr;
+    SimplerNativeRunFn poll_run_fn_ = nullptr;
+    SimplerNativeRunFn wait_run_fn_ = nullptr;
+    SimplerNativeRunFn finalize_run_fn_ = nullptr;
+    SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
+    GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
+    GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
@@ -228,15 +341,71 @@ private:
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
+    CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
+    CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
+    CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
+    std::unordered_set<uint64_t> global_domain_ids_;
     uint64_t base_comm_handle_ = 0;
 
-    std::vector<uint8_t> runtime_buf_;
+    uint32_t arena_bank_for_slot(uint32_t slot_id) const;
+
+    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
+    class PreparedRunIncompatible : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+    struct NativeRunSlotState {
+        uint64_t lease_generation{0};
+        uint64_t run_epoch{0};
+        NativeRunPhase phase{NativeRunPhase::EMPTY};
+        int wait_rc{0};
+        bool permits_prepared_successor{false};
+    };
+    ChipWorkerNativeRun prepare_native_run_on_slot(
+        int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
+        uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
+        int32_t accepted_value, bool admit_pipeline_generation
+    );
+    ChipWorkerNativeRun prepare_native_run_for_lane(
+        int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
+        uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
+        bool pipeline_leased
+    );
+    void cleanup_native_runs_noexcept() noexcept;
+
+    friend struct ChipRunLaneState;
+
+    class RuntimeStorage {
+    public:
+        RuntimeStorage() = default;
+        RuntimeStorage(size_t size, size_t alignment);
+        ~RuntimeStorage();
+        RuntimeStorage(RuntimeStorage &&other) noexcept;
+        RuntimeStorage &operator=(RuntimeStorage &&other) noexcept;
+        RuntimeStorage(const RuntimeStorage &) = delete;
+        RuntimeStorage &operator=(const RuntimeStorage &) = delete;
+
+        void *data() { return data_; }
+        const void *data() const { return data_; }
+
+    private:
+        void *data_{nullptr};
+    };
+
+    // Allocated once during init and never resized. Each allocation honors the
+    // runtime-reported alignment and keeps a stable C ABI address through
+    // prepare/finalize even if the owning vector itself is moved.
+    std::vector<RuntimeStorage> runtime_bufs_;
+    std::array<NativeRunSlotState, PTO_PIPELINE_MAX_DEPTH> native_run_states_{};
+    mutable std::mutex native_run_mu_;
+    PipelineSlotGenerationFilter pipeline_generations_;
     PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
+    std::unique_ptr<ChipRunLane> run_lane_;
     // device_id_ is set once in init() and never modified afterward. All
     // ChipWorker callers run on the thread that called init() (the same
     // thread is the only one that subsequently calls malloc / copy_to /
@@ -246,5 +415,3 @@ private:
     bool initialized_ = false;
     bool finalized_ = false;
 };
-
-#endif  // SRC_COMMON_WORKER_CHIP_WORKER_H_

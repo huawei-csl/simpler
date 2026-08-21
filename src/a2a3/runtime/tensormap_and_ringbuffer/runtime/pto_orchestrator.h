@@ -25,10 +25,9 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_ORCHESTRATOR_H
-#define PTO_ORCHESTRATOR_H
+#pragma once
 
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
@@ -96,8 +95,8 @@ struct PTO2OrchestratorState {
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
 #if SIMPLER_DFX
-    // L2 swimlane_level copied from get_l2_swimlane_level().
-    L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};
+    // chip swimlane_level copied from get_chip_swimlane_level().
+    ChipSwimlaneLevel chip_swimlane_level{ChipSwimlaneLevel::DISABLED};
 #endif
 
     // === GM HEAP (for output buffers) ===
@@ -139,7 +138,7 @@ struct PTO2OrchestratorState {
     // Phase 1: declare every sub-region (per-ring fanin pool, scope arrays,
     // tensor_map sub-layout) on the supplied arena. task_window_sizes feeds
     // the nested tensor_map layout. Returned layout is consumed by
-    // init_from_layout.
+    // init_data_from_layout.
     static PTO2OrchestratorLayout reserve_layout(
         DeviceArena &arena, const int32_t task_window_sizes[PTO2_MAX_RING_DEPTH],
         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
@@ -180,9 +179,9 @@ struct PTO2OrchestratorState {
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
-    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    TaskOutputTensors submit_dummy_task(const L0TaskArgs &args);
-    TaskOutputTensors alloc_tensors(const L0TaskArgs &args);
+    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
+    TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
+    TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
     void mark_done();
 };
 
@@ -211,5 +210,3 @@ struct PTO2OrchProfilingData {
 
 PTO2OrchProfilingData orchestrator_get_profiling();
 #endif
-
-#endif  // PTO_ORCHESTRATOR_H

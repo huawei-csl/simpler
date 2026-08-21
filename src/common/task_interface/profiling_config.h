@@ -12,14 +12,18 @@
 #ifndef SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
 #define SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
 
+#if defined(__has_include)
+#if __has_include(<simpler_profiling_build_config.h>)
+#include <simpler_profiling_build_config.h>
+#endif
+#endif
+
 #ifndef SIMPLER_DFX
 #define SIMPLER_DFX 1
 #endif
 
-// Gate for the host-side `[STRACE]` run-timing trace facility
-// (src/common/log/include/common/strace.h). Separate from SIMPLER_DFX (which
-// gates the device orch/sched markers) so the host trace can be toggled
-// independently; default on, mirroring SIMPLER_DFX.
+// Gate for `[STRACE]` markers and the onboard capture work that exclusively
+// backs device-domain markers. Independent of the SIMPLER_DFX collectors.
 #ifndef SIMPLER_HOST_STRACE
 #define SIMPLER_HOST_STRACE 1
 #endif

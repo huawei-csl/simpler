@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -76,8 +77,8 @@ public:
     // child and consumes the mailbox via the Python child loop.
     // `child_pid` is the forked child servicing `mailbox`, or -1 when the
     // caller owns no waitable child.
-    void add_worker(WorkerType type, void *mailbox, int child_pid = -1);
-    void add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid = -1);
+    void add_worker(WorkerType type, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
+    void add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.
@@ -86,11 +87,20 @@ public:
         uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
         double runtime_timeout_s
     );
+    void add_mpi_group_mailbox(
+        const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids, void *mailbox,
+        size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s
+    );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
     // otherwise be accidentally inherited across fork.
     void init();
+
+    void configure_pipeline_depth(uint32_t depth) {
+        if (initialized_) throw std::logic_error("Worker: configure_pipeline_depth after init");
+        orchestrator_.configure_pipeline_depth(depth);
+    }
 
     // Shut down the Scheduler thread and release resources.
     void close();
@@ -116,17 +126,23 @@ public:
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
-    void
-    control_l3_l2_region_create(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
-        manager_.control_l3_l2_region_create(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
+    void control_worker_chip_region_create(
+        int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name
+    ) {
+        manager_.control_worker_chip_region_create(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
     }
-    void control_l3_l2_region_release(int worker_id, uint64_t region_id) {
-        manager_.control_l3_l2_region_release(worker_id, region_id);
+    void control_worker_chip_region_release(int worker_id, uint64_t region_id) {
+        manager_.control_worker_chip_region_release(worker_id, region_id);
     }
 
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s) {
         return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
+    }
+    std::vector<uint8_t> control_payload(
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+    ) {
+        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s);
     }
     ControlResult remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
@@ -175,6 +191,38 @@ public:
         return manager_.control_remote_import(importer_worker_id, export_desc, requested_access_flags);
     }
     void remote_release_import(const RemoteBufferHandle &handle) { manager_.control_remote_release_import(handle); }
+    std::vector<uint8_t> remote_domain_control(
+        int worker_id, remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes,
+        bool group_target = false
+    ) {
+        return manager_.control_remote_domain(worker_id, control_name, command_bytes, group_target);
+    }
+
+    // Device memory on a next-level worker. The Worker is the sole owner of buffer lifecycle; the
+    // Python Orchestrator's malloc/free/copy are thin wrappers that route back here. Each resolves
+    // the target worker thread and forwards to its control-plane op (CTRL_MALLOC / FREE / COPY).
+    uint64_t malloc(int worker_id, size_t size) {
+        auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (!wt) throw std::runtime_error("Worker::malloc: invalid worker_id");
+        return wt->control_malloc(size);
+    }
+    void free(int worker_id, uint64_t ptr) {
+        auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (!wt) throw std::runtime_error("Worker::free: invalid worker_id");
+        wt->control_free(ptr);
+    }
+    // Both ends of a copy are handles: the child resolves each descriptor through its
+    // ImportRegistry, so neither side is described by an address the parent minted.
+    void copy_to(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+        auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (!wt) throw std::runtime_error("Worker::copy_to: invalid worker_id");
+        wt->control_copy_to(dst, src, nbytes);
+    }
+    void copy_from(int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+        auto *wt = manager_.get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (!wt) throw std::runtime_error("Worker::copy_from: invalid worker_id");
+        wt->control_copy_from(dst, src, nbytes);
+    }
 
     // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable digest to
     // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe

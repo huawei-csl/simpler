@@ -96,12 +96,16 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 TRB bind normally allocates one device buffer per ordinary non-child tensor
 during host-side argument staging, copies input bytes as needed, records
 copy-back metadata, and frees those temporary buffers during runtime
-validation. TRB replaces those per-run malloc/free pairs with a single
-runner-scoped retained buffer that is reused across runs. This is always on for
-TRB — an internal allocation optimization, not user-facing configuration.
+validation. TRB replaces those per-run malloc/free pairs with a retained buffer
+that its runs reuse. This is always on for TRB — an internal allocation
+optimization, not user-facing configuration.
+
+The buffer is owned per pipeline slot, not per runner: TRB's task args are
+`HOST_PER_RUN`, so two runs holding different slot leases stage through
+different buffers even though they share arena bank 0 for device scratch.
 
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
-`{addr, size}` slot across runs, exposed through two HostApi callbacks —
+`{addr, size}` slot per pipeline slot, exposed through two HostApi callbacks —
 `get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
 allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
 (`RetainedTempBump`).
@@ -123,11 +127,10 @@ On each trb bind, `RetainedTempBump`:
   falls back to `device_malloc` mid-run.
 
 Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
-the retained buffer is neither freed at end of run nor per run — it lives on
-the runner and is freed once in `finalize`. If the platform leaves the slot
-callbacks null (e.g. a backend without a retained buffer), bind transparently
-falls back to per-tensor `device_malloc` (recorded as `Free` leases, freed in
-validate).
+the retained buffer is neither freed at end of run nor per run — each slot's
+buffer lives on the runner and is freed once in `finalize`. The uniform host-runtime contract
+requires the retained-buffer callbacks on every backend; bind has no
+per-tensor allocation fallback.
 
 Public device-memory APIs keep their original semantics. `device_malloc_ctx`,
 `device_free_ctx`, `Worker.malloc()`, and `Worker.free()` still allocate and
@@ -223,6 +226,11 @@ The heap ring manages output buffer allocation from a circular GM heap.
 **Allocation**: Buffers are allocated contiguously from `top`. When reaching the end, allocation wraps to the beginning if `tail` has advanced far enough. Buffers never straddle the wrap-around boundary.
 
 **Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
+
+When an empty ring is parked at a non-zero offset and neither free arc can hold a request that fits the full
+capacity, allocation restarts at offset zero: `heap_tail` resets to zero and `heap_top` advances past the new
+allocation. Reclaim markers from tasks in the preceding coordinate space are ignored until the first post-rebase
+allocation retires.
 
 ### 4.3 Dependency List Pool
 
@@ -329,7 +337,7 @@ This guarantees lookup only traverses valid entries — O(valid_entries_in_bucke
 
 Every time the orchestrator submits a task (Step 0 of `PTO2OrchestratorState::submit_task`), it calls `PTO2TensorMap::sync_tensormap`. When `last_task_alive` has advanced by more than `PTO2_TENSORMAP_CLEANUP_INTERVAL` (default 64) tasks since the last cleanup, `PTO2TensorMap::cleanup_retired` runs:
 
-This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`, allowing O(entries_per_task) cleanup without scanning the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
+This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`. A slot's chain can hold more than one task's entries: a task at `local_id + N * window` reuses the slot and prepends to the chain already there, and cleanup can lag that reuse. Cleanup therefore walks the chain and frees only the entries whose `producer_task_id` matches the retiring task, unlinking each and leaving the rest linked — O(entries_in_slot), with no scan of the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
@@ -428,8 +436,8 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. This step runs **before** `payload.init()`. |
-| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues |
+| 5 | **Record fanin metadata**: store producer edges (slot pointer + `DepFlags` packed in the low bits) in `payload->fanin_inline_edges[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. Creator edges are `DEP_WAIT\|DEP_RETAIN`, tensormap-modifier edges `DEP_WAIT`. This step runs **before** `payload.init()`. |
+| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues. Only `DEP_WAIT` edges gate readiness — they count toward `fanin_count` and are linked onto the producer's `fanout_head` for completion notification. A `DEP_WAIT`-only edge releases its submit→wire retention pin **at wiring** (and on the already-completed fast path), so its producer can be CONSUMED without waiting for this consumer; a `DEP_RETAIN` edge keeps the pin until this consumer's `on_task_release`. A hypothetical `RETAIN`-only edge (none exist yet) would neither gate readiness nor link a fanout node — it only holds the lifetime pin. |
 
 > **Note**: Fanout wiring is now completed before publish in the orchestrator submit path.
 > Scheduler threads consume ready queues directly.
@@ -546,7 +554,7 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 2 — Dispatch** (full model in §8.6):
 
-- Drain each source (normal ready ▸ speculative early) in occupancy order — `sync_start`
+- Service each source (normal ready ▸ speculative early) in occupancy order — `sync_start`
   Tier-0 ▸ MIX ▸ AIC/AIV, idle ▸ pending — popping from the matching shape-based ready queue
   (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
@@ -580,7 +588,9 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
     sync_to_sm()  // release-store last_task_alive
 ```
 
-This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time.
+This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time. If a scheduler thread changes a ring head to `CONSUMED` but loses this try-lock, it sets the ring bit in `advance_pending_mask`. Scheduler no-progress iterations drain that mask: each pending ring retries the same in-order `advance_ring_pointers()` under `advance_lock`, leaves the bit set while the lock is still busy, and treats a successful watermark advance as scheduler progress.
+
+For ring-heap stall triage, a `CONSUMED` head whose ring bit is still set means no retry has acquired `advance_lock` and cleared the deferred request yet. If the bit clears and the published `last_task_alive` remains pinned, the stall is outside this deferred consumed-head advance path.
 
 ### 8.5 SchedulerContext
 
@@ -593,7 +603,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `init(runtime, aicpu_thread_num, sched_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
-| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
+| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled. No-op on a fatal run — `emergency_shutdown` has already quiesced every core, and PMU finalize is skipped with it |
 | `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_` (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
@@ -633,44 +643,53 @@ pending slot, promoted on completion). This order lives in one shared skeleton,
 | EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
 
 A task routes to the sync lane iff `task_attrs.requires_sync_start()`. In each source the
-sync lane is drained as a strict **Tier-0** before the regular lane (`sync_start > MIX > C/V`),
+sync lane is serviced as a strict **Tier-0** before the regular lane (`sync_start > MIX > C/V`),
 and early dispatch runs only once *both* normal lanes are empty (normal ▸ early).
 
 **Asymmetry (deliberate):** the normal sync lane is per-shape (3 queues) because a ready sync
 cohort can dispatch *inline* when it fits, reusing the per-shape `dispatch_shape`; the early
-sync lane is a single, shape-agnostic queue because an early cohort is *always* gated → always
-takes the drain path, whose rendezvous counts cores (not blocks) and is shape-agnostic. Both
-feed the same drain.
+sync lane is a single, shape-agnostic queue because its per-task owner must make one
+all-or-nothing decision. The owner stages locally when its tracker can hold the complete
+cohort and falls back to the global drain only when local capacity is short. Both paths use
+the same gated, core-counting rendezvous.
 
-#### sync_start drain + rendezvous
+#### sync_start local fast path, drain fallback, and rendezvous
 
-A sync_start cohort of `block_num` cores must occupy all its cores before any of them run.
-When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
+A sync_start cohort of `block_num` logical blocks must occupy all of its required core slots
+before any core runs. The early Tier-0 owner first asks its own `CoreTracker` for complete
+idle+pending capacity. AIC/AIV capacity is counted in cores; MIX capacity is counted in
+logical clusters even though each block may stage multiple cores.
 
-1. **Single election** — a CAS on `sync_start_pending` (0 → −1) makes drains mutually
-   exclusive; only one cohort drains at a time, regardless of source.
-2. **All-or-nothing** — the elected thread checks `count_global_available >= block_num`
-   *before* staging; if short it aborts (stages nothing) and retries after completions free
-   cores. A cohort is fully staged or not at all — never partial.
-3. **Parallel stage** — all threads barrier, then each CAS-claims a block range and stages
-   its own cores with a non-zero `src_payload` gate: idle cores → running slots, busy cores →
-   pending slots.
-4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
-   reaches `popcount(staged_core_mask)` **and** the producer has released,
-   `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
+1. **Local Case A** — if no global drain is already published and one owner tracker has at
+   least `block_num` slots, that scheduler force-gates and stages the entire cohort
+   synchronously. It does not modify `sync_start_pending`, the drain generation, or ack
+   tokens. Once staging starts it cannot cancel or partially fall back.
+2. **Global Case B** — otherwise `enter_drain_mode` uses a CAS on `sync_start_pending`
+   (0 → −1) to select one global drain. Scheduler thread 0 coordinates the
+   generation-tagged ack tree and checks global capacity before releasing parallel staging.
+   If short, it advances the attempt and retries after completions free cores.
+3. **Parallel fallback stage** — after thread 0 broadcasts the completed root token, each
+   scheduler CAS-claims a block range and stages only its own cores. The generation-tagged
+   barrier also serializes a global coordinator with any local staging that raced drain
+   publication: the local scheduler cannot ack until its tracker mutations are complete.
+4. **Rendezvous launch** — both paths publish every `staged_core_mask` word before storing
+   the final `running_slot_count` seed. `maybe_rendezvous_ring` reads the seed first and then
+   the mask; when the counts match **and** the producer has released, one launch-latch winner
+   rings every gated core's doorbell together.
 
-Single-election + all-or-nothing make the drain deadlock-free across multiple cohorts: at most
-one drains, and it fully stages or waits, so two cohorts can never each half-occupy the cluster
-set (see the completion path's `pending_gated` classification for why a promoted-but-still-gated
-block is not mistaken for a normal task).
+Per-task ownership plus all-or-nothing admission prevents two cohorts from each partially
+occupying the available cluster set. The global drain remains single-owner; independent local
+cohorts may proceed on disjoint scheduler-owned trackers. See the completion path's
+`pending_gated` classification for why a promoted-but-still-gated block is not mistaken for a
+normal task.
 
 #### Early-candidate gate: producer must publish every block (deadlock avoidance)
 
 Producer-side `propagate_dispatch_fanin` no-ops until the producer is **fully published**:
-`published_block_count == logical_block_num`. Normal dispatch, regular early staging, and the
-sync drain increment this counter only after the claimed range's payloads and MMIO dispatch
-tokens are visible. A staged producer also waits for release and completion of its owned
-doorbell pass before exposing fanout.
+`published_block_count == logical_block_num`. Normal dispatch, regular early staging, and
+both local and global sync staging increment this counter only after the claimed range's
+payloads and MMIO dispatch tokens are visible. A staged producer also waits for release and
+completion of its owned doorbell pass before exposing fanout.
 
 This is load-bearing: a flagged SPMD producer with more blocks than cores (for example, a
 50-block AIC projection on 24 AIC cores) dispatches in waves. If its first wave triggered a
@@ -778,7 +797,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
 | `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
-Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `chip_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
 scheduler/orchestrator thread starts — so it needs no cross-thread init
 handshake.

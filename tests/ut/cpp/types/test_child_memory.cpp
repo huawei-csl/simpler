@@ -17,101 +17,86 @@
 #include "task_args.h"
 
 // ---------------------------------------------------------------------------
-// Tensor layout
+// ChipTensor layout
 // ---------------------------------------------------------------------------
 
 // ABI contract: size must match the wire serialization format (2 cache lines).
-TEST(ChildMemory, TensorAbiSize) { EXPECT_EQ(sizeof(Tensor), 128u); }
+TEST(ChildMemory, TensorAbiSize) { EXPECT_EQ(sizeof(ChipTensor), 128u); }
 
 TEST(ChildMemory, DefaultIsZero) {
-    Tensor t{};
-    EXPECT_EQ(t.child_memory, 0);
-    EXPECT_FALSE(t.is_child_memory());
+    ChipTensor t{};
+    EXPECT_EQ(t.address_space, AddressSpace::HOST);
+    EXPECT_FALSE(t.is_device_memory());
 }
 
 TEST(ChildMemory, SetChildMemory) {
-    Tensor t{};
+    ChipTensor t{};
     t.buffer.addr = 0xDEAD0000;
     t.shapes[0] = 16;
     t.ndims = 1;
     t.dtype = DataType::FLOAT32;
-    t.child_memory = 1;
+    t.address_space = AddressSpace::DEVICE;
 
-    EXPECT_TRUE(t.is_child_memory());
+    EXPECT_TRUE(t.is_device_memory());
     EXPECT_EQ(t.buffer.addr, 0xDEAD0000u);
     EXPECT_EQ(t.nbytes(), 16u * 4u);
 }
 
 // ---------------------------------------------------------------------------
-// write_blob / read_blob roundtrip preserves child_memory
+// write_blob / read_blob roundtrip preserves each wire tensor's address space
 // ---------------------------------------------------------------------------
 
-TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
+namespace {
+
+// A minimal valid wire tensor over a POSIX_SHM backing: a 4-element FLOAT32 view at the origin.
+Tensor make_wire_tensor(uint64_t buffer_id, AddressSpace space) {
+    static constexpr const char *kShmName = "psm_child_memory";
+    Tensor r{};
+    r.buffer.magic = BUFFER_DESCRIPTOR_MAGIC;
+    r.buffer.address_space = static_cast<uint8_t>(space);
+    r.buffer.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    r.buffer.identity.buffer_id = buffer_id;
+    r.buffer.identity.generation = 1;
+    r.buffer.nbytes = 64;
+    if (space == AddressSpace::DEVICE) {
+        r.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DEVICE_MALLOC);
+        r.buffer.body_len = static_cast<uint16_t>(BACKEND_ADDRESS_BODY_BYTES);
+        uint64_t base = 0x2000;
+        std::memcpy(r.buffer.body, &base, sizeof(base));
+    } else {
+        r.buffer.backend_kind = static_cast<uint8_t>(BackendKind::POSIX_SHM);
+        r.buffer.body_len = static_cast<uint16_t>(std::strlen(kShmName));
+        std::memcpy(r.buffer.body, kShmName, r.buffer.body_len);
+    }
+    r.byte_offset = 0;
+    r.ndims = 1;
+    r.shapes[0] = 4;
+    r.strides[0] = 1;
+    r.dtype = DataType::FLOAT32;
+    return r;
+}
+
+}  // namespace
+
+TEST(ChildMemory, BlobRoundtripPreservesAddressSpace) {
     TaskArgs args;
-
-    Tensor host_t{};
-    host_t.buffer.addr = 0x1000;
-    host_t.shapes[0] = 4;
-    host_t.ndims = 1;
-    host_t.dtype = DataType::FLOAT32;
-    host_t.child_memory = 0;
-    args.add_tensor(host_t, TensorArgType::INPUT);
-
-    Tensor dev_t{};
-    dev_t.buffer.addr = 0x2000;
-    dev_t.shapes[0] = 8;
-    dev_t.ndims = 1;
-    dev_t.dtype = DataType::FLOAT16;
-    dev_t.child_memory = 1;
-    args.add_tensor(dev_t, TensorArgType::INPUT);
-
+    args.add_tensor(make_wire_tensor(1, AddressSpace::HOST), TensorArgType::INPUT);
+    args.add_tensor(make_wire_tensor(2, AddressSpace::DEVICE), TensorArgType::INPUT);
     args.add_scalar(42);
 
-    // Serialize
     size_t blob_size = task_args_blob_size(args);
     std::vector<uint8_t> buf(blob_size);
     write_blob(buf.data(), args);
 
-    // Deserialize (test owns the buffer, so capacity = blob_size).
+    // Test owns the buffer, so capacity = blob_size.
     TaskArgsView view = read_blob(buf.data(), blob_size);
     ASSERT_EQ(view.tensor_count, 2);
     ASSERT_EQ(view.scalar_count, 1);
 
-    EXPECT_EQ(view.tensors(0).child_memory, 0);
-    EXPECT_FALSE(view.tensors(0).is_child_memory());
-
-    EXPECT_EQ(view.tensors(1).child_memory, 1);
-    EXPECT_TRUE(view.tensors(1).is_child_memory());
-    EXPECT_EQ(view.tensors(1).buffer.addr, 0x2000u);
-}
-
-// ---------------------------------------------------------------------------
-// view_to_chip_storage preserves child_memory
-// ---------------------------------------------------------------------------
-
-TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
-    Tensor tensors[2] = {};
-    tensors[0].buffer.addr = 0xA000;
-    tensors[0].shapes[0] = 1;
-    tensors[0].ndims = 1;
-    tensors[0].dtype = DataType::INT32;
-    tensors[0].child_memory = 0;
-
-    tensors[1].buffer.addr = 0xB000;
-    tensors[1].shapes[0] = 2;
-    tensors[1].ndims = 1;
-    tensors[1].dtype = DataType::INT32;
-    tensors[1].child_memory = 1;
-
-    uint64_t scalars[] = {99};
-    TaskArgsView view{2, 1, reinterpret_cast<const uint8_t *>(tensors), scalars};
-
-    ChipStorageTaskArgs chip = view_to_chip_storage(view);
-
-    ASSERT_EQ(chip.tensor_count(), 2);
-    EXPECT_FALSE(chip.tensor(0).is_child_memory());
-    EXPECT_TRUE(chip.tensor(1).is_child_memory());
-    EXPECT_EQ(chip.tensor(1).buffer.addr, 0xB000u);
+    EXPECT_EQ(view.tensors(0).buffer.address_space, static_cast<uint8_t>(AddressSpace::HOST));
+    EXPECT_EQ(view.tensors(1).buffer.address_space, static_cast<uint8_t>(AddressSpace::DEVICE));
+    EXPECT_EQ(view.tensors(1).buffer.identity.buffer_id, 2u);
+    EXPECT_EQ(view.scalars[0], 42u);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,28 +109,28 @@ TEST(ChildMemory, SkipLogicSimulation) {
     // malloc'd vs passed-through.
     ChipStorageTaskArgs args;
 
-    Tensor host_t{};
+    ChipTensor host_t{};
     host_t.buffer.addr = 0x1000;
     host_t.shapes[0] = 4;
     host_t.ndims = 1;
     host_t.dtype = DataType::FLOAT32;
-    host_t.child_memory = 0;
+    host_t.address_space = AddressSpace::HOST;
     args.add_tensor(host_t);
 
-    Tensor dev_t{};
+    ChipTensor dev_t{};
     dev_t.buffer.addr = 0x2000;
     dev_t.shapes[0] = 8;
     dev_t.ndims = 1;
     dev_t.dtype = DataType::FLOAT32;
-    dev_t.child_memory = 1;
+    dev_t.address_space = AddressSpace::DEVICE;
     args.add_tensor(dev_t);
 
     int malloc_count = 0;
     int passthrough_count = 0;
 
     for (int i = 0; i < args.tensor_count(); i++) {
-        Tensor t = args.tensor(i);
-        if (t.is_child_memory()) {
+        ChipTensor t = args.tensor(i);
+        if (t.is_device_memory()) {
             passthrough_count++;
         } else {
             malloc_count++;

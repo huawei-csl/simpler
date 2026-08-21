@@ -10,10 +10,10 @@ rather than restating them:
 - Hardware substrate → [hardware/chip-architecture.md](hardware/chip-architecture.md),
   [hardware/mmio-performance.md](hardware/mmio-performance.md),
   [hardware/cache-coherency.md](hardware/cache-coherency.md)
-- Level model → [hierarchical_level_runtime.md](hierarchical_level_runtime.md)
+- Level model → [hierarchical-level-runtime.md](hierarchical-level-runtime.md)
 - Three-program model → [chip-level-arch.md](chip-level-arch.md)
 - AICPU launch mechanics → [aicpu-kernel-launch-mechanisms.md](aicpu-kernel-launch-mechanisms.md)
-- Comm domains / overlays → [comm-domain.md](comm-domain.md), [a5-sdma-overlay.md](a5-sdma-overlay.md)
+- Comm domains / overlays → [comm-domain.md](comm-domain.md)
 - Remote L3 / L4 → [remote-l3-worker-design.md](remote-l3-worker-design.md)
 
 Status claims rot faster than architecture. Re-derive rather than trust this
@@ -33,8 +33,8 @@ be re-checked directly.
 ## Topology: L2 (host / AICPU / AICore) → L4 (host → remote host)
 
 The 7-level model (L6 Cluster … L0 Core) is declared in
-[hierarchical_level_runtime.md](hierarchical_level_runtime.md). Its own status
-table is accurate: L3 implemented; L4 local implemented, remote simulation only;
+[hierarchical-level-runtime.md](hierarchical-level-runtime.md). Its own status
+table is accurate: L3 implemented; L4 local implemented, remote host_tcp shipped;
 L5/L6 untested.
 
 **The level is a label in C++ and a real branch in Python.** `Worker` stores
@@ -63,10 +63,10 @@ shared across a device's AICPU/AICore tiers but exclusive per `device_id`.
 | Comm window | Fabric V2 handles, VMM-IPC fallback | VMM shareable handles only |
 
 Two numbers surprise readers who skip the arch docs: the default
-`aicpu_thread_num` is **3** (`src/common/task_interface/call_config.h:112`) —
-neither the per-arch max nor the launch bound — and AICore geometry is not
-selectable at all, because `resolve_block_dim()` unconditionally takes the
-device maximum (`src/common/platform/onboard/host/device_runner_base.cpp:1201-1212`).
+`aicpu_thread_num` is **0 (auto)** — each architecture resolves it against its
+usable AICPU topology — and AICore geometry is not selectable at all, because
+`resolve_block_dim()` unconditionally takes the device maximum
+(`src/common/platform/onboard/host/device_runner_base.cpp:1201-1212`).
 Each arch doc's "three views of how many cores" section explains why the spec
 count, the silicon count, and the runtime-visible count differ
 (`src/a2a3/docs/hardware.md:42-51`).
@@ -98,7 +98,7 @@ AICPU directly: [l3-l2-orch-comm.md](l3-l2-orch-comm.md) and
 `examples/workers/l3/`. Parent-directed targeting of a specific child is
 [directed-next-level-scheduling.md](directed-next-level-scheduling.md).
 
-### L4 — host → remote host (control plane shipped, data plane simulation only)
+### L4 — host → remote host (host_tcp data plane shipped)
 
 Shipped: `add_remote_worker(RemoteWorkerSpec)` → JSON manifest over TCP →
 `simpler-remote-worker` daemon → session runner → C++ `RemoteL3Endpoint`
@@ -107,13 +107,15 @@ registered as a NEXT_LEVEL endpoint and dispatched by the same Scheduler
 The remote session builds a real `Worker(level=3, device_ids=…)` and initialises
 its chip subtree before answering READY.
 
-**Design only:** `transport` defaults to `"sim"` and the daemon raises on any
-other value (`python/simpler/remote_l3_worker.py:66`). Remote buffers are
-`multiprocessing.shared_memory`, so `REMOTE_WINDOW` / `UB_LDST` are protocol
-placeholders. The A2 RoCE / A3 HCCS / A5 UB HCOMM profiles are documented
-contracts marked hardware-gated
-([remote-l3-worker-design.md](remote-l3-worker-design.md):71-77). There is no
-L4 example and no CI job starts the daemon.
+`transport` defaults to `"host_tcp"`, and the daemon rejects other
+profiles. Remote buffers use session-managed host storage, so `REMOTE_WINDOW` /
+`UB_LDST` remain protocol placeholders for future peer-memory transports. The
+A2 RoCE / A3 HCCS / A5 UB HCOMM profiles are documented contracts marked
+hardware-gated
+([remote-l3-worker-design.md](remote-l3-worker-design.md):71-77).
+`examples/workers/l4/vector_add_mixed_l3/` is the L4 example — one parent
+driving a local L3 subtree and a remote one on a second machine — and the
+`st-network1-onboard-a2a3` job starts the daemon on that peer.
 
 ## Launching AICore and AICPU work (the CANN surface)
 
@@ -172,7 +174,7 @@ values**: op-execute 45 s, stream-sync 50 s, scheduler 10 s
 env-overridable with ordering validation
 (`resolve_onboard_timeout_config`, `device_runner_base.cpp:66-110`;
 [troubleshooting/local-timeout-defaults.md](troubleshooting/local-timeout-defaults.md)),
-and **CI runs at 2 s / 3 s / 4 s** (`.github/workflows/ci.yml:480-482`). Triage
+and **CI runs at 2 s / 3 s / 4 s** (the `SIMPLER_*_TIMEOUT_*` env block on each self-hosted job in `.github/workflows/ci.yml`). Triage
 a CI timeout against the CI values, not the header constants.
 
 Every failed launch runs a recovery path that is easy to miss:
@@ -217,8 +219,8 @@ values yield `PTO2_ERROR_ASYNC_COMPLETION_INVALID`.
 
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
-| COUNTER (default) | registered | registered | **Shipped** — CI-run on both arches (`ci.yml:883`, `async_notify_demo` / `deferred_notify_demo`, no `skipif`) |
-| SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (dedicated CI step, `ci.yml:628-643`); a5 not built |
+| COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures; `tests/st/worker/comm_domain/deferred_notify` runs in sim on both and onboard on a2a3, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `CASES[*]["platforms"]`, no `skipif` |
+| SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |
 
@@ -227,7 +229,7 @@ compiled, but provisioning the 48 STARS streams requires
 `Worker(..., enable_sdma=True)`, default `False`
 (`python/simpler/worker.py:4178`, `:4396`;
 `python/bindings/task_interface.cpp:1367`). It is quarantined from the general
-CI sweep via `SDMA_IGNORE` (`ci.yml:600`) for a measured hazard: with 48
+CI sweep via `@pytest.mark.sdma` for a measured hazard: with 48
 device-only SDMA streams an AICore fault takes ~306 s to tear down versus ~0.3 s
 without, traced to a single 300,000 ms remote TRS event timeout
 ([investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md),
@@ -272,8 +274,7 @@ Unresolved after this survey, in rough order of how much they block:
    investigation entry, or code comment says whether they are reserved slots or
    leftovers from a dropped design.
 2. **Has a5 URMA ever run on silicon?** No CI run, test artifact, or
-   investigation attests to it, and `a5-sdma-overlay.md` has no URMA re-enable
-   checklist analogous to its SDMA one.
+   investigation attests to it.
 3. **Which CANN mitigation closed issue #822, and is Path B usable on CANN
    9.0.0?** The doc says "CANN-side mitigation landed" without naming it, and
    nobody re-ran the repro.
@@ -299,7 +300,6 @@ re-check before editing.
 | `dynamic-linking.md:355-361` | AICPU launches before AICore; call is `rtKernelLaunch` | AICore launches first; the call is `rtKernelLaunchWithHandleV2` |
 | `comm-domain.md:111` | window is VMM + shareable-handle import with `aclrtDeviceEnablePeerAccess` | a2a3 prefers Fabric V2 (`comm_hccl.cpp:762`); the doc never mentions Fabric |
 | `comm-domain.md:262-264` | a producer `CoreCallable` declares the SDMA workspace requirement | that API was removed by PR #1406 |
-| `a5-sdma-overlay.md:24` | the a2a3 SDMA path "is always on" | build macro is ON; runtime provisioning defaults to `False` |
 | `investigations/2026-07-a2a3-sdma-fault-teardown.md:153` | `sdma_async_completion_demo` is "unaffected by this change" | that demo sets `enable_sdma=True` (test:134), as CI's own comment states |
 | `src/common/worker/pto_runtime_c_api.h:259` | "`config` carries block_dim (0 = auto)" | `CallConfig` has no such field — "There is no block_dim knob" (`src/common/task_interface/call_config.h:22`) |
 | `src/common/platform/sim/host/device_runner_base.h:62-64` | "an explicit block_dim is still honoured" | same as above |

@@ -1,0 +1,113 @@
+name: NPU Unit Tests (a2a3)
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      include_cann_examples:
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  run:
+    name: ut-a2a3
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 45
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind cmake>=3.15"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3 .[test]"
+          install-torch: "false"
+          system-site-packages: "true"
+          source-cann: "true"
+
+      - name: Build C++ hardware unit tests (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build --target test_comm_lifecycle
+
+      # `ctest --timeout 300` matches the no-hardware lane. It is not a budget:
+      # the only test in this label set, test_comm_lifecycle, runs in 2.4-3.2 s
+      # across sampled CI runs, so 300 s is ~90x its slowest observed run and
+      # cannot fail a healthy one. It exists so a hung test reports
+      # `test_comm_lifecycle (Timeout)` in five minutes instead of consuming the
+      # 45-minute job budget while holding this lane's exclusive device lock.
+      - name: Run Python and C++ hardware unit tests (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/ut -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+            python3 -c "
+          import json, os
+          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]
+          npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
+          json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
+                    open('tests/ut/cpp/build/resources.json', 'w'))
+          "
+            ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure --timeout 300
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/ut -m requires_hardware --platform a2a3 --device \$TASK_DEVICE -v && python3 -c \"import json,os; ids=os.environ['TASK_DEVICE'].split(','); json.dump({'version':{'major':1,'minor':0},'local':[{'npus':[{'id':i,'slots':1} for i in ids]}]}, open('tests/ut/cpp/build/resources.json','w'))\" && ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure --timeout 300"
+          fi
+
+      - name: Build cann-examples/query
+        if: inputs.include_cann_examples
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          cd tools/cann-examples/query
+          cmake -B build .
+          cmake --build build
+          ./build/query version
+
+      - name: Build cann-examples/aicpu-device-query
+        if: inputs.include_cann_examples
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+      - name: Build cann-examples/aicpu-kernel-launch
+        if: inputs.include_cann_examples
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-kernel-launch/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build

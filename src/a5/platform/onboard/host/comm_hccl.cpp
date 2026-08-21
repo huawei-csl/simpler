@@ -19,25 +19,24 @@
  *
  * Scope: L3 single-host multi-card only. The VMM shareable-handle
  * exchange is host-local, so cross-host (L4) deployments need a different
- * windows backend -- see .docs/28.l3-comm/ext.01.pr-774-review.md F2 /
- * 05.plan.zh.md for the channel-API direction.
+ * windows backend.
  */
 
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_context.h"
 
+#include "common/acl_hal_device.h"
 #include "common/unified_log.h"
+#include "host/file_marker_handshake.h"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -159,25 +158,11 @@ static uint64_t make_run_token(int rank) {
 
 static std::string
 barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const std::string &tag, int rank) {
-    return handshake_dir(rootinfo_path) + "/barrier_" + handshake_prefix(rootinfo_path) + "_" + tag + "_" +
-           run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
+    return file_marker_handshake::marker_path(rootinfo_path, run_token, tag, rank);
 }
 
 static void cleanup_handshake_files(const std::string &rootinfo_path) {
-    std::error_code ec;
-    std::filesystem::remove(rootinfo_path, ec);
-
-    const std::string prefix = "barrier_" + handshake_prefix(rootinfo_path) + "_";
-    const std::string dir = handshake_dir(rootinfo_path);
-    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (ec) break;
-        if (!entry.is_regular_file(ec)) continue;
-        const std::string name = entry.path().filename().string();
-        if (name.rfind(prefix, 0) != 0) continue;
-        if (name.size() < 6 || name.substr(name.size() - 6) != ".ready") continue;
-        std::filesystem::remove(entry.path(), ec);
-        ec.clear();
-    }
+    (void)file_marker_handshake::cleanup(rootinfo_path);
 }
 
 static bool
@@ -205,7 +190,7 @@ wait_for_rootinfo(const std::string &path, HcclRootInfo *root_info, uint64_t *ru
             return true;
         }
         if (i > 0 && i % (kLogEverySec * 10) == 0) {
-            LOG_INFO_V0("[comm] wait_for_rootinfo: still waiting (%ds elapsed) path=%s", i / 10, path.c_str());
+            LOG_INFO("[comm] wait_for_rootinfo: still waiting (%ds elapsed) path=%s", i / 10, path.c_str());
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -504,10 +489,15 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         aclrtFreePhysical(handle);
         return -1;
     }
+    // aclrtMemAccessDesc::location.id is consumed in the driver-visible space, unlike
+    // aclrtPhysicalMemProp::location.id above, which takes the ACL-logical id. Under
+    // ASCEND_RT_VISIBLE_DEVICES the logical id here names the wrong card and aclrtMemSetAccess
+    // fails with 507899 (ACL_ERROR_RT_DRV_INTERNAL_ERROR). See common/acl_hal_device.h. The same
+    // descriptor is reused for the peer mappings below, so it carries the translation with it.
     aclrtMemAccessDesc accessDesc{};
     accessDesc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
     accessDesc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    accessDesc.location.id = static_cast<uint32_t>(myDevice);
+    accessDesc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(myDevice));
     aret = aclrtMemSetAccess(localBuf, aligned_size, &accessDesc, 1);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] ipc: MemSetAccess -> %d", rank, static_cast<int>(aret));
@@ -613,8 +603,7 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     // windowsOut[] is intentionally left zero: no kernel path reads it
     // (verified by grep across simpler + pto-isa). The field is kept in
     // CommContext only to preserve byte-equivalence with pto-isa's parallel
-    // HcclDeviceContext declaration; removing it is gated on the F4
-    // private-ization decision (see .docs/28.l3-comm/ext.01.pr-774-review.md).
+    // HcclDeviceContext declaration.
     // host_ctx was value-initialized at handle construction (CommContext{}),
     // and the idempotency guard in comm_alloc_windows prevents a second entry;
     // no re-zero needed before populating it here.
@@ -745,10 +734,7 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
 // workspace on the comm handle and mirror its address into host_ctx.  Both
 // the base-window path and the dynamic per-domain path call this; only the
 // first call allocates.  Requires CANN to expose working
-// aclnnShmemSdmaStarsQuery primitives — see docs/a5-sdma-overlay.md for why
-// this is gated behind SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (default OFF) and
-// how to re-enable it once the a5 environment supports it (#1315).  No-op (workSpace
-// stays 0, SDMA demos self-skip) when the macro is undefined.
+// aclnnShmemSdmaStarsQuery primitives.
 static void ensure_sdma_workspace(CommHandle h) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (h->sdma_workspace) return;
@@ -757,6 +743,11 @@ static void ensure_sdma_workspace(CommHandle h) {
         h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
         h->host_ctx.workSpaceSize = 16 * 1024;
     } else {
+        // SDMA workspace initialization failed - this may occur due to:
+        // 1. Missing ACL symbols in libopapi.so (CANN version compatibility)
+        // 2. Device state issues (e.g., Critical health status)
+        // 3. Resource exhaustion from repeated test runs
+        // The system gracefully degrades to non-SDMA mode when this occurs.
         h->sdma_workspace.reset();
     }
 #else
@@ -767,9 +758,13 @@ static void ensure_sdma_workspace(CommHandle h) {
 // Callable-declared workspace injection is not available on a5 yet. Its URMA
 // workspace is sized per communication domain (rank count), not per device;
 // reject required masks before a callable runs instead of silently launching
-// it with a null workspace. The separate, default-off communication overlay
-// above remains gated by SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (#1315).
+// it with a null workspace.
 extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
+
+// 0 channels: a5 provisions no device-wide SDMA workspace (see above), so there
+// is nothing for the control-path warmup to walk. Defined anyway because the
+// shared onboard DeviceRunnerBase references the symbol.
+extern "C" uint32_t dma_workspace_channel_count(void) { return 0; }
 
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
     if (!addr_out || !handle_out || count < 0) return -1;
@@ -912,10 +907,11 @@ static int domain_alloc_via_ipc(
         aclrtFreePhysical(handle);
         return -1;
     }
+    // Driver-visible id, as in alloc_windows_via_ipc above; the peer mappings reuse this descriptor.
     aclrtMemAccessDesc accessDesc{};
     accessDesc.flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
     accessDesc.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    accessDesc.location.id = static_cast<uint32_t>(myDevice);
+    accessDesc.location.id = static_cast<uint32_t>(pto::acl_to_hal_device_id(myDevice));
     aret = aclrtMemSetAccess(localBuf, aligned_size, &accessDesc, 1);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: MemSetAccess -> %d", h->rank, static_cast<int>(aret));
@@ -1398,14 +1394,35 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 }
 
+extern "C" int
+comm_global_domain_prepare(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
+extern "C" int comm_global_domain_import(uint64_t, const CommGlobalDomainDescriptor *, size_t, uint64_t *) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
+extern "C" int comm_global_domain_release(uint64_t) {
+    LOG_ERROR("[comm] Global CommDomain is not supported by the a5 backend");
+    return -1;
+}
+
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
     int rc = 0;
-    if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "destroy", h->run_token)) {
-        LOG_WARN("[comm rank %d] comm_destroy: final barrier timed out; releasing local state anyway", h->rank);
+    const auto destroy_handshake =
+        file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+    if (!destroy_handshake.ok()) {
+        LOG_WARN(
+            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
+            h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
+        );
         rc = -1;
     }
 
@@ -1443,13 +1460,23 @@ extern "C" int comm_destroy(CommHandle h) try {
     // lifecycle belongs to DeviceRunner, whose finalize() releases all
     // device memory before resetting the device and running aclFinalize.
 
-    // Only rank 0 sweeps the on-disk handshake markers, and only if the
-    // final barrier succeeded.  Deleting them after a timeout would strand
-    // any peer that hasn't observed our marker yet, and leak that peer
-    // into the next run with no rootinfo to discover.  Letting cleanup
-    // ride on the next rank-0 init is the safer recovery path.
-    if (h->rank == 0 && rc == 0) {
-        cleanup_handshake_files(h->rootinfo_path);
+    // Do not let a faster follower return and reuse this path while rank 0
+    // can still sweep the old generation. Rank 0 first retires rootinfo and
+    // best-effort sweeps its token-scoped barrier markers, then publishes a
+    // per-follower release outside the sweep namespace; each follower
+    // consumes its own release before return.
+    // This post phase runs after HcclCommDestroy, so waiting cannot hold a
+    // communicator resource needed by rank 0's teardown.
+    if (destroy_handshake.ok()) {
+        const auto destroy_release =
+            file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token);
+        if (!destroy_release.ok()) {
+            LOG_WARN(
+                "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,
+                file_marker_handshake::stage_name(destroy_release.stage), destroy_release.rank
+            );
+            rc = -1;
+        }
     }
 
     delete h;

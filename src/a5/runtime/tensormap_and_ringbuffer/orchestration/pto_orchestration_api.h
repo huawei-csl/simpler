@@ -37,16 +37,16 @@
 #include "pto_runtime2_types.h"  // PTO2_ERROR_*
 #include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"           // ChipStorageTaskArgs, Tensor
-#include "tensor.h"              // Tensor, TensorCreateInfo
+#include "task_args.h"           // ChipStorageTaskArgs, ChipTensor
+#include "tensor.h"              // ChipTensor, TensorCreateInfo
 
 // =============================================================================
-// Tensor Factory Helpers
+// ChipTensor Factory Helpers
 // =============================================================================
 
 // make_tensor_external(...) — canonical factory for pre-allocated external
 // memory — is defined in the unified tensor.h (common), so host and runtime
-// build Tensors through the same controlled path.
+// build ChipTensors through the same controlled path.
 
 // =============================================================================
 // Ops Table and Opaque Runtime
@@ -64,7 +64,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -74,18 +74,18 @@ typedef struct PTO2RuntimeOps {
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
     void (*log_warn)(const char *func, const char *fmt, ...);
+    void (*log_timing)(const char *func, const char *fmt, ...);
+    void (*log_info)(const char *func, const char *fmt, ...);
     void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
     void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const CoreTaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const CoreTaskArgs &args);
 
     // This-run core geometry from runtime_finalize_after_wire: MIX clusters
     // (one AIC each) and standalone AIV cores.
@@ -117,7 +117,7 @@ struct PTO2Runtime {
 
 static inline PTO2Runtime *current_runtime() { return framework_current_runtime(); }
 
-static inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
+static inline TaskOutputTensors alloc_tensors(const CoreTaskArgs &args) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
@@ -130,7 +130,7 @@ static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_info
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
-    L0TaskArgs args;
+    CoreTaskArgs args;
     for (uint32_t i = 0; i < count; i++) {
         args.add_output(create_infos[i]);
     }
@@ -155,7 +155,7 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
-    L0TaskArgs args;
+    CoreTaskArgs args;
     (args.add_output(cis), ...);
     if (args.has_error) {
         rt->ops->report_fatal(
@@ -167,7 +167,7 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     return alloc_tensors(args);
 }
 
-static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
+static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
@@ -178,7 +178,7 @@ static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0TaskArgs &args) {
+static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const CoreTaskArgs &args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
@@ -187,7 +187,7 @@ static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0Ta
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0TaskArgs &args) {
+static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const CoreTaskArgs &args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
@@ -200,7 +200,7 @@ static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0Ta
  * waits on its fanin and notifies its fanout. Useful as a synchronization
  * barrier or as a placeholder producer for tests / dep-graph wiring.
  */
-static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
+static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
@@ -259,19 +259,9 @@ static inline bool rt_is_fatal() {
 
 #define LOG_ERROR(fmt, ...) current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...) current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_TIMING(fmt, ...) current_runtime()->ops->log_timing(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
-
-// INFO verbosity tiers. v=0 most verbose, v=9 must-see, v=5 default.
-#define LOG_INFO_V0(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 0, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V1(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 1, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V2(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 2, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V3(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 3, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V4(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 4, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V5(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 5, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V6(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 6, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V7(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 7, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V8(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 8, fmt, ##__VA_ARGS__)
-#define LOG_INFO_V9(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 9, fmt, ##__VA_ARGS__)
 
 // =============================================================================
 // Cross-Layer Data Access
@@ -291,7 +281,7 @@ static inline bool rt_is_fatal() {
  * are read immediately without waiting.
  */
 template <typename T = uint64_t>
-static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+static inline T get_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return from_u64<T>(0);
@@ -323,11 +313,11 @@ static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint
  * consumer tracking via fanout_refcount.
  *
  * The tensor must already have an allocated buffer (addr != 0).
- * For runtime-created outputs, call this only on the Tensor returned by
+ * For runtime-created outputs, call this only on the ChipTensor returned by
  * add_output(TensorCreateInfo) after submit returns.
  */
 template <typename T = uint64_t>
-static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+static inline void set_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
@@ -396,8 +386,8 @@ struct PTO2OrchestrationConfig {
 };
 #endif
 
-// Convenience layer (L0TaskArgsWithDeps<N> + matching rt_submit_*_task overloads).
-// Pulled in at the bottom so the wrapper sees L0TaskArgs, MixedKernels, and the
+// Convenience layer (CoreTaskArgsWithDeps<N> + matching rt_submit_*_task overloads).
+// Pulled in at the bottom so the wrapper sees CoreTaskArgs, MixedKernels, and the
 // rt_submit_*_task primitives defined above. Orchestration sources include
 // only this single header to access both the primitive and convenience APIs.
 #include "pto_arg_with_deps.h"  // NOLINT(build/include_subdir)

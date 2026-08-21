@@ -426,8 +426,8 @@ class TestQwen314BDecode(SceneTestCase):
         {
             "name": "StressBatch16Seq3500",
             "platforms": ["a2a3"],
+            "manual": True,
             # A run takes the whole device, matching the lib default.
-            "config": {"aicpu_thread_num": 4},
             "params": {"seed": 1234, "seq_len": 3500},
         },
     ]

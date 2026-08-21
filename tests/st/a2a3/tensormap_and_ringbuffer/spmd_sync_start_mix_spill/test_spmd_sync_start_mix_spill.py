@@ -11,7 +11,7 @@
 (and spins), leaving every AIC core idle. The require_sync_start MIX consumer then pre-stages
 with EVERY cluster mixed — AIC on an idle running slot, both AIVs on the producer's busy cores'
 gated pending slots. Exercises the rendezvous seed/mask counting on the MIX per-core split path
-(drain_stage_cores to_pending=true, mix_cluster_idle_core_count=1/cluster + Case 3.3 promote for
+(stage_sync_start_cores to_pending=true, mix_cluster_idle_core_count=1/cluster + Case 3.3 promote for
 every pending AIV). A counting mismatch stalls the rendezvous -> gated cores never launch ->
 allocator deadlock.
 
@@ -24,7 +24,7 @@ widths in `layout` and the golden is rebuilt from them.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3  # MIX consumer block writes 3 cache lines: AIC slot 0, AIV0 slot 1, AIV1 slot 2
@@ -89,8 +89,8 @@ class TestSpmdSyncStartMixSpill(SceneTestCase):
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            Tensor("layout", torch.zeros(2, dtype=torch.int32)),
+            TensorArg("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
+            TensorArg("layout", torch.zeros(2, dtype=torch.int32)),
         )
 
     def compute_golden(self, args, params):

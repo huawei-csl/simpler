@@ -86,7 +86,52 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 // SimDeviceRunnerBase Implementation
 // =============================================================================
 
-int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
+bool SimDeviceRunnerBase::try_acquire_native_run(
+    const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit
+) {
+    if (owner == nullptr || permit == nullptr) return false;
+    const void *expected = nullptr;
+    if (!active_native_run_.compare_exchange_strong(
+            expected, owner, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    *permit = LaunchPermit(identity);
+    return true;
+}
+
+void SimDeviceRunnerBase::release_native_run(const void *owner) {
+    if (active_native_run_.load(std::memory_order_acquire) != owner) return;
+    const void *expected = owner;
+    (void)active_native_run_.compare_exchange_strong(
+        expected, nullptr, std::memory_order_release, std::memory_order_relaxed
+    );
+}
+
+bool SimDeviceRunnerBase::native_run_active() const {
+    return active_native_run_.load(std::memory_order_acquire) != nullptr;
+}
+
+bool SimDeviceRunnerBase::native_run_owned_by(const void *owner) const {
+    return owner != nullptr && active_native_run_.load(std::memory_order_acquire) == owner;
+}
+
+uint64_t SimDeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
+    if (bank_id >= arena_banks_.size()) return 0;
+    const ArenaBank &bank = *arena_banks_[bank_id];
+    return bank.gm_heap.is_committed() ? reinterpret_cast<uint64_t>(bank.gm_heap.base()) : 0;
+}
+
+uint64_t SimDeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
+    if (slot_id >= retained_temp_addrs_.size()) return 0;
+    return reinterpret_cast<uint64_t>(retained_temp_addrs_[slot_id]);
+}
+
+int SimDeviceRunnerBase::setup_static_arena(
+    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+) {
+    if (arena_bank >= arena_banks_.size()) return -1;
+    ArenaBank &bank = this->arena_bank(arena_bank);
     // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
@@ -124,16 +169,16 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
     // all on any failure" semantic (PR #922). Pooled pointers from a prior
     // successful call stay valid; a failed resize attempt does not leave a
     // partial layout behind.
-    bool ok = commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) == 0;
-    ok = ok && commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) == 0;
-    ok = ok && commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) == 0;
+    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
+    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
+    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
     if (!ok) {
-        gm_heap_arena_.release();
-        gm_sm_arena_.release();
-        runtime_arena_pool_.release();
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-        cached_runtime_arena_size_ = 0;
+        bank.gm_heap.release();
+        bank.gm_sm.release();
+        bank.runtime_pool.release();
+        bank.cached_gm_heap_size = 0;
+        bank.cached_gm_sm_size = 0;
+        bank.cached_runtime_arena_size = 0;
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -154,9 +199,12 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
 }
 
 bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
-    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
     void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
 ) const {
+    // The cache holds one entry and its bases point into bank 0, so any other
+    // bank must rebuild rather than be handed a region it does not own.
+    if (arena_bank != 0) return false;
     if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
         prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
         sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
@@ -176,9 +224,11 @@ bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
 }
 
 void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
-    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
-    size_t runtime_off, const void *image_data, size_t image_size
+    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+    void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
 ) {
+    // Single-entry cache owned by bank 0; see lookup_prebuilt_runtime_arena_cache.
+    if (arena_bank != 0) return;
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_hash_ = hash;
     prebuilt_runtime_arena_cache_key_.assign(
@@ -194,19 +244,25 @@ void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
     prebuilt_runtime_arena_cache_valid_ = true;
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
+void *SimDeviceRunnerBase::acquire_pooled_gm_heap(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_heap;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
+void *SimDeviceRunnerBase::acquire_pooled_gm_sm(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).gm_sm;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
-void *SimDeviceRunnerBase::acquire_pooled_runtime_arena() {
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
+void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
+    if (arena_bank >= arena_banks_.size()) return nullptr;
+    DeviceArena &arena = this->arena_bank(arena_bank).runtime_pool;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn) {
@@ -248,16 +304,18 @@ int SimDeviceRunnerBase::ensure_device_initialized() {
 }
 
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
-    if (config.aicpu_thread_num < 1 || config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
+    if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
+        config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
-            "launch_aicpu_num (%d) must be in range [1, %d]", config.aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
+            "launch_aicpu_num (%d) must be 0 (auto) or in range [2, %d]", config.aicpu_thread_num,
+            PLATFORM_MAX_AICPU_THREADS
         );
         return -1;
     }
     // A run always takes the whole simulated device; orchestration sizes its
     // cohorts from rt_available_cluster_count() rather than a per-call width.
     const int block_dim = SIM_AUTO_BLOCKDIM;
-    LOG_INFO_V0("block_dim resolved to %d", block_dim);
+    LOG_INFO("block_dim resolved to %d", block_dim);
 
     int num_aicore = block_dim * cores_per_blockdim_;
     if (num_aicore > RUNTIME_MAX_WORKER) {
@@ -310,21 +368,71 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
-void SimDeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
+void SimDeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (pipeline_slot >= retained_temp_addrs_.size()) {
+        if (addr != nullptr) *addr = nullptr;
+        if (size != nullptr) *size = 0;
+        return;
+    }
+    if (addr != nullptr) *addr = retained_temp_addrs_[pipeline_slot];
+    if (size != nullptr) *size = retained_temp_sizes_[pipeline_slot];
 }
 
-void SimDeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
+void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size) {
+    if (pipeline_slot >= retained_temp_addrs_.size()) return;
+    retained_temp_addrs_[pipeline_slot] = addr;
+    retained_temp_sizes_[pipeline_slot] = size;
+}
+
+void *SimDeviceRunnerBase::acquire_graph_definition_buffer(
+    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
+) {
+    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return nullptr;
+    }
+    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
+    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
+        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
+        return buffer.aligned_addr;
+    }
+
+    const size_t allocation_bytes = bytes + alignment - 1;
+    void *allocation = mem_alloc_.alloc(allocation_bytes);
+    if (allocation == nullptr) return nullptr;
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+    if (raw > UINTPTR_MAX - (alignment - 1)) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+    if (device_memset(aligned_addr, 0, bytes) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
+        mem_alloc_.free(allocation);
+        return nullptr;
+    }
+    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
+    return aligned_addr;
+}
+
+void SimDeviceRunnerBase::release_graph_definition_buffers() {
+    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
+        for (auto &entry : by_key) {
+            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
+        }
+        by_key.clear();
+    }
 }
 
 void SimDeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
+    for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
+        if (retained_temp_addrs_[slot] == nullptr) continue;
+        mem_alloc_.free(retained_temp_addrs_[slot]);
+        retained_temp_addrs_[slot] = nullptr;
+        retained_temp_sizes_[slot] = 0;
     }
 }
 
@@ -366,7 +474,7 @@ int SimDeviceRunnerBase::commit_device_register(int32_t cid) {
     const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
     if (inserted) {
         ++aicpu_dlopen_total_;
-        LOG_INFO_V0("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
+        LOG_INFO("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
     }
     return 0;
 }
@@ -448,7 +556,7 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
-    LOG_INFO_V0(
+    LOG_INFO(
         "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
         chip_buffer_hash, orch_so_size
     );
@@ -486,7 +594,7 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO_V0("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_INFO("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
 }
 
@@ -564,13 +672,86 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 }
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
-    set_l2_swimlane_enabled(config.enable_l2_swimlane);
+    set_chip_swimlane_enabled(config.enable_chip_swimlane);
     set_dump_args_enabled(config.enable_dump_args);
     set_pmu_enabled(config.enable_pmu);
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_scope_stats_enabled(config.enable_scope_stats != 0);
     set_output_prefix(config.output_prefix);
+}
+
+HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_wants_records) noexcept {
+    if (clock_correlation_provider_ != nullptr) {
+        clock_correlation_provider_->release(false);
+        clock_correlation_provider_.reset();
+    }
+    const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
+    const bool artifact_wants_records = producer_wants_records && !output_prefix_.empty();
+    chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
+    // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
+    // where an escaping exception is std::terminate. A pass that cannot get its
+    // storage collects no records and says so by handing back nullptr.
+    HostPhaseRecordPool *pool = nullptr;
+    try {
+        pool = host_phase_records_.arm(artifact_wants_records || swimlane_wants_records);
+    } catch (...) {
+        LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
+    }
+    if (!swimlane_wants_records) return pool;
+
+    // Only the chip-swimlane reader places these records against device
+    // timestamps, so only it needs the two clocks anchored.
+    try {
+        clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
+        chip_swimlane_collector_.begin_clock_correlation_session(
+            clock_correlation_provider_->name(), clock_correlation_provider_->raw_device_timestamp_unit()
+        );
+        chip_swimlane_collector_.record_clock_anchor_samples(
+            simpler::dfx::capture_clock_anchor_group(
+                *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
+            )
+        );
+    } catch (...) {
+        clock_correlation_provider_.reset();
+        try {
+            chip_swimlane_collector_.begin_clock_correlation_session("unavailable", "unknown");
+        } catch (...) {
+            // begin() stores diagnostic strings and can still fail under
+            // allocation pressure. Keep this noexcept path fail-closed.
+            chip_swimlane_collector_.finish_clock_correlation_session();
+        }
+    }
+    return pool;
+}
+
+void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
+    if (!host_phase_records_.finished()) return;
+    chip_swimlane_collector_.set_host_phase_records(
+        host_phase_records_.submit_records(), host_phase_records_.device_upload_records(),
+        host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
+        host_phase_records_.dropped_records()
+    );
+}
+
+void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {
+    if (!chip_swimlane_collector_.clock_correlation_active()) {
+        if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
+        clock_correlation_provider_.reset();
+        return;
+    }
+    if (capture_device_complete && clock_correlation_provider_ != nullptr) {
+        try {
+            chip_swimlane_collector_.record_clock_anchor_samples(
+                simpler::dfx::capture_clock_anchor_group(
+                    *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
+                )
+            );
+        } catch (...) {}
+    }
+    chip_swimlane_collector_.finish_clock_correlation_session();
+    if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
+    clock_correlation_provider_.reset();
 }
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {

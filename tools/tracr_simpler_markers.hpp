@@ -33,6 +33,7 @@ inline std::atomic<int> g_TraCR_thread_idx_counter{0};
 // Global thread local thread idx placeholder
 inline thread_local int g_TraCR_thread_idx{-1};
 
+// X-Macro approach. Pretty cool
 #define MARKER_TYPES       \
     X(Orchestrating)       \
     X(Read_Dimensions)     \
@@ -53,7 +54,8 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Running_Task_Pair)   \
     X(Barrier)             \
     X(CopyH2D)             \
-    X(CopyD2H)
+    X(CopyD2H)             \
+    X(Resolving)
 
 enum MarkerType {
 #define X(name) name,

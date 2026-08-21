@@ -1,0 +1,157 @@
+name: Pre-commit
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository to checkout.
+        required: false
+        type: string
+      ref:
+        description: Ref or SHA to checkout.
+        required: false
+        type: string
+      base_repository:
+        description: Canonical base repository for self-cpu diff resolution.
+        required: false
+        type: string
+      base_sha:
+        description: Exact base SHA for GitHub-hosted PR runs.
+        required: false
+        type: string
+      head_sha:
+        description: Exact head SHA for GitHub-hosted PR runs.
+        required: false
+        type: string
+      runs_on:
+        description: JSON-encoded runs-on value.
+        required: true
+        type: string
+      setup_variant:
+        description: github or self-cpu.
+        required: true
+        type: string
+
+jobs:
+  run:
+    name: pre-commit
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.10
+        if: inputs.setup_variant == 'github'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Resolve base SHA
+        id: base
+        if: inputs.setup_variant == 'self-cpu'
+        env:
+          BASE_REPOSITORY: ${{ inputs.base_repository || github.repository }}
+        run: |
+          git fetch --no-tags "https://github.com/${BASE_REPOSITORY}.git" main
+          echo "base_sha=$(git merge-base FETCH_HEAD HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Select lint build target
+        id: lint-build
+        env:
+          BASE_SHA: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
+        run: |
+          needs_build=false
+
+          changed_files=$(mktemp)
+          trap 'rm -f "$changed_files"' EXIT
+          if ! git diff --name-only --no-ext-diff -z "$BASE_SHA"..."$HEAD_SHA" > "$changed_files"; then
+            git diff --name-only --no-ext-diff -z "$BASE_SHA".."$HEAD_SHA" > "$changed_files"
+          fi
+
+          needs_build="$(
+            python "$GITHUB_WORKSPACE/tests/lint/clang_tidy_paths.py" --needs-build --null < "$changed_files"
+          )"
+
+          echo "needs_build=$needs_build" >> "$GITHUB_OUTPUT"
+
+      - name: Find missing build and lint tools
+        id: apt-packages
+        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
+        run: |
+          missing_packages=()
+          command -v cmake >/dev/null 2>&1 || missing_packages+=(cmake)
+          command -v ninja >/dev/null 2>&1 || missing_packages+=(ninja-build)
+          command -v g++ >/dev/null 2>&1 || missing_packages+=(g++)
+          if ! command -v clang-tidy >/dev/null 2>&1; then
+            missing_packages+=(clang-tidy)
+          fi
+          echo "required-packages=${missing_packages[*]}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build and lint tools
+        if: inputs.setup_variant == 'github' && runner.os == 'Linux' && steps.lint-build.outputs.needs_build == 'true' && steps.apt-packages.outputs.required-packages != ''
+        uses: ./.github/actions/apt-install
+        with:
+          required-packages: ${{ steps.apt-packages.outputs.required-packages }}
+          install-timeout-seconds: "240"
+
+      - name: Verify provisioned toolchain
+        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build == 'true'
+        run: |
+          command -v cmake
+          command -v ninja
+          command -v g++
+          command -v clang-tidy
+          if ! command -v g++-15 >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/bin"
+            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+          if command -v clang-tidy-18 >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/bin"
+            ln -sf "$(command -v clang-tidy-18)" "$RUNNER_TEMP/bin/clang-tidy"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+          PATH="$RUNNER_TEMP/bin:$PATH" command -v clang-tidy
+          PATH="$RUNNER_TEMP/bin:$PATH" clang-tidy --version
+
+      - name: Cache pip packages
+        if: inputs.setup_variant == 'self-cpu' || steps.lint-build.outputs.needs_build == 'true'
+        uses: ./.github/actions/cache-pip
+
+      - name: Install package (for clang-tidy compile databases)
+        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
+        run: pip install --config-settings="build.targets=build_package_sim" .
+
+      - name: venv + deps
+        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build == 'true'
+        uses: ./.github/actions/setup-venv
+        with:
+          install-torch: "false"
+          packages: >-
+            --config-settings=build.targets=build_package_sim .
+
+      - name: Lint-only venv
+        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build != 'true'
+        run: python3 -m venv .venv
+
+      - name: Use lint venv
+        if: inputs.setup_variant == 'self-cpu'
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: >-
+            --from-ref ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
+            --to-ref ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}

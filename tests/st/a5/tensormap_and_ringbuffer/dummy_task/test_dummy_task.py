@@ -36,7 +36,7 @@ The orchestration submits one of four scenes, controlled by params["case"]:
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 SENTINEL = 42.0
 INIT_VAL = -1.0  # so unmodified Y is distinguishable from the sentinel
@@ -81,6 +81,7 @@ class TestDummyTask(SceneTestCase):
         {
             "name": "LongDummyChain",
             "platforms": ["a5sim", "a5"],
+            "manual": True,
             "config": {"aicpu_thread_num": 2},
             "params": {"case": 2},
         },
@@ -96,6 +97,7 @@ class TestDummyTask(SceneTestCase):
             # Correctness is still just the copy.
             "name": "DenseFanoutFanin",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
             "config": {"aicpu_thread_num": 2},
             "params": {"case": 4},
         },
@@ -106,9 +108,9 @@ class TestDummyTask(SceneTestCase):
         y = torch.full((16,), INIT_VAL, dtype=torch.float32)
         w = torch.full((16,), INIT_VAL, dtype=torch.float32)
         return TaskArgsBuilder(
-            Tensor("x", x),
-            Tensor("y", y),
-            Tensor("w", w),
+            TensorArg("x", x),
+            TensorArg("y", y),
+            TensorArg("w", w),
             Scalar("case", int(params["case"])),
         )
 

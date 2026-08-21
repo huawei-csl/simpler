@@ -35,8 +35,8 @@ static inline __aicore__ __gm__ T *comm_remote_ptr(__gm__ CommContext *ctx, __gm
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *in_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ ChipTensor *in_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
+    __gm__ ChipTensor *out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
     __gm__ float *local_in = reinterpret_cast<__gm__ float *>(in_tensor->buffer.addr) + in_tensor->start_offset;
@@ -44,9 +44,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
-    // workSpace == 0 means the SDMA overlay is not built in
-    // (SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=OFF, see docs/a5-sdma-overlay.md
-    // #1315): self-skip rather than dereferencing a null workspace.
+    // A null workspace indicates that host-side SDMA provisioning failed.
     if (nranks != 2 || comm_ctx->workSpace == 0) {
         pipe_barrier(PIPE_ALL);
         return;

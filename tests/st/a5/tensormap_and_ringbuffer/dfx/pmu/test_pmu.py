@@ -24,7 +24,7 @@ import time
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
 KERNELS_BASE = "../../../../../../examples/a5/tensormap_and_ringbuffer/vector_example/kernels"
@@ -69,7 +69,7 @@ class TestPmu(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4},
+            "manual": ["a5sim"],
             "params": {},
         },
     ]
@@ -77,9 +77,9 @@ class TestPmu(SceneTestCase):
     def generate_args(self, params):
         SIZE = 128 * 128
         return TaskArgsBuilder(
-            Tensor("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
-            Tensor("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
-            Tensor("f", torch.zeros(SIZE, dtype=torch.float32)),
+            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
+            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(SIZE, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -92,9 +92,8 @@ class TestPmu(SceneTestCase):
         super().test_run(st_platform, st_worker, request)
         if not request.config.getoption("--enable-pmu", default=0):
             return
-        for case in self.CASES:
-            if st_platform in case["platforms"]:
-                self._validate_pmu_artifact(case, run_marker)
+        for case in self._matching_cases(st_platform, request):
+            self._validate_pmu_artifact(case, run_marker)
 
     def _validate_pmu_artifact(self, case, run_marker):
         safe_label = _sanitize_for_filename(f"TestPmu_{case['name']}")

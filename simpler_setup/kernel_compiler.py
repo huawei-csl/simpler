@@ -6,17 +6,20 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+import hashlib
 import importlib.util
 import logging
 import os
 import subprocess
 import sys
 import tempfile
+from functools import cache
 from pathlib import Path
 from typing import Optional, Union
 
 from simpler import env_manager
 
+from .compile_paths import compiler_visible_path
 from .environment import PROJECT_ROOT
 from .toolchain import (
     Aarch64GxxToolchain,
@@ -27,6 +30,54 @@ from .toolchain import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Covers the part of the persistent scene-test cache key that nothing else
+# fingerprints: how ``scene_test._compile_chip_callable_from_spec`` assembles
+# compiled binaries into a ``ChipCallable``. The modules that decide the bytes
+# of a single compiled artifact carry their own digest (see
+# ``_artifact_logic_token``), and the binding layout carries an ABI token, so a
+# manual bump here is only owed for a change in that assembly step.
+_COMPILE_CACHE_SCHEMA = 1
+
+# Modules whose logic turns kernel sources into artifact bytes: compiler
+# invocation and flags, toolchain selection, and the ELF section extraction
+# applied to every onboard incore.
+_ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.py", "elf_parser.py")
+
+
+@cache
+def _artifact_logic_token() -> str:
+    """Digest the modules that decide a compiled artifact's bytes.
+
+    Source content, compiler identity and compile flags are keyed separately;
+    this token is what invalidates a cached artifact when the compilation logic
+    itself changes, so editing one of these modules takes effect without a
+    manual ``_COMPILE_CACHE_SCHEMA`` bump.
+    """
+    digest = hashlib.sha256()
+    module_dir = Path(__file__).resolve().parent
+    for name in _ARTIFACT_LOGIC_MODULES:
+        digest.update(name.encode())
+        try:
+            digest.update(hashlib.sha256((module_dir / name).read_bytes()).digest())
+        except OSError:
+            digest.update(b"unreadable")
+    return digest.hexdigest()
+
+
+@cache
+def _executable_cache_identity(executable: str) -> dict[str, object]:
+    """Return stable compiler identity without embedding runner-local paths."""
+    try:
+        result = subprocess.run([executable, "--version"], check=False, capture_output=True, text=True, timeout=5)
+        return {
+            "name": os.path.basename(executable),
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        }
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"name": os.path.basename(executable), "error": type(error).__name__}
 
 
 class KernelCompiler:
@@ -44,13 +95,13 @@ class KernelCompiler:
     Available toolchains:
     - CCEC: ccec compiler for AICore kernels (real hardware)
     - HOST_GXX_15: g++-15 for simulation kernels (host execution)
-    - HOST_GXX: g++ for orchestration .so (host dlopen)
+    - HOST_GXX: g++ (g++-15 under sanitizers) for host orchestration .so
     - AARCH64_GXX: aarch64 cross-compiler for device orchestration
     """
 
     # Comma-separated `-fsanitize` tokens, set once by conftest from the pytest
     # `--sanitizer` option (default "" = off). Only host toolchains (Gxx15 sim
-    # incore, Gxx sim orchestration) honor it; ccec/aarch64 device builds never
+    # incore, Gxx host orchestration) honor it; ccec/aarch64 device builds never
     # do. Must match the runtime's install-time SIMPLER_SANITIZER.
     _sanitizers = ""
 
@@ -82,12 +133,10 @@ class KernelCompiler:
             env_manager.ensure("ASCEND_HOME_PATH")
             self.ccec = CCECToolchain(platform)
             self.aarch64 = Aarch64GxxToolchain()
-            self.host_gxx = GxxToolchain()
+            self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         else:
             self.ccec = None
             self.aarch64 = None
-            # Sim orchestration must match the sim kernels' g++-15 under a
-            # sanitizer (one runtime per process); see GxxToolchain prefer_g15.
             self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.gxx15 = Gxx15Toolchain()
@@ -237,13 +286,100 @@ class KernelCompiler:
             str(source_dir / "device_time.cpp"),
         ]
 
+    def get_orchestration_cache_inputs(self, runtime_name: str) -> tuple[list[str], list[str]]:
+        """Return the include directories and extra sources used by orchestration compilation.
+
+        Keeping this calculation beside ``compile_orchestration`` ensures the
+        persistent scene-test cache hashes the same inputs the compiler sees.
+        """
+        include_dirs = self.get_orchestration_include_dirs(runtime_name)
+        config_include_dirs, config_sources = self._get_orchestration_config(runtime_name)
+        platform_sources = self._get_orchestration_platform_sources()
+        if self._orchestration_toolchain(runtime_name).is_host:
+            include_dirs.append(str(self.project_root / "src" / "common" / "log" / "include"))
+            host_log_dir = self.project_root / "src" / "common" / "log"
+            platform_sources.extend([str(host_log_dir / "host_log.cpp"), str(host_log_dir / "unified_log_host.cpp")])
+        return (
+            [*include_dirs, *config_include_dirs],
+            [*config_sources, *platform_sources],
+        )
+
+    def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
+        if runtime_name == "host_build_graph":
+            return self.host_gxx
+        if runtime_name == "tensormap_and_ringbuffer":
+            if self.platform.endswith("sim"):
+                return self.host_gxx
+            assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
+            return self.aarch64
+        raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
+
+    def _orchestration_compile_flags(self, toolchain: Union[GxxToolchain, Aarch64GxxToolchain]) -> list[str]:
+        return [*toolchain.get_compile_flags(), *self._sanitizer_flags(toolchain)]
+
+    @staticmethod
+    def _orchestration_link_flags(toolchain: Union[GxxToolchain, Aarch64GxxToolchain]) -> list[str]:
+        """Return the link flags every orchestration ``.so`` carries on this host.
+
+        macOS/clang resolves the runtime's symbols at dlopen time, so undefined
+        symbols must be allowed. Elsewhere a deterministic ELF GNU Build-ID is
+        forced in: the host-side DeviceRunner reads ``.note.gnu.build-id`` to
+        recognize a callable it has already uploaded, and passing the flag
+        explicitly keeps that id stable across toolchain versions even though
+        the compiler default already injects one.
+        """
+        flags = ["-undefined", "dynamic_lookup"] if sys.platform == "darwin" else ["-Wl,--build-id=sha1"]
+        if toolchain.is_host:
+            flags.append("-pthread")
+        return flags
+
+    def compile_cache_token(self, runtime_name: str, core_types: list[str]) -> dict[str, object]:
+        """Describe every compiler and fixed flag that affects kernel artifacts."""
+        orchestration = self._orchestration_toolchain(runtime_name)
+        incore_tokens = [self.incore_compile_cache_token(core_type) for core_type in sorted(set(core_types))]
+        return {
+            "schema": _COMPILE_CACHE_SCHEMA,
+            "logic": _artifact_logic_token(),
+            "orchestration": {
+                "identity": _executable_cache_identity(orchestration.cxx_path),
+                "compile_flags": self._orchestration_compile_flags(orchestration),
+                "link_flags": self._orchestration_link_flags(orchestration),
+            },
+            "incore": {
+                "variants": incore_tokens,
+            },
+        }
+
+    def incore_compile_cache_token(self, core_type: str) -> dict[str, object]:
+        """Describe the compiler inputs shared by identical incore sources."""
+        if self.platform.endswith("sim"):
+            incore = self.gxx15
+            flags = [*incore.get_compile_flags(core_type=core_type), *self._sanitizer_flags(incore)]
+            linker = None
+        else:
+            assert self.ccec is not None, "ccec toolchain is only available for hardware platforms"
+            incore = self.ccec
+            flags = incore.get_compile_flags(core_type=core_type)
+            linker = {
+                "identity": _executable_cache_identity(self.ccec.linker_path),
+                "flags": ["-e", "kernel_entry"],
+            }
+        return {
+            "schema": _COMPILE_CACHE_SCHEMA,
+            "logic": _artifact_logic_token(),
+            "identity": _executable_cache_identity(incore.cxx_path),
+            "core_type": core_type,
+            "flags": flags,
+            "linker": linker,
+        }
+
     def _run_subprocess(
         self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
     ) -> subprocess.CompletedProcess:
         """Run a subprocess command with standardized logging and error handling."""
         logger.debug(f"[{label}] Command: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=self.project_root)
 
             if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
                 logger.debug(f"[{label}] stdout:\n{result.stdout}")
@@ -312,12 +448,13 @@ class KernelCompiler:
 
     @staticmethod
     def _make_temp_path(prefix: str, suffix: str, build_dir: Optional[str] = None) -> str:
-        """Create a unique temporary file path in /tmp via mkstemp.
+        """Create a unique absolute temporary file path via mkstemp.
 
         The file is created atomically to avoid races, then immediately
         closed so the caller can overwrite it with compiler output.
         """
-        fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=build_dir or "/tmp")
+        directory = os.path.abspath(build_dir) if build_dir else "/tmp"
+        fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
         os.close(fd)
         return path
 
@@ -387,17 +524,17 @@ class KernelCompiler:
         )
 
         # Build command from toolchain
-        cmd = [self.ccec.cxx_path] + self.ccec.get_compile_flags(core_type=core_type)
-        cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
+        cmd = [self.ccec.cxx_path, *self.ccec.get_compile_flags(core_type=core_type)]
+        cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
         for inc_dir in self.get_incore_include_dirs():
-            cmd.append(f"-I{os.path.abspath(inc_dir)}")
+            cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
         if extra_include_dirs:
             for inc_dir in extra_include_dirs:
-                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+                cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
-        cmd.extend(["-o", output_path, source_path])
+        cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 
         # Execute compilation
         core_type_name = "AIV" if core_type == "aiv" else "AIC"
@@ -473,39 +610,15 @@ class KernelCompiler:
             RuntimeError: If compilation fails
             ValueError: If runtime_name is unknown
         """
-        include_dirs = self.get_orchestration_include_dirs(runtime_name)
+        include_dirs, orch_sources = self.get_orchestration_cache_inputs(runtime_name)
         if extra_include_dirs:
             include_dirs = include_dirs + list(extra_include_dirs)
-
-        # Load optional orchestration config for extra sources/includes
-        orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
-        if orch_includes:
-            include_dirs = include_dirs + orch_includes
-        orch_sources = list(orch_sources) + self._get_orchestration_platform_sources()
 
         # host_build_graph dlopens the orchestration .so on the host, so it
         # compiles with the host g++ (x86_64) regardless of platform.
         # tensormap_and_ringbuffer dlopens it on the aarch64 AICPU onboard, so
         # it cross-compiles there and uses the host g++ only for sim.
-        if runtime_name == "host_build_graph":
-            toolchain_type = ToolchainType.HOST_GXX
-        elif runtime_name == "tensormap_and_ringbuffer":
-            toolchain_type = self._get_toolchain(
-                {
-                    "a2a3": ToolchainType.AARCH64_GXX,
-                    "a2a3sim": ToolchainType.HOST_GXX,
-                    "a5": ToolchainType.AARCH64_GXX,
-                    "a5sim": ToolchainType.HOST_GXX,
-                },
-            )
-        else:
-            raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
-        toolchain: Union[GxxToolchain, Aarch64GxxToolchain]
-        if toolchain_type == ToolchainType.AARCH64_GXX:
-            assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
-            toolchain = self.aarch64
-        else:
-            toolchain = self.host_gxx
+        toolchain = self._orchestration_toolchain(runtime_name)
 
         # HOST_GXX: simulation build (host execution)
         # AARCH64_GXX: cross-compilation for supported runtimes
@@ -549,17 +662,11 @@ class KernelCompiler:
             prefix=f"{os.path.basename(source_path)}.orch_", suffix=".so", build_dir=build_dir
         )
 
-        cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
-        cmd += self._sanitizer_flags(toolchain)
-
-        # Force a deterministic ELF GNU Build-ID into every orchestration .so.
-        # The host-side DeviceRunner reads `.note.gnu.build-id` to detect when
-        # the same callable is being re-run (cache hit → skip device upload +
-        # device dlopen). The compiler default already injects a Build-ID,
-        # but pass it explicitly so the cache key remains stable across
-        # toolchain versions. macOS/clang ld silently ignores this flag.
-        if sys.platform != "darwin":
-            cmd.append("-Wl,--build-id=sha1")
+        cmd = [
+            toolchain.cxx_path,
+            *self._orchestration_compile_flags(toolchain),
+            *self._orchestration_link_flags(toolchain),
+        ]
 
         if os.getenv("BUILD_TRACR", "OFF") == "ON":
             cmd.extend(
@@ -574,21 +681,16 @@ class KernelCompiler:
             for src in extra_sources:
                 src = os.path.abspath(src)
                 if os.path.isfile(src):
-                    cmd.append(src)
+                    cmd.append(str(compiler_visible_path(src)))
                     logger.debug(f"  Including extra source: {os.path.basename(src)}")
-
-        # On macOS, allow undefined symbols to be resolved at dlopen time
-        if sys.platform == "darwin":
-            cmd.append("-undefined")
-            cmd.append("dynamic_lookup")
 
         # Add include dirs
         if extra_include_dirs:
             for inc_dir in extra_include_dirs:
-                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+                cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
         # Output and input
-        cmd.extend(["-o", output_path, source_path])
+        cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 
         # Log compilation command
         logger.info(f"[Orchestration] Compiling: {source_path}")
@@ -638,7 +740,7 @@ class KernelCompiler:
         )
 
         # Build command from toolchain
-        cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
+        cmd = [self.gxx15.cxx_path, *self.gxx15.get_compile_flags(core_type=core_type)]
         cmd += self._sanitizer_flags(self.gxx15)
 
         # Add PTO ISA header paths if provided. The path always comes from
@@ -647,17 +749,17 @@ class KernelCompiler:
         if pto_isa_root:
             pto_include = os.path.join(pto_isa_root, "include")
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
-            cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
+            cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
         for inc_dir in self.get_incore_include_dirs():
-            cmd.append(f"-I{os.path.abspath(inc_dir)}")
+            cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
         # Add extra include directories if provided
         if extra_include_dirs:
             for inc_dir in extra_include_dirs:
-                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+                cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
-        cmd.extend(["-o", output_path, source_path])
+        cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 
         # Log compilation command
         logger.info(f"[SimKernel] Compiling: {source_path}")

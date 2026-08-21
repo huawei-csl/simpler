@@ -31,18 +31,13 @@ Both `simpler` and `simpler_setup` are part of the surface you write against:
 - **`simpler`** — the runtime itself. `Worker`, and the task/callable types in
   `simpler.task_interface`.
 - **`simpler_setup`** — compilation and test scaffolding: `KernelCompiler`,
-  `SceneTestCase` / `scene_test`, `Tensor`, `TaskArgsBuilder`,
-  `ensure_pto_isa_root`, `make_tensor_arg`. Also the analysis CLIs under
+  `SceneTestCase` / `scene_test`, `TensorArg`, `TaskArgsBuilder`,
+  `ensure_pto_isa_root`, `make_chip_tensor_arg`. Also the analysis CLIs under
   `simpler_setup.tools`.
 
 You cannot compile a kernel without `simpler_setup`, so treat both as yours to
-use. Note that
-[`.claude/rules/project-layout.md`](../../.claude/rules/project-layout.md)
-describes `simpler_setup` as internal test framework — that boundary does not
-match how the examples import today, and neither does the claim that `simpler`
-is the whole user API: `simpler.__all__` currently exports only the logging
-helpers, so `Worker` must be imported as `from simpler.worker import Worker`
-rather than `from simpler import Worker`.
+use. `from simpler import Worker` works; the task and callable types come from
+`simpler.task_interface`.
 
 ## Where the worked examples live
 

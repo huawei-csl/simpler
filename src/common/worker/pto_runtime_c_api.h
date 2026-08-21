@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime C API — canonical header
+ * simpler host-runtime C API — canonical header
  *
  * Declares all C-linkage functions exported by the host runtime .so.
  * Both the ChipWorker (consumer, resolves public symbols via dlsym) and the
@@ -20,27 +20,37 @@
  * stubs rather than omitting symbols):
  *   - lifecycle:    create_device_context, destroy_device_context,
  *                   simpler_init, finalize_device
- *   - sizing:       get_runtime_size
+ *   - sizing:       get_runtime_size, get_runtime_alignment
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
+ *                   committed_device_memory_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
+ *   - prepared run: simpler_register_callable, simpler_prepare_run,
+ *                   simpler_launch_run, simpler_poll_run, simpler_wait_run,
+ *                   simpler_finalize_run, simpler_run,
+ *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count,
  *                   simpler_provision_dma_workspace
+ *   - pipeline:     get_pipeline_contract,
+ *                   supports_concurrent_native_prepare_ctx,
+ *                   get_arena_bank_gm_heap_base_ctx,
+ *                   get_retained_temp_addr_ctx
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
- * Optional metadata:
- *   - pipeline:     get_pipeline_contract
- *
- * Memory management: caller allocates a buffer of get_runtime_size() bytes
- * and passes it to simpler_run(). Error codes: 0 = success, negative = error.
+ * Native-run storage: caller allocates at least get_runtime_size() bytes with
+ * get_runtime_alignment() alignment, zero-initializes it before first use, and
+ * keeps its address stable from prepare through finalize. After finalize the
+ * same storage may be reused without re-zeroing. The storage must not be moved,
+ * copied, or used for overlapping runs while it contains a prepared run. The
+ * caller must serialize phase functions for a given context/storage pair;
+ * poll/wait/finalize are not concurrent operations on the same run.
+ * Error codes: 0 = success, negative = error.
  */
 
-#ifndef SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_
-#define SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_
+#pragma once
 
 #include <stddef.h>
 #include <stdint.h>
@@ -62,6 +72,14 @@ typedef void *DeviceContextHandle;
 
 enum {
     PTO_RUNTIME_ERR_UNSUPPORTED = -2,
+    PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE = -3,
+};
+
+/** Return values from simpler_poll_run(). */
+enum {
+    SIMPLER_NATIVE_RUN_POLL_ERROR = -1,
+    SIMPLER_NATIVE_RUN_POLL_NOT_READY = 0,
+    SIMPLER_NATIVE_RUN_POLL_COMPLETE = 1,
 };
 
 enum {
@@ -123,6 +141,40 @@ typedef struct PipelineContract {
     PipelineResource resources[PTO_PIPELINE_MAX_RESOURCES];
 } PipelineContract;
 
+/**
+ * Ownership token for one pipeline resource slot.
+ *
+ * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
+ * time that slot is leased, so delayed completion or cleanup from an older run
+ * cannot mutate resources now owned by its successor. Generation zero is
+ * reserved for an invalid/uninitialised lease.
+ */
+typedef struct PipelineSlotLease {
+    uint32_t slot_id;
+    uint32_t reserved;
+    uint64_t generation;
+} PipelineSlotLease;
+
+/**
+ * Immutable resource and trace identity copied into one prepared run.
+ * `pipeline_slot` and `arena_bank` must be smaller than
+ * PTO_PIPELINE_MAX_DEPTH; they remain explicit because some runtimes map a
+ * leased slot to a different arena bank. `run_epoch` is the process-unique
+ * identity used by later phase calls; lease generation, run id, and dispatch
+ * id remain diagnostic after admission. A non-null acceptance sink is written
+ * only at the real kernel-launch marker.
+ */
+typedef struct NativeRunDescriptor {
+    uint32_t pipeline_slot;
+    uint32_t arena_bank;
+    uint64_t run_id;
+    uint64_t generation;
+    uint64_t dispatch_id;
+    uint64_t run_epoch;
+    volatile int32_t *accepted_state;
+    int32_t accepted_value;
+} NativeRunDescriptor;
+
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
@@ -132,7 +184,7 @@ typedef struct PipelineContract {
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
-/** Return this runtime's immutable pipeline resource declaration. Optional. */
+/** Return this runtime's immutable pipeline resource declaration. */
 const PipelineContract *get_pipeline_contract(void);
 
 /**
@@ -144,18 +196,30 @@ DeviceContextHandle create_device_context(void);
 
 /**
  * Destroy a device context created by create_device_context().
- * Calls finalize internally, then frees the underlying object.
+ * The caller must finalize every prepared native run and call
+ * finalize_device() first. An active native run makes this operation log an
+ * error and leave the context alive; otherwise it frees the underlying object.
  */
 void destroy_device_context(DeviceContextHandle ctx);
 
-/** Return sizeof(Runtime) for caller buffer allocation. */
+/** Return the byte size of the opaque prepared-run storage. */
 size_t get_runtime_size(void);
+
+/** Return the required byte alignment of the opaque prepared-run storage. */
+size_t get_runtime_alignment(void);
 
 /** Allocate device memory in the given device context. */
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
 
 /** Free device memory previously allocated in the given device context. */
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
+
+/**
+ * Total device HBM (bytes) currently committed by this device context's
+ * MemoryAllocator (user tensors + pooled arenas + Graph execution blocks +
+ * runtime buffers). Excludes HCCL/VMM comm windows. Returns 0 on NULL ctx.
+ */
+size_t committed_device_memory_ctx(DeviceContextHandle ctx);
 
 /** Copy host memory to a device pointer within the given device context. */
 int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size);
@@ -164,17 +228,19 @@ int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
 
 /**
- * One-shot platform-side init. Called once by ChipWorker::init() right
- * after dlopen, before any other entry. Three responsibilities, in order:
+ * One-shot platform-side init. Called once by ChipWorker::init() after the
+ * runtime module's private HostLogger has been bound to process-owned state.
+ * Its responsibilities, in order:
  *
- *   1. (Onboard only) Sync CANN dlog with HostLogger::get_instance().level()
- *      via dlog_setlevel(-1, level, 0), unless ASCEND_GLOBAL_LOG_LEVEL was
+ *   1. (Onboard only) Sync CANN dlog with
+ *      HostLogger::get_instance().cann_level() via
+ *      dlog_setlevel(-1, level, 0), unless ASCEND_GLOBAL_LOG_LEVEL was
  *      externally configured, in which case CANN keeps the user's choice.
  *      This must run before step 2 because CANN snapshots the device-side
  *      log session's level at context-open time (rtSetDevice); a later
  *      dlog_setlevel would not re-level the already-opened device session.
- *      The log level itself is owned by libsimpler_log.so (seeded earlier
- *      by simpler_log_init); it never travels through this ABI.
+ *      The threshold is read from the state bound by ChipWorker immediately
+ *      after dlopen.
  *
  *   2. Attach the calling thread to `device_id` (rtSetDevice on onboard,
  *      pto_cpu_sim_bind_device + pto_cpu_sim_acquire_device on sim) and
@@ -203,7 +269,8 @@ int simpler_init(
 
 /**
  * Release all device resources held by the context.
- * Must be called before destroy_device_context() / dlclose().
+ * Must be called before destroy_device_context() / dlclose(). Returns an error
+ * without teardown while a prepared native run remains unfinalized.
  */
 int finalize_device(DeviceContextHandle ctx);
 
@@ -218,7 +285,9 @@ int finalize_device(DeviceContextHandle ctx);
  * MAX_REGISTERED_CALLABLE_IDS in the AICPU executor) and rejects ids outside
  * `[0, 64)`. Lifetime: caller must `unregister_callable` before
  * `finalize_device` to release the device-side orch SO buffer; kernels stay
- * resident until finalize regardless.
+ * resident until finalize regardless. Register and unregister mutate state
+ * referenced by a prepared run, so both are rejected from successful prepare
+ * until its matching finalize.
  * =========================================================================== */
 
 /**
@@ -233,6 +302,8 @@ int finalize_device(DeviceContextHandle ctx);
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
+ * Callable-registry mutation is rejected while a native run is prepared or
+ * executing on this context.
  *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
  *         range, upload/copy failure, or AICPU prewarm failure).
@@ -256,20 +327,89 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * Per-stage run timing is not returned — the platform emits it as `[STRACE]`
  * log markers (see docs/dfx/host-trace.md).
  *
- * `config` carries block_dim (0 = auto), aicpu_thread_num, the five diagnostic
+ * `config` carries aicpu_thread_num, the five diagnostic
  * enables + output_prefix, and the per-task ring sizing overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a
  * per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT entries; 0 = unset,
  * precedence per ring: per-ring entry > PTO2_RING_* env var > compile-time
  * default). Ring overrides are consumed by tensormap_and_ringbuffer only; other
- * runtime variants accept and ignore them. Wire-compatible POD; the platform
- * reads it by pointer without copying.
+ * runtime variants accept and ignore them. Wire-compatible POD; prepare copies
+ * it into the native-run context before returning.
+ *
+ * `descriptor` carries this run's immutable resource selection, trace identity,
+ * and optional launch-acceptance sink. It is copied before prepare returns. The
+ * platform release-stores the acceptance value only after the real
+ * kernel-launch marker; the sink is not retained after this blocking call.
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx/config, etc.).
  */
 int simpler_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
 );
+
+/**
+ * Build and bind one run into caller-owned opaque storage without launching it.
+ * A successful prepare must be paired with simpler_finalize_run(), even when
+ * launch is abandoned or fails. The `args` container itself is consumed during
+ * prepare and need not remain alive afterward, but every tensor backing buffer
+ * referenced by it must remain valid through finalize (which may copy results
+ * back to those addresses). See the storage size/alignment/lifetime contract at
+ * the top of this header. `descriptor` is required and copied before this
+ * function returns. A non-null acceptance sink in the descriptor must remain
+ * valid until launch returns or the prepared run is finalized without launch.
+ */
+int simpler_prepare_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+);
+
+/**
+ * Return nonzero when non-diagnostic preparation may overlap the execution
+ * claim held by a run in another pipeline slot.
+ */
+int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
+
+/**
+ * Launch a prepared run. Returns only after the platform has published its
+ * real kernel-launch marker, or after execution terminates before that marker.
+ * The acceptance sink captured by prepare is published at that marker; an
+ * execution failure before the marker leaves it unchanged.
+ */
+int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Non-blocking device-completion query. Returns
+ * SIMPLER_NATIVE_RUN_POLL_NOT_READY, SIMPLER_NATIVE_RUN_POLL_COMPLETE, or a
+ * negative validation, phase, or device-query error. COMPLETE is published
+ * only after the executor has also finished host-side drain work. Polling
+ * never releases the prepared run's resources; call only after
+ * simpler_launch_run() returns.
+ */
+int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/** Wait for device execution to terminate. Does not release prepared resources. */
+int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Wait if needed, validate/copy results, and release the opaque prepared run.
+ * Also safely aborts a run that was prepared but never launched.
+ */
+int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Committed GM heap base of one arena bank, or 0 when that bank has never been
+ * committed or the platform keeps a single shared arena set. Reports which
+ * device allocation a bank actually owns; changes nothing.
+ */
+uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id);
+
+/**
+ * Retained temporary-buffer address held for one pipeline slot, or 0 while that
+ * slot holds none. Reports which staging buffer a slot actually owns; changes
+ * nothing.
+ */
+uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id);
 
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of
@@ -285,6 +425,7 @@ int simpler_run(
  * `launch_device_register` triggers `dlclose` + reload), or at process
  * exit. Long-running processes that register / unregister cids without ever
  * reusing them will hold the AICPU SO handle until shutdown.
+ * Rejected while a native run is prepared or executing on this context.
  *
  * @return 0 on success or if callable_id was not registered, negative on error.
  */
@@ -307,11 +448,13 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
 size_t get_host_dlopen_count(DeviceContextHandle ctx);
 
 /**
- * Number of run stream sets the runner bound to `ctx` has created. A set
- * belongs to a pipeline slot and is reused for every run on that slot, so a
- * runner that has served any number of runs on one slot reports 1. Returns 0
- * on platforms whose runs use the persistent bootstrap pair. Used by tests to
- * assert that repeated `simpler_run` calls do not rebuild the set per run.
+ * Number of AICore run streams the runner bound to `ctx` has created. One
+ * AICPU + AICore pair serves every run for the runner's lifetime. The AICPU
+ * stream persists; the AICore stream is recreated when a new code upload makes
+ * it stale, and destroyed when an unproven completion retires it, so this
+ * advances per publication or unproven retirement rather than once per run or
+ * per pipeline slot. Returns 0 on platforms whose runs use the persistent
+ * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 
@@ -322,11 +465,18 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
  * for a Worker created with SDMA enabled. Bits unsupported by this
  * platform/runtime are rejected, so a Worker opting into SDMA on sim / a5 / hbg
  * fails fast. Returns 0 on success, negative on unsupported/failed provisioning.
+ *
+ * `sdma_warmup_binary` / `sdma_warmup_size` carry the vector-only ELF that walks
+ * the SDMA control path once per channel against the workspace just provisioned,
+ * so the first TPREFETCH_ASYNC does not pay that cold start. A null/empty buffer,
+ * or a warmup the platform cannot run, skips it and still provisions
+ * successfully — the only cost is first-call latency. A warmup whose device launch
+ * or sync fails does fail provisioning, because that card is then poisoned.
  */
-int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask);
+int simpler_provision_dma_workspace(
+    DeviceContextHandle ctx, uint32_t required_mask, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
+);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_

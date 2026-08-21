@@ -16,7 +16,7 @@
  * only handles:
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, aicpu_thread_num)
- * - Tensor pair management for host-device memory tracking
+ * - ChipTensor pair management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
@@ -37,8 +37,7 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/host_api.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "pto2_dispatch_payload.h"
@@ -68,12 +67,13 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * AICPU and AICore during task execution.
  *
  * Protocol State Machine:
- * 1. Initialization: AICPU sets aicpu_ready=1
- * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
- * 4. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
- * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
- * 6. Shutdown: AICPU sets control=1, AICore exits
+ * 1. AICore publishes physical_core_id, core_type, and aicore_done on launch
+ * 2. AICPU publishes the task pointer and opens the register window with DATA_MAIN_BASE=IDLE
+ * 3. AICore observes window-open, reports initial idle state, and reads the task pointer
+ * 4. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
+ * 5. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
+ * 6. Task Completion: AICore writes FIN to COND; AICPU observes completion
+ * 7. Shutdown: AICPU writes the exit signal to DATA_MAIN_BASE; AICore exits
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
  * task execution across multiple cores.
@@ -87,23 +87,23 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * between cores and optimize cache coherency operations.
  *
  * Field Access Patterns:
- * - aicpu_ready: Written by AICPU, read by AICore
+ * - aicpu_ready: Reserved legacy field; the current handshake does not use it
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
  *   and core_type are published alongside it in the same write)
- * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPayload*)
+ * - task: Written by AICPU before window-open, read by AICore after window-open
  * - core_type: Written by AICore (with aicore_done), read by AICPU (CoreType::AIC or CoreType::AIV)
  * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicpu_ready;  // Legacy layout field; unused by the current handshake
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
+    volatile uint64_t task;         // PTO2DispatchPayload* published before register window-open
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
 
 /**
- * Tensor pair for tracking host-device memory mappings.
+ * ChipTensor pair for tracking host-device memory mappings.
  * Used for copy-back during finalize.
  */
 struct TensorPair {
@@ -115,15 +115,6 @@ struct TensorPair {
     // keep the safe default of copying back.
     bool needs_copy_back = true;
 };
-
-/**
- * Host API function pointers for device memory operations live in the shared
- * common/host_api.h (included at the top of this header) so the field set
- * stays identical across runtime variants (tensormap_and_ringbuffer /
- * host_build_graph) and arches; the platform layer builds one const table and
- * passes it by address. hbg leaves the trb-only fields (prebuilt-arena cache)
- * unset — see host_api.h.
- */
 
 /**
  * Task structure - Compatibility stub for platform layer
@@ -195,8 +186,6 @@ public:
 
 private:
     // Kernel binary tracking for cleanup
-    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
-    int registered_kernel_count_;
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
@@ -293,18 +282,23 @@ public:
     void set_device_orch_config_name(const char *name);
 
     uint64_t get_function_bin_addr(int func_id) const;
-    void set_function_bin_addr(int func_id, uint64_t addr);
     /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime
-     * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime so prepared kernel
-     * binaries are not freed by validate_runtime_impl across runs.
+     * Map a func_id onto the device address of its CoreCallable. Used by
+     * DeviceRunner::bind_callable_to_runtime for each of the active callable's
+     * child kernels, after clear_function_bin_addrs() has emptied the table.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);
 
-    int get_registered_kernel_count() const;
-    int get_registered_kernel_func_id(int index) const;
-    void clear_registered_kernels();
+    /**
+     * Drop every func_id -> CoreCallable address mapping.
+     *
+     * Each mapping points into one callable's retained ChipCallable buffer,
+     * which unregistering that callable frees. `bind_callable_to_runtime` calls
+     * this before replaying the active callable's addresses so no entry outlives
+     * the buffer it points into: the scheduler dereferences these addresses and
+     * the AICore calls what it finds there.
+     */
+    void clear_function_bin_addrs();
 
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)
@@ -320,9 +314,9 @@ public:
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Not read by AICPU/AICore — the device-side
-    // Runtime image carries the std::vector control block as harmless
-    // garbage, identical to host_api above. No fixed cap — grows with the
-    // chip-level entry-tensor count.
+    // Runtime image also carries the host-only std::vector control block, which
+    // device code must not inspect. No fixed cap — grows with the chip-level
+    // entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
 };
 

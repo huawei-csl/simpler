@@ -7,17 +7,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L3 multi-communication-domain demo with overlapping domains.
+"""L3 demo: one chip belonging to two communication domains.
 
-Three chip workers form two communication domains:
+Three chip workers form two domains whose *membership* overlaps — the
+overlap is structural, not temporal, and the two domains' collectives never
+run concurrently:
 
   left   = workers [0, 1]
-  right  = workers [1, 2]
+  right  = workers [1, 2]        # chip 1 is in both
 
-Worker 1 participates in both domains and receives two independent domain
-contexts.  The L3 orchestration submits communication in both domains and
-then submits affine compute tasks that depend only on their own domain's
-reduced tensor.
+Chip 1 belongs to both domains — rank 1 in `left`, rank 0 in `right` — and
+receives an independent ChipDomainContext, with its own scratch pointer and
+device_ctx, in each domain's own reduction run. The two contexts are never
+live at the same time. `reduce_out` and `affine_out` are keyed by
+(domain, chip), so chip 1 writes a distinct result per domain — that pair of
+values is what the golden check makes sharp.
+
+Three synchronous `worker.run` calls, each its own DAG: one allreduce per
+domain, then a final run holding both affine groups. A domain allocated in
+a run stays live for exactly that run, and reduce precedes affine by the
+run boundary rather than by a dependency edge.
 
 Run:
     python examples/workers/l3/dual_domain_overlap/main.py -p a2a3sim -d 0-2
@@ -42,7 +51,6 @@ from simpler.task_interface import (  # noqa: E402
     CoreCallable,
     DataType,
     TaskArgs,
-    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -51,6 +59,8 @@ from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
+
+_F32 = DataType.FLOAT32
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -154,15 +164,7 @@ def _scratch_buffers() -> list[CommBufferSpec]:
 
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
-    args.add_tensor(
-        Tensor.make(
-            data=domain.buffer_ptrs["scratch"],
-            shapes=(COUNT,),
-            dtype=DataType.FLOAT32,
-            child_memory=True,
-        ),
-        TensorArgType.INOUT,
-    )
+    args.add_tensor(domain.buffers["scratch"].tensor((COUNT,), _F32), TensorArgType.INOUT)
     args.add_scalar(domain.domain_size)
     args.add_scalar(domain.device_ctx)
 
@@ -208,20 +210,22 @@ def run(platform: str, device_ids: list[int]) -> int:
                     window_size=WINDOW_SIZE,
                     buffers=_scratch_buffers(),
                 ) as handle:
+                    args_list = []
                     for worker_idx in worker_indices:
                         domain = handle[worker_idx]
                         print(
                             f"[dual_domain_overlap] {domain_name} chip {worker_idx}: "
                             f"rank={domain.domain_rank}/{domain.domain_size} "
-                            f"scratch=0x{domain.buffer_ptrs['scratch']:x} ctx=0x{domain.device_ctx:x}"
+                            f"scratch=0x{domain.buffers['scratch'].base:x} ctx=0x{domain.device_ctx:x}"
                         )
                         args = TaskArgs()
-                        args.add_tensor(make_tensor_arg(host_x[worker_idx]), TensorArgType.INPUT)
+                        args.add_tensor(make_tensor_arg(worker, host_x[worker_idx]), TensorArgType.INPUT)
                         args.add_tensor(
-                            make_tensor_arg(reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
+                            make_tensor_arg(worker, reduce_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
                         )
                         _add_domain_scratch(args, domain)
-                        orch.submit_next_level(allreduce_handle, args, cfg, worker=worker_idx)
+                        args_list.append(args)
+                    orch.submit_next_level_group(allreduce_handle, args_list, cfg, workers=worker_indices)
 
             return _orch_fn
 
@@ -230,10 +234,12 @@ def run(platform: str, device_ids: list[int]) -> int:
                 args_list = []
                 for worker_idx in worker_indices:
                     args = TaskArgs()
-                    args.add_tensor(make_tensor_arg(reduce_out[domain_name][worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(scale[worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(bias[worker_idx]), TensorArgType.INPUT)
-                    args.add_tensor(make_tensor_arg(affine_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING)
+                    args.add_tensor(make_tensor_arg(worker, reduce_out[domain_name][worker_idx]), TensorArgType.INPUT)
+                    args.add_tensor(make_tensor_arg(worker, scale[worker_idx]), TensorArgType.INPUT)
+                    args.add_tensor(make_tensor_arg(worker, bias[worker_idx]), TensorArgType.INPUT)
+                    args.add_tensor(
+                        make_tensor_arg(worker, affine_out[domain_name][worker_idx]), TensorArgType.OUTPUT_EXISTING
+                    )
                     args_list.append(args)
                 orch.submit_next_level_group(affine_handle, args_list, cfg, workers=worker_indices)
 

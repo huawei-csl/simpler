@@ -25,18 +25,20 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_ORCHESTRATOR_H
-#define PTO_ORCHESTRATOR_H
+#pragma once
 
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
+#include "graph_cache.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
+
+struct GraphHostState;
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
@@ -93,10 +95,6 @@ struct PTO2OrchestratorState {
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
-#if SIMPLER_DFX
-    // L2 swimlane_level copied from get_l2_swimlane_level().
-    L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};
-#endif
 
     // === GM HEAP (for output buffers) ===
     void *gm_heap_base;     // Base address of GM heap
@@ -113,11 +111,16 @@ struct PTO2OrchestratorState {
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
 
+    // This host-only state is cleared before the arena/shared-memory image
+    // crosses to the device.
+    GraphHostState *graph_host_state{nullptr};
+
     // === STATISTICS ===
 #if SIMPLER_DFX
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
+
 #endif
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
@@ -151,9 +154,14 @@ struct PTO2OrchestratorState {
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
-    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    TaskOutputTensors submit_dummy_task(const L0TaskArgs &args);
-    TaskOutputTensors alloc_tensors(const L0TaskArgs &args);
+    TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
+    TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
+    TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
+    GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash);
+    bool graph_prepare(const GraphTaskArgs &args);
+    void graph_abort();
+    bool graph_end();
+    void graph_commit();
     void mark_done();
 };
 
@@ -163,7 +171,6 @@ struct PTO2OrchestratorState {
 
 #if SIMPLER_ORCH_PROFILING
 struct PTO2OrchProfilingData {
-    uint64_t sync_cycle;
     uint64_t alloc_cycle;  // Combined task slot + heap allocation
     uint64_t args_cycle;
     uint64_t lookup_cycle;
@@ -172,15 +179,11 @@ struct PTO2OrchProfilingData {
     uint64_t scope_end_cycle;
     int64_t submit_count;
     // Wait time tracking for blocking phases
-    uint64_t alloc_wait_cycle;  // Cycles spent waiting in unified alloc
     uint64_t fanin_wait_cycle;  // Legacy (wiring): fanout_lock wait; polling has no such lock
     // Atomic operation counts per phase
-    uint64_t alloc_atomic_count;
     uint64_t args_atomic_count;
     uint64_t scope_end_atomic_count;
 };
 
 PTO2OrchProfilingData orchestrator_get_profiling();
 #endif
-
-#endif  // PTO_ORCHESTRATOR_H

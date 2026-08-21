@@ -11,7 +11,7 @@
 /**
  * Nanobind Python extension for task_interface headers.
  *
- * Wraps DataType, Tensor, ChipStorageTaskArgs, TaskArgs (unified
+ * Wraps DataType, ChipTensor, ChipStorageTaskArgs, TaskArgs (unified
  * vector-backed builder with per-tensor TensorArgType tags), TensorArgType,
  * ArgDirection, CoreCallable, ChipCallable, and helper functions from
  * data_type.h / tensor.h / task_args.h / arg_direction.h / callable.h.
@@ -32,8 +32,12 @@
 #include <chrono>
 #include <cerrno>
 #include <array>
+#include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
+#include <exception>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -50,11 +54,15 @@
 #include "arg_direction.h"
 #include "callable.h"
 #include "callable_protocol.h"
+#include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "common/host_span_names.h"
+#include "common/host_span_scope.h"
+#include "host_log.h"
 #include "data_type.h"
 #include "dma_workspace.h"
-#include "l3_l2_orch_comm.h"
-#include "l3_l2_orch_region_access.h"
+#include "worker_chip_orch_comm.h"
+#include "worker_chip_orch_region_access.h"
 #include "worker_bind.h"
 #include "task_args.h"
 #include "tensor.h"
@@ -62,16 +70,6 @@
 namespace nb = nanobind;
 
 namespace {
-
-std::string shm_name_for_open(const std::string &token) {
-    if (token.empty()) {
-        throw std::invalid_argument("L3-L2 sim backing shm token must be non-empty");
-    }
-    if (token[0] == '/') {
-        return token;
-    }
-    return "/" + token;
-}
 
 struct LocalAclMemLocation {
     uint32_t id{0};
@@ -303,19 +301,145 @@ private:
 
 AclRuntimeApi &acl_api() {
     static std::once_flag once;
-    static std::unique_ptr<AclRuntimeApi> api;
+    // Intentionally process-lifetime: late Python finalizers may still need
+    // the initialized ACL dispatch table after ordinary static destruction
+    // begins, so deleting it would reintroduce a destruction-order use-after-free.
+    static AclRuntimeApi *api{nullptr};
     std::call_once(once, []() {
         auto candidate = std::make_unique<AclRuntimeApi>();
         candidate->load();
         candidate->init();
-        api = std::move(candidate);
+        api = candidate.release();
     });
     return *api;
 }
 
-class L3HostMappedRegion {
+class ChipChildOnboardRegion {
 public:
-    L3L2RegionAccessProfile profile{L3L2RegionAccessProfile::SIM_POSIX_SHM};
+    int device_id{-1};
+    uint64_t device_addr{0};
+    uint64_t mapping_bytes{0};
+    uint64_t shareable_handle{0};
+    void *vmm_handle{nullptr};
+
+    void bind_acl_device() const {
+        if (device_id < 0) {
+            throw std::runtime_error("L3-L2 onboard child region has no device id");
+        }
+        acl_api().bind_device_with_check(device_id);
+    }
+};
+
+struct ChipChildOnboardRegionExport {
+    uint64_t device_addr{0};
+    uint64_t mapping_bytes{0};
+    uint64_t shareable_handle{0};
+    uint64_t registry_handle{0};
+};
+
+std::string region_shm_name_for_open(const std::string &token) {
+    if (token.empty()) {
+        throw std::invalid_argument("mapped-region sim backing shm token must be non-empty");
+    }
+    if (token[0] == '/') {
+        return token;
+    }
+    return "/" + token;
+}
+
+WorkerChipOrchNotifyOp checked_region_notify_op(int op) {
+    auto typed = static_cast<WorkerChipOrchNotifyOp>(op);
+    if (!worker_chip_orch_comm::valid_notify_op(typed)) {
+        throw std::invalid_argument("region counter notify op is invalid");
+    }
+    return typed;
+}
+
+WorkerChipOrchWaitCmp checked_region_wait_cmp(int cmp) {
+    auto typed = static_cast<WorkerChipOrchWaitCmp>(cmp);
+    if (!worker_chip_orch_comm::valid_wait_cmp(typed)) {
+        throw std::invalid_argument("region counter wait comparison is invalid");
+    }
+    return typed;
+}
+
+class RegionCleanupErrors {
+public:
+    void record(const std::string &owner_token, const std::string &message) noexcept {
+        try {
+            std::lock_guard<std::mutex> lk(mu_);
+            append_cleanup_error(errors_[owner_token], message);
+        } catch (...) {}
+    }
+
+    std::string take(const std::string &owner_token) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = errors_.find(owner_token);
+        if (it == errors_.end()) {
+            return {};
+        }
+        std::string error = std::move(it->second);
+        errors_.erase(it);
+        return error;
+    }
+
+    std::string peek(const std::string &owner_token) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = errors_.find(owner_token);
+        return it == errors_.end() ? std::string{} : it->second;
+    }
+
+    void acknowledge(const std::string &owner_token, const std::string &observed) {
+        if (observed.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = errors_.find(owner_token);
+        if (it == errors_.end()) {
+            return;
+        }
+        if (it->second == observed) {
+            errors_.erase(it);
+            return;
+        }
+        if (it->second.size() > observed.size() + 2 && it->second.compare(0, observed.size(), observed) == 0 &&
+            it->second.compare(observed.size(), 2, "; ") == 0) {
+            it->second.erase(0, observed.size() + 2);
+        }
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<std::string, std::string> errors_;
+};
+
+RegionCleanupErrors &region_cleanup_errors() {
+    static auto *errors = new RegionCleanupErrors();
+    return *errors;
+}
+
+enum class RegionMappingProfile { SimPosixShm, OnboardVmm };
+
+class RegionMapping {
+public:
+    RegionMapping() = default;
+    RegionMapping(const RegionMapping &) = delete;
+    RegionMapping &operator=(const RegionMapping &) = delete;
+
+    ~RegionMapping() noexcept {
+        try {
+            std::string cleanup_error;
+            close_collecting(cleanup_error);
+            if (!cleanup_error.empty()) {
+                region_cleanup_errors().record(owner_token, cleanup_error);
+            }
+        } catch (...) {
+            region_cleanup_errors().record(owner_token, "mapped-region cleanup failed with an unknown error");
+        }
+    }
+
+    std::string owner_token;
+    RegionMappingProfile profile{RegionMappingProfile::SimPosixShm};
     int fd{-1};
     uint64_t device_addr{0};
     int device_id{-1};
@@ -323,22 +447,30 @@ public:
     void *vmm_handle{nullptr};
     uint64_t mapping_bytes{0};
 
+    void close() {
+        std::string cleanup_error;
+        close_collecting(cleanup_error);
+        if (!cleanup_error.empty()) {
+            throw std::runtime_error(cleanup_error);
+        }
+    }
+
     void bind_acl_device() const {
         if (device_id < 0) {
-            throw std::runtime_error("L3-L2 onboard mapped-region handle has no device id");
+            throw std::runtime_error("onboard mapped-region handle has no device id");
         }
         acl_api().bind_device_with_check(device_id);
     }
 
     void validate_mapping_range_or_throw(uint64_t offset, uint64_t nbytes) const {
         if (nbytes == 0 || offset > mapping_bytes || nbytes > mapping_bytes - offset) {
-            throw std::out_of_range("L3-L2 L3 Host mapped-region access is out of range");
+            throw std::out_of_range("mapped-region byte access is out of range");
         }
     }
 
     void copy_to(uint64_t offset, const void *host_ptr, uint64_t nbytes) const {
         validate_mapping_range_or_throw(offset, nbytes);
-        if (profile == L3L2RegionAccessProfile::SIM_POSIX_SHM) {
+        if (profile == RegionMappingProfile::SimPosixShm) {
             auto *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(device_addr));
             std::memcpy(dst + offset, host_ptr, static_cast<size_t>(nbytes));
             return;
@@ -350,7 +482,7 @@ public:
 
     void copy_from(void *host_ptr, uint64_t offset, uint64_t nbytes) const {
         validate_mapping_range_or_throw(offset, nbytes);
-        if (profile == L3L2RegionAccessProfile::SIM_POSIX_SHM) {
+        if (profile == RegionMappingProfile::SimPosixShm) {
             const auto *src = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(device_addr));
             std::memcpy(host_ptr, src + offset, static_cast<size_t>(nbytes));
             return;
@@ -368,45 +500,42 @@ public:
 
     void store_counter(uint64_t offset, int32_t value) const { copy_to(offset, &value, sizeof(value)); }
 
-    void notify_counter(uint64_t offset, int32_t value, L3L2OrchNotifyOp op) const {
+    void notify_counter(uint64_t offset, int32_t value, WorkerChipOrchNotifyOp op) const {
         if (offset % sizeof(int32_t) != 0) {
-            throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            throw std::invalid_argument("region counter offset must be 4-byte aligned");
         }
-        if (!l3_l2_orch_comm::valid_notify_op(op)) {
-            throw std::invalid_argument("L3-L2 counter notify op is invalid");
+        if (!worker_chip_orch_comm::valid_notify_op(op)) {
+            throw std::invalid_argument("region counter notify op is invalid");
         }
-        if (op == L3L2OrchNotifyOp::Add) {
+        if (op == WorkerChipOrchNotifyOp::Add) {
             value = load_counter(offset) + value;
         }
         store_counter(offset, value);
     }
 
-    std::tuple<bool, int32_t> test_counter(uint64_t offset, int32_t operand, L3L2OrchWaitCmp cmp) const {
+    std::tuple<bool, int32_t> test_counter(uint64_t offset, int32_t operand, WorkerChipOrchWaitCmp cmp) const {
         if (offset % sizeof(int32_t) != 0) {
-            throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            throw std::invalid_argument("region counter offset must be 4-byte aligned");
         }
-        if (!l3_l2_orch_comm::valid_wait_cmp(cmp)) {
-            throw std::invalid_argument("L3-L2 counter wait comparison is invalid");
+        if (!worker_chip_orch_comm::valid_wait_cmp(cmp)) {
+            throw std::invalid_argument("region counter wait comparison is invalid");
         }
         int32_t observed = load_counter(offset);
-        return std::make_tuple(l3_l2_orch_comm::compare_counter(observed, operand, cmp), observed);
+        return std::make_tuple(worker_chip_orch_comm::compare_counter(observed, operand, cmp), observed);
     }
 
-    // Returns (status, error_kind, observed, matched, message). The status/error
-    // values are the wire contract with the Python facade
-    // (_WAIT_STATUS_TIMEOUT / _WAIT_ERROR_SIGNAL_TIMEOUT in l3_l2_orch_comm.py).
     std::tuple<int, int, int32_t, bool, std::string>
-    wait_counter(uint64_t offset, int32_t operand, L3L2OrchWaitCmp cmp, uint64_t timeout_ns) const {
+    wait_counter(uint64_t offset, int32_t operand, WorkerChipOrchWaitCmp cmp, uint64_t timeout_ns) const {
         if (offset % sizeof(int32_t) != 0) {
-            throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            throw std::invalid_argument("region counter offset must be 4-byte aligned");
         }
-        if (!l3_l2_orch_comm::valid_wait_cmp(cmp)) {
-            throw std::invalid_argument("L3-L2 counter wait comparison is invalid");
+        if (!worker_chip_orch_comm::valid_wait_cmp(cmp)) {
+            throw std::invalid_argument("region counter wait comparison is invalid");
         }
         auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
         while (true) {
             int32_t observed = load_counter(offset);
-            bool matched = l3_l2_orch_comm::compare_counter(observed, operand, cmp);
+            bool matched = worker_chip_orch_comm::compare_counter(observed, operand, cmp);
             if (matched) {
                 return std::make_tuple(kWaitStatusOk, kWaitErrorNone, observed, true, std::string{});
             }
@@ -420,6 +549,45 @@ public:
     }
 
 private:
+    void close_collecting(std::string &cleanup_error) {
+        uint64_t mapped_addr = std::exchange(device_addr, 0);
+        uint64_t mapped_bytes = std::exchange(mapping_bytes, 0);
+        void *physical_handle = std::exchange(vmm_handle, nullptr);
+        int mapped_device_id = std::exchange(device_id, -1);
+        int mapped_fd = std::exchange(fd, -1);
+
+        if (profile == RegionMappingProfile::OnboardVmm) {
+            if (mapped_addr == 0 && physical_handle == nullptr) {
+                return;
+            }
+            try {
+                if (mapped_device_id < 0) {
+                    throw std::runtime_error("onboard mapped-region handle has no device id");
+                }
+                AclRuntimeApi &api = acl_api();
+                api.bind_device_with_check(mapped_device_id);
+                api.vmm_release_collecting(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(mapped_addr)), physical_handle, cleanup_error
+                );
+            } catch (const std::exception &exc) {
+                append_cleanup_error(cleanup_error, exc.what());
+            } catch (...) {
+                append_cleanup_error(cleanup_error, "onboard mapped-region cleanup failed");
+            }
+            return;
+        }
+
+        if (mapped_addr != 0 &&
+            munmap(reinterpret_cast<void *>(static_cast<uintptr_t>(mapped_addr)), mapped_bytes) != 0) {
+            int err = errno;
+            append_cleanup_error(cleanup_error, std::string("sim mapped-region munmap failed: ") + std::strerror(err));
+        }
+        if (mapped_fd >= 0 && ::close(mapped_fd) != 0) {
+            int err = errno;
+            append_cleanup_error(cleanup_error, std::string("sim mapped-region close failed: ") + std::strerror(err));
+        }
+    }
+
     static constexpr int kWaitStatusOk = 0;
     static constexpr int kWaitStatusTimeout = -1;
     static constexpr int kWaitErrorNone = 0;
@@ -427,93 +595,318 @@ private:
     static constexpr int64_t kWaitPollIntervalNs = 50000;
 };
 
-class L2ChildOnboardRegion {
+class RegionEntry {
 public:
-    int device_id{-1};
-    uint64_t device_addr{0};
-    uint64_t mapping_bytes{0};
-    uint64_t shareable_handle{0};
-    void *vmm_handle{nullptr};
+    explicit RegionEntry(std::unique_ptr<RegionMapping> mapping) :
+        mapping_(std::move(mapping)) {}
 
-    void bind_acl_device() const {
-        if (device_id < 0) {
-            throw std::runtime_error("L3-L2 onboard child region has no device id");
-        }
-        acl_api().bind_device_with_check(device_id);
-    }
-};
-
-struct L2ChildOnboardRegionExport {
-    uint64_t device_addr{0};
-    uint64_t mapping_bytes{0};
-    uint64_t shareable_handle{0};
-    uint64_t registry_handle{0};
-};
-
-class L3HostMappedRegionRegistry {
-public:
-    uint64_t emplace(L3HostMappedRegion mapping) {
+    void acquire() {
         std::lock_guard<std::mutex> lk(mu_);
-        uint64_t handle = next_handle_++;
-        regions_.emplace(handle, std::move(mapping));
+        if (state_ != State::OPEN) {
+            throw std::runtime_error("mapped-region handle is closed or unknown");
+        }
+        active_leases_ += 1;
+    }
+
+    void release() noexcept {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (active_leases_ == 0) {
+            return;
+        }
+        active_leases_ -= 1;
+        if (active_leases_ == 0) {
+            idle_.notify_all();
+        }
+    }
+
+    RegionMapping &mapping() { return *mapping_; }
+
+    size_t active_leases() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return active_leases_;
+    }
+
+    void close() {
+        std::unique_ptr<RegionMapping> mapping;
+        std::exception_ptr close_error;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            if (state_ != State::OPEN) {
+                idle_.wait(lk, [this]() {
+                    return state_ == State::CLOSED;
+                });
+                close_error = close_error_;
+                lk.unlock();
+                if (close_error != nullptr) {
+                    std::rethrow_exception(close_error);
+                }
+                return;
+            }
+            state_ = State::CLOSING;
+            idle_.wait(lk, [this]() {
+                return active_leases_ == 0;
+            });
+            mapping = std::move(mapping_);
+        }
+
+        try {
+            if (mapping != nullptr) {
+                mapping->close();
+            }
+        } catch (...) {
+            close_error = std::current_exception();
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            close_error_ = close_error;
+            state_ = State::CLOSED;
+        }
+        idle_.notify_all();
+        if (close_error != nullptr) {
+            std::rethrow_exception(close_error);
+        }
+    }
+
+private:
+    enum class State { OPEN, CLOSING, CLOSED };
+
+    std::unique_ptr<RegionMapping> mapping_;
+    mutable std::mutex mu_;
+    std::condition_variable idle_;
+    size_t active_leases_{0};
+    State state_{State::OPEN};
+    std::exception_ptr close_error_;
+};
+
+class RegionLease {
+public:
+    explicit RegionLease(std::shared_ptr<RegionEntry> entry) :
+        entry_(std::move(entry)) {
+        entry_->acquire();
+    }
+    RegionLease(const RegionLease &) = delete;
+    RegionLease &operator=(const RegionLease &) = delete;
+    RegionLease(RegionLease &&) noexcept = default;
+    RegionLease &operator=(RegionLease &&) = delete;
+    ~RegionLease() {
+        if (entry_ != nullptr) {
+            entry_->release();
+        }
+    }
+
+    RegionMapping *operator->() { return &entry_->mapping(); }
+
+private:
+    std::shared_ptr<RegionEntry> entry_;
+};
+
+class RegionRegistry {
+public:
+    uint64_t emplace(std::unique_ptr<RegionMapping> mapping) {
+        auto entry = std::make_shared<RegionEntry>(std::move(mapping));
+        std::lock_guard<std::mutex> lk(mu_);
+        if (std::exchange(fail_next_insert_for_test_, false)) {
+            throw std::runtime_error("injected mapped-region registry insertion failure");
+        }
+        uint64_t handle = next_handle_;
+        auto result = regions_.emplace(handle, std::move(entry));
+        if (!result.second) {
+            throw std::overflow_error("mapped-region handle space is exhausted");
+        }
+        next_handle_ += 1;
+        if (next_handle_ == 0) {
+            next_handle_ = 1;
+        }
         return handle;
     }
 
-    L3HostMappedRegion find(uint64_t handle) const {
+    RegionLease lease(uint64_t handle) const {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = regions_.find(handle);
         if (it == regions_.end()) {
-            throw std::runtime_error("L3-L2 L3 Host mapped-region handle is closed or unknown");
+            throw std::runtime_error("mapped-region handle is closed or unknown");
         }
-        return it->second;
+        return RegionLease(it->second);
     }
 
-    std::optional<L3HostMappedRegion> remove(uint64_t handle) {
+    size_t active_leases(uint64_t handle) const {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = regions_.find(handle);
         if (it == regions_.end()) {
-            return std::nullopt;
+            throw std::runtime_error("mapped-region handle is closed or unknown");
         }
-        L3HostMappedRegion mapping = std::move(it->second);
-        regions_.erase(it);
-        return mapping;
+        return it->second->active_leases();
+    }
+
+    void close(uint64_t handle) {
+        std::shared_ptr<RegionEntry> entry;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = regions_.find(handle);
+            if (it == regions_.end()) {
+                return;
+            }
+            entry = it->second;
+        }
+
+        std::exception_ptr close_error;
+        try {
+            entry->close();
+        } catch (...) {
+            close_error = std::current_exception();
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = regions_.find(handle);
+            if (it != regions_.end() && it->second == entry) {
+                regions_.erase(it);
+            }
+        }
+        if (close_error != nullptr) {
+            std::rethrow_exception(close_error);
+        }
+    }
+
+    void fail_next_insert_for_test() {
+        std::lock_guard<std::mutex> lk(mu_);
+        fail_next_insert_for_test_ = true;
     }
 
 private:
     mutable std::mutex mu_;
-    std::unordered_map<uint64_t, L3HostMappedRegion> regions_;
+    std::unordered_map<uint64_t, std::shared_ptr<RegionEntry>> regions_;
     uint64_t next_handle_{1};
+    bool fail_next_insert_for_test_{false};
 };
 
-L3HostMappedRegionRegistry g_l3_host_mapped_regions;
+RegionRegistry &region_registry() {
+    static auto *registry = new RegionRegistry();
+    return *registry;
+}
 
-class L2ChildOnboardRegionRegistry {
+void close_region(uint64_t handle) { region_registry().close(handle); }
+
+class RegionHandle {
 public:
-    uint64_t emplace(L2ChildOnboardRegion region) {
+    explicit RegionHandle(uint64_t handle, std::string owner_token) :
+        handle_(handle),
+        owner_token_(std::move(owner_token)) {}
+    RegionHandle(const RegionHandle &) = delete;
+    RegionHandle &operator=(const RegionHandle &) = delete;
+    RegionHandle(RegionHandle &&other) noexcept :
+        handle_(std::exchange(other.handle_, 0)),
+        owner_token_(std::move(other.owner_token_)) {}
+    RegionHandle &operator=(RegionHandle &&) = delete;
+
+    ~RegionHandle() noexcept {
+        if (handle_ == 0) {
+            return;
+        }
+        try {
+            close_region(handle_);
+        } catch (const std::exception &exc) {
+            region_cleanup_errors().record(owner_token_, exc.what());
+        } catch (...) {
+            region_cleanup_errors().record(owner_token_, "mapped-region owner cleanup failed with an unknown error");
+        }
+    }
+
+    uint64_t value() const { return handle_; }
+
+private:
+    uint64_t handle_{0};
+    std::string owner_token_;
+};
+
+RegionHandle import_sim_region(
+    const std::string &token, uint64_t mapping_bytes, const std::string &owner_token, const char *size_error,
+    const char *owner_error, const char *open_error, const char *mmap_error
+) {
+    if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::invalid_argument(size_error);
+    }
+    if (owner_token.empty()) {
+        throw std::invalid_argument(owner_error);
+    }
+    std::string handle_owner_token = owner_token;
+    std::string name = region_shm_name_for_open(token);
+    auto mapping = std::make_unique<RegionMapping>();
+    mapping->owner_token = owner_token;
+    mapping->fd = shm_open(name.c_str(), O_RDWR, 0);
+    if (mapping->fd < 0) {
+        throw std::runtime_error(open_error);
+    }
+    void *base = mmap(nullptr, static_cast<size_t>(mapping_bytes), PROT_READ | PROT_WRITE, MAP_SHARED, mapping->fd, 0);
+    if (base == MAP_FAILED) {
+        int err = errno;
+        throw std::runtime_error(std::string(mmap_error) + std::strerror(err));
+    }
+    mapping->profile = RegionMappingProfile::SimPosixShm;
+    mapping->device_addr = reinterpret_cast<uint64_t>(base);
+    mapping->mapping_bytes = mapping_bytes;
+    uint64_t handle = region_registry().emplace(std::move(mapping));
+    return RegionHandle(handle, std::move(handle_owner_token));
+}
+
+RegionHandle import_onboard_region(
+    int device_id, uint64_t shareable_handle, uint64_t mapping_bytes, const std::string &owner_token,
+    const char *device_error, const char *size_error, const char *owner_error
+) {
+    if (device_id < 0) {
+        throw std::invalid_argument(device_error);
+    }
+    if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::invalid_argument(size_error);
+    }
+    if (owner_token.empty()) {
+        throw std::invalid_argument(owner_error);
+    }
+    std::string handle_owner_token = owner_token;
+    auto mapping = std::make_unique<RegionMapping>();
+    mapping->owner_token = owner_token;
+    mapping->profile = RegionMappingProfile::OnboardVmm;
+    mapping->device_id = device_id;
+    mapping->mapping_bytes = mapping_bytes;
+    mapping->bind_acl_device();
+    AclRuntimeApi &api = acl_api();
+    mapping->shareable_handle = shareable_handle;
+    mapping->vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
+    void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+    mapping->device_addr = reinterpret_cast<uint64_t>(mapped_addr);
+    api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping->vmm_handle);
+    api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+    uint64_t handle = region_registry().emplace(std::move(mapping));
+    return RegionHandle(handle, std::move(handle_owner_token));
+}
+
+class ChipChildOnboardRegionRegistry {
+public:
+    uint64_t emplace(ChipChildOnboardRegion region) {
         std::lock_guard<std::mutex> lk(mu_);
         uint64_t handle = next_handle_++;
         regions_.emplace(handle, std::move(region));
         return handle;
     }
 
-    std::optional<L2ChildOnboardRegion> remove(uint64_t handle) {
+    std::optional<ChipChildOnboardRegion> remove(uint64_t handle) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = regions_.find(handle);
         if (it == regions_.end()) {
             return std::nullopt;
         }
-        L2ChildOnboardRegion region = std::move(it->second);
+        ChipChildOnboardRegion region = std::move(it->second);
         regions_.erase(it);
         return region;
     }
 
 private:
     mutable std::mutex mu_;
-    std::unordered_map<uint64_t, L2ChildOnboardRegion> regions_;
+    std::unordered_map<uint64_t, ChipChildOnboardRegion> regions_;
     uint64_t next_handle_{1};
 };
 
-L2ChildOnboardRegionRegistry g_l2_child_onboard_regions;
+ChipChildOnboardRegionRegistry g_chip_child_onboard_regions;
 
 uint64_t align_vmm_bytes(uint64_t bytes, uint64_t granularity) {
     if (bytes == 0 || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -533,27 +926,62 @@ uint64_t align_vmm_bytes(uint64_t bytes, uint64_t granularity) {
     return bytes + bump;
 }
 
-L3L2OrchNotifyOp checked_notify_op(int op) {
-    auto typed = static_cast<L3L2OrchNotifyOp>(op);
-    if (!l3_l2_orch_comm::valid_notify_op(typed)) {
-        throw std::invalid_argument("L3-L2 counter notify op is invalid");
-    }
-    return typed;
-}
-
-L3L2OrchWaitCmp checked_wait_cmp(int cmp) {
-    auto typed = static_cast<L3L2OrchWaitCmp>(cmp);
-    if (!l3_l2_orch_comm::valid_wait_cmp(typed)) {
-        throw std::invalid_argument("L3-L2 counter wait comparison is invalid");
-    }
-    return typed;
-}
-
 void append_cleanup_error(std::string &cleanup_error, const std::string &message) {
     if (!cleanup_error.empty()) {
         cleanup_error += "; ";
     }
     cleanup_error += message;
+}
+
+// The int wire value of a dtype given either a DataType enumerator or its int value. The nanobind
+// DataType enum is not arithmetic, so a caller holding one has only `.value`; accept both forms.
+uint8_t datatype_wire_value(nb::object dtype) {
+    if (nb::hasattr(dtype, "value")) dtype = dtype.attr("value");
+    return nb::cast<uint8_t>(dtype);
+}
+
+// The leading `ndims` entries of a wire shapes[] / strides[] array as a Python tuple. The trailing
+// entries are unused padding, so exposing them would invent dimensions the tensor does not have.
+nb::tuple dims_tuple(const uint32_t *dims, uint32_t ndims) {
+    if (ndims > static_cast<uint32_t>(MAX_TENSOR_DIMS)) ndims = static_cast<uint32_t>(MAX_TENSOR_DIMS);
+    nb::list out;
+    for (uint32_t i = 0; i < ndims; ++i)
+        out.append(dims[i]);
+    return nb::tuple(out);
+}
+
+// Resolve one wire tensor onto a local base and build the address-bearing device POD.
+// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
+// materializing each embedded descriptor.
+ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
+    uint64_t elem = get_element_size(r.dtype);
+    if (elem == 0) {
+        throw std::runtime_error("materialize: unknown dtype");
+    }
+    if (r.byte_offset % elem != 0) {
+        throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
+    }
+    nb::object key = nb::cast(r.buffer.identity);
+    if (!resolved.contains(key)) {
+        throw std::runtime_error("materialize: canonical identity not in the import registry");
+    }
+    nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
+    auto base = nb::cast<uint64_t>(val[0]);
+    auto addr_space = nb::cast<int>(val[1]);
+    // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
+    // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
+    return make_tensor_strided(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
+        /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
+    );
+}
+
+// The same rule the submit point enforces, applied early so a mistake surfaces at the offending
+// add_tensor call rather than at submit. A tag can change afterwards, which is why submit re-checks.
+void check_access_subset(uint8_t granted, TensorArgType tag) {
+    if (!access_permits(granted, tag)) {
+        throw std::invalid_argument("TaskArgs.add_tensor: arg TensorArgType requires access not granted by the buffer");
+    }
 }
 
 }  // namespace
@@ -567,7 +995,7 @@ void append_cleanup_error(std::string &cleanup_error, const std::string &message
 #endif
 
 NB_MODULE(_task_interface, m) {
-    m.doc() = "Nanobind bindings for task_interface (DataType, Tensor, TaskArgs variants)";
+    m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was
     // unavailable at build time. simpler.task_interface compares it against the
@@ -587,7 +1015,10 @@ NB_MODULE(_task_interface, m) {
         .value("INT64", DataType::INT64)
         .value("UINT64", DataType::UINT64)
         .value("UINT16", DataType::UINT16)
-        .value("UINT32", DataType::UINT32);
+        .value("UINT32", DataType::UINT32)
+        .value("FP8E4M3FN", DataType::FP8E4M3FN)  // A5 only
+        .value("FP8E8M0", DataType::FP8E8M0)      // A5 only
+        .value("FP4E2M1", DataType::FP4E2M1);     // A5 only
 
     // --- Free functions ---
     m.def(
@@ -607,55 +1038,355 @@ NB_MODULE(_task_interface, m) {
     m.attr("MAX_TENSOR_DIMS") = MAX_TENSOR_DIMS;
     m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
     m.attr("RUNTIME_ENV_RING_COUNT") = RUNTIME_ENV_RING_COUNT;
-    // Byte size of a Tensor and the offset of its child_memory flag within it.
-    // A task-args blob stores Tensors as a raw memcpy array, so a Python-side
-    // blob walker locates tensor i's fields at i * TENSOR_STRIDE_BYTES without
+#if SIMPLER_HOST_STRACE
+    m.attr("HOST_STRACE_ENABLED") = true;
+#else
+    m.attr("HOST_STRACE_ENABLED") = false;
+#endif
+    m.def(
+        "_initialize_host_log",
+        [](int level) {
+            if (!simpler::log::is_valid_level(level)) return false;
+            HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(level));
+            return true;
+        },
+        nb::arg("level"), "Seed the process-owned host-log state before workers fork or load runtime modules."
+    );
+    m.def(
+        "_set_host_span_level_prefix",
+        [](const std::string &word) {
+            simpler::host_trace::set_level_prefix(word.c_str());
+#if SIMPLER_HOST_STRACE
+            return std::string(simpler::host_trace::level_prefix());
+#else
+            return word;
+#endif
+        },
+        nb::arg("word"),
+        "Bind this process's level word for host-scheduler span names, and return what is now bound. "
+        "Python owns the level -> word mapping (simpler.worker_level); this pushes the resolved word so "
+        "the C++ emit sites and Python agree on one derivation."
+    );
+    m.def(
+        "_emit_host_span",
+        [](const std::string &name, uint64_t invocation_id, uint64_t callable_hash, int32_t depth, int64_t timestamp_ns,
+           int64_t duration_ns, const std::string &attributes) {
+            simpler::host_trace::emit(
+                name.c_str(), invocation_id, callable_hash, depth, timestamp_ns, duration_ns, attributes.c_str()
+            );
+        },
+        nb::arg("name"), nb::arg("invocation_id"), nb::arg("callable_hash"), nb::arg("depth"), nb::arg("timestamp_ns"),
+        nb::arg("duration_ns"), nb::arg("attributes") = "",
+        "Emit one explicitly timed host span through this extension's bound logger sink."
+    );
+    // Byte size of a ChipTensor and the offset of its address_space field within it.
+    // A task-args blob stores ChipTensors as a raw memcpy array, so a Python-side
+    // blob walker locates tensor i's fields at i * CHIP_TENSOR_STRIDE_BYTES without
     // reimplementing the struct layout.
-    m.attr("TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(Tensor));
-    m.attr("TENSOR_CHILD_MEMORY_OFFSET") = static_cast<int>(offsetof(Tensor, child_memory));
+    m.attr("CHIP_TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(ChipTensor));
+    m.attr("CHIP_TENSOR_ADDRESS_SPACE_OFFSET") = static_cast<int>(offsetof(ChipTensor, address_space));
+
+    // Width of the opaque per-incarnation nonce, so the owner can draw one of the right size.
+    // The struct sizes stay unexported: no Python path turns these types into bytes or back, so a
+    // byte count here would have no reader — the layout is pinned by buffer.h's static_asserts.
+    m.attr("OWNER_INSTANCE_ID_BYTES") = static_cast<int>(OWNER_INSTANCE_ID_BYTES);
+
+    // --- Buffer ABI enums ---
+    // nb::is_arithmetic makes these IntEnums, so a wire value and an enumerator compare and
+    // int()-convert interchangeably — the descriptor stores them as raw u8.
+    nb::enum_<AddressSpace>(m, "AddressSpace", nb::is_arithmetic())
+        .value("HOST", AddressSpace::HOST)
+        .value("DEVICE", AddressSpace::DEVICE);
+
+    nb::enum_<AccessMode>(m, "AccessMode", nb::is_arithmetic())
+        .value("READ", AccessMode::READ)
+        .value("WRITE", AccessMode::WRITE)
+        .value("READWRITE", AccessMode::READWRITE);
+
+    nb::enum_<BackendKind>(m, "BackendKind", nb::is_arithmetic())
+        .value("FORK_SHM", BackendKind::FORK_SHM)
+        .value("POSIX_SHM", BackendKind::POSIX_SHM)
+        .value("VMM_WINDOW", BackendKind::VMM_WINDOW)
+        .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
+        .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
+        .value("FORK_COW", BackendKind::FORK_COW);
+
+    // --- CanonicalIdentity ---
+    // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
+    // padding keys identically to a clean one — two views of a backing never split across buckets.
+    // There is deliberately no `pack()`: the only correct key for this type is the value itself, and
+    // exposing its bytes is what once let a registry key on padding and split one backing in two.
+    nb::class_<CanonicalIdentity>(m, "CanonicalIdentity")
+        .def(
+            "__init__",
+            [](CanonicalIdentity *self, nb::bytes owner_instance_id, uint64_t buffer_id, uint32_t generation) {
+                if (owner_instance_id.size() != OWNER_INSTANCE_ID_BYTES) {
+                    throw std::invalid_argument(
+                        "owner_instance_id must be " + std::to_string(OWNER_INSTANCE_ID_BYTES) + " bytes, got " +
+                        std::to_string(owner_instance_id.size())
+                    );
+                }
+                new (self) CanonicalIdentity{};
+                std::memcpy(self->owner_instance_id, owner_instance_id.c_str(), OWNER_INSTANCE_ID_BYTES);
+                self->buffer_id = buffer_id;
+                self->generation = generation;
+            },
+            nb::arg("owner_instance_id"), nb::arg("buffer_id"), nb::arg("generation") = 1
+        )
+
+        .def_prop_ro(
+            "owner_instance_id",
+            [](const CanonicalIdentity &self) {
+                return nb::bytes(reinterpret_cast<const char *>(self.owner_instance_id), OWNER_INSTANCE_ID_BYTES);
+            },
+            "The opaque per-incarnation nonce (bytewise-compared, no integer meaning)."
+        )
+        .def_ro("buffer_id", &CanonicalIdentity::buffer_id)
+        .def_ro("generation", &CanonicalIdentity::generation)
+
+        .def(
+            "__eq__",
+            [](const CanonicalIdentity &a, const CanonicalIdentity &b) {
+                return a == b;
+            }
+        )
+        .def(
+            "__ne__",
+            [](const CanonicalIdentity &a, const CanonicalIdentity &b) {
+                return a != b;
+            }
+        )
+        .def(
+            "__hash__",
+            [](const CanonicalIdentity &self) {
+                return CanonicalIdentityHash{}(self);
+            }
+        )
+        .def("__repr__", [](const CanonicalIdentity &self) -> std::string {
+            std::ostringstream os;
+            os << "CanonicalIdentity(owner_instance_id=0x" << std::hex;
+            for (uint32_t i = 0; i < OWNER_INSTANCE_ID_BYTES; ++i) {
+                os << std::setw(2) << std::setfill('0') << static_cast<int>(self.owner_instance_id[i]);
+            }
+            os << std::dec << ", buffer_id=" << self.buffer_id << ", generation=" << self.generation << ")";
+            return os.str();
+        });
+
+    // --- BufferDescriptor ---
+    // Construction runs validate_buffer_descriptor, so an unsupported address_space x backend_kind
+    // or an over-long backend body is refused before the descriptor can reach a Tensor or the wire.
+    nb::class_<BufferDescriptor>(m, "BufferDescriptor")
+        .def(
+            "__init__",
+            [](BufferDescriptor *self, const CanonicalIdentity &identity, AddressSpace address_space, AccessMode access,
+               BackendKind backend_kind, uint64_t nbytes, nb::bytes body, uint32_t owner_worker_path_id) {
+                if (body.size() > DESC_MAX_BYTES) {
+                    throw std::invalid_argument(
+                        "backend body exceeds DESC_MAX_BYTES (" + std::to_string(DESC_MAX_BYTES) + "), got " +
+                        std::to_string(body.size())
+                    );
+                }
+                new (self) BufferDescriptor{};
+                self->magic = BUFFER_DESCRIPTOR_MAGIC;
+                self->address_space = static_cast<uint8_t>(address_space);
+                self->access = static_cast<uint8_t>(access);
+                self->backend_kind = static_cast<uint8_t>(backend_kind);
+                self->identity = identity;
+                self->nbytes = nbytes;
+                self->owner_worker_path_id = owner_worker_path_id;
+                self->body_len = static_cast<uint16_t>(body.size());
+                std::memcpy(self->body, body.c_str(), body.size());
+                validate_buffer_descriptor(*self);
+            },
+            nb::arg("identity"), nb::arg("address_space"), nb::arg("access"), nb::arg("backend_kind"),
+            nb::arg("nbytes"), nb::arg("body") = nb::bytes(""), nb::arg("owner_worker_path_id") = 0
+        )
+
+        .def_ro("identity", &BufferDescriptor::identity)
+        .def_prop_ro(
+            "address_space",
+            [](const BufferDescriptor &self) {
+                return static_cast<AddressSpace>(self.address_space);
+            }
+        )
+        .def_prop_ro(
+            "access",
+            [](const BufferDescriptor &self) {
+                return static_cast<AccessMode>(self.access);
+            }
+        )
+        .def_prop_ro(
+            "backend_kind",
+            [](const BufferDescriptor &self) {
+                return static_cast<BackendKind>(self.backend_kind);
+            }
+        )
+        .def_ro("nbytes", &BufferDescriptor::nbytes)
+        .def_ro("owner_worker_path_id", &BufferDescriptor::owner_worker_path_id)
+        .def_prop_ro(
+            "body",
+            [](const BufferDescriptor &self) {
+                return nb::bytes(self.body, self.body_len);
+            },
+            "The per-backend materialization payload (shm name, base VA, ...), body_len bytes."
+        )
+
+        .def(
+            "__eq__",
+            [](const BufferDescriptor &a, const BufferDescriptor &b) {
+                return a == b;
+            }
+        )
+        .def(
+            "__ne__",
+            [](const BufferDescriptor &a, const BufferDescriptor &b) {
+                return a != b;
+            }
+        )
+        .def("__repr__", [](const BufferDescriptor &self) -> std::string {
+            std::ostringstream os;
+            os << "BufferDescriptor(buffer_id=" << self.identity.buffer_id
+               << ", generation=" << self.identity.generation << ", address_space=" << int(self.address_space)
+               << ", access=" << int(self.access) << ", backend_kind=" << int(self.backend_kind)
+               << ", nbytes=" << self.nbytes << ", body_len=" << self.body_len << ")";
+            return os.str();
+        });
 
     // --- Tensor ---
+    // The L3+ task argument: a strided view over a buffer, carrying that buffer's descriptor whole
+    // and no address. Construction runs validate_tensor, the same gate blob decode runs, so a view
+    // that does not fit its backing cannot be built in the first place.
+    //
+    // No bytes cross this binding in either direction. Python builds a Tensor from its fields and
+    // receives one already decoded; turning mailbox bytes into a Tensor is task_args.h's job, and
+    // keeping that the only decode path is what makes validate_tensor a gate rather than a habit.
+    nb::class_<Tensor>(m, "Tensor")
+        .def(
+            "__init__",
+            [](Tensor *self, const BufferDescriptor &buffer, uint64_t byte_offset, nb::sequence shapes,
+               nb::sequence strides, nb::object dtype) {
+                const size_t ndims = nb::len(shapes);
+                if (ndims != nb::len(strides)) {
+                    throw std::invalid_argument("Tensor shapes and strides must have equal length");
+                }
+                if (ndims == 0 || ndims > static_cast<size_t>(MAX_TENSOR_DIMS)) {
+                    throw std::invalid_argument(
+                        "Tensor ndims must be in [1, " + std::to_string(MAX_TENSOR_DIMS) + "], got " +
+                        std::to_string(ndims)
+                    );
+                }
+                new (self) Tensor{};
+                self->buffer = buffer;
+                self->byte_offset = byte_offset;
+                self->ndims = static_cast<uint32_t>(ndims);
+                for (size_t i = 0; i < ndims; ++i) {
+                    self->shapes[i] = nb::cast<uint32_t>(shapes[i]);
+                    self->strides[i] = nb::cast<uint32_t>(strides[i]);
+                }
+                self->dtype = static_cast<DataType>(datatype_wire_value(dtype));
+                validate_tensor(*self);
+            },
+            nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype")
+        )
+
+        .def_ro("buffer", &Tensor::buffer)
+        .def_ro("byte_offset", &Tensor::byte_offset)
+        .def_ro("ndims", &Tensor::ndims)
+        .def_prop_ro(
+            "shapes",
+            [](const Tensor &self) {
+                return dims_tuple(self.shapes, self.ndims);
+            }
+        )
+        .def_prop_ro(
+            "strides",
+            [](const Tensor &self) {
+                return dims_tuple(self.strides, self.ndims);
+            }
+        )
+        .def_prop_ro(
+            "dtype",
+            [](const Tensor &self) {
+                return static_cast<int>(self.dtype);
+            },
+            "The dtype's int wire value (a DataType enumerator's .value)."
+        )
+
+        .def(
+            "__eq__",
+            [](const Tensor &a, const Tensor &b) {
+                if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
+                    a.dtype != b.dtype) {
+                    return false;
+                }
+                for (uint32_t i = 0; i < a.ndims; ++i) {
+                    if (a.shapes[i] != b.shapes[i] || a.strides[i] != b.strides[i]) return false;
+                }
+                return true;
+            }
+        )
+        .def("__repr__", [](const Tensor &self) -> std::string {
+            std::ostringstream os;
+            os << "Tensor(buffer_id=" << self.buffer.identity.buffer_id << ", byte_offset=" << self.byte_offset
+               << ", shapes=(";
+            for (uint32_t i = 0; i < self.ndims; ++i) {
+                if (i) os << ", ";
+                os << self.shapes[i];
+            }
+            os << "), strides=(";
+            for (uint32_t i = 0; i < self.ndims; ++i) {
+                if (i) os << ", ";
+                os << self.strides[i];
+            }
+            os << "), dtype=" << get_dtype_name(self.dtype) << ")";
+            return os.str();
+        });
+
+    // --- ChipTensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
     // (row-major strides, start_offset == 0); see src/common/task_interface/tensor.h.
-    nb::class_<Tensor>(m, "Tensor")
+    nb::class_<ChipTensor>(m, "ChipTensor")
         .def(nb::init<>())
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> Tensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ChipTensor {
                 size_t n = nb::len(shapes);
                 if (n == 0 || n > MAX_TENSOR_DIMS)
-                    throw std::invalid_argument("Tensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
+                    throw std::invalid_argument("ChipTensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
                 uint32_t shp[MAX_TENSOR_DIMS];
                 for (size_t i = 0; i < n; ++i)
                     shp[i] = nb::cast<uint32_t>(shapes[i]);
-                // make_tensor_external yields a contiguous Tensor: row-major strides,
+                // make_tensor_external yields a contiguous ChipTensor: row-major strides,
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    /*manual_dep=*/false, /*version=*/0, child_memory ? 1 : 0
+                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
                 );
             },
+            // The keyword stays `child_memory` while the C++ field is `address_space`: it is the
+            // name of a u8 on the remote-L3 tensor wire (see remote_wire.cpp encode_tensor), which
+            // renaming here would not change and which this constructor decodes into.
             nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
-            "Create a contiguous Tensor over pre-allocated memory. Set child_memory=True when "
+            "Create a contiguous ChipTensor over pre-allocated memory. Set child_memory=True when "
             "data is a device pointer allocated by the child process (skips H2D copy in "
             "init_runtime_impl)."
         )
 
-        // `data` is the tensor's memory address — i.e. Tensor::buffer.addr.
+        // `data` is the tensor's memory address — i.e. ChipTensor::buffer.addr.
         .def_prop_rw(
             "data",
-            [](const Tensor &self) -> uint64_t {
+            [](const ChipTensor &self) -> uint64_t {
                 return self.buffer.addr;
             },
-            [](Tensor &self, uint64_t v) {
+            [](ChipTensor &self, uint64_t v) {
                 self.buffer.addr = v;
             }
         )
 
         .def_prop_rw(
             "shapes",
-            [](const Tensor &self) -> nb::tuple {
+            [](const ChipTensor &self) -> nb::tuple {
                 uint32_t n = self.ndims;
                 if (n > MAX_TENSOR_DIMS) n = MAX_TENSOR_DIMS;
                 nb::list lst;
@@ -663,7 +1394,7 @@ NB_MODULE(_task_interface, m) {
                     lst.append(self.shapes[i]);
                 return nb::tuple(lst);
             },
-            [](Tensor &self, nb::tuple t) {
+            [](ChipTensor &self, nb::tuple t) {
                 size_t n = nb::len(t);
                 if (n == 0 || n > MAX_TENSOR_DIMS)
                     throw std::invalid_argument(
@@ -678,7 +1409,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.child_memory
+                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.address_space
                 );
             }
         )
@@ -688,17 +1419,17 @@ NB_MODULE(_task_interface, m) {
         // through the `shapes` setter, which rebuilds a valid contiguous layout.
         .def_prop_ro(
             "ndims",
-            [](const Tensor &self) -> uint32_t {
+            [](const ChipTensor &self) -> uint32_t {
                 return self.ndims;
             }
         )
 
         .def_prop_rw(
             "dtype",
-            [](const Tensor &self) -> DataType {
+            [](const ChipTensor &self) -> DataType {
                 return self.dtype;
             },
-            [](Tensor &self, DataType dt) {
+            [](ChipTensor &self, DataType dt) {
                 self.dtype = dt;
                 self.buffer.size = self.numel() * get_element_size(dt);
             }
@@ -706,18 +1437,18 @@ NB_MODULE(_task_interface, m) {
 
         .def_prop_rw(
             "child_memory",
-            [](const Tensor &self) -> bool {
-                return self.is_child_memory();
+            [](const ChipTensor &self) -> bool {
+                return self.is_device_memory();
             },
-            [](Tensor &self, bool v) {
-                self.child_memory = v ? 1 : 0;
+            [](ChipTensor &self, bool v) {
+                self.address_space = v ? AddressSpace::DEVICE : AddressSpace::HOST;
             }
         )
 
         // Read-only views of the strided metadata (always contiguous for make()).
         .def_prop_ro(
             "strides",
-            [](const Tensor &self) -> nb::tuple {
+            [](const ChipTensor &self) -> nb::tuple {
                 nb::list lst;
                 for (uint32_t i = 0; i < self.ndims && i < MAX_TENSOR_DIMS; ++i)
                     lst.append(self.strides[i]);
@@ -726,34 +1457,34 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro(
             "start_offset",
-            [](const Tensor &self) -> uint64_t {
+            [](const ChipTensor &self) -> uint64_t {
                 return self.start_offset;
             }
         )
         .def_prop_ro(
             "is_contiguous",
-            [](const Tensor &self) -> bool {
+            [](const ChipTensor &self) -> bool {
                 return self.is_contiguous;
             }
         )
 
         .def(
             "nbytes",
-            [](const Tensor &self) -> uint64_t {
+            [](const ChipTensor &self) -> uint64_t {
                 return self.nbytes();
             },
             "Compute total bytes (product of shapes * element_size)."
         )
 
-        .def("__repr__", [](const Tensor &self) -> std::string {
+        .def("__repr__", [](const ChipTensor &self) -> std::string {
             std::ostringstream os;
-            os << "Tensor(data=0x" << std::hex << self.buffer.addr << std::dec << ", shapes=(";
+            os << "ChipTensor(data=0x" << std::hex << self.buffer.addr << std::dec << ", shapes=(";
             for (uint32_t i = 0; i < self.ndims; ++i) {
                 if (i) os << ", ";
                 os << self.shapes[i];
             }
             os << "), dtype=" << get_dtype_name(self.dtype);
-            if (self.is_child_memory()) os << ", child_memory=True";
+            if (self.is_device_memory()) os << ", child_memory=True";
             os << ")";
             return os.str();
         });
@@ -764,7 +1495,7 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "add_tensor", &ChipStorageTaskArgs::add_tensor, nb::arg("t"),
-            "Add a Tensor. Must be called before any add_scalar()."
+            "Add a ChipTensor. Must be called before any add_scalar()."
         )
 
         .def(
@@ -774,12 +1505,12 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tensor",
-            [](const ChipStorageTaskArgs &self, int32_t i) -> const Tensor & {
+            [](const ChipStorageTaskArgs &self, int32_t i) -> const ChipTensor & {
                 if (i < 0 || i >= self.tensor_count())
                     throw std::out_of_range("ChipStorageTaskArgs tensor index out of range");
                 return self.tensor(i);
             },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
+            nb::arg("i"), nb::rv_policy::reference_internal, "Return the ChipTensor at index i."
         )
 
         .def(
@@ -836,10 +1567,13 @@ NB_MODULE(_task_interface, m) {
         .def(
             "add_tensor",
             [](TaskArgs &self, const Tensor &t, TensorArgType tag) {
+                validate_tensor(t);
+                check_access_subset(t.buffer.access, tag);
                 self.add_tensor(t, tag);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
-            "Add a Tensor with an optional TensorArgType tag (default INPUT)."
+            "Add a Tensor arg (the self-describing wire view built by Buffer.tensor) with an "
+            "optional TensorArgType tag (default INPUT)."
         )
 
         .def(
@@ -849,11 +1583,11 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tensor",
-            [](const TaskArgs &self, int32_t i) -> const Tensor & {
+            [](const TaskArgs &self, int32_t i) -> Tensor {
                 if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tensor index out of range");
                 return self.tensor(i);
             },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
+            nb::arg("i"), "Return the Tensor at index i."
         )
 
         .def(
@@ -1260,24 +1994,24 @@ NB_MODULE(_task_interface, m) {
             nb::rv_policy::reference_internal
         )
         .def_prop_rw(
-            "enable_l2_swimlane",
+            "enable_chip_swimlane",
             [](const CallConfig &c) {
-                return c.enable_l2_swimlane;
+                return c.enable_chip_swimlane;
             },
             // Accept either an int perf_level (0-4) or a Python bool. `True` maps to
             // level 4 (full collection) to preserve the pre-perf_level semantics for
             // callers that still pass a boolean; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
-                    c.enable_l2_swimlane = nb::cast<bool>(v) ? 4 : 0;
+                    c.enable_chip_swimlane = nb::cast<bool>(v) ? 4 : 0;
                 } else {
                     int level = nb::cast<int>(v);
-                    c.enable_l2_swimlane = (level < 0) ? 0 : (level > 4) ? 4 : level;
+                    c.enable_chip_swimlane = (level < 0) ? 0 : (level > 4) ? 4 : level;
                 }
             }
         )
         // Accept either an int dump level (0=off, 1=partial, 2=full,
-        // 3=full_json_only) or a Python bool. `True` maps to level 1
+        // 3=hybrid) or a Python bool. `True` maps to level 1
         // (partial) — the default when --dump-args is passed without a
         // value; `False` maps to 0.
         .def_prop_rw(
@@ -1333,8 +2067,9 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [append_ring_values](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_l2_swimlane=" << self.enable_l2_swimlane << ", enable_dump_args=" << self.enable_dump_args
-               << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
+               << ", enable_chip_swimlane=" << self.enable_chip_swimlane
+               << ", enable_dump_args=" << self.enable_dump_args << ", enable_pmu=" << self.enable_pmu
+               << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
                << ", flow_id=" << self.flow_id;
             if (self.runtime_env.any()) {
@@ -1350,13 +2085,66 @@ NB_MODULE(_task_interface, m) {
         });
 
     // Log default constant — single source. Mirrored in
-    // src/common/log/host_log.h::simpler::log::kDefaultThreshold; if you change
+    // src/common/log/include/common/log_level.h::simpler::log::kDefaultThreshold; if you change
     // one, change the other.
-    m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
+    m.attr("DEFAULT_LOG_THRESHOLD") = 25;  // TIMING
 
     // Per-stage run timing (host wall, on-NPU device wall + AICPU phase
     // breakdown) is no longer returned from run(); the platform emits it as
     // `[STRACE]` log markers — parse with simpler_setup.tools.strace_timing.
+
+    nb::class_<ChipWorkerNativeRun>(m, "_ChipWorkerNativeRun")
+        .def_ro("slot_id", &ChipWorkerNativeRun::slot_id)
+        .def_ro("generation", &ChipWorkerNativeRun::generation)
+        .def_ro("run_epoch", &ChipWorkerNativeRun::run_epoch)
+        .def_ro("run_id", &ChipWorkerNativeRun::run_id)
+        .def_ro("dispatch_id", &ChipWorkerNativeRun::dispatch_id);
+
+    nb::enum_<ChipRunPreparationDisposition>(m, "_ChipRunPreparationDisposition")
+        .value("VALIDATED_ONLY", ChipRunPreparationDisposition::VALIDATED_ONLY)
+        .value("NATIVE_PREPARED", ChipRunPreparationDisposition::NATIVE_PREPARED);
+
+    nb::class_<ChipRun>(m, "_ChipRun")
+        .def("done", &ChipRun::done)
+        .def("activate", &ChipRun::activate)
+        .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("launched", &ChipRun::launched)
+        .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
+        .def(
+            "wait",
+            [](ChipRun &self, double timeout) {
+                // NaN compares false against everything, so it reaches the cast
+                // unless it is rejected by name. Converting a non-finite or
+                // out-of-range double to the clock's integral rep is undefined,
+                // and this timeout comes straight from Python.
+                if (std::isnan(timeout)) throw std::invalid_argument("ChipRun.wait timeout must not be NaN");
+                if (timeout < 0) return self.wait_until(ChipRun::Deadline::max());
+                const std::chrono::duration<double> requested(timeout);
+                const auto limit =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(ChipRun::Clock::duration::max());
+                // Saturate rather than reject: a caller asking to wait longer
+                // than the clock can express means "effectively forever", and
+                // the unbounded path is the one that blocks on the device
+                // instead of polling.
+                if (requested >= limit) return self.wait_until(ChipRun::Deadline::max());
+                return self.wait_until(
+                    ChipRun::Clock::now() + std::chrono::duration_cast<ChipRun::Clock::duration>(requested)
+                );
+            },
+            nb::arg("timeout") = -1.0, nb::call_guard<nb::gil_scoped_release>(),
+            "Wait for this run's completion fence. A negative timeout waits without a deadline and blocks on the "
+            "device rather than polling, as does one past the clock's range. Rejects NaN. Returns whether the run "
+            "reached terminal; raises the run's error."
+        )
+        .def(
+            "_raise_if_failed",
+            [](ChipRun &self) {
+                if (!self.done()) throw std::logic_error("ChipRun is not terminal");
+                (void)self.wait_until(ChipRun::Deadline::max());
+            },
+            nb::call_guard<nb::gil_scoped_release>()
+        );
 
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
@@ -1365,18 +2153,21 @@ NB_MODULE(_task_interface, m) {
             "init",
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
-               std::optional<CallConfig> prewarm_config, bool enable_sdma) {
+               std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
+               const std::string &sdma_warmup_path) {
                 // Translate the Python bool into a DmaWorkspaceKind bitmask so the
                 // platform-agnostic ChipWorker stays free of the enum. Empty mask
                 // when disabled leaves the Worker with no async-DMA provisioning.
                 uint32_t dma_workspace_mask = enable_sdma ? (uint32_t{1} << DMA_WORKSPACE_SDMA) : 0;
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
-                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr, dma_workspace_mask
+                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr, dma_workspace_mask, sim_context_path,
+                    sdma_warmup_path
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
+            nb::arg("sim_context_path") = "", nb::arg("sdma_warmup_path") = "",
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
@@ -1423,33 +2214,108 @@ NB_MODULE(_task_interface, m) {
             "None; per-stage timing is emitted as `[STRACE]` log markers."
         )
         .def(
-            "run",
-            [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
-                TaskArgsView view = make_view(args);
-                self.run(callable_id, view, config);
+            "_run_with_pipeline_lease",
+            [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config,
+               uint32_t slot_id, uint64_t generation) {
+                self.run_with_lease(callable_id, &args, config, PipelineSlotLease{slot_id, 0, generation});
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id from a TaskArgs (used for in-process callers). "
-            "Returns None; timing is emitted as `[STRACE]` log markers."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
+            "Internal generation-safe pipeline-slot launch. Takes the runtime.so-ABI POD, "
+            "which is what every lease caller already holds."
         )
         .def(
-            "run_from_blob",
-            [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
-               const CallConfig &config) {
-                // The mailbox region is the on-wire format `write_blob` produced;
-                // `read_blob` is the matching reader that returns a zero-copy
-                // TaskArgsView into the caller-owned bytes. Forwards to the
-                // existing `run(cid, view, config)` path so chip-child
-                // loops never re-implement the tensor/scalar layout in Python
-                // (where it has historically dropped fields like child_memory).
-                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config);
+            "_prepare_native_run_with_pipeline_lease",
+            [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config,
+               uint32_t slot_id, uint64_t generation) {
+                return self.prepare_native_run(callable_id, &args, config, PipelineSlotLease{slot_id, 0, generation});
             },
-            nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
-            "Launch a callable_id from a raw mailbox-blob pointer + capacity "
-            "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
-            "of the per-task tensor/scalar layout). The blob must be in the format "
-            "produced by `write_blob`; read_blob enforces capacity bounds against shm corruption."
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Prepare a native run from pre-encoded task args after lease admission."
+        )
+        .def(
+            "_submit_chip_run_materialized",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
+               uint64_t accepted_state_addr, int32_t accepted_value, bool activated) {
+                return self.submit_chip_run(
+                    callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated
+                );
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
+            nb::arg("run_id"), nb::arg("dispatch_id"), nb::arg("accepted_state_addr"), nb::arg("accepted_value"),
+            nb::arg("activated"), nb::call_guard<nb::gil_scoped_release>(),
+            "Submit materialized task args to the chip native-run lane."
+        )
+        .def(
+            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
+            "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
+        )
+        .def(
+            "_submit_chip_run_direct",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
+                return self.submit_chip_run(callable_id, args, config);
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>(),
+            "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
+            "run. The lane follows the runtime PipelineContract: compatible runs admit one active plus one prepared "
+            "successor; otherwise this call drains its predecessor before admitting."
+        )
+        .def(
+            "_prepare_native_run_materialized",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
+               uint64_t accepted_state_addr, int32_t accepted_value) {
+                return self.prepare_native_run(
+                    callable_id, &args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value
+                );
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
+            nb::arg("run_id") = 0, nb::arg("dispatch_id") = 0, nb::arg("accepted_state_addr") = 0,
+            nb::arg("accepted_value") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "Prepare a native run from materialized task args after lease admission."
+        )
+        .def(
+            "_launch_native_run", &ChipWorker::launch_native_run, nb::arg("run"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Launch a prepared native run and return after its real device launch fence."
+        )
+        .def(
+            "_poll_native_run", &ChipWorker::poll_native_run, nb::arg("run"),
+            "Return whether a launched native run has reached its completion fence."
+        )
+        .def(
+            "_wait_native_run", &ChipWorker::wait_native_run, nb::arg("run"), nb::call_guard<nb::gil_scoped_release>(),
+            "Wait for a launched native run's completion fence."
+        )
+        .def(
+            "_finalize_native_run", &ChipWorker::finalize_native_run, nb::arg("run"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Validate, copy back, emit diagnostics, and destroy a prepared native run."
+        )
+        .def(
+            "run_materialized",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
+               uint64_t pipeline_generation) {
+                if (pipeline_generation == 0) {
+                    self.run(
+                        callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
+                        accepted_value
+                    );
+                } else {
+                    self.run_with_lease(
+                        callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
+                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value
+                    );
+                }
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("accepted_state_addr") = 0,
+            nb::arg("accepted_value") = 0, nb::arg("pipeline_slot") = 0, nb::arg("pipeline_generation") = 0,
+            "Launch a callable_id from the runtime.so-ABI POD a chip-child mailbox loop built with "
+            "materialize_task_args, so no Python code re-implements the tensor/scalar layout."
         )
         .def(
             "unregister_callable",
@@ -1463,6 +2329,27 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
+        .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)
+        .def_prop_ro(
+            "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
+            "Whether non-diagnostic native preparation may overlap one active run in another slot."
+        )
+        .def_prop_ro(
+            "runtime_buffer_addrs", &ChipWorker::runtime_buffer_addrs,
+            "Host Runtime staging buffer address of every copy the runtime's "
+            "PipelineContract asked for, in slot order."
+        )
+        .def(
+            "retained_temp_addr", &ChipWorker::retained_temp_addr, nb::arg("slot_id"),
+            "Retained temporary-buffer address held for one pipeline slot, or 0 "
+            "while that slot holds none."
+        )
+        .def(
+            "arena_bank_gm_heap_base", &ChipWorker::arena_bank_gm_heap_base, nb::arg("bank_id"),
+            "Committed GM heap base of one arena bank on the bound runner, or 0 "
+            "when that bank has never been committed."
+        )
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
             "Number of distinct callable entries the AICPU has dlopened for on the "
@@ -1478,11 +2365,19 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro(
             "run_stream_set_create_count", &ChipWorker::run_stream_set_create_count,
-            "Number of run stream sets the bound runner has created. A set "
-            "belongs to a pipeline slot and is reused for every run on that "
-            "slot, so a worker that has served any number of runs reports 1; "
-            "platforms whose runs use the persistent bootstrap pair report 0. "
-            "Tests assert this to verify repeated runs do not rebuild the set."
+            "Number of AICore run streams the bound runner has created. One AICPU "
+            "+ AICore pair serves every run for the runner's lifetime. The AICPU "
+            "stream persists; the AICore stream is recreated when a new code upload "
+            "makes it stale, and destroyed when an unproven completion retires it. "
+            "Platforms using the persistent bootstrap pair report 0."
+        )
+        .def_prop_ro(
+            "committed_device_memory", &ChipWorker::committed_device_memory,
+            "Total device HBM (bytes) currently committed by this worker's "
+            "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "
+            "Excludes HCCL/VMM comm windows. 0 when not "
+            "initialized. Lets downstream runtimes subtract simpler's own HBM "
+            "from their cache budget (it may be invisible to aclrtGetMemInfo)."
         )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
@@ -1514,20 +2409,57 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size) {
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address) {
+                if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
+                    throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
+                }
                 auto [device_ctx, local_window_base] =
                     self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
+                __atomic_store_n(
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
+                    __ATOMIC_RELEASE
+                );
                 return nb::make_tuple(device_ctx, local_window_base);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
-            nb::arg("window_size"),
+            nb::arg("window_size"), nb::arg("commit_flag_address"),
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base) for this rank."
+            "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
+        .def(
+            "comm_global_domain_prepare",
+            [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
+               uint32_t profile) {
+                auto [descriptor, local_window_base, actual_window_size] =
+                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
+                return nb::make_tuple(
+                    nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
+                    actual_window_size
+                );
+            },
+            nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
+            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
+        )
+        .def(
+            "comm_global_domain_import",
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors) {
+                std::vector<uint8_t> descriptor_bytes(
+                    reinterpret_cast<const uint8_t *>(descriptors.c_str()),
+                    reinterpret_cast<const uint8_t *>(descriptors.c_str()) + descriptors.size()
+                );
+                return self.comm_global_domain_import(domain_id, descriptor_bytes);
+            },
+            nb::arg("domain_id"), nb::arg("descriptors"),
+            "Import a rank-ordered Global CommDomain descriptor table and return the device context."
+        )
+        .def(
+            "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
+            "Release a prepared or imported Global CommDomain."
         )
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
@@ -1537,10 +2469,34 @@ NB_MODULE(_task_interface, m) {
         .def("comm_destroy_all", &ChipWorker::comm_destroy_all, "Destroy all owned communicators in LIFO order.");
 
     // --- Standalone blob helpers ---
+
+    m.def(
+        "materialize_task_args",
+        [](const TaskArgs &args, nb::dict resolved) -> ChipStorageTaskArgs {
+            ChipStorageTaskArgs out;
+            for (int32_t i = 0; i < args.tensor_count(); i++) {
+                out.add_tensor(materialize_one(args.tensor(i), resolved));
+            }
+            for (int32_t i = 0; i < args.scalar_count(); i++) {
+                out.add_scalar(args.scalar(i));
+            }
+            return out;
+        },
+        nb::arg("args"), nb::arg("resolved"),
+        "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
+        "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
+        "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
+        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
+        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
+        "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
+        "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "
+        "byte_offset."
+    );
+
     m.def(
         "read_args_from_blob",
-        [](uint64_t blob_ptr) {
-            TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
+        [](uint64_t blob_ptr, size_t capacity) -> TaskArgs {
+            TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), capacity);
             TaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
                 args.add_tensor(view.tensors(i));
@@ -1550,183 +2506,328 @@ NB_MODULE(_task_interface, m) {
             }
             return args;
         },
-        nb::arg("blob_ptr"),
-        "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
-        "Tags are not preserved (blob wire format strips them)."
+        nb::arg("blob_ptr"), nb::arg("capacity"),
+        "Reconstruct a TaskArgs from the length-prefixed blob at blob_ptr. `capacity` bounds how far "
+        "the reader may walk and belongs to the caller's mapping — the mailbox frame's args region, "
+        "or the length of a buffer the caller owns. Every element is gated by validate_tensor on the "
+        "way out. Tags are not preserved (the wire format strips them)."
     );
 
-    nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")
-        .def_ro("device_addr", &L2ChildOnboardRegionExport::device_addr)
-        .def_ro("mapping_bytes", &L2ChildOnboardRegionExport::mapping_bytes)
-        .def_ro("shareable_handle", &L2ChildOnboardRegionExport::shareable_handle)
-        .def_ro("registry_handle", &L2ChildOnboardRegionExport::registry_handle);
+    nb::class_<ChipChildOnboardRegionExport>(m, "_ChipChildOnboardRegionExport")
+        .def_ro("device_addr", &ChipChildOnboardRegionExport::device_addr)
+        .def_ro("mapping_bytes", &ChipChildOnboardRegionExport::mapping_bytes)
+        .def_ro("shareable_handle", &ChipChildOnboardRegionExport::shareable_handle)
+        .def_ro("registry_handle", &ChipChildOnboardRegionExport::registry_handle);
+
+    nb::class_<RegionHandle>(m, "_RegionHandle").def("__int__", &RegionHandle::value);
 
     m.def(
-        "_l3_host_mapped_region_import_sim",
-        [](const std::string &token, uint64_t mapping_bytes) -> uint64_t {
-            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-                throw std::invalid_argument("L3-L2 sim L3 Host mapped-region import requires a positive mapping size");
-            }
-            std::string name = shm_name_for_open(token);
-            int fd = shm_open(name.c_str(), O_RDWR, 0);
-            if (fd < 0) {
-                throw std::runtime_error("L3-L2 sim L3 Host mapped-region import shm_open failed");
-            }
-            void *base = mmap(nullptr, static_cast<size_t>(mapping_bytes), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-            if (base == MAP_FAILED) {
-                int err = errno;
-                ::close(fd);
-                throw std::runtime_error(
-                    std::string("L3-L2 sim L3 Host mapped-region import mmap failed: ") + std::strerror(err)
-                );
-            }
-            L3HostMappedRegion mapping{};
-            mapping.profile = L3L2RegionAccessProfile::SIM_POSIX_SHM;
-            mapping.fd = fd;
-            mapping.device_addr = reinterpret_cast<uint64_t>(base);
-            mapping.mapping_bytes = mapping_bytes;
-            return g_l3_host_mapped_regions.emplace(mapping);
+        "_region_import_sim",
+        [](const std::string &token, uint64_t mapping_bytes, const std::string &owner_token) -> RegionHandle {
+            return import_sim_region(
+                token, mapping_bytes, owner_token, "mapped-region sim import requires a positive mapping size",
+                "mapped-region import requires a non-empty owner token", "mapped-region sim import shm_open failed",
+                "mapped-region sim import mmap failed: "
+            );
         },
-        nb::arg("token"), nb::arg("mapping_bytes"), nb::call_guard<nb::gil_scoped_release>(),
+        nb::arg("token"), nb::arg("mapping_bytes"), nb::arg("owner_token"), nb::call_guard<nb::gil_scoped_release>(),
+        "Import a sim POSIX shm mapped region."
+    );
+    m.def(
+        "_region_import_onboard",
+        [](int device_id, uint64_t shareable_handle, uint64_t mapping_bytes,
+           const std::string &owner_token) -> RegionHandle {
+            return import_onboard_region(
+                device_id, shareable_handle, mapping_bytes, owner_token,
+                "onboard mapped-region import requires a non-negative device id",
+                "onboard mapped-region import requires a positive mapping size",
+                "mapped-region import requires a non-empty owner token"
+            );
+        },
+        nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"), nb::arg("owner_token"),
+        nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM mapped region."
+    );
+    m.def(
+        "_region_close",
+        [](uint64_t handle) {
+            close_region(handle);
+        },
+        nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(), "Close a mapped-region handle."
+    );
+    m.def(
+        "_region_active_leases",
+        [](uint64_t handle) {
+            return region_registry().active_leases(handle);
+        },
+        nb::arg("handle"), "Return the number of in-flight native operations holding this mapped region."
+    );
+    m.def(
+        "_region_take_cleanup_error",
+        [](const std::string &owner_token) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("cleanup-error lookup requires a non-empty owner token");
+            }
+            return region_cleanup_errors().take(owner_token);
+        },
+        nb::arg("owner_token"), "Take a mapped-region cleanup error for one owner."
+    );
+    m.def(
+        "_region_peek_cleanup_error",
+        [](const std::string &owner_token) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("cleanup-error lookup requires a non-empty owner token");
+            }
+            return region_cleanup_errors().peek(owner_token);
+        },
+        nb::arg("owner_token"), "Read one mapped-region cleanup error without consuming it."
+    );
+    m.def(
+        "_region_ack_cleanup_error",
+        [](const std::string &owner_token, const std::string &observed) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("cleanup-error acknowledgement requires an owner token");
+            }
+            region_cleanup_errors().acknowledge(owner_token, observed);
+        },
+        nb::arg("owner_token"), nb::arg("observed"), "Acknowledge a mapped-region cleanup error."
+    );
+    m.def(
+        "_region_record_cleanup_error_for_test",
+        [](const std::string &owner_token, const std::string &message) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("cleanup-error injection requires a non-empty owner token");
+            }
+            region_cleanup_errors().record(owner_token, message);
+        },
+        nb::arg("owner_token"), nb::arg("message"), "Inject one owner-scoped mapped-region cleanup error."
+    );
+    m.def(
+        "_region_fail_next_registry_insert_for_test",
+        []() {
+            region_registry().fail_next_insert_for_test();
+        },
+        "Inject one mapped-region registry insertion failure after native acquisition."
+    );
+    m.def(
+        "_host_vmm_copy_to",
+        [](uint64_t handle, uint64_t mapping_offset, uint64_t host_ptr, uint64_t nbytes) {
+            if (host_ptr == 0) {
+                throw std::invalid_argument("host_vmm_copy_to host_ptr must be nonzero");
+            }
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->copy_to(mapping_offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), nbytes);
+        },
+        nb::arg("handle"), nb::arg("mapping_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
+        nb::call_guard<nb::gil_scoped_release>(), "Copy host bytes into an imported mapped-region byte range."
+    );
+    m.def(
+        "_host_vmm_copy_to_with_delay_for_test",
+        [](uint64_t handle, uint64_t mapping_offset, uint64_t host_ptr, uint64_t nbytes, uint64_t delay_ms) {
+            if (host_ptr == 0) {
+                throw std::invalid_argument("host_vmm_copy_to host_ptr must be nonzero");
+            }
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->copy_to(mapping_offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), nbytes);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        },
+        nb::arg("handle"), nb::arg("mapping_offset"), nb::arg("host_ptr"), nb::arg("nbytes"), nb::arg("delay_ms"),
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Copy host bytes into an imported mapped-region byte range while holding the native lease for tests."
+    );
+    m.def(
+        "_host_vmm_copy_from",
+        [](uint64_t handle, uint64_t mapping_offset, uint64_t host_ptr, uint64_t nbytes) {
+            if (host_ptr == 0) {
+                throw std::invalid_argument("host_vmm_copy_from host_ptr must be nonzero");
+            }
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->copy_from(reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), mapping_offset, nbytes);
+        },
+        nb::arg("handle"), nb::arg("mapping_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
+        nb::call_guard<nb::gil_scoped_release>(), "Copy imported mapped-region bytes into host memory."
+    );
+    m.def(
+        "_region_counter_notify",
+        [](uint64_t handle, uint64_t counter_offset, int32_t value, int op) {
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->notify_counter(counter_offset, value, checked_region_notify_op(op));
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("value"), nb::arg("op"),
+        nb::call_guard<nb::gil_scoped_release>(), "Store or add one mapped-region signal counter."
+    );
+    m.def(
+        "_region_counter_test",
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) -> std::tuple<bool, int32_t> {
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->test_counter(counter_offset, operand, checked_region_wait_cmp(cmp));
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"),
+        nb::call_guard<nb::gil_scoped_release>(), "Load and compare one mapped-region signal counter."
+    );
+    m.def(
+        "_region_counter_wait",
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp,
+           uint64_t timeout_ns) -> std::tuple<int, int, int32_t, bool, std::string> {
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->wait_counter(counter_offset, operand, checked_region_wait_cmp(cmp), timeout_ns);
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
+        nb::call_guard<nb::gil_scoped_release>(), "Poll one mapped-region signal counter until match or timeout."
+    );
+
+    m.def(
+        "_worker_host_mapped_region_import_sim",
+        [](const std::string &token, uint64_t mapping_bytes, const std::string &owner_token) -> RegionHandle {
+            return import_sim_region(
+                token, mapping_bytes, owner_token,
+                "L3-L2 sim L3 Host mapped-region import requires a positive mapping size",
+                "L3-L2 mapped-region import requires a non-empty Worker owner token",
+                "L3-L2 sim L3 Host mapped-region import shm_open failed",
+                "L3-L2 sim L3 Host mapped-region import mmap failed: "
+            );
+        },
+        nb::arg("token"), nb::arg("mapping_bytes"), nb::arg("owner_token"), nb::call_guard<nb::gil_scoped_release>(),
         "Import a sim L3-L2 POSIX shm region for L3 Host mapped-region access."
     );
     m.def(
-        "_l3_host_mapped_region_import_onboard",
-        [](int device_id, uint64_t shareable_handle, uint64_t mapping_bytes) -> uint64_t {
-            if (device_id < 0) {
-                throw std::invalid_argument("L3-L2 onboard mapped-region import requires a non-negative device id");
-            }
-            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-                throw std::invalid_argument("L3-L2 onboard mapped-region import requires a positive mapping size");
-            }
-            L3HostMappedRegion mapping{};
-            mapping.profile = L3L2RegionAccessProfile::ONBOARD_VMM;
-            mapping.device_id = device_id;
-            mapping.mapping_bytes = mapping_bytes;
-            mapping.bind_acl_device();
-            AclRuntimeApi &api = acl_api();
-            mapping.shareable_handle = shareable_handle;
-            mapping.vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
-            void *mapped_addr = nullptr;
-            try {
-                mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
-                api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping.vmm_handle);
-                api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
-            } catch (...) {
-                std::string cleanup_error;
-                api.vmm_release_collecting(mapped_addr, mapping.vmm_handle, cleanup_error);
-                throw;
-            }
-            mapping.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
-            return g_l3_host_mapped_regions.emplace(mapping);
+        "_worker_host_mapped_region_import_onboard",
+        [](int device_id, uint64_t shareable_handle, uint64_t mapping_bytes,
+           const std::string &owner_token) -> RegionHandle {
+            return import_onboard_region(
+                device_id, shareable_handle, mapping_bytes, owner_token,
+                "L3-L2 onboard mapped-region import requires a non-negative device id",
+                "L3-L2 onboard mapped-region import requires a positive mapping size",
+                "L3-L2 mapped-region import requires a non-empty Worker owner token"
+            );
         },
-        nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"),
+        nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"), nb::arg("owner_token"),
         nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM L3-L2 region for L3 Host mapped-region access."
     );
     m.def(
-        "_l3_host_mapped_region_close",
+        "_worker_host_mapped_region_close",
         [](uint64_t handle) {
-            std::optional<L3HostMappedRegion> removed = g_l3_host_mapped_regions.remove(handle);
-            if (!removed.has_value()) {
-                return;
-            }
-            L3HostMappedRegion mapping = *removed;
-            if (mapping.profile == L3L2RegionAccessProfile::ONBOARD_VMM) {
-                mapping.bind_acl_device();
-                std::string cleanup_error;
-                acl_api().vmm_release_collecting(
-                    reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.device_addr)), mapping.vmm_handle,
-                    cleanup_error
-                );
-                if (!cleanup_error.empty()) {
-                    throw std::runtime_error(cleanup_error);
-                }
-                return;
-            }
-
-            std::string cleanup_error;
-            if (mapping.device_addr != 0 &&
-                munmap(reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.device_addr)), mapping.mapping_bytes) !=
-                    0) {
-                int err = errno;
-                append_cleanup_error(
-                    cleanup_error, std::string("L3-L2 sim L3 Host mapped-region munmap failed: ") + std::strerror(err)
-                );
-            }
-            if (mapping.fd >= 0 && ::close(mapping.fd) != 0) {
-                int err = errno;
-                append_cleanup_error(
-                    cleanup_error, std::string("L3-L2 sim L3 Host mapped-region close failed: ") + std::strerror(err)
-                );
-            }
-            if (!cleanup_error.empty()) {
-                throw std::runtime_error(cleanup_error);
-            }
+            close_region(handle);
         },
         nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(), "Close an L3 Host mapped-region handle."
     );
     m.def(
-        "_l3_host_mapped_payload_write",
+        "_worker_host_mapped_region_active_leases",
+        [](uint64_t handle) {
+            return region_registry().active_leases(handle);
+        },
+        nb::arg("handle"), "Return the number of in-flight native operations holding this mapped region."
+    );
+    m.def(
+        "_worker_host_mapped_region_take_cleanup_error",
+        [](const std::string &owner_token) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("L3-L2 cleanup-error lookup requires a non-empty Worker owner token");
+            }
+            return region_cleanup_errors().take(owner_token);
+        },
+        nb::arg("owner_token"),
+        "Take a cleanup error recorded by an unadopted native mapped-region owner for one Worker."
+    );
+    m.def(
+        "_worker_host_mapped_region_peek_cleanup_error",
+        [](const std::string &owner_token) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("L3-L2 cleanup-error lookup requires a non-empty Worker owner token");
+            }
+            return region_cleanup_errors().peek(owner_token);
+        },
+        nb::arg("owner_token"), "Read one Worker's mapped-region cleanup error without consuming it."
+    );
+    m.def(
+        "_worker_host_mapped_region_ack_cleanup_error",
+        [](const std::string &owner_token, const std::string &observed) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("L3-L2 cleanup-error acknowledgement requires a Worker owner token");
+            }
+            region_cleanup_errors().acknowledge(owner_token, observed);
+        },
+        nb::arg("owner_token"), nb::arg("observed"),
+        "Acknowledge the mapped-region cleanup error already published by one Worker."
+    );
+    m.def(
+        "_worker_host_mapped_region_record_cleanup_error_for_test",
+        [](const std::string &owner_token, const std::string &message) {
+            if (owner_token.empty()) {
+                throw std::invalid_argument("L3-L2 cleanup-error injection requires a non-empty Worker owner token");
+            }
+            region_cleanup_errors().record(owner_token, message);
+        },
+        nb::arg("owner_token"), nb::arg("message"), "Inject one Worker-owned mapped-region cleanup error."
+    );
+    m.def(
+        "_worker_host_mapped_region_fail_next_registry_insert_for_test",
+        []() {
+            region_registry().fail_next_insert_for_test();
+        },
+        "Inject one mapped-region registry insertion failure after native acquisition."
+    );
+    m.def(
+        "_worker_host_mapped_payload_write",
         [](uint64_t handle, uint64_t payload_offset, uint64_t host_ptr, uint64_t nbytes) {
             if (host_ptr == 0) {
                 throw std::invalid_argument("L3-L2 payload_write host_ptr must be nonzero");
             }
-            L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            mapping.copy_to(payload_offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), nbytes);
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->copy_to(payload_offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), nbytes);
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
         nb::call_guard<nb::gil_scoped_release>(), "Copy L3 Host bytes into an imported L3-L2 payload range."
     );
     m.def(
-        "_l3_host_mapped_payload_read",
+        "_worker_host_mapped_payload_read",
         [](uint64_t handle, uint64_t payload_offset, uint64_t host_ptr, uint64_t nbytes) {
             if (host_ptr == 0) {
                 throw std::invalid_argument("L3-L2 payload_read host_ptr must be nonzero");
             }
-            L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            mapping.copy_from(reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), payload_offset, nbytes);
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->copy_from(reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), payload_offset, nbytes);
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
         nb::call_guard<nb::gil_scoped_release>(), "Copy imported L3-L2 payload bytes into L3 Host memory."
     );
     m.def(
-        "_l3_host_mapped_counter_notify",
+        "_worker_host_mapped_counter_notify",
         [](uint64_t handle, uint64_t counter_offset, int32_t value, int op) {
-            L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            mapping.notify_counter(counter_offset, value, checked_notify_op(op));
+            RegionLease mapping = region_registry().lease(handle);
+            mapping->notify_counter(counter_offset, value, checked_region_notify_op(op));
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("value"), nb::arg("op"),
         nb::call_guard<nb::gil_scoped_release>(), "Store or add one L3 Host-side L3-L2 signal counter."
     );
     m.def(
-        "_l3_host_mapped_counter_test",
+        "_worker_host_mapped_counter_test",
         [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) -> std::tuple<bool, int32_t> {
-            L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            return mapping.test_counter(counter_offset, operand, checked_wait_cmp(cmp));
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->test_counter(counter_offset, operand, checked_region_wait_cmp(cmp));
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"),
         nb::call_guard<nb::gil_scoped_release>(), "Load and compare one L3 Host-side L3-L2 signal counter."
     );
     m.def(
-        "_l3_host_mapped_counter_wait",
+        "_worker_host_mapped_counter_wait",
         [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp,
            uint64_t timeout_ns) -> std::tuple<int, int, int32_t, bool, std::string> {
-            L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            return mapping.wait_counter(counter_offset, operand, checked_wait_cmp(cmp), timeout_ns);
+            RegionLease mapping = region_registry().lease(handle);
+            return mapping->wait_counter(counter_offset, operand, checked_region_wait_cmp(cmp), timeout_ns);
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
     );
     m.def(
         "_l3_child_onboard_region_create",
-        [](uint64_t nbytes) -> L2ChildOnboardRegionExport {
+        [](uint64_t nbytes) -> ChipChildOnboardRegionExport {
             if (nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
                 throw std::invalid_argument("L3-L2 onboard child region requires a positive mapping size");
             }
             AclRuntimeApi &api = acl_api();
             int device_id = api.current_device_with_check();
             uint64_t mapping_bytes = align_vmm_bytes(nbytes, api.vmm_granularity_with_check(device_id));
-            L2ChildOnboardRegion region{};
+            ChipChildOnboardRegion region{};
             region.device_id = device_id;
             region.mapping_bytes = mapping_bytes;
             region.vmm_handle = api.vmm_malloc_physical_with_check(mapping_bytes, device_id);
@@ -1742,8 +2843,8 @@ NB_MODULE(_task_interface, m) {
                 throw;
             }
             region.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
-            uint64_t registry_handle = g_l2_child_onboard_regions.emplace(region);
-            return L2ChildOnboardRegionExport{
+            uint64_t registry_handle = g_chip_child_onboard_regions.emplace(region);
+            return ChipChildOnboardRegionExport{
                 region.device_addr,
                 region.mapping_bytes,
                 region.shareable_handle,
@@ -1756,11 +2857,11 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "_l3_child_onboard_region_close",
         [](uint64_t registry_handle) {
-            std::optional<L2ChildOnboardRegion> removed = g_l2_child_onboard_regions.remove(registry_handle);
+            std::optional<ChipChildOnboardRegion> removed = g_chip_child_onboard_regions.remove(registry_handle);
             if (!removed.has_value()) {
                 return;
             }
-            L2ChildOnboardRegion region = *removed;
+            ChipChildOnboardRegion region = *removed;
             region.bind_acl_device();
             std::string cleanup_error;
             acl_api().vmm_release_collecting(

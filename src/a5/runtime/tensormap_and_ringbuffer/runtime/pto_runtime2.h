@@ -67,7 +67,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -77,18 +77,18 @@ struct PTO2RuntimeOps {
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
     void (*log_warn)(const char *func, const char *fmt, ...);
+    void (*log_timing)(const char *func, const char *fmt, ...);
+    void (*log_info)(const char *func, const char *fmt, ...);
     void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
     void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const CoreTaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const CoreTaskArgs &args);
 
     // This-run core geometry from runtime_finalize_after_wire: MIX clusters
     // (one AIC each) and standalone AIV cores.
@@ -96,8 +96,8 @@ struct PTO2RuntimeOps {
     int32_t (*available_aiv_count)(PTO2Runtime *rt);
 
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
-    // collector. Always present to keep ops-table layout stable across
-    // SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
+    // collector. Always present in the struct to keep ops-table layout stable
+    // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
 };
 
@@ -295,14 +295,16 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+uint64_t get_tensor_data(PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
  * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
  * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+void set_tensor_data(
+    PTO2Runtime *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

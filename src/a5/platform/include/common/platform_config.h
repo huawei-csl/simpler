@@ -22,8 +22,7 @@
  * - Derived: All other limits calculated from base configuration
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_PLATFORM_CONFIG_H_
-#define SRC_A5_PLATFORM_INCLUDE_COMMON_PLATFORM_CONFIG_H_
+#pragma once
 
 #include <cstdint>
 
@@ -49,7 +48,15 @@ constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
  * Maximum AICPU scheduling threads
  * Determines parallelism level of the AICPU task scheduler.
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
+constexpr int PLATFORM_MAX_AICPU_THREADS = 5;
+
+/**
+ * Default active AICPU thread count when aicpu_thread_num is left at 0 (auto):
+ * 1 orchestrator + 4 schedulers. Keep this distinct from the active upper
+ * bound even while both values are 5; the two settings have different runtime
+ * semantics and match the A2/A3 platform contract.
+ */
+constexpr int PLATFORM_DEFAULT_AICPU_THREAD_NUM = 5;  // 1 orch + 4 sched
 
 /**
  * Compile-time upper bound on the number of AICPU threads CANN may
@@ -58,10 +65,10 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
  * popcount(OCCUPY), and DeviceRunner passes that count (not this
  * constant) to rtsLaunchCpuKernel.
  *
- * The bound exists for the static gate buffers in
- * src/common/platform/onboard/aicpu/platform_aicpu_affinity.cpp
- * (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) — keep it ≥ any
- * runtime aicpu_launch_count we expect to see.
+ * The bound sizes the per-launched-thread phase/task-timing storage and rejects
+ * a runtime launch population beyond the supported A5 topology. The common
+ * affinity gate has its own ABI bound, MAX_GATE_THREADS=16; keep this platform
+ * limit at or below that independent common bound.
  *
  * Two over-subscription failure modes to keep in mind when choosing
  * the runtime launch count vs this bound:
@@ -141,7 +148,7 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 
 /**
  * Performance buffer capacity per buffer
- * Number of L2SwimlaneAicpuTaskRecord entries per dynamically allocated L2SwimlaneAicpuTaskBuffer
+ * Number of ChipSwimlaneAicpuTaskRecord entries per dynamically allocated ChipSwimlaneAicpuTaskBuffer
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
@@ -156,7 +163,7 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
- * L2SwimlaneAicpuTaskBuffer pre-allocation count per AICore.
+ * ChipSwimlaneAicpuTaskBuffer pre-allocation count per AICore.
  * 1 goes into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
@@ -177,7 +184,23 @@ constexpr int PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD = 6;
 constexpr int PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD = 8;
 
 /**
- * Per-core L2SwimlaneAicoreTaskBuffer pre-allocation count.
+ * Host phase-record pool geometry (host_build_graph's bind path and host
+ * orchestrator).
+ *
+ * Same rotating-pool shape as the sched/orch pools above, sized for its own
+ * producer rather than theirs: a scheduler thread emits tens of thousands of
+ * records per run, while one host orchestration pass emits a few hundred (a
+ * 40-layer decode: 12 bind segments + ~325 submit-level operations). Inheriting
+ * PLATFORM_PHASE_RECORDS_PER_THREAD here would allocate 4 MB to hold 11 KB and
+ * leave the rotation path unreachable, so per-buffer capacity is 1024 records
+ * (32 KB) and the pool holds 5 of them — the floor that lets
+ * PLATFORM_PROF_SLOT_COUNT spares fill the free_queue with one buffer active.
+ */
+constexpr int PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER = 1024;
+constexpr int PLATFORM_HOST_PHASE_BUFFERS = PLATFORM_PROF_SLOT_COUNT + 1;
+
+/**
+ * Per-core ChipSwimlaneAicoreTaskBuffer pre-allocation count.
  * 1 goes into the free_queue at init, the rest are recycled by host as
  * AICPU rotates per BUFFER_SIZE dispatches. Declared here so the ready-queue
  * formula below can include the AICore-pool worst-case burst depth.
@@ -191,7 +214,7 @@ constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
  *
  * The phase term is sized to the ORIGINAL per-thread count (16), decoupled from
  * PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD, on purpose: this array sizes the
- * device-visible L2SwimlaneDataHeader::queues[], so shrinking the host
+ * device-visible ChipSwimlaneDataHeader::queues[], so shrinking the host
  * preallocation must NOT shrink it (that would change the shm layout = ABI).
  */
 constexpr int PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD = 16;
@@ -200,7 +223,7 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
     2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD +
     PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
-// PLATFORM_PHASE_RECORDS_PER_THREAD lives in l2_swimlane_profiling.h (16384) —
+// PLATFORM_PHASE_RECORDS_PER_THREAD lives in chip_swimlane_profiling.h (16384) —
 // kept beside the buffer types that use it. Do not redeclare here.
 
 /**
@@ -208,6 +231,12 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
  * Used to convert timestamps to microseconds.
  */
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
+
+// aclrtEventGetTimestamp capability, verified on a5 silicon: the raw value
+// is device-uptime microseconds and covers the same epoch as profiling syscnt
+// after frequency normalization.
+constexpr uint64_t PLATFORM_ACL_EVENT_TIMESTAMP_FREQ_HZ = 1000000;
+constexpr const char *PLATFORM_ACL_EVENT_TIMESTAMP_UNIT = "device_uptime_us";
 
 /**
  * Unified spin-wait timeout for DFX subsystem backpressure gates (system-counter
@@ -235,7 +264,7 @@ inline double cycles_to_us(uint64_t cycles) {
 // "Profiling" is the umbrella; each bit is a parallel diagnostics sub-feature.
 #define SIMPLER_DFX_FLAG_NONE 0u
 #define SIMPLER_DFX_FLAG_DUMP_ARGS (1u << 0)
-#define SIMPLER_DFX_FLAG_L2_SWIMLANE (1u << 1)
+#define SIMPLER_DFX_FLAG_CHIP_SWIMLANE (1u << 1)
 #define SIMPLER_DFX_FLAG_PMU (1u << 2)
 #define SIMPLER_DFX_FLAG_DEP_GEN (1u << 3)
 #define SIMPLER_DFX_FLAG_SCOPE_STATS (1u << 4)
@@ -300,7 +329,7 @@ constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
 /**
  * Per-core PMU staging ring depth (AICore-side dual-issue slots).
  *
- * Same constraints as PLATFORM_L2_AICORE_RING_SIZE: ≥ in-flight task
+ * Constraints: ≥ in-flight task
  * depth on a single core, and ideally a power of two so the
  * `task_id % RING_SIZE` slot index compiles to a mask. Decoupled from
  * the rotating PmuBuffer so the AICore write address is stable across
@@ -340,7 +369,7 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is 4672 B (16 Tensor blobs + small header). At 4×1024 =
+ * Each DepGenRecord is 4672 B (16 ChipTensor blobs + small header). At 4×1024 =
  * 4096 in-flight records (~19 MB), aligning dep_gen's in-flight count with the
  * scope_stats / l2 AicoreTask pools (also 4096) per the #977 cross-subsystem
  * review. History: original 32 (dropped 50% on unroll Case1) → #977 commit
@@ -719,5 +748,3 @@ enum : uint32_t {
  * Used to indicate that pending_task_ids_ or running_task_ids_ slot is empty.
  */
 constexpr int AICPU_TASK_INVALID = -1;
-
-#endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_PLATFORM_CONFIG_H_

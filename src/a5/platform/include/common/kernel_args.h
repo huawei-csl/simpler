@@ -32,11 +32,11 @@
  * we use host memory instead of device memory.
  */
 
-#ifndef PLATFORM_COMMON_KERNEL_ARGS_H_
-#define PLATFORM_COMMON_KERNEL_ARGS_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "common/dma_workspace.h"
 
@@ -85,15 +85,15 @@ struct KernelArgs {
     // no interior alignment padding. Order among these is free (device reads by
     // field name, not offset); only runtime_args/regs are offset-locked.
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
-    // L2 swimlane shared memory base address; use explicit flags to detect enablement
-    uint64_t l2_swimlane_data_base{0};
+    // chip swimlane shared memory base address; use explicit flags to detect enablement
+    uint64_t chip_swimlane_data_base{0};
     uint64_t pmu_data_base{0};      // PMU buffer base address (device memory); 0 = PMU disabled
     uint64_t dep_gen_data_base{0};  // dep_gen shared memory base address; use explicit flags to detect enablement
     // Profiling per-core address arrays (moved out of Handshake). Each *_addrs
     // field is a device pointer to uint64_t[num_aicore]. AICore KERNEL_ENTRY
     // indexes by block_idx and forwards into per-core platform state.
-    // L2SwimlaneActiveHead* per core (rotation channel); 0 when L2 swimlane is off
-    uint64_t l2_swimlane_aicore_rotation_table{0};
+    // ChipSwimlaneActiveHead* per core (rotation channel); 0 when chip swimlane is off
+    uint64_t chip_swimlane_aicore_rotation_table{0};
     uint64_t aicore_pmu_ring_addrs{0};  // PmuAicoreRing* per core; 0 when PMU is off
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
                                         // a5 has no halHostRegister — host keeps a separate shadow and
@@ -104,7 +104,7 @@ struct KernelArgs {
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
@@ -130,13 +130,39 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
  */
 struct InitArgs {
     uint32_t device_id{0};            // ACL device ordinal -> set_orch_device_id
-    uint32_t log_level{1};            // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
-    uint32_t log_info_v{5};           // INFO verbosity threshold (0..9); default V5
+    uint32_t log_level{25};           // Threshold: DEBUG=10, INFO=20, TIMING=25, WARN=30, ERROR=40, NUL=60
     int32_t scheduler_timeout_ms{0};  // AICPU no-progress watchdog (ms); 0 -> compile default
     // Per-engine async-DMA workspace dev addrs -> set_dma_workspace_addr(kind, .);
     // indexed by DmaWorkspaceKind; 0 = that engine unavailable.
     uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT]{};
 };
+
+struct AicpuTopologyQueryResult {
+    int32_t occupy_rc{-1};
+    int32_t pf_occupy_rc{-1};
+    int32_t os_sched_rc{-1};
+    int32_t reserved{0};
+    uint64_t occupy{0};
+    uint64_t pf_occupy{0};
+    uint64_t os_sched{0};
+};
+
+struct AicpuTopologyQueryArgs {
+    uint64_t result_addr{0};
+};
+
+static_assert(
+    std::is_trivially_copyable_v<AicpuTopologyQueryResult> && std::is_standard_layout_v<AicpuTopologyQueryResult>,
+    "AicpuTopologyQueryResult must remain a memcpy-safe wire type"
+);
+static_assert(sizeof(AicpuTopologyQueryResult) == 40, "AicpuTopologyQueryResult ABI size drift");
+static_assert(offsetof(AicpuTopologyQueryResult, occupy) == 16, "AicpuTopologyQueryResult::occupy offset drift");
+static_assert(offsetof(AicpuTopologyQueryResult, os_sched) == 32, "AicpuTopologyQueryResult::os_sched offset drift");
+static_assert(
+    std::is_trivially_copyable_v<AicpuTopologyQueryArgs> && std::is_standard_layout_v<AicpuTopologyQueryArgs>,
+    "AicpuTopologyQueryArgs must remain a memcpy-safe wire type"
+);
+static_assert(sizeof(AicpuTopologyQueryArgs) == 8, "AicpuTopologyQueryArgs ABI size drift");
 
 /**
  * RegisterCallableArgs - device orchestration SO registration payload
@@ -158,5 +184,3 @@ struct RegisterCallableArgs {
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // PLATFORM_COMMON_KERNEL_ARGS_H_

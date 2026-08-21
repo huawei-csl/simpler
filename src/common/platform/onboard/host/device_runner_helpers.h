@@ -20,19 +20,31 @@
  *   - `KernelArgsHelper`: host-side `KernelArgs` wrapper with device-memory
  *     management for the H2D `Runtime` and `KernelArgs` copies.
  *
- * Future migrations (see `.docs/ONBOARD_HOST_COMMON_REFACTOR.md`):
+ * Future migrations:
  *   - `DeviceRunnerBase` (lifecycle + registration + profiling init).
  *   - C-API common shims.
  */
 
-#ifndef SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_HELPERS_H
-#define SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_HELPERS_H
+#pragma once
+
+#include <runtime/rt.h>
 
 #include <cstdint>
+#include <utility>
 
 #include "common/kernel_args.h"  // arch-specific KernelArgs layout
 #include "host/memory_allocator.h"
+#include "pto_runtime_c_api.h"
 #include "runtime.h"
+
+/**
+ * Query both streams that form one onboard run without waiting.
+ *
+ * Completion is reported only after rtStreamQuery reports both the AICPU and
+ * AICore streams complete. The return value is one of the
+ * SIMPLER_NATIVE_RUN_POLL_* constants.
+ */
+int query_stream_pair_nonblocking(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
 /**
  * Helper class for managing `KernelArgs` with device memory.
@@ -49,6 +61,17 @@
  * free functions in the arch's own `device_runner.h`.
  */
 struct KernelArgsHelper {
+    KernelArgsHelper() = default;
+    KernelArgsHelper(const KernelArgsHelper &) = delete;
+    KernelArgsHelper &operator=(const KernelArgsHelper &) = delete;
+    KernelArgsHelper(KernelArgsHelper &&other) noexcept :
+        args(other.args),
+        allocator_(std::exchange(other.allocator_, nullptr)),
+        device_k_args_(std::exchange(other.device_k_args_, nullptr)) {
+        other.args = KernelArgs{};
+    }
+    KernelArgsHelper &operator=(KernelArgsHelper &&) = delete;
+
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
     KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
@@ -78,6 +101,17 @@ struct KernelArgsHelper {
     int finalize_device_kernel_args();
 
     /**
+     * Clear device-pointer bookkeeping without calling the allocator.
+     *
+     * Used only by fatal teardown after reset/quarantine.
+     */
+    void abandon_after_device_failure() {
+        args.runtime_args = nullptr;
+        device_k_args_ = nullptr;
+        allocator_ = nullptr;
+    }
+
+    /**
      * Implicit conversion operators for seamless use with runtime APIs.
      *
      * These allow `KernelArgsHelper` to be used wherever a payload
@@ -86,5 +120,3 @@ struct KernelArgsHelper {
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }
 };
-
-#endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_HELPERS_H

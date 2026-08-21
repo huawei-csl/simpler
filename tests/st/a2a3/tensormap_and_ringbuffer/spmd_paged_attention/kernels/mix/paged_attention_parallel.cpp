@@ -32,15 +32,15 @@
  *   AIV: TPOP(sij) → online softmax → TPUSH(pij) → TPOP(oi_new) → online update
  *
  * MixedKernels args:
- *   args[0]  = query         Tensor* (batch*num_heads, head_dim) bf16
- *   args[1]  = key_cache     Tensor* (kv_total_rows, head_dim) bf16
- *   args[2]  = value_cache   Tensor* (kv_total_rows, head_dim) bf16
- *   args[3]  = block_table   Tensor* (batch, max_blocks_per_req) int32
- *   args[4]  = context_lens  Tensor* (batch,) int32
- *   args[5]  = out           Tensor* (batch*num_heads, head_dim) float32 [output]
- *   args[6]  = sij_fifo      Tensor* GM ring buffer for sij pipe
- *   args[7]  = pij_fifo      Tensor* GM ring buffer for pij pipe
- *   args[8]  = oi_fifo       Tensor* GM ring buffer for oi_new pipe
+ *   args[0]  = query         ChipTensor* (batch*num_heads, head_dim) bf16
+ *   args[1]  = key_cache     ChipTensor* (kv_total_rows, head_dim) bf16
+ *   args[2]  = value_cache   ChipTensor* (kv_total_rows, head_dim) bf16
+ *   args[3]  = block_table   ChipTensor* (batch, max_blocks_per_req) int32
+ *   args[4]  = context_lens  ChipTensor* (batch,) int32
+ *   args[5]  = out           ChipTensor* (batch*num_heads, head_dim) float32 [output]
+ *   args[6]  = sij_fifo      ChipTensor* GM ring buffer for sij pipe
+ *   args[7]  = pij_fifo      ChipTensor* GM ring buffer for pij pipe
+ *   args[8]  = oi_fifo       ChipTensor* GM ring buffer for oi_new pipe
  *   args[9]  = scale_value   scalar (float bits in uint64)
  *   args[10] = num_heads     scalar
  *   args[11] = head_dim      scalar
@@ -113,6 +113,7 @@ template <int QT>
 struct PAConfig {
     static constexpr int Q_TILE = QT;
     static constexpr int SUB_QT = QT / 2;
+    static constexpr uint32_t LOCAL_SLOT_NUM = 2;
 
     // GM FIFO slot sizes (full tile per slot, sized for max block_size to allow
     // the same FIFO to host both block_size=64 and block_size=128 cases).
@@ -120,20 +121,23 @@ struct PAConfig {
     static constexpr uint32_t PIJ_SLOT_SIZE = QT * MAX_BLOCK_SIZE * sizeof(bfloat16_t);
     static constexpr uint32_t OI_SLOT_SIZE = QT * HEAD_DIM * sizeof(float);
 
-    using SijPipeT = TPipe<SIJ_FLAG_ID, Direction::DIR_C2V, SIJ_SLOT_SIZE, FIFO_DEPTH>;
-    using PijPipeT = TPipe<PIJ_FLAG_ID, Direction::DIR_V2C, PIJ_SLOT_SIZE, FIFO_DEPTH>;
-    using OiPipeT = TPipe<OI_FLAG_ID, Direction::DIR_C2V, OI_SLOT_SIZE, FIFO_DEPTH>;
+    using SijPipeT = TPipe<SIJ_FLAG_ID, Direction::DIR_C2V, SIJ_SLOT_SIZE, FIFO_DEPTH, LOCAL_SLOT_NUM>;
+    using PijPipeT = TPipe<PIJ_FLAG_ID, Direction::DIR_V2C, PIJ_SLOT_SIZE, FIFO_DEPTH, LOCAL_SLOT_NUM>;
+    using OiPipeT = TPipe<OI_FLAG_ID, Direction::DIR_C2V, OI_SLOT_SIZE, FIFO_DEPTH, LOCAL_SLOT_NUM>;
 
-    // AIV UB consumer buffer layout (sized for SUB_QT rows per AIV lane)
+    // Local TPOP slots start SLOT_SIZE bytes apart; the final slot only needs
+    // the lane-local tile footprint.
     static constexpr uint32_t SIJ_UB_BASE = 0x0;
-    static constexpr uint32_t SIJ_UB_SIZE = 2 * SUB_QT * MAX_BLOCK_SIZE * sizeof(float);
+    static constexpr uint32_t SIJ_LOCAL_TILE_SIZE = SUB_QT * MAX_BLOCK_SIZE * sizeof(float);
+    static constexpr uint32_t SIJ_UB_SIZE = (LOCAL_SLOT_NUM - 1) * SIJ_SLOT_SIZE + SIJ_LOCAL_TILE_SIZE;
     static constexpr uint32_t OI_UB_BASE = SIJ_UB_BASE + SIJ_UB_SIZE;
-    static constexpr uint32_t OI_UB_SIZE = 2 * SUB_QT * HEAD_DIM * sizeof(float);
+    static constexpr uint32_t OI_LOCAL_TILE_SIZE = SUB_QT * HEAD_DIM * sizeof(float);
+    static constexpr uint32_t OI_UB_SIZE = (LOCAL_SLOT_NUM - 1) * OI_SLOT_SIZE + OI_LOCAL_TILE_SIZE;
     static constexpr uint32_t WORK_UB_BASE = OI_UB_BASE + OI_UB_SIZE;
 
     // AIC L1 consumer buffer for V2C pij pipe (full QT * MAX_BLOCK_SIZE rows)
     static constexpr uint32_t PIJ_L1_BASE = 0x40000;
-    static constexpr uint32_t PIJ_L1_SIZE = 2 * QT * MAX_BLOCK_SIZE * sizeof(bfloat16_t);
+    static constexpr uint32_t PIJ_L1_SIZE = LOCAL_SLOT_NUM * PIJ_SLOT_SIZE;
 };
 
 // ============================================================================
@@ -383,13 +387,14 @@ static __aicore__ void aiv_sf_step(
     using SijPipeT = typename Cfg::SijPipeT;
     using PijPipeT = typename Cfg::PijPipeT;
 
+    const uint32_t sij_slot = static_cast<uint32_t>(sij_pipe.cons.getTileId()) % Cfg::LOCAL_SLOT_NUM;
     TPOP<SijPipeT, SijVecTile, TileSplitAxis::TILE_UP_DOWN>(sij_pipe, sijTile);
 
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
     if (is_last_partial) {
-        int sij_addr = Cfg::SIJ_UB_BASE + static_cast<int>((i % 2) * TM * TN * static_cast<int>(sizeof(float)));
+        int sij_addr = Cfg::SIJ_UB_BASE + static_cast<int>(sij_slot * Cfg::SIJ_SLOT_SIZE);
         TASSIGN(sijPadTile, sij_addr);
         TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
         TASSIGN(sijDynTile, sij_addr);
@@ -637,10 +642,10 @@ static __aicore__ void run_aic(
     typename Cfg::PijPipeT pij_pipe(pij_fifo_base, 0U, Cfg::PIJ_L1_BASE);
     typename Cfg::OiPipeT oi_pipe(oi_fifo_base, Cfg::OI_UB_BASE, 0U);
 
-    __gm__ Tensor *query_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *key_cache_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *value_cache_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *block_table_t = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ ChipTensor *query_t = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
+    __gm__ ChipTensor *key_cache_t = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
+    __gm__ ChipTensor *value_cache_t = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
+    __gm__ ChipTensor *block_table_t = reinterpret_cast<__gm__ ChipTensor *>(args[3]);
 
     __gm__ bfloat16_t *query_base = reinterpret_cast<__gm__ bfloat16_t *>(query_t->buffer.addr) + query_t->start_offset;
     __gm__ bfloat16_t *key_base =
@@ -683,7 +688,7 @@ static __aicore__ void run_aiv(
     typename Cfg::PijPipeT pij_pipe(pij_fifo_base, 0U, Cfg::PIJ_L1_BASE);
     typename Cfg::OiPipeT oi_pipe(oi_fifo_base, Cfg::OI_UB_BASE, 0U);
 
-    __gm__ Tensor *out_t = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ ChipTensor *out_t = reinterpret_cast<__gm__ ChipTensor *>(args[5]);
     float scale_value = from_u64<float>(static_cast<uint64_t>(args[9]));
 
     int32_t sub_block_id = get_sub_block_id(args);
@@ -750,10 +755,10 @@ static __aicore__ void run_aiv(
 // ============================================================================
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *context_lens_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *sij_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[6]);
-    __gm__ Tensor *pij_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[7]);
-    __gm__ Tensor *oi_fifo_t = reinterpret_cast<__gm__ Tensor *>(args[8]);
+    __gm__ ChipTensor *context_lens_t = reinterpret_cast<__gm__ ChipTensor *>(args[4]);
+    __gm__ ChipTensor *sij_fifo_t = reinterpret_cast<__gm__ ChipTensor *>(args[6]);
+    __gm__ ChipTensor *pij_fifo_t = reinterpret_cast<__gm__ ChipTensor *>(args[7]);
+    __gm__ ChipTensor *oi_fifo_t = reinterpret_cast<__gm__ ChipTensor *>(args[8]);
 
     int64_t num_heads = static_cast<int64_t>(args[10]);
     int64_t head_dim = static_cast<int64_t>(args[11]);

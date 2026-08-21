@@ -28,6 +28,19 @@ template <typename T>
 inline constexpr bool is_supported_scalar_arg_v = std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
                                                   std::is_enum_v<std::remove_cv_t<std::remove_reference_t<T>>>;
 
+// Maximum tensor rank a view can describe. Both the L3+ `Tensor` of buffer.h and the device
+// `ChipTensor` of tensor.h size their shapes[] / strides[] by it, so it is shared here rather than
+// owned by either.
+constexpr int MAX_TENSOR_DIMS = 5;
+
+// Memory space of a backing. Orthogonal to location (local/remote, derived) and to visibility.
+// Both a `BufferDescriptor` field and byte 43 of `ChipTensor` store it, so it is shared here rather
+// than owned by either.
+enum class AddressSpace : uint8_t {
+    HOST = 0,
+    DEVICE = 1,
+};
+
 /**
  * Supported data types for tensor elements
  */
@@ -44,6 +57,12 @@ enum class DataType : uint8_t {
     UINT16,    // 2 bytes
     UINT32,    // 4 bytes
     BOOL,      // 1 byte (stored as 1/0 in uint64_t slot)
+    // MX block-scale dtypes — A5 only (consumed by the A5-only pto.tquant.mx /
+    // tmatmul.mx ops). Host transfer itself is arch-agnostic (1 byte/element).
+    // FP8E5M2 is intentionally omitted: MX paths use E4M3FN (+ E8M0 scale), not E5M2.
+    FP8E4M3FN,  // 1 byte — MXFP8 E4M3FN (A5 only)
+    FP8E8M0,    // 1 byte — MXFP8 E8M0 shared exponent (A5 only)
+    FP4E2M1,    // 1 byte — MXFP4 E2M1, 2 values packed (torch float4_e2m1fn_x2) (A5 only)
     DATA_TYPE_NUM,
 };
 
@@ -70,8 +89,13 @@ inline uint64_t get_element_size(DataType dtype) {
         2,  // DataType::UINT16
         4,  // DataType::UINT32
         1,  // DataType::BOOL
+        1,  // DataType::FP8E4M3FN (A5 only)
+        1,  // DataType::FP8E8M0 (A5 only)
+        1,  // DataType::FP4E2M1 (A5 only)
     };
-    return data_type_size[static_cast<int>(dtype)];
+    // Bounds-checked: `dtype` is a raw u8 on the wire, so a decoder can hand this any value.
+    const auto index = static_cast<std::size_t>(dtype);
+    return index < data_type_size.size() ? data_type_size[index] : 0;
 }
 
 /**
@@ -106,6 +130,12 @@ inline const char *get_dtype_name(DataType dtype) {
         return "UINT32";
     case DataType::BOOL:
         return "BOOL";
+    case DataType::FP8E4M3FN:  // A5 only
+        return "FP8E4M3FN";
+    case DataType::FP8E8M0:  // A5 only
+        return "FP8E8M0";
+    case DataType::FP4E2M1:  // A5 only
+        return "FP4E2M1";
     default:
         return "UNKNOWN";
     }

@@ -32,23 +32,24 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 1,
     };
 }
 
-static void submit_spmd_aiv(int32_t kernel_id, const Tensor &out, int16_t block_num, int64_t base_cl) {
-    L0TaskArgs args;
+static void submit_spmd_aiv(int32_t kernel_id, const ChipTensor &out, int16_t block_num, int64_t base_cl) {
+    CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_core_num(block_num);
     rt_submit_aiv_task(kernel_id, args);
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
-    const Tensor &ext_output = orch_args.tensor(0).ref();
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
+    const ChipTensor &ext_output = orch_args.tensor(0).ref();
 
     // T0: 4 blocks — basic multi-block
     submit_spmd_aiv(FUNC_SPMD_WRITE_AIV, ext_output, 4, 0);
@@ -65,7 +66,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     // T4: 96 blocks — two full rounds of all AIV cores
     submit_spmd_aiv(FUNC_SPMD_WRITE_AIV, ext_output, 96, 92);
 
-    LOG_INFO_V9("[spmd_multiblock_aiv] Submitted 5 AIV tasks: block_num=4,16,24,48,96");
+    LOG_INFO("[spmd_multiblock_aiv] Submitted 5 AIV tasks: block_num=4,16,24,48,96");
 }
 
 }  // extern "C"

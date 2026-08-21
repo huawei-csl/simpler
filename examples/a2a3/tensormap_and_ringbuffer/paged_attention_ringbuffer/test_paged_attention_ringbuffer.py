@@ -17,7 +17,7 @@ INOUT tensors, bfloat16, and AIC+AIV mixed execution.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 
@@ -72,7 +72,6 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
             # ring_heap is bytes per ring. Non power-of-2 sizes are accepted,
             # but 4 MiB keeps the small-ring stress intent compact.
             "config": {
-                "aicpu_thread_num": 4,
                 "runtime_env": {
                     "ring_task_window": 64,
                     "ring_heap": 4 * 1024 * 1024,
@@ -97,16 +96,16 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
         specs = []
         for name, val in inputs:
             if isinstance(val, torch.Tensor):
-                specs.append(Tensor(name, val))
+                specs.append(TensorArg(name, val))
             else:
                 specs.append(Scalar(name, val))
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):
-        tensors = {s.name: s.value for s in args.specs if isinstance(s, Tensor)}
+        tensors = {s.name: s.value for s in args.specs if isinstance(s, TensorArg)}
         _pa_compute_golden(tensors, params)
         for s in args.specs:
-            if isinstance(s, Tensor) and s.name in tensors:
+            if isinstance(s, TensorArg) and s.name in tensors:
                 getattr(args, s.name)[:] = tensors[s.name]
 
 

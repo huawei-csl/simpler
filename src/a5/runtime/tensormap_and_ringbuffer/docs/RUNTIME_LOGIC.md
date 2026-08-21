@@ -52,7 +52,8 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 - **Task storage**: `PTO2TaskDescriptor[]` in shared memory ring buffer
 - **Memory**: GM Heap ring for output buffer allocation
 - **Dependencies**: automatically derived from tensor read/write patterns via TensorMap
-- **Thread model**: 3 scheduler threads + 1 orchestrator thread on AICPU
+- **Thread model**: `aicpu_thread_num - 1` scheduler threads + 1 orchestrator
+  thread on AICPU; the common four-thread configuration uses 3 schedulers
 - **Multi-ring**: HeapRing, TaskRing, and DepPool are split into `PTO2_MAX_RING_DEPTH` (4) independent instances for nested scope isolation. See [MULTI_RING.md](MULTI_RING.md) for details.
 - **Use case**: production workloads; supports streaming, flow control, and large batch sizes
 
@@ -62,7 +63,7 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 
 Two platform implementations exist under `src/platform/`, sharing a common interface.
 
-### 2.1 a2a3 (Real Ascend Hardware)
+### 2.1 a5 (Real Ascend Hardware)
 
 | Component | Description |
 | --------- | ----------- |
@@ -72,7 +73,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | `aicpu/kernel.cpp` | `DynTileFwkBackendKernelServer` entry → `aicpu_execute` |
 | `spin_hint.h` | ARM `wfe`/`yield` instructions for efficient spinning |
 
-### 2.2 a2a3sim (Thread Simulation)
+### 2.2 a5sim (Thread Simulation)
 
 | Component | Description |
 | --------- | ----------- |
@@ -85,23 +86,27 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 
 | Constant | Value | Description |
 | -------- | ----- | ----------- |
-| `PLATFORM_MAX_BLOCKDIM` | 24 | Maximum blocks (each = 1 AIC + 2 AIV) |
-| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (3 schedulers + 1 orchestrator) |
-| `PLATFORM_MAX_AIC_PER_THREAD` | 24 | Max AIC cores per scheduler thread |
-| `PLATFORM_MAX_AIV_PER_THREAD` | 48 | Max AIV cores per scheduler thread |
-| `PLATFORM_PROF_SYS_CNT_FREQ` | 50 MHz | System counter frequency for profiling |
+| `PLATFORM_MAX_BLOCKDIM` | 36 | Maximum blocks (each = 1 AIC + 2 AIV) |
+| `PLATFORM_MAX_AICPU_THREADS` | 5 | Maximum active AICPU threads (up to 4 schedulers + 1 orchestrator) |
+| `PLATFORM_MAX_AIC_PER_THREAD` | 36 | Max AIC cores per scheduler thread |
+| `PLATFORM_MAX_AIV_PER_THREAD` | 72 | Max AIV cores per scheduler thread |
+| `PLATFORM_PROF_SYS_CNT_FREQ` | 1000 MHz | System counter frequency for profiling |
 
 ### 2.4 Host Temporary Buffer
 
 TRB bind normally allocates one device buffer per ordinary non-child tensor
 during host-side argument staging, copies input bytes as needed, records
 copy-back metadata, and frees those temporary buffers during runtime
-validation. TRB replaces those per-run malloc/free pairs with a single
-runner-scoped retained buffer that is reused across runs. This is always on for
-TRB — an internal allocation optimization, not user-facing configuration.
+validation. TRB replaces those per-run malloc/free pairs with a retained buffer
+that its runs reuse. This is always on for TRB — an internal allocation
+optimization, not user-facing configuration.
+
+The buffer is owned per pipeline slot, not per runner: TRB's task args are
+`HOST_PER_RUN`, so two runs holding different slot leases stage through
+different buffers even though they share arena bank 0 for device scratch.
 
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
-`{addr, size}` slot across runs, exposed through two HostApi callbacks —
+`{addr, size}` slot per pipeline slot, exposed through two HostApi callbacks —
 `get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
 allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
 (`RetainedTempBump`).
@@ -123,11 +128,10 @@ On each trb bind, `RetainedTempBump`:
   falls back to `device_malloc` mid-run.
 
 Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
-the retained buffer is neither freed at end of run nor per run — it lives on
-the runner and is freed once in `finalize`. If the platform leaves the slot
-callbacks null (e.g. a backend without a retained buffer), bind transparently
-falls back to per-tensor `device_malloc` (recorded as `Free` leases, freed in
-validate).
+the retained buffer is neither freed at end of run nor per run — each slot's
+buffer lives on the runner and is freed once in `finalize`. The uniform host-runtime contract
+requires the retained-buffer callbacks on every backend; bind has no
+per-tensor allocation fallback.
 
 Public device-memory APIs keep their original semantics. `device_malloc_ctx`,
 `device_free_ctx`, `Worker.malloc()`, and `Worker.free()` still allocate and
@@ -224,6 +228,11 @@ The heap ring manages output buffer allocation from a circular GM heap.
 
 **Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
 
+When an empty ring is parked at a non-zero offset and neither free arc can hold a request that fits the full
+capacity, allocation restarts at offset zero: `heap_tail` resets to zero and `heap_top` advances past the new
+allocation. Reclaim markers from tasks in the preceding coordinate space are ignored until the first post-rebase
+allocation retires.
+
 ### 4.3 Dependency List Pool
 
 A simple bump allocator for `PTO2DepListEntry` nodes used in fanin/fanout linked lists.
@@ -241,6 +250,15 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 **Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
 **TensorMap pool back-pressure**: Before STEP 4 registers a task's outputs, the orchestrator's `ensure_tensormap_capacity` reserves pool space for the inserts. When the shared entry pool is exhausted, it reclaims retired entries across all rings and spin-waits until reclaim actually frees entries, with a 500 ms wall-clock deadlock backstop (see Section 5.4).
+
+On A5, a reclaim consumer that observes no reclaim progress for 10 ms sets its
+ring bit in `publication_request_mask`. The scheduler force-publishes its exact
+local `last_task_alive` under `advance_lock` and acknowledges the request before
+the orchestrator uses the watermark for structural deadlock detection.
+TensorMap pressure requests this publication from every ring because all rings
+share one entry pool. K=16 batching is enabled only after every reclaim
+consumer is wired to the current request/ack masks; incomplete wiring keeps
+per-advance publication.
 
 This back-pressure is essential for correctness with small ring sizes — for example, with `PTO2_RING_TASK_WINDOW=16` and 208 tasks, the orchestrator blocks ~192 times, each time waiting for the scheduler to drain completed tasks before continuing.
 
@@ -329,7 +347,7 @@ This guarantees lookup only traverses valid entries — O(valid_entries_in_bucke
 
 Every time the orchestrator submits a task (Step 0 of `PTO2OrchestratorState::submit_task`), it calls `PTO2TensorMap::sync_tensormap`. When `last_task_alive` has advanced by more than `PTO2_TENSORMAP_CLEANUP_INTERVAL` (default 64) tasks since the last cleanup, `PTO2TensorMap::cleanup_retired` runs:
 
-This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`, allowing O(entries_per_task) cleanup without scanning the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
+This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each task's entries are doubly-linked together at insert time via `next_in_task`/`prev_in_task`. A slot's chain can hold more than one task's entries: a task at `local_id + N * window` reuses the slot and prepends to the chain already there, and cleanup can lag that reuse. Cleanup therefore walks the chain and frees only the entries whose `producer_task_id` matches the retiring task, unlinking each and leaving the rest linked — O(entries_in_slot), with no scan of the entire pool or all buckets. Freed entries are returned to `free_entry_list` for immediate reuse.
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
@@ -428,8 +446,8 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. This step runs **before** `payload.init()`. |
-| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues |
+| 5 | **Record fanin metadata**: store producer edges (slot pointer + `DepFlags` packed in the low bits) in `payload->fanin_inline_edges[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. Creator edges are `DEP_WAIT\|DEP_RETAIN`, tensormap-modifier edges `DEP_WAIT`. This step runs **before** `payload.init()`. |
+| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues. Only `DEP_WAIT` edges gate readiness — they count toward `fanin_count` and are linked onto the producer's `fanout_head` for completion notification. A `DEP_WAIT`-only edge releases its submit→wire retention pin **at wiring** (and on the already-completed fast path), so its producer can be CONSUMED without waiting for this consumer; a `DEP_RETAIN` edge keeps the pin until this consumer's `on_task_release`. A hypothetical `RETAIN`-only edge (none exist yet) would neither gate readiness nor link a fanout node — it only holds the lifetime pin. |
 
 > **Note**: Fanout wiring is now completed before publish in the orchestrator submit path.
 > Scheduler threads consume ready queues directly.
@@ -524,13 +542,16 @@ verified by review.
 
 ### 8.1 Thread Model
 
-With `aicpu_thread_num=4`, the AICPU runs 4 threads:
+With `aicpu_thread_num=4`, the AICPU runs 4 threads. The core counts below
+describe the 36-cluster target in §2.3; the runtime partitions the detected
+cores across the scheduler threads, so smaller SKUs use proportionally smaller
+slices.
 
 | Thread | Role | Cores |
 | ------ | ---- | ----- |
-| 0 | Scheduler | 6 AIC + ~13 AIV |
-| 1 | Scheduler | 6 AIC + ~13 AIV |
-| 2 | Scheduler | 6 AIC + ~13 AIV |
+| 0 | Scheduler | 12 AIC + 24 AIV |
+| 1 | Scheduler | 12 AIC + 24 AIV |
+| 2 | Scheduler | 12 AIC + 24 AIV |
 | 3 | Orchestrator | none |
 
 Core assignment: AICs and AIVs are divided equally among the 3 scheduler threads.
@@ -546,7 +567,9 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 2 — Dispatch** (full model in §8.6):
 
-- For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
+- Service each source (normal ready ▸ speculative early) in occupancy order — `sync_start`
+  Tier-0 ▸ MIX ▸ AIC/AIV, idle ▸ pending — popping from the matching shape-based ready queue
+  (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE` (DMB offset `0xD0` on a5)
 - After normal ready queues are empty, Phase **4b** may stage speculative early-dispatch candidates onto spare slots (`early_dispatch_queues[]` / `early_sync_start_queue`)
@@ -557,13 +580,14 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (`MIX` / `AIC` / `AIV` in the production tensormap path)
-- **Push**: any thread (orchestrator via wiring, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
+- One `PTO2ReadyQueue` per resource shape — 3 shapes (`PTO2_NUM_RESOURCE_SHAPES`): `MIX`
+  (AIC+AIV cluster), `AIC`, `AIV`. Alongside `ready_queues[]` there is a per-shape
+  `ready_sync_queues[]` (sync_start Tier-0) and the speculative `early_dispatch_queues[]` /
+  `early_sync_start_queue` — see §8.6 for the full source × tier model.
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()` (sync_start cohorts to the sync lane)
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
-
-Unlike a2a3, a5 does **not** keep a separate `ready_sync_queues[]` tier: ready `require_sync_start` cohorts share `ready_queues[]`. Speculative sync_start early candidates still use the dedicated `early_sync_start_queue` (see §8.6).
 
 ### 8.4 Watermark Advancement (last_task_alive)
 
@@ -575,10 +599,16 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
         if task_state[la & mask] < CONSUMED: break
         reset slot for reuse
         la++
-    sync_to_sm()  // release-store last_task_alive
+    if force_publish or la - last_published_to_sm >= 16 or la == current_task_index:
+        sync_to_sm()  // release-store last_task_alive
 ```
 
-This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time.
+This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time. A scheduler thread that changes a ring head to `CONSUMED` but loses this try-lock sets the ring bit in `advance_pending_mask`; no-progress loops drain that mask. An orchestrator reclaim consumer with no reclaim progress for 10 ms instead sets `publication_request_mask`. Scheduler thread 0 drains only that request mask in both productive and no-progress iterations, force-publishes the exact watermark, and sets the matching bit in `publication_ack_mask`. The two masks occupy separate cache lines, so scheduler lock contention neither triggers acknowledgments nor invalidates the productive-loop request poll. Runtime wiring, relocation, and reuse enable K=16 batching only after the allocator, fanin pool, and dependency pool all point to the current masks; otherwise `sync_to_sm()` publishes each advance.
+
+For ring-heap stall triage, a set request bit means no retry has yet acquired
+`advance_lock`. A matching acknowledgment means the published
+`last_task_alive` was synchronized with scheduler-local reclamation; only that
+acknowledged value is eligible for the exact open-scope head check.
 
 ### 8.5 SchedulerContext
 
@@ -609,51 +639,70 @@ Private internals are split across three .cpp files by responsibility:
 ### 8.6 Dispatch model — two sources, sync tiers, occupancy order
 
 `resolve_and_dispatch` places ready and speculative work onto AICore cores under one
-occupancy model (ported from a2a3 early-dispatch; a5 specifics called out below). Two
-orthogonal axes decide *what* runs and *where*:
+occupancy model. Two orthogonal axes decide *what* runs and *where*:
 
 - **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
   pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; its dispatch
-  payload carries a non-zero `src_payload` gate and launches later by a high-32 doorbell on
-  `DATA_MAIN_BASE`). Normal strictly precedes early.
+  payload carries a non-zero `src_payload` gate and launches later by a doorbell). Normal
+  strictly precedes early.
 - **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
   block launches independently). "is it ready" (source) and "does it need a rendezvous"
   (cohort) are orthogonal.
 
-Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV`** (shape), and per
+Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV** (shape), and per
 shape **idle ▸ pending** (an idle core takes its running slot; a busy core takes its gated
-pending slot, promoted on completion). a5 implements this order inline in
-`dispatch_ready_tasks` / `try_early_dispatch` (no separate `run_staging_order` helper).
+pending slot, promoted on completion). This order lives in one shared skeleton,
+`run_staging_order`; the normal and early sources differ only in the per-shape stage callback
+(pickup vs gated).
 
 #### Queues
 
 | Source | Regular lanes | sync_start lane |
 | ------ | ------------- | --------------- |
-| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | *(same `ready_queues[]` — a5 has no `ready_sync_queues[]`)* |
+| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | `ready_sync_queues[MIX\|AIC\|AIV]` (per-shape) |
 | EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
 
 A task routes to the early sync lane iff `task_attrs.requires_sync_start()`. Early
-dispatch runs only once normal `ready_queues[]` are empty **and** the local
+dispatch runs only once both normal ready lanes are empty **and** the local
 `CoreTracker` has a spare slot (`has_any_free_slot`, a2a3 #1288).
 
 **Direct-only eligibility (a2a3 #1285/#1292):** a consumer is an early candidate only when
 every *direct* producer is flagged `allow_early_resolve` (slot-state hint from Arg, or
 unconditional true for hidden alloc creators). There is no auto-chain inheritance.
 
-#### sync_start drain + rendezvous
+#### sync_start local stage, drain fallback, and rendezvous
 
-A sync_start cohort of `block_num` cores must occupy all its cores before any of them run.
-When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
+A sync_start cohort of `block_num` blocks must occupy all its cores before any of them run.
+An early Tier-0 pop first claims the cohort's task-local staging owner, then chooses one of
+two all-or-nothing cases:
 
-1. **Single election** — a CAS on `sync_start_pending` makes drains mutually exclusive.
-2. **All-or-nothing** — the elected thread checks global available capacity ≥ `block_num`
-   before staging; if short it aborts and retries after completions free cores.
-3. **Parallel stage** — threads barrier, then each CAS-claims a block range and stages its
-   own cores with a non-zero `src_payload` gate (`drain_stage_cores`): idle → running,
-   busy → pending (`pending_gated` when still waiting for the doorbell).
-4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
-   reaches `popcount(staged_core_mask)` **and** the producer has released,
-   `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
+1. **Case A — single-owner local stage** — when the popping scheduler's own
+   `CoreTracker` has at least `block_num` compatible idle + pending slots and no global
+   drain is already published, it force-gates and stages the complete cohort locally.
+   AIC/AIV capacity is the number of idle plus pending-capable cores; MIX capacity is the
+   number of active-mask-compatible split-placement clusters. This path never writes
+   `sync_start_pending`, `drain_attempt`, or the drain ack tokens.
+2. **Case B — global drain fallback** — otherwise `enter_drain_mode` CAS-claims
+   `sync_start_pending`. Scheduler thread 0 coordinates the generation-tagged ack tree,
+   checks global capacity, and retries after completions when capacity is short. Once
+   released, every scheduler thread CAS-claims block ranges and stages only its own cores.
+3. **Shared staging** — `stage_sync_start_cores` publishes every claimed block with a
+   non-zero `src_payload` gate: idle cores → running slots, busy cores → pending slots
+   (`pending_gated` while waiting for the doorbell). It returns both logical blocks staged
+   and running-slot cores, because one MIX block may use multiple cores.
+4. **Rendezvous launch** — after the complete `staged_core_mask` is published,
+   `running_slot_count` is seeded with the staged running-slot cores. The rendezvous reads
+   that seed before the full mask; when it equals `popcount(staged_core_mask)` **and** the
+   producer has released, `maybe_rendezvous_ring` rings every gated core's doorbell
+   together — the cohort starts as one.
+
+If a global drain is published concurrently after Case A's zero check, its ack barrier
+waits until the local scheduler returns to the loop; the coordinator then observes the
+locally occupied tracker slots before making its global capacity decision.
+
+At scheduler-phase profiling level, local speculative staging is emitted as
+`EarlyDispatch` rather than being folded into the normal `Dispatch` bar. This lets the
+single-owner regression prove that the cohort was staged by Case A.
 
 Doorbell ownership is exclusive (`claim_all_staged_doorbell_bits` /
 `claim_late_staged_doorbell_bits`); launch is latched via `early_dispatch_launch_state`.
@@ -680,7 +729,8 @@ edge (#1405).
 
 #### MIX per-core placement
 
-A MIX task spans a cluster (1 AIC + 2 AIV). Gated MIX may place **per core**
+A MIX task spans a cluster (1 AIC + 2 AIV). `classify_mix_cluster` admits a cluster whenever
+every used core has a free slot; `prepare_block_for_dispatch` then places **per core**
 (`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
 skew within a block is tolerated by AICore incore synchronization.
 
@@ -769,7 +819,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
 | `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
-Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `chip_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
 scheduler/orchestrator thread starts — so it needs no cross-thread init
 handshake.

@@ -33,6 +33,16 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable
 
+from .buffer import (
+    AccessMode,
+    AddressSpace,
+    BackendKind,
+    Buffer,
+    create_host_shared_buffer,
+    intern_worker_path,
+    mint_owner_instance_id,
+    remote_backing_identity,
+)
 from .callable_identity import (
     CallableHandle,
     build_chip_callable_descriptor,
@@ -42,7 +52,22 @@ from .callable_identity import (
     parse_python_import_target,
     validate_hashid,
 )
+from .global_comm_domain import (
+    GLOBAL_DOMAIN_PROFILE_SIM,
+    GlobalDomainCommand,
+    GlobalDomainPhase,
+    GlobalDomainReleaseCommand,
+    decode_comm_init,
+    decode_copy_command,
+    decode_domain_command,
+    decode_release_command,
+    encode_comm_init_result,
+    encode_copy_result,
+    encode_descriptor_table,
+    resolve_global_comm_capability,
+)
 from .remote_l3_protocol import (
+    HOST_TCP_TRANSPORT_PROFILE,
     PROTOCOL_VERSION,
     CallableKind,
     ChipCallableBlobLocation,
@@ -56,6 +81,7 @@ from .remote_l3_protocol import (
     RemoteAddressSpace,
     RemoteRegistryTarget,
     RemoteTaskArgsWire,
+    RemoteTensorDesc,
     decode_control,
     decode_digest_callable_command,
     decode_export_buffer_request,
@@ -74,8 +100,8 @@ from .remote_l3_protocol import (
     read_frame,
     send_frame,
 )
-from .task_interface import ChipCallable, TaskArgs, Tensor
-from .worker import Worker
+from .task_interface import ChipCallable, TaskArgs
+from .worker import Worker, _NoBufferConsumerError
 
 sys.modules.setdefault("simpler.remote_l3_session", sys.modules[__name__])
 
@@ -111,25 +137,68 @@ class _RemoteBufferEntry:
     nbytes: int
     generation: int
     address_space: RemoteAddressSpace
+    owner: Worker | None = None
     offset: int = 0
     released: bool = False
+    # An imported backing's owner lives in another process, so no ``Buffer`` of this session
+    # describes it; ``_import_wire_buffer`` builds one at IMPORT_BUFFER and it is stored here.
+    wire: Buffer | None = None
+
+    def wire_buffer(self) -> Buffer:
+        """The owner-side ``Buffer`` every task arg over this backing views.
+
+        One per entry, so two args naming different sub-ranges of one backing carry one canonical
+        identity and dependency inference sees the edge between them. The descriptor spans the whole
+        entry (``nbytes`` from ``addr``); a sub-range is a ``byte_offset`` on the view, never a
+        second identity.
+        """
+        if isinstance(self.data, Buffer):
+            return self.data
+        if self.wire is None:
+            raise ValueError("remote buffer entry has no wire descriptor a task arg can name")
+        return self.wire
 
     @property
     def addr(self) -> int:
+        if isinstance(self.data, Buffer):
+            return int(self.data.base)
         if isinstance(self.data, shared_memory.SharedMemory):
             buf = self.data.buf
             assert buf is not None
             return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        if hasattr(self.data, "data_ptr"):
+            return int(self.data.data_ptr)
         return ctypes.addressof(self.data)
 
     @property
     def shm_name(self) -> str:
+        if isinstance(self.data, Buffer):
+            # Every Buffer an entry holds is POSIX_SHM-backed, and its shm name is what an importer
+            # on another worker opens.
+            assert self.data.shm is not None
+            return self.data.shm.name
         if not isinstance(self.data, shared_memory.SharedMemory):
             raise ValueError("remote buffer is not backed by SharedMemory")
         return self.data.name
 
     def close(self, *, unlink: bool = False) -> None:
+        if isinstance(self.data, Buffer):
+            # A Buffer always unlinks its own backing on close, so ``unlink`` does not apply here.
+            # Releasing through the owning Worker is what additionally drops its registry entry; a
+            # session-scoped Buffer has no such entry and closes directly.
+            owner = self.owner
+            if owner is None:
+                self.data.close()
+            else:
+                # release_buffer() can raise (the Buffer is still referenced by an in-flight run):
+                # self.owner must stay set until it actually succeeds, or a retried close() would
+                # see owner=None and fall through to self.data.close() -- bypassing the in-flight
+                # guard entirely and leaving the owner's registry entry behind.
+                owner.release_buffer(self.data)
+            self.owner = None
+            return
         if not isinstance(self.data, shared_memory.SharedMemory):
+            self.owner = None
             return
         self.data.close()
         if unlink:
@@ -149,10 +218,10 @@ def _load_import_target(target: str) -> Callable[..., Any]:
     return obj
 
 
-def _bind_listener(host: str) -> socket.socket:
+def _bind_listener(host: str, port: int = 0) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, 0))
+    sock.bind((host, int(port)))
     sock.listen(1)
     return sock
 
@@ -461,6 +530,20 @@ def _control_reply(
     send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, sequence), payload)
 
 
+def _control_result_reply(
+    conn: socket.socket,
+    manifest: dict[str, Any],
+    sequence: int,
+    control_name: ControlName,
+    version: int,
+    result: bytes,
+) -> None:
+    session_id = int(manifest["session_id"])
+    worker_id = int(manifest["worker_id"])
+    payload = encode_control_reply(sequence, control_name, version, 0, "", bytes(result))
+    send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, sequence), payload)
+
+
 def _copy_command_header(data: bytes) -> tuple[int, int, int, int, int, bytes]:
     if len(data) < 36:
         raise ValueError("remote buffer copy command is truncated")
@@ -472,59 +555,116 @@ def _buffer_key(buffer_id: int, generation: int) -> tuple[int, int]:
     return int(buffer_id), int(generation)
 
 
-def _tensor_with_data(tensor: Tensor, data: int) -> Tensor:
-    return Tensor.make(int(data), tuple(tensor.shapes), tensor.dtype, bool(tensor.child_memory))
+def _import_wire_buffer(export_desc: Any, shm_name: str, base: int) -> Buffer:
+    """The wire ``Buffer`` naming an imported backing, whose owner is another worker's process.
+
+    The backing is named by ``remote_backing_identity`` — the one rule the submitting L4's
+    ``REMOTE_SIDECAR`` placeholder also uses — so one remote backing carries one identity on both
+    sides of the hop. It is minted here, at IMPORT_BUFFER, because a local address for an imported
+    shm exists from then on and every later task over it must name the same backing.
+    """
+    return Buffer(
+        identity=remote_backing_identity(export_desc.owner_worker_id, export_desc.buffer_id, export_desc.generation),
+        owner_worker_path_id=intern_worker_path(f"remote/{int(export_desc.owner_worker_id)}"),
+        address_space=AddressSpace.HOST,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.POSIX_SHM,
+        nbytes=int(export_desc.nbytes),
+        body=shm_name.encode("utf-8"),
+        shm=None,
+        base=int(base),
+    )
 
 
-def _materialize_task_args(  # noqa: PLR0912
-    args: RemoteTaskArgsWire, buffers: dict[tuple[int, ...], _RemoteBufferEntry], worker_id: int
-) -> tuple[TaskArgs, list[Any]]:
-    if len(args.remote_desc) != len(args.tensor_metadata):
-        raise ValueError("remote TASK descriptor count does not match tensor metadata count")
+def _materialize_task_args(
+    args: RemoteTaskArgsWire,
+    buffers: dict[tuple[int, ...], _RemoteBufferEntry],
+    worker_id: int,
+    *,
+    mint_inline_buffer: Callable[[int], Buffer],
+) -> tuple[TaskArgs, list[Buffer]]:
+    """The wire ``TaskArgs`` a remote TASK's orchestration function receives.
+
+    The wire carries each argument as the submitter's own ``REMOTE_SIDECAR`` ``Tensor``: its view
+    (shapes, strides, dtype) is taken verbatim, and the sidecar names the local backing that view is
+    rebuilt over. Every element is therefore a ``Tensor`` over a backing this runner holds, so an
+    orchestration function forwards its own args to a chip child exactly as one at any other level
+    does. The returned ``Buffer`` list is the session-scoped backings minted for this task's
+    HOST_INLINE payloads; they live no longer than the run and the caller closes them once it
+    returns.
+    """
+    if len(args.remote_desc) != len(args.tensors):
+        raise ValueError("remote TASK descriptor count does not match tensor count")
     task_args = TaskArgs()
-    keepalive: list[Any] = []
+    inline_backings: list[Buffer] = []
 
-    for tensor, sidecar in zip(args.tensor_metadata, args.remote_desc):
-        materialized = tensor
-        if sidecar.present:
+    try:
+        for tensor, sidecar in zip(args.tensors, args.remote_desc):
+            if not sidecar.present:
+                raise ValueError("remote TASK tensor payload requires a RemoteTensorRef sidecar")
             desc = sidecar.desc
             if desc is None:
                 raise ValueError("remote TASK descriptor is marked present but missing")
-            if desc.nbytes != tensor.nbytes():
-                raise ValueError("remote TASK descriptor nbytes does not match tensor metadata")
+            if desc.nbytes != tensor.buffer.nbytes:
+                raise ValueError("remote TASK descriptor nbytes does not match the tensor's backing")
+            # The sidecar is the sole authority for where the view sits in the backing, so the
+            # placeholder's own descriptor spans exactly the view and its byte_offset is zero.
+            if tensor.byte_offset != 0:
+                raise ValueError("remote TASK tensor must carry no byte_offset of its own")
             if desc.address_space == RemoteAddressSpace.HOST_INLINE:
-                start = int(desc.inline_payload_offset)
-                end = start + int(desc.inline_payload_len)
-                payload = args.inline_payload[start:end]
-                if len(payload) != desc.inline_payload_len:
-                    raise ValueError("HOST_INLINE payload range exceeds inline arena")
-                buf = ctypes.create_string_buffer(payload, len(payload))
-                keepalive.append(buf)
-                materialized = _tensor_with_data(tensor, ctypes.addressof(buf))
+                backing, byte_offset = _materialize_inline_payload(args, desc, mint_inline_buffer)
+                inline_backings.append(backing)
             else:
-                if desc.owner_worker_id == worker_id and desc.address_space == RemoteAddressSpace.REMOTE_DEVICE:
-                    key = _buffer_key(desc.buffer_id, desc.generation)
-                elif desc.address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
-                    key = (desc.owner_worker_id, desc.buffer_id, desc.generation, desc.rkey_or_token)
-                else:
-                    raise ValueError(
-                        "remote TASK descriptor names a different worker without an imported buffer handle"
-                    )
-                entry = buffers.get(key)
-                if entry is None:
-                    raise KeyError("remote TASK descriptor names an unknown or stale buffer/import generation")
-                if entry.released:
-                    raise ValueError("remote TASK descriptor references a released buffer/import")
-                if desc.offset < entry.offset or desc.offset + desc.nbytes > entry.offset + entry.nbytes:
-                    raise ValueError("remote TASK descriptor range exceeds buffer/import")
-                materialized = _tensor_with_data(tensor, entry.addr + int(desc.offset - entry.offset))
-        elif tensor.nbytes() != 0:
-            raise ValueError("remote TASK tensor payload requires a RemoteTensorRef sidecar")
-        task_args.add_tensor(materialized)
+                backing, byte_offset = _resolve_session_backing(desc, buffers, worker_id)
+            task_args.add_tensor(
+                backing.tensor(tensor.shapes, tensor.dtype, strides=tensor.strides, byte_offset=byte_offset)
+            )
+    except BaseException:
+        # A rejected arg leaves the caller no list to release, so the backings minted for the args
+        # that did decode are released here.
+        for backing in inline_backings:
+            backing.close()
+        raise
 
     for scalar in args.scalars:
         task_args.add_scalar(int(scalar))
-    return task_args, keepalive
+    return task_args, inline_backings
+
+
+def _materialize_inline_payload(
+    args: RemoteTaskArgsWire,
+    desc: RemoteTensorDesc,
+    mint_inline_buffer: Callable[[int], Buffer],
+) -> tuple[Buffer, int]:
+    start = int(desc.inline_payload_offset)
+    end = start + int(desc.inline_payload_len)
+    payload = args.inline_payload[start:end]
+    if len(payload) != desc.inline_payload_len:
+        raise ValueError("HOST_INLINE payload range exceeds inline arena")
+    backing = mint_inline_buffer(len(payload))
+    ctypes.memmove(backing.base, payload, len(payload))
+    return backing, 0
+
+
+def _resolve_session_backing(
+    desc: RemoteTensorDesc,
+    buffers: dict[tuple[int, ...], _RemoteBufferEntry],
+    worker_id: int,
+) -> tuple[Buffer, int]:
+    if desc.owner_worker_id == worker_id and desc.address_space == RemoteAddressSpace.REMOTE_DEVICE:
+        key = _buffer_key(desc.buffer_id, desc.generation)
+    elif desc.address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
+        key = (desc.owner_worker_id, desc.buffer_id, desc.generation, desc.rkey_or_token)
+    else:
+        raise ValueError("remote TASK descriptor names a different worker without an imported buffer handle")
+    entry = buffers.get(key)
+    if entry is None:
+        raise KeyError("remote TASK descriptor names an unknown or stale buffer/import generation")
+    if entry.released:
+        raise ValueError("remote TASK descriptor references a released buffer/import")
+    if desc.offset < entry.offset or desc.offset + desc.nbytes > entry.offset + entry.nbytes:
+        raise ValueError("remote TASK descriptor range exceeds buffer/import")
+    return entry.wire_buffer(), int(desc.offset - entry.offset)
 
 
 def _run_command_loop(  # noqa: PLR0912, PLR0915
@@ -533,6 +673,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     inner_worker: Worker,
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
+    global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
 ) -> None:
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
@@ -544,12 +685,32 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     next_export_id = 1
     next_import_id = 1
     buffers: dict[tuple[int, ...], _RemoteBufferEntry] = {}
+    # One nonce per runner incarnation, backing the identity of every buffer this loop mints itself
+    # (the inner Worker mints its own for the ones it owns).
+    session_owner_instance_id = mint_owner_instance_id()
+    global_comm_inits: dict[str, Any] = {}
+
+    def mint_session_buffer(nbytes: int) -> Buffer:
+        """A POSIX_SHM backing this loop owns, under a buffer_id no other one in the session reuses.
+
+        Every session-minted identity draws from the one counter, so a consumer's map-once import
+        cache never sees two different backings arrive under one identity.
+        """
+        nonlocal next_buffer_id
+        buffer_id = next_buffer_id
+        next_buffer_id += 1
+        return create_host_shared_buffer(
+            int(nbytes),
+            session_owner_instance_id,
+            buffer_id=buffer_id,
+            owner_worker_path=f"remote/{worker_id}",
+        )
 
     hello = HelloPayload(
         session_id=session_id,
         worker_id=worker_id,
         protocol_version=PROTOCOL_VERSION,
-        comm_profile=str(manifest["transport"]),
+        comm_profile=str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM)),
         feature_flags=0,
         ready_state=ReadyState.READY,
     )
@@ -656,9 +817,29 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         buffer_id = next_buffer_id
                         next_buffer_id += 1
                         generation = 1
-                        buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
+                        # Either way the backing is one POSIX_SHM ``Buffer``: a canonical identity
+                        # plus a descriptor a consumer resolves by name, so a child forked at any
+                        # time can map it. The remote buffer_id above is the protocol's own handle
+                        # space and names the entry, not the Buffer's identity.
+                        try:
+                            buf = inner_worker.create_buffer(int(nbytes))
+                            entry = _RemoteBufferEntry(
+                                buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE, owner=inner_worker
+                            )
+                        except _NoBufferConsumerError:
+                            # A runner with no forked child consumes its own buffers: the
+                            # orchestration fn dereferences the mapping this process holds, which
+                            # ``_materialize_task_args`` resolves from the entry. The backing is
+                            # session-scoped instead of Worker-owned, and the loop's exit releases
+                            # it — the two lifetimes are the same process.
+                            buf = create_host_shared_buffer(
+                                int(nbytes),
+                                session_owner_instance_id,
+                                buffer_id=buffer_id,
+                                owner_worker_path=f"remote/{worker_id}",
+                            )
+                            entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
                         key = _buffer_key(buffer_id, generation)
-                        entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
                         buffers[key] = entry
                         remote_addr = entry.addr
                         result = struct.pack(
@@ -752,8 +933,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             raise ValueError("EXPORT_BUFFER names released buffer")
                         if request.offset + request.nbytes > entry.nbytes:
                             raise ValueError("EXPORT_BUFFER range exceeds buffer")
-                        if request.transport_profile not in ("", "sim"):
-                            raise ValueError("EXPORT_BUFFER transport_profile is not supported by sim")
+                        if request.transport_profile not in ("", HOST_TCP_TRANSPORT_PROFILE):
+                            raise ValueError("EXPORT_BUFFER transport_profile is not supported by host_tcp")
                         export_id = next_export_id
                         next_export_id += 1
                         result = ExportBufferResult(
@@ -768,7 +949,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             rkey_or_token=export_id,
                             ub_ldst_va=0,
                             access_flags=request.access_flags,
-                            transport_profile="sim",
+                            transport_profile=HOST_TCP_TRANSPORT_PROFILE,
                             transport_descriptor=entry.shm_name.encode("utf-8"),
                         )
                         payload = encode_control_reply(
@@ -789,20 +970,22 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         if request.importer_worker_id != worker_id:
                             raise ValueError("IMPORT_BUFFER worker mismatch")
                         export_desc = request.export_desc
-                        if export_desc.transport_profile != "sim":
-                            raise ValueError("IMPORT_BUFFER transport_profile is not supported by sim")
+                        if export_desc.transport_profile != HOST_TCP_TRANSPORT_PROFILE:
+                            raise ValueError("IMPORT_BUFFER transport_profile is not supported by host_tcp")
                         shm_name = export_desc.transport_descriptor.decode("utf-8")
                         shm = shared_memory.SharedMemory(name=shm_name)
                         import_id = next_import_id
                         next_import_id += 1
                         key = (export_desc.owner_worker_id, export_desc.buffer_id, export_desc.generation, import_id)
-                        buffers[key] = _RemoteBufferEntry(
+                        entry = _RemoteBufferEntry(
                             shm,
                             int(export_desc.nbytes),
                             int(export_desc.generation),
                             export_desc.address_space,
                             offset=int(export_desc.offset),
                         )
+                        entry.wire = _import_wire_buffer(export_desc, shm_name, entry.addr)
+                        buffers[key] = entry
                         result = ImportBufferResult(
                             importer_worker_id=worker_id,
                             owner_worker_id=export_desc.owner_worker_id,
@@ -816,7 +999,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             rkey_or_token=import_id,
                             ub_ldst_va=export_desc.ub_ldst_va,
                             access_flags=request.requested_access_flags,
-                            transport_profile="sim",
+                            transport_profile=HOST_TCP_TRANSPORT_PROFILE,
                             import_descriptor=b"",
                         )
                         payload = encode_control_reply(
@@ -846,19 +1029,143 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         _control_reply(
                             conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                         )
-                    elif control.control_name in (
-                        ControlName.COMM_INIT,
-                        ControlName.ALLOC_DOMAIN,
-                        ControlName.RELEASE_DOMAIN,
-                    ):
+                    elif control.control_name == ControlName.COMM_INIT:
+                        command = decode_comm_init(control.command_bytes)
+                        manifest_profile = str(manifest.get("comm_profile", GLOBAL_DOMAIN_PROFILE_SIM))
+                        if command.cluster_id != str(manifest.get("cluster_id", "")):
+                            raise ValueError("COMM_INIT cluster_id does not match the session manifest")
+                        if command.profile != manifest_profile:
+                            raise ValueError("COMM_INIT profile does not match the session manifest")
+                        if command.node_rank != int(manifest.get("node_rank", 0)) or command.node_count != int(
+                            manifest.get("node_count", 1)
+                        ):
+                            raise ValueError("COMM_INIT node identity does not match the session manifest")
+                        global_ranks = tuple(int(rank) for rank in manifest.get("global_device_ranks", ()))
+                        local_members = tuple(
+                            member for member in command.members if member.node_worker_id == worker_id
+                        )
+                        if not local_members:
+                            raise ValueError("COMM_INIT topology has no local members")
+                        for member in local_members:
+                            if member.local_worker_id < 0 or member.local_worker_id >= len(global_ranks):
+                                raise ValueError("COMM_INIT local worker id exceeds the session device list")
+                            if member.global_device_rank != global_ranks[member.local_worker_id]:
+                                raise ValueError("COMM_INIT global device rank does not match the manifest")
+                        prior = global_comm_inits.get(command.topology_hash)
+                        if prior is not None and prior != command:
+                            raise ValueError("COMM_INIT topology hash conflicts with an earlier command")
+                        result = resolve_global_comm_capability(
+                            platform=str(manifest["platform"]),
+                            profile=manifest_profile,
+                            local_device_count=len(global_ranks),
+                        )
+                        global_comm_inits[command.topology_hash] = command
+                        _control_result_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            encode_comm_init_result(result),
+                        )
+                    elif control.control_name == ControlName.ALLOC_DOMAIN:
+                        command = decode_domain_command(control.command_bytes)
+                        if not any(
+                            init.profile == command.profile and init.members == command.members
+                            for init in global_comm_inits.values()
+                        ):
+                            raise RuntimeError("ALLOC_DOMAIN requires a matching COMM_INIT topology")
+                        if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
+                            if command.descriptors:
+                                raise ValueError("PREPARE_EXPORT must not carry descriptors")
+                            result = (
+                                global_domain_prepare_import(command, inner_worker, worker_id)
+                                if global_domain_prepare_import is not None
+                                else None
+                            )
+                            if result is None:
+                                descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
+                                result = encode_descriptor_table(descriptors)
+                            _control_result_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                result,
+                            )
+                        elif command.phase is GlobalDomainPhase.IMPORT:
+                            inner_worker._import_global_domain_node(command, worker_id)  # noqa: SLF001
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        elif command.phase is GlobalDomainPhase.COMMIT:
+                            inner_worker._commit_global_domain_node(command)  # noqa: SLF001
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        elif command.phase is GlobalDomainPhase.ABORT:
+                            inner_worker._release_global_domain_node(  # noqa: SLF001
+                                GlobalDomainReleaseCommand(command.domain_id, command.generation),
+                                suppress_errors=True,
+                            )
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        else:
+                            raise ValueError("ALLOC_DOMAIN phase is not supported")
+                    elif control.control_name == ControlName.RELEASE_DOMAIN:
+                        command = decode_release_command(control.command_bytes)
+                        inner_worker._release_global_domain_node(command)  # noqa: SLF001
                         _control_reply(
                             conn,
                             manifest,
                             header.sequence,
                             control.control_name,
                             control.control_version,
-                            1,
-                            f"unsupported reserved remote domain control {control.control_name.name}",
+                            0,
+                            "",
+                        )
+                    elif control.control_name == ControlName.COPY_TO_DOMAIN:
+                        command = decode_copy_command(control.command_bytes, include_data=True)
+                        inner_worker._copy_global_domain_node(command, copy_to_device=True)  # noqa: SLF001
+                        _control_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            0,
+                            "",
+                        )
+                    elif control.control_name == ControlName.COPY_FROM_DOMAIN:
+                        command = decode_copy_command(control.command_bytes, include_data=False)
+                        result = inner_worker._copy_global_domain_node(command, copy_to_device=False)  # noqa: SLF001
+                        _control_result_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            encode_copy_result(result),
                         )
                     else:
                         _control_reply(
@@ -900,11 +1207,14 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 orch_fn = dispatch_registry.get(task.callable_digest)
                 if orch_fn is None:
                     raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
-                task_args, keepalive = _materialize_task_args(task.args, buffers, worker_id)
+                task_args, inline_backings = _materialize_task_args(
+                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
+                )
                 try:
                     inner_worker.run(orch_fn, task_args, task.config)
                 finally:
-                    keepalive.clear()
+                    for backing in inline_backings:
+                        backing.close()
                 payload = encode_completion(header.sequence, 0, "")
             except BaseException as exc:  # noqa: BLE001
                 payload = encode_completion(
@@ -924,7 +1234,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
             _INNER_HANDLES.clear()
 
 
-def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
+def run_session(
+    manifest: dict[str, Any],
+    ready_fd: int | None,
+    *,
+    ready_writer: Callable[[dict[str, Any]], None] | None = None,
+    global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
+) -> int:
     inner_worker = Worker(
         level=3,
         platform=str(manifest["platform"]),
@@ -937,6 +1253,16 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     health_sock: socket.socket | None = None
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
+    ready_sent = False
+
+    def _publish_ready(payload: dict[str, Any]) -> None:
+        nonlocal ready_sent
+        if ready_writer is not None:
+            ready_writer(payload)
+        elif ready_fd is not None:
+            _send_ready(ready_fd, payload)
+        ready_sent = True
+
     try:
         # Validate the runtime command timeout wire value up front (rejects a
         # malformed session_timeout_s); the command lane itself idle-waits blocking.
@@ -962,8 +1288,10 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         inner_worker.init(_startup_deadline=startup_deadline)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
-        command_sock = _bind_listener(listen_host)
-        health_sock = _bind_listener(listen_host)
+        command_port = int(manifest.get("command_port", 0) or 0)
+        health_port = int(manifest.get("health_port", 0) or 0)
+        command_sock = _bind_listener(listen_host) if command_port == 0 else _bind_listener(listen_host, command_port)
+        health_sock = _bind_listener(listen_host) if health_port == 0 else _bind_listener(listen_host, health_port)
         health_thread = threading.Thread(
             target=_health_loop,
             args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["worker_id"])),
@@ -973,8 +1301,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
 
         command_port = int(command_sock.getsockname()[1])
         health_port = int(health_sock.getsockname()[1])
-        _send_ready(
-            ready_fd,
+        _publish_ready(
             {
                 "ok": True,
                 "command_host": str(manifest.get("connect_host", listen_host)),
@@ -1001,13 +1328,21 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         # parent closes the command socket (read_frame sees EOF).
         conn.settimeout(None)
         with conn:
-            _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)
+            _run_command_loop(
+                conn,
+                manifest,
+                inner_worker,
+                manifest_inner_handles,
+                manifest_dispatch_registry,
+                global_domain_prepare_import,
+            )
         return 0
     except BaseException as exc:  # noqa: BLE001
-        try:
-            _send_ready(ready_fd, {"ok": False, "error": _format_remote_error("remote session startup", exc)})
-        except OSError:
-            pass
+        if not ready_sent:
+            try:
+                _publish_ready({"ok": False, "error": _format_remote_error("remote session startup", exc)})
+            except OSError:
+                pass
         return 1
     finally:
         stop_health.set()

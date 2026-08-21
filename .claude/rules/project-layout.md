@@ -6,9 +6,21 @@ How this repo organizes Python packages, the build system, and example / test di
 
 | Package | Source | What's in wheel | Use for |
 | ------- | ------ | --------------- | ------- |
-| `simpler` | `python/simpler/` | `task_interface`, `worker`, `env_manager` only | Stable user API at runtime |
-| `simpler_setup` | `simpler_setup/` | All files + `_assets/{src,build/lib}` | Test framework, compilers, path resolution |
+| `simpler` | `python/simpler/` | `task_interface`, `worker`, `env_manager` only | Runtime user API: `Worker` plus the task/callable types |
+| `simpler_setup` | `simpler_setup/` | All files + `_assets/{src,build/lib}` | **Also user-facing**, not internal-only: `KernelCompiler`, `SceneTestCase` / `scene_test`, `TensorArg`, `Scalar`, `TaskArgsBuilder`, `ensure_pto_isa_root`, `make_chip_tensor_arg`, plus the `simpler_setup.tools` CLIs. A kernel cannot be compiled without it |
 | `_task_interface` | `python/bindings/` | nanobind `.so` at wheel root | Internal nanobind module |
+
+`simpler` exposes `Worker` and the `task_interface` submodule lazily (PEP 562
+`__getattr__`), so `from simpler import Worker` works while `import simpler` does
+not require the `_task_interface` extension. Importing `simpler` only configures
+the Python logger; it performs no native `dlopen`. Once `_task_interface` is
+loaded, it owns the process's host-log state. `Worker.init()` seeds that state
+before the first fork, and each host runtime module compiles a private logger
+implementation and binds it to the state during module initialization.
+`simpler.task_interface.ChipTensor` is the GM-address-bearing device descriptor
+a `ChipWorker` consumes; `simpler_setup.TensorArg` is the address-free
+scene-test arg spec `NamedTuple`. They are separate types in separate
+namespaces.
 
 The 4 files `kernel_compiler.py`, `runtime_compiler.py`, `toolchain.py`, `elf_parser.py` exist in **both** `python/simpler/` and `simpler_setup/` during transition. The `simpler_setup/` copies are authoritative; the `python/simpler/` copies are excluded from wheel via `pyproject.toml::wheel.exclude`. New code must `import` from `simpler_setup.*`, not `simpler.*`, for these four.
 

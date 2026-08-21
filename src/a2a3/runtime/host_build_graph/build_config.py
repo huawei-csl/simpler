@@ -20,11 +20,14 @@
 #
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
-# by the Tensor constructor's validation logic).
+# by the ChipTensor constructor's validation logic).
 
 BUILD_CONFIG = {
     "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
-    "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
+    "aicpu": {
+        "include_dirs": ["runtime", "common", ".."],
+        "source_dirs": ["aicpu", "runtime", "orchestration", "../../../common/host_build_graph"],
+    },
     "host": {
         "include_dirs": ["runtime", "common", ".."],
         "source_dirs": ["host", "runtime/orchestrator_core", "runtime/shared", "orchestration"],

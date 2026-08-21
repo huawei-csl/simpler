@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 from simpler import env_manager
 
@@ -23,22 +23,40 @@ from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolcha
 logger = logging.getLogger(__name__)
 
 
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
+def place_binary(
+    src: Union[str, Path], dest: Union[str, Path], post_process: Optional[Callable[[Path], None]] = None
+) -> Path:
+    """Copy `src` over `dest` atomically, preserving metadata.
 
+    `shutil.copy2` alone truncates and rewrites the destination in place, which
+    corrupts the mapping of any process that already has `dest` dlopened — the
+    fault surfaces later, as a SIGSEGV inside the dynamic linker on an unrelated
+    dlopen or at interpreter exit, far from the rewrite. Writing a sibling
+    temporary and renaming leaves the old inode intact for those processes while
+    new dlopens pick up the replacement.
 
-def _sdma_workspace_enabled() -> bool:
-    """Whether the a5 PTO SDMA workspace overlay is opted in.
+    `post_process` runs on the staged copy, before it becomes visible under
+    `dest`; a step that rewrites the artifact (`strip`) must go there rather than
+    run against `dest` afterwards, or it reintroduces the in-place rewrite.
 
-    Mirrors the CMake ``option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ... OFF)`` in
-    src/a5/platform/onboard/host/CMakeLists.txt. Set the env var of the same
-    name to a truthy value (1/ON/TRUE/YES) to enable the overlay at build time.
+    The temporary is created in `dest`'s directory so the rename stays within one
+    filesystem, which is what makes it atomic.
     """
-    return os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in _WORKSPACE_TRUTHY
-
-
-def _urma_workspace_enabled() -> bool:
-    """Whether the a5 PTO URMA workspace overlay is opted in."""
-    return os.environ.get("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "").upper() in _WORKSPACE_TRUTHY
+    src_path = Path(src)
+    dest_path = Path(dest)
+    fd, staged_name = tempfile.mkstemp(dir=str(dest_path.parent), prefix=f".{dest_path.name}.", suffix=".tmp")
+    os.close(fd)
+    staged = Path(staged_name)
+    try:
+        shutil.copy2(src_path, staged)
+        os.chmod(staged, os.stat(src_path).st_mode & 0o7777)
+        if post_process is not None:
+            post_process(staged)
+        os.replace(staged, dest_path)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return dest_path
 
 
 class BuildTarget:
@@ -75,12 +93,15 @@ class BuildTarget:
         if cmake_defines:
             for key, value in sorted(cmake_defines.items()):
                 args.append(f"-D{key}={value}")
+        # Host-compiled targets load shared project CMake modules through this
+        # stable path rather than paths relative to each target directory.
+        if self.toolchain.is_host:
+            args.append(f"-DSIMPLER_CMAKE_DIR={PROJECT_ROOT / 'cmake'}")
         # Sanitizers only apply to host-compiled targets — device toolchains
         # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
-        # runtime. cmake/sanitizers.cmake reads both defines.
+        # runtime.
         if sanitizers and self.toolchain.is_host:
             args.append(f"-DSIMPLER_SANITIZERS={sanitizers}")
-            args.append(f"-DSIMPLER_CMAKE_DIR={PROJECT_ROOT / 'cmake'}")
         if logger.isEnabledFor(logging.DEBUG):
             args.append("--log-level=VERBOSE")
         return args
@@ -99,7 +120,8 @@ class RuntimeCompiler:
     - "a2a3": ccec for aicore, aarch64 cross-compiler for aicpu, gcc for host
     - "a2a3sim": all use host gcc/g++ (builds host-compatible .so files)
 
-    Use get_instance() to get a cached instance per platform.
+    Use get_instance() to get a cached instance per platform and sanitizer
+    configuration.
     """
 
     _instances = {}
@@ -111,10 +133,11 @@ class RuntimeCompiler:
 
     @classmethod
     def get_instance(cls, platform: str = "a2a3") -> "RuntimeCompiler":
-        """Get or create a RuntimeCompiler instance for the given platform."""
-        if platform not in cls._instances:
-            cls._instances[platform] = cls(platform)
-        return cls._instances[platform]
+        """Get or create an instance for the platform/sanitizer combination."""
+        cache_key = (platform, cls._sanitizers)
+        if cache_key not in cls._instances:
+            cls._instances[cache_key] = cls(platform)
+        return cls._instances[cache_key]
 
     def __init__(self, platform: str = "a2a3"):
         self.platform = platform
@@ -170,9 +193,10 @@ class RuntimeCompiler:
         aarch64 = Aarch64GxxToolchain()
         self.aicpu_target = BuildTarget(aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
 
-        # Host: standard gcc/g++
+        # Under a sanitizer, every host consumer (onboard, sim, and global
+        # helper SOs) must use the same GCC sanitizer runtime.
         self._ensure_host_compilers()
-        host_gxx = GxxToolchain()
+        host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         self.host_target = BuildTarget(host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_a2a3sim(self):
@@ -192,15 +216,12 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
-        # The PTO async workspace overlays (SDMA / URMA) are opt-in until the
-        # CI CANN package exposes the required primitives reliably; see #1315.
-        # When either is opted in the host build embeds pto-isa headers and
-        # must use the same pinned managed checkout as a2a3 (#1351). Path is
-        # stored for RuntimeBuilder to pass as -DPTO_ISA_ROOT= (#1403).
-        if _sdma_workspace_enabled() or _urma_workspace_enabled():
-            from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+        # a5 onboard always embeds the PTO-ISA SDMA workspace. Use the pinned
+        # managed checkout so build metadata and load-time validation match
+        # the headers compiled into host_runtime (#1351, #1403).
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-            self.pto_isa_root = ensure_pto_isa_root(verbose=True)
+        self.pto_isa_root = ensure_pto_isa_root(verbose=True)
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")
@@ -210,9 +231,10 @@ class RuntimeCompiler:
         aarch64 = Aarch64GxxToolchain()
         self.aicpu_target = BuildTarget(aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
 
-        # Host: standard gcc/g++
+        # Under a sanitizer, every host consumer (onboard, sim, and global
+        # helper SOs) must use the same GCC sanitizer runtime.
         self._ensure_host_compilers()
-        host_gxx = GxxToolchain()
+        host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         self.host_target = BuildTarget(host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_a5sim(self):
@@ -255,6 +277,7 @@ class RuntimeCompiler:
         build_dir: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
         dispatcher_dest: Optional[Union[str, Path]] = None,
+        sdma_warmup_dest: Optional[Union[str, Path]] = None,
         cmake_defines: Optional[dict[str, str]] = None,
     ) -> Union[bytes, Path]:
         """
@@ -273,6 +296,11 @@ class RuntimeCompiler:
                         When None, the dispatcher SO is not exported. Used by
                         runtime_builder to share one dispatcher SO across all
                         runtimes for a given arch.
+            sdma_warmup_dest: Directory to stage sdma_warmup_kernel.o into. Only
+                        consumed when target_platform == 'aicore' (the aicore
+                        CMakeLists builds the vector-only warmup ELF as a side
+                        product). When None, or when the arch does not build the
+                        warmup ELF at all, nothing is exported.
             cmake_defines: Additional CMake cache definitions for this target.
 
         Returns:
@@ -324,17 +352,37 @@ class RuntimeCompiler:
                     dest_dir = Path(dispatcher_dest)
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     dest_dispatcher = dest_dir / dispatcher_name
-                    shutil.copy2(dispatcher_so, dest_dispatcher)
                     # Cross-arch strip: aicpu .so is aarch64 even on x86 host;
                     # GNU strip 2.38 on Ubuntu 22.04 cannot read it. Prefer
                     # llvm-strip (multi-arch) when available.
                     strip_bin = shutil.which("llvm-strip") or shutil.which("aarch64-linux-gnu-strip") or "strip"
-                    subprocess.run([strip_bin, "-s", str(dest_dispatcher)], check=True)
+
+                    def _strip(staged: Path, strip_bin: str = strip_bin) -> None:
+                        # strip_bin is selected only from the trusted host toolchain.
+                        subprocess.run([strip_bin, "-s", str(staged)], check=True)  # noqa: S603
+
+                    place_binary(dispatcher_so, dest_dispatcher, post_process=_strip)
+            # Stage the vector-only SDMA warmup ELF the same way: it has no
+            # runtime-specific code either, so one copy per arch serves every
+            # runtime and the path is surfaced through
+            # RuntimeBinaries.sdma_warmup_path. Absent whenever the arch's aicore
+            # CMakeLists does not build it (or PTO_ISA_ROOT was unset), which the
+            # host launcher degrades on rather than failing.
+            if target_platform == "aicore" and sdma_warmup_dest is not None:
+                warmup_name = "sdma_warmup_kernel.o"
+                warmup_obj = Path(actual_build_dir) / warmup_name
+                if warmup_obj.is_file():
+                    dest_dir = Path(sdma_warmup_dest)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    place_binary(warmup_obj, dest_dir / warmup_name)
             if output_dir is not None:
                 od = Path(output_dir)
                 od.mkdir(parents=True, exist_ok=True)
                 dest = od / binary_name
-                shutil.copy2(binary_path, dest)
+                place_binary(binary_path, dest)
+                if target_platform == "host" and self.platform == "a5":
+                    topo_fallback = Path(cmake_source_dir) / "aicpu_cpu_topo_fallback.json"
+                    place_binary(topo_fallback, od / topo_fallback.name)
                 return dest
             else:
                 with open(binary_path, "rb") as f:
@@ -458,8 +506,9 @@ class RuntimeCompiler:
             ".",
             "--parallel",
             str(min(multiprocessing.cpu_count(), 32)),
-            "--verbose",
         ]
+        if logger.isEnabledFor(logging.DEBUG):
+            build_cmd.append("--verbose")
         self._run_build_step(build_cmd, build_dir, platform, "Build")
 
         # Return the path to the compiled binary
@@ -472,7 +521,7 @@ class RuntimeCompiler:
         return binary_path
 
     def _sanitizer_cmake_args(self) -> list[str]:
-        """Sanitizer defines for the standalone host helper SOs (log, sim_context).
+        """Sanitizer defines for standalone host helper SOs such as sim_context.
 
         These are always host-compiled (g++), so they follow the host runtime's
         instrumentation; cmake/sanitizers.cmake reads both defines.
@@ -514,7 +563,7 @@ class RuntimeCompiler:
                 od = Path(output_dir)
                 od.mkdir(parents=True, exist_ok=True)
                 dest = od / binary_name
-                shutil.copy2(binary_path, dest)
+                place_binary(binary_path, dest)
                 return dest
             else:
                 with open(binary_path, "rb") as f:
@@ -527,44 +576,3 @@ class RuntimeCompiler:
             ctx_build_dir = Path(os.path.realpath(build_dir)) / "sim_context"
             os.makedirs(ctx_build_dir, exist_ok=True)
             return _build(str(ctx_build_dir))
-
-    def compile_simpler_log(
-        self,
-        build_dir: Optional[str] = None,
-        output_dir: Optional[Union[str, Path]] = None,
-    ) -> Union[bytes, Path]:
-        """Compile the standalone libsimpler_log.so (all platforms).
-
-        Single-instance host-side HostLogger. Loaded with RTLD_GLOBAL by
-        ChipWorker so every consumer .so (host_runtime, cpu_sim_context,
-        the binding) shares one HostLogger across the process.
-        """
-        cmake_source_dir = str(self.project_root / "src" / "common" / "log")
-        binary_name = "libsimpler_log.so"
-        cmake_args = self.host_target.toolchain.get_cmake_args() + self._sanitizer_cmake_args()
-
-        def _build(actual_build_dir: str) -> Union[bytes, Path]:
-            binary_path = self._run_compilation(
-                cmake_source_dir,
-                cmake_args,
-                binary_name,
-                platform="SIMPLER_LOG",
-                build_dir=actual_build_dir,
-            )
-            if output_dir is not None:
-                od = Path(output_dir)
-                od.mkdir(parents=True, exist_ok=True)
-                dest = od / binary_name
-                shutil.copy2(binary_path, dest)
-                return dest
-            else:
-                with open(binary_path, "rb") as f:
-                    return f.read()
-
-        if build_dir is None:
-            with tempfile.TemporaryDirectory(prefix="simpler_log_build_", dir="/tmp") as tmp_dir:
-                return _build(tmp_dir)
-        else:
-            log_build_dir = Path(os.path.realpath(build_dir)) / "simpler_log"
-            os.makedirs(log_build_dir, exist_ok=True)
-            return _build(str(log_build_dir))

@@ -27,7 +27,7 @@ expected, and the tail is zero on both sides.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
@@ -79,15 +79,14 @@ class TestAvailableAicoreCounts(SceneTestCase):
         {
             "name": "Default",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4},
             "params": {},
         },
     ]
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("blocks", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            Tensor("shape", torch.zeros(2, dtype=torch.int32)),
+            TensorArg("blocks", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
+            TensorArg("shape", torch.zeros(2, dtype=torch.int32)),
         )
 
     def compute_golden(self, args, params):

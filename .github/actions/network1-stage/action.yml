@@ -1,0 +1,151 @@
+name: Stage the checkout on the network1 peer
+description: >-
+  Put this run's source tree on the peer and build it there. Done once per run —
+  the tree and the venv it produces are what every network1 example then runs
+  against, so re-staging per example would repeat the job's whole cost.
+
+inputs:
+  platform:
+    description: Onboard platform to build on the peer, either a2a3 or a5.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        NETWORK1_PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        case "$NETWORK1_PLATFORM" in
+          a2a3|a5) ;;
+          *) echo "::error::unsupported network1 platform: $NETWORK1_PLATFORM"; exit 2 ;;
+        esac
+        if ! command -v rsync >/dev/null 2>&1; then
+          echo "::error::rsync is required on the network1 runner for remote checkout sync"
+          exit 1
+        fi
+
+        REMOTE_TARGET="${NETWORK1_REMOTE_USER:+$NETWORK1_REMOTE_USER@}$NETWORK1_REMOTE_HOST"
+        REMOTE_WORKDIR="$NETWORK1_REMOTE_STAGING_ROOT/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        RUN_DIR="$GITHUB_WORKSPACE/output/network1-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+        # The peer's proxy is only reachable from the peer, so its liveness
+        # check has to run there; split the address here where the parsing is
+        # readable. pip below reaches PyPI over https, so an unreachable
+        # https proxy is the one that actually stops the staging build.
+        proxy_hostport() {
+          local hostport=${1#*://} host port
+          hostport=${hostport##*@}
+          hostport=${hostport%%/*}
+          host=${hostport%:*}
+          port=${hostport##*:}
+          [ "$host" != "$port" ] || port=$2
+          printf '%s %s' "$host" "$port"
+        }
+        REMOTE_PROXY_HOST=""
+        REMOTE_PROXY_PORT=""
+        REMOTE_PROXY_HTTPS_HOST=""
+        REMOTE_PROXY_HTTPS_PORT=""
+        if [ -n "$NETWORK1_REMOTE_HTTP_PROXY" ]; then
+          read -r REMOTE_PROXY_HOST REMOTE_PROXY_PORT <<<"$(proxy_hostport "$NETWORK1_REMOTE_HTTP_PROXY" 80)"
+        fi
+        if [ -n "$NETWORK1_REMOTE_HTTPS_PROXY" ]; then
+          read -r REMOTE_PROXY_HTTPS_HOST REMOTE_PROXY_HTTPS_PORT <<<"$(proxy_hostport "$NETWORK1_REMOTE_HTTPS_PROXY" 443)"
+        fi
+
+        {
+          echo "REMOTE_TARGET=$REMOTE_TARGET"
+          echo "REMOTE_WORKDIR=$REMOTE_WORKDIR"
+          echo "RUN_DIR=$RUN_DIR"
+          echo "REMOTE_DAEMON_HOST=$NETWORK1_REMOTE_HOST"
+          echo "NETWORK1_SSH_HELPER=$RUNNER_TEMP/network1-ssh.sh"
+        } >> "$GITHUB_ENV"
+
+        echo "network1 parent=${NETWORK1_MACHINE} local=${NETWORK1_LOCAL_DEVICES} peer=${NETWORK1_REMOTE_MACHINE} remote=${NETWORK1_REMOTE_DEVICES}"
+
+        mkdir -p "$RUN_DIR"
+        mkdir -p "$HOME/.ssh"
+        chmod 700 "$HOME/.ssh"
+        touch "$HOME/.ssh/known_hosts"
+        chmod 600 "$HOME/.ssh/known_hosts"
+        ssh-keyscan -H -p "$NETWORK1_REMOTE_SSH_PORT" "$NETWORK1_REMOTE_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+
+        # SSH_OPTS is a bash array and network1_ssh a function, neither of which any
+        # step or action boundary carries, so they live in a file the rest of
+        # the job sources.
+        cat > "$RUNNER_TEMP/network1-ssh.sh" <<'HELPER'
+        SSH_OPTS=(-p "$NETWORK1_REMOTE_SSH_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+        RSYNC_SSH="ssh -p $NETWORK1_REMOTE_SSH_PORT -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+        network1_ssh() { ssh "${SSH_OPTS[@]}" "$REMOTE_TARGET" "$@"; }
+        HELPER
+        source "$RUNNER_TEMP/network1-ssh.sh"
+
+        # Each run stages a full source tree plus its own venv on the peer, so
+        # the staging root grows without a reclaim step. network1-teardown removes
+        # this run's directory, but a cancelled job is SIGKILLed and never
+        # reaches it — the age sweep is what reclaims those. The TTL must stay
+        # well above the job's timeout so a live run is never swept out from
+        # under itself.
+        network1_ssh "
+          mkdir -p '$NETWORK1_REMOTE_STAGING_ROOT'
+          find '$NETWORK1_REMOTE_STAGING_ROOT' -mindepth 1 -maxdepth 1 -type d -mtime +${NETWORK1_REMOTE_STAGING_TTL_DAYS} -exec rm -rf {} + || true
+          rm -rf '$REMOTE_WORKDIR' && mkdir -p '$REMOTE_WORKDIR'
+        "
+        rsync -a --delete -e "$RSYNC_SSH" \
+          --exclude .git --exclude .venv --exclude build --exclude output \
+          "$GITHUB_WORKSPACE/" "$REMOTE_TARGET:$REMOTE_WORKDIR/"
+
+        # The script goes to `bash -s` on stdin rather than to the peer's
+        # default shell: `pipefail` and `/dev/tcp` below are bash features, and
+        # nothing pins the peer's login shell to bash. Stdin also keeps the
+        # script one argument — ssh concatenates argv into a command string,
+        # which would re-split a multi-line `bash -c` payload on whitespace.
+        network1_ssh bash -s <<REMOTE_STAGE
+          set -eo pipefail
+          cd '$REMOTE_WORKDIR'
+          if [ -n '$REMOTE_PROXY_HOST' ] && ! (exec 3<>'/dev/tcp/$REMOTE_PROXY_HOST/$REMOTE_PROXY_PORT') 2>/dev/null; then
+            echo '::error::NETWORK1_REMOTE_HTTP_PROXY names $REMOTE_PROXY_HOST:$REMOTE_PROXY_PORT, which is not reachable from machine $NETWORK1_REMOTE_MACHINE'
+            exit 1
+          fi
+          if [ -n '$REMOTE_PROXY_HTTPS_HOST' ] && ! (exec 3<>'/dev/tcp/$REMOTE_PROXY_HTTPS_HOST/$REMOTE_PROXY_HTTPS_PORT') 2>/dev/null; then
+            echo '::error::NETWORK1_REMOTE_HTTPS_PROXY names $REMOTE_PROXY_HTTPS_HOST:$REMOTE_PROXY_HTTPS_PORT, which is not reachable from machine $NETWORK1_REMOTE_MACHINE'
+            exit 1
+          fi
+          export PYTHONPATH="\${PYTHONPATH:-}"
+          export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
+          export http_proxy='$NETWORK1_REMOTE_HTTP_PROXY' https_proxy='$NETWORK1_REMOTE_HTTPS_PROXY' no_proxy='$NETWORK1_REMOTE_NO_PROXY'
+          export HTTP_PROXY='$NETWORK1_REMOTE_HTTP_PROXY' HTTPS_PROXY='$NETWORK1_REMOTE_HTTPS_PROXY' NO_PROXY='$NETWORK1_REMOTE_NO_PROXY'
+          source '$NETWORK1_REMOTE_CANN_ENV'
+          set -u
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install --config-settings=build.targets=build_package_$NETWORK1_PLATFORM '.[test]'
+        REMOTE_STAGE
+
+        # One mpirun command line launches an L3 rank on each machine, so the
+        # interpreter must resolve at a single absolute path on both. The
+        # launcher pinned here sources CANN, enters that machine's copy of
+        # this run's tree (rank-side orchestration imports resolve from the
+        # cwd), and execs that machine's venv python. mpirun/mpi4py are
+        # machine-provisioned; tests skip when they are absent.
+        MPI_PYTHON="/tmp/simpler-network1-mpi-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        cat > "$MPI_PYTHON" <<LOCAL_LAUNCHER
+        #!/usr/bin/env bash
+        source '$NETWORK1_CANN_ENV'
+        cd '$GITHUB_WORKSPACE'
+        exec '$GITHUB_WORKSPACE/.venv/bin/python' "\$@"
+        LOCAL_LAUNCHER
+        chmod +x "$MPI_PYTHON"
+        network1_ssh "
+          cat > '$MPI_PYTHON' <<'REMOTE_LAUNCHER'
+        #!/usr/bin/env bash
+        source '$NETWORK1_REMOTE_CANN_ENV'
+        cd '$REMOTE_WORKDIR'
+        exec '$REMOTE_WORKDIR/.venv/bin/python' \"\$@\"
+        REMOTE_LAUNCHER
+          chmod +x '$MPI_PYTHON'
+        "
+        echo "NETWORK1_MPI_PYTHON=$MPI_PYTHON" >> "$GITHUB_ENV"

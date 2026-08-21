@@ -129,15 +129,15 @@ AICORE inline __gm__ T_ *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T_ *local
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *indices_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *x_norm_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *w_padded_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *idx_padded_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    __gm__ Tensor *recv_x_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *recv_w_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
-    __gm__ Tensor *recv_idx_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[6]);
-    __gm__ Tensor *recv_count_out_tensor = reinterpret_cast<__gm__ Tensor *>(args[7]);
-    __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[8]);
+    __gm__ ChipTensor *indices_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
+    __gm__ ChipTensor *x_norm_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
+    __gm__ ChipTensor *w_padded_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
+    __gm__ ChipTensor *idx_padded_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[3]);
+    __gm__ ChipTensor *recv_x_out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[4]);
+    __gm__ ChipTensor *recv_w_out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[5]);
+    __gm__ ChipTensor *recv_idx_out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[6]);
+    __gm__ ChipTensor *recv_count_out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[7]);
+    __gm__ ChipTensor *scratch_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[8]);
     int nranks = static_cast<int>(args[9]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[10]);
 
@@ -308,7 +308,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // its row loop. Flush the one cache line ([L=16,1] INT32 = 64 B) so its HBM
     // value is visible regardless of dispatch/consumer timing. (recv_x/recv_w/
     // recv_idx go out via TSTORE and need no dcci.)
-    dcci((__gm__ void *)recv_count_out, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci((__gm__ void *)recv_count_out, cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
 
     // ------------------------------------------------------------------
     // payload_push: push x / weight / idx payloads via TPUT.

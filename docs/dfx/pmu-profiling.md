@@ -65,8 +65,8 @@ SIMPLER_PMU_EVENT_TYPE=4 \
 python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-pmu
 ```
 
-`--rounds > 1` disables PMU collection in the test harness so warm-up
-rounds are not double-counted.
+`--rounds > 1` disables PMU collection in the test harness so benchmark
+rounds stay uninstrumented.
 
 ### 3.2 Output
 
@@ -315,7 +315,7 @@ reconciliation removes the temporary files. An abrupt process exit can leave
 them in the CSV directory; the next `start()` for the same output path removes
 those stale run-scoped files before collector threads launch. The
 mgmt/collector threading, buffer pooling, and `Module` trait pattern are shared
-with ArgsDump and L2Swimlane — see
+with ArgsDump and ChipSwimlane — see
 [profiling-framework.md](profiling-framework.md) for the framework reference.
 
 ### 5.3 a5 — same framework, host-shadow transport (DAV_3510, 10 counters)
@@ -333,7 +333,7 @@ a2a3). At shutdown, AICPU flushes any partially-filled buffers via
 a5's `PmuCollector` derives from
 `ProfilerBase<PmuCollector, PmuModule>` and uses the same framework
 abstractions as a2a3, including the same split mgmt + collector shard
-shape (`kMaxCollectorThreads` = `PLATFORM_MAX_AICPU_THREADS`, i.e. 7 on
+shape (`kMaxCollectorThreads` = `PLATFORM_MAX_AICPU_THREADS`, i.e. 5 on
 a5 vs 4 on a2a3, capping the shard arrays; the live drain/collector
 count is `min(aicpu_thread_num, kMaxCollectorThreads)`). The
 behavioral deviation from §5.2 is the **transport channel**: a5 has no
@@ -502,7 +502,7 @@ device-side counters.
 | Counter readout | AICPU MMIO `read_reg` | AICore MMIO `ld_dev` |
 | Per-core staging | direct write into `records[count]` | dual-issue slots, AICPU commits on FIN |
 | Buffer model | rotating pool (free + ready queues, SPSC protocol) | identical |
-| Host threads | split mgmt + collector shards, writes shard-local temp files during execution and merges at reconcile | same split mgmt + collector shards (7 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
+| Host threads | split mgmt + collector shards, writes shard-local temp files during execution and merges at reconcile | same split mgmt + collector shards (5 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
 | Host-class shape | `ProfilerBase<PmuCollector, PmuModule>` | identical |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |

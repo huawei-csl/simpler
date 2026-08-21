@@ -31,7 +31,7 @@
 
 #include <cstddef>
 #include <mutex>
-#include <set>
+#include <unordered_map>
 
 /**
  * MemoryAllocator class for managing memory allocations
@@ -92,18 +92,47 @@ public:
     int finalize();
 
     /**
+     * Forget tracked device pointers without calling the platform free API.
+     *
+     * Use only after a device reset has already invalidated every allocation,
+     * or when a fatal device state makes further runtime calls unsafe. This
+     * makes the RAII destructor a no-op while leaving healthy teardown on the
+     * normal finalize() path.
+     */
+    void abandon_after_device_failure() {
+        std::scoped_lock lk(mu_);
+        ptr_size_map_.clear();
+        committed_bytes_ = 0;
+    }
+
+    /**
      * Get number of tracked allocations
      *
      * @return Number of currently tracked pointers
      */
     size_t get_allocation_count() const {
         std::scoped_lock lk(mu_);
-        return ptr_set_.size();
+        return ptr_size_map_.size();
+    }
+
+    /**
+     * Get total bytes currently committed by this allocator
+     *
+     * Sums the requested sizes of all currently-tracked allocations. Used by
+     * downstream runtimes to account for device HBM this process has reserved
+     * (which may be invisible to aclrtGetMemInfo) when sizing their own caches.
+     *
+     * @return Sum of the requested sizes of all currently-tracked allocations
+     */
+    size_t committed_bytes() const {
+        std::scoped_lock lk(mu_);
+        return committed_bytes_;
     }
 
 private:
     mutable std::mutex mu_;
-    std::set<void *> ptr_set_;
+    std::unordered_map<void *, size_t> ptr_size_map_;
+    size_t committed_bytes_ = 0;
 };
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_

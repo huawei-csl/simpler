@@ -28,19 +28,24 @@
  *
  * Subclasses (`{a2a3,a5}::DeviceRunner`) add arch-specific state
  * (callable registry, profiling collectors, ACL/HCCL plumbing on a2a3,
- * `enable_*` flags) and the divergent methods (`run`, `finalize`,
- * `setup_static_arena`, the kernel launch / chip-callable upload, the
- * per-callable registration helpers, and the per-diagnostic `init_*`).
+ * `enable_*` flags) and the divergent methods (`prepare_execution`,
+ * `launch_execution`, `poll_execution`, `drain_execution`, `finalize`,
+ * `setup_static_arena`, the kernel launch /
+ * chip-callable upload, the per-callable registration helpers, and the
+ * per-diagnostic `init_*`).
  */
 
-#ifndef SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H
-#define SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H
+#pragma once
 
 #include <runtime/rt.h>
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -49,23 +54,27 @@
 #include <vector>
 
 #include "arg_direction.h"
+#include "call_config.h"
 #include "callable.h"
 #include "common/device_phase.h"
 #include "common/dma_workspace.h"
-#include "common/l2_swimlane_profiling.h"
+#include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
+#include "device_phase_capture.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
-#include "host/l2_swimlane_collector.h"
+#include "host/chip_swimlane_collector.h"
+#include "host/host_phase_records.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
 #include "host/args_dump_collector.h"
 #include "prepare_callable_common.h"
+#include "pto_runtime_c_api.h"
+#include "native_run_execution.h"
 
-struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
-struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
+struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
 /**
  * Common base class for both a2a3 and a5 onboard `DeviceRunner`s.
@@ -87,14 +96,56 @@ public:
     DeviceRunnerBase(DeviceRunnerBase &&) = delete;
     DeviceRunnerBase &operator=(DeviceRunnerBase &&) = delete;
 
+    /**
+     * Claim the runner for one native execution. The opaque owner and
+     * runner-owned timing and diagnostic state remain exclusive through
+     * validation/finalize.
+     */
+    bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
+    void release_native_run(const void *owner);
+    bool native_run_active() const;
+    bool native_run_owned_by(const void *owner) const;
+
+    /**
+     * Reserve caller-owned native-run storage before binding starts. A
+     * concurrent reservation is admitted only while the first reservation
+     * owns the execution claim and selects a distinct pipeline slot. A backend
+     * that shares an arena bank must reject or defer incompatible preparation
+     * before mutating that bank.
+     */
+    bool try_reserve_native_run(
+        const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
+    );
+    void release_native_run_reservation(const void *owner);
+    bool native_runs_outstanding() const;
+
+    /**
+     * Committed GM heap base of one arena bank, or 0 while that bank has never
+     * been committed. Two banks that have both served a run hold distinct
+     * device allocations; tests read this to prove the depth-two split is real
+     * rather than two names for one region.
+     */
+    uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
+
+    /**
+     * Retained temporary-buffer address held for one pipeline slot, or 0 while
+     * that slot holds none. Two slots that have both staged arguments hold
+     * distinct buffers; tests read this to prove the split is real.
+     */
+    uint64_t retained_temp_addr(uint32_t slot_id) const;
+
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
+    /** Total device HBM (bytes) currently committed by this runner's MemoryAllocator. */
+    std::size_t committed_device_memory() const { return mem_alloc_.committed_bytes(); }
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
-    void get_retained_temp_buffer(void **addr, std::size_t *size);
-    void set_retained_temp_buffer(void *addr, std::size_t size);
+    void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
+    void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
+    void *
+    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -132,24 +183,25 @@ public:
      *
      * @return 0 on success, -1 on failure.
      */
-    int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM / runtime arena base pointer.
-     * `setup_static_arena` (arch subclass) must have already committed
-     * the relevant region; otherwise returns nullptr. The runtime arena
-     * accessor is trb-only — hbg's `setup_static_arena(...,0)` leaves
-     * `runtime_arena_pool_` uncommitted and this returns nullptr.
+     * Return the pooled GM heap / PTO2 SM / runtime arena base pointer of the
+     * selected arena bank. `setup_static_arena` (arch subclass) must have
+     * already committed the relevant region on that bank; otherwise returns
+     * nullptr. The runtime arena accessor is trb-only — hbg's
+     * `setup_static_arena(...,0)` leaves the runtime pool uncommitted and this
+     * returns nullptr.
      */
-    void *acquire_pooled_gm_heap();
-    void *acquire_pooled_gm_sm();
-    void *acquire_pooled_runtime_arena();
+    void *acquire_pooled_gm_heap(uint32_t arena_bank);
+    void *acquire_pooled_gm_sm(uint32_t arena_bank);
+    void *acquire_pooled_runtime_arena(uint32_t arena_bank);
     bool lookup_prebuilt_runtime_arena_cache(
-        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
         void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
     ) const;
     void mark_prebuilt_runtime_arena_cached(
-        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     );
 
@@ -191,14 +243,14 @@ public:
     /**
      * Print handshake results from device. Reads the per-core
      * `Handshake` array out of device memory and logs it at DEBUG. Must
-     * be called after `run()` and before `finalize()`.
+     * be called after `drain_execution()` and before `finalize()`.
      */
-    void print_handshake_results();
+    void print_handshake_results(const KernelArgsHelper &kernel_args);
 
     /**
      * Take ownership of the AICPU + AICore executor binaries. Called
      * once by simpler_init at ChipWorker::init time; subsequent
-     * `run()` invocations read from `aicpu_so_binary_` /
+     * enqueue invocations read from `aicpu_so_binary_` /
      * `aicore_kernel_binary_`.
      */
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
@@ -303,8 +355,8 @@ public:
      * @return 0 on success, negative on failure.
      */
     int record_device_orch_callable(
-        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
-        size_t orch_so_size, const char *func_name, const char *config_name,
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, uint64_t chip_dev,
+        const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
@@ -319,8 +371,9 @@ public:
      * dlclose'd by `unregister_callable`. Increments `host_dlopen_total_`.
      */
     int record_host_orch_callable(
-        int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t aicore_image_hash, void *host_dlopen_handle,
+        void *host_orch_func_ptr, std::vector<std::pair<int, uint64_t>> kernel_addrs,
+        std::vector<ArgDirection> signature
     );
 
     /**
@@ -348,9 +401,16 @@ public:
      * a platform/runtime without SDMA fails fast. The provider handle is released
      * by finalize_common().
      *
+     * `sdma_warmup_binary` / `sdma_warmup_size`, when non-empty, are handed to
+     * launch_sdma_warmup_kernel() once the workspace is live. An absent or
+     * unrunnable warmup does NOT fail provisioning; a warmup whose device launch or
+     * sync fails does, and leaves the runner marked unusable.
+     *
      * @return 0 on success, negative on unsupported/failed provisioning.
      */
-    int provision_dma_workspace(uint32_t required_mask);
+    int provision_dma_workspace(
+        uint32_t required_mask, const void *sdma_warmup_binary = nullptr, size_t sdma_warmup_size = 0
+    );
 
     /**
      * Content-derived stable identity for a registered callable: the
@@ -369,7 +429,7 @@ public:
      * Publish this run's core geometry onto `Runtime` before the graph is
      * built: resolves `block_dim`, derives `num_aicore = block_dim *
      * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
-     * publishes `worker_count` / `worker_count_` / `aicpu_thread_num`,
+     * publishes the Runtime's `worker_count` / `aicpu_thread_num`,
      * and zero-initializes the handshake worker array with AIC/AIV core
      * typing (first `block_dim` cores are AIC, remaining are AIV).
      *
@@ -382,6 +442,9 @@ public:
      */
     int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
 
+    /** Latch a prepared Runtime's geometry immediately before execution. */
+    void activate_launch_shape(const Runtime &runtime);
+
     /**
      * Replay a previously-registered callable's state onto a fresh Runtime and
      * complete the per-run binding in one step. Writes back kernel addrs and
@@ -389,7 +452,7 @@ public:
      * with the CallableState-derived host_orch_func_ptr + signature (kept
      * internal to the runner rather than returned across the c_api boundary).
      *
-     * @param api               Platform device-memory hooks (g_host_api).
+     * @param api               Context-bound platform device-memory hooks.
      * @param orch_args         const ChipStorageTaskArgs* for this run (void* to
      *                          keep task_interface headers out of this header).
      * @param ring_task_window  Per-ring overrides (trb); ignored by hbg.
@@ -420,10 +483,9 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
-     * Number of run stream sets this runner has created. A set belongs to a
-     * pipeline slot and is reused for every run on that slot, so a runner that
-     * has served any number of runs on one slot reports 1. Arches whose runs
-     * use the persistent pair report 0.
+     * Number of run stream generations this runner has created. AICPU streams
+     * belong to pipeline slots, while an AICore stream is reused only for the
+     * same AICore image. Arches whose runs use the persistent pair report 0.
      */
     virtual size_t run_stream_set_create_count() const { return 0; }
 
@@ -448,27 +510,113 @@ public:
     //
     // The shared `pto_runtime_c_api` glue (`src/common/platform/onboard/host/
     // c_api_shared.cpp`) works through `DeviceRunnerBase *` and dispatches
-    // through these virtuals. Each arch's `DeviceRunner` overrides
-    // `run` and `finalize`; a2a3 and a5 both override `set_dep_gen_enabled`
-    // (an arch without dep_gen keeps the base no-op default).
+    // through these virtuals. Each arch's `DeviceRunner` overrides the
+    // enqueue/poll/drain lifecycle and `finalize`; a2a3 and a5 both override
+    // `set_dep_gen_enabled` (an arch without dep_gen keeps the base no-op
+    // default).
 
     /**
      * Whether this runner may start another run without first being finalized.
-     * The shared c_api checks this before attaching the thread or provisioning
-     * optional resources, so a poisoned runner cannot create SDMA streams on
-     * its way to the arch-specific run() fail-fast guard.
+     * The shared c_api checks this at every run boundary (prepare / launch /
+     * finalize), so a poisoned runner fails admission ahead of the arch-specific
+     * enqueue fail-fast guard.
      */
     virtual bool can_accept_run() const = 0;
 
     /**
-     * Execute a Runtime. Each arch implements its own `run()` — the bodies
-     * are too divergent for a shared implementation (FFTS / dep_gen / ACL
-     * register init on a2a3; MIX core handling on a5). See the subclass
-     * docs for the per-arch contract. `config` carries block_dim (0 = auto),
-     * aicpu_thread_num, and the diagnostic enables; each arch calls
-     * `apply_call_config(config)` at entry to latch the `enable_*_` members.
+     * An AICore launch or stream sync failed outside the per-run path. The arch
+     * runner drains what it can and flips its device-unusable flag, so the next
+     * admission fails fast and finalize() takes its fatal teardown path instead of
+     * per-resource release on a faulted card. The base default is a no-op for
+     * runners that track no such state.
      */
-    virtual int run(Runtime &runtime, const CallConfig &config) = 0;
+    virtual void recover_device_or_mark_unusable(int /*aicore_rc*/) {}
+
+    /** Invalidate retained run streams after new AICore code is published. */
+    virtual void mark_run_streams_stale() {}
+
+    /** Provision/abandon platform resources owned by one prepared native run. */
+    virtual int provision_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
+    virtual int abandon_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
+
+    struct PreparedExecution {
+        PreparedExecution(
+            const NativeRunIdentity &identity_in, Runtime &runtime_in, const CallConfig &config_in,
+            uint32_t pipeline_slot_in
+        ) :
+            identity(identity_in),
+            runtime(&runtime_in),
+            config(config_in),
+            pipeline_slot(pipeline_slot_in) {}
+        PreparedExecution(const PreparedExecution &) = delete;
+        PreparedExecution &operator=(const PreparedExecution &) = delete;
+        PreparedExecution(PreparedExecution &&other) noexcept :
+            identity(other.identity),
+            runtime(std::exchange(other.runtime, nullptr)),
+            config(other.config),
+            pipeline_slot(other.pipeline_slot),
+            num_aicore(other.num_aicore),
+            launch_aicpu_num(other.launch_aicpu_num),
+            kernel_args(std::move(other.kernel_args)),
+            resources_owned(std::exchange(other.resources_owned, false)),
+            aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)) {}
+        PreparedExecution &operator=(PreparedExecution &&) = delete;
+
+        NativeRunIdentity identity{};
+        Runtime *runtime{nullptr};
+        CallConfig config{};
+        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        int num_aicore{0};
+        int launch_aicpu_num{0};
+        KernelArgsHelper kernel_args{};
+        bool resources_owned{false};
+        bool aicore_retirement_attempted{false};
+    };
+
+    struct ActiveExecution {
+        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
+            prepared(std::move(prepared_in)),
+            progress(progress_in) {}
+        ActiveExecution(const ActiveExecution &) = delete;
+        ActiveExecution &operator=(const ActiveExecution &) = delete;
+        ActiveExecution(ActiveExecution &&) noexcept = default;
+        ActiveExecution &operator=(ActiveExecution &&) noexcept = default;
+
+        std::unique_ptr<PreparedExecution> prepared;
+        LaunchProgress progress{LaunchProgress::NotStarted};
+    };
+
+    struct LaunchOutcome {
+        int rc{-1};
+        LaunchProgress progress{LaunchProgress::NotStarted};
+        std::unique_ptr<PreparedExecution> prepared{};
+        std::unique_ptr<ActiveExecution> active{};
+        LaunchReceipt receipt{};
+
+        bool poisoned() const { return progress == LaunchProgress::Partial; }
+    };
+    /**
+     * Prepare host-owned execution state without crossing the device launch
+     * boundary. The returned object owns everything needed by launch.
+     */
+    virtual int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *prepared
+    ) = 0;
+    virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
+    virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
+
+    /**
+     * Query the active run without waiting. Returns one of the
+     * SIMPLER_NATIVE_RUN_POLL_* values.
+     */
+    virtual int poll_execution(const ActiveExecution &active) = 0;
+
+    /**
+     * Wait for the launched run, publish DFX, and release its execution
+     * resources. Called on the child progress path that performed launch.
+     */
+    virtual int drain_execution(ActiveExecution &active) = 0;
 
     /**
      * Cleanup all resources. Each arch's `finalize()` wraps
@@ -488,7 +636,7 @@ public:
 
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
-     * `run()`; thin wrapper that dispatches through `load_aicpu_op_`'s
+     * `launch_execution()`; thin wrapper that dispatches through `load_aicpu_op_`'s
      * cached `rtFuncHandle` (resolved by `LoadAicpuOp::Init` at first
      * bootstrap).
      *
@@ -531,17 +679,56 @@ public:
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
+     * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
+     * of a run does not pay it. Called from provision_dma_workspace() once the
+     * workspace is live, on `stream_aicore_`, and synchronized before returning.
+     *
+     * `binary` is a vector-only ELF, registered separately from the executor
+     * (`RT_DEV_BINARY_MAGIC_ELF_AIVEC`, its own handle) because the executor is a
+     * resident loop launched per run with a `block_dim_` that is still 0 here.
+     *
+     * Unavailability is best-effort and returns 0: an absent binary, no channels,
+     * a failed registration or allocation, and a channel that declines to warm all
+     * cost only first-call latency. A failed launch or stream sync is not, because
+     * it means an AICore operation faulted on this card; that marks the runner
+     * unusable and returns the error so the caller does not hand a poisoned device
+     * to the first run.
+     *
+     * @return 0 when the warmup ran or was unavailable, the device error otherwise.
+     */
+    int launch_sdma_warmup_kernel(const void *binary, size_t size);
+
+    /**
+     * Read back the warmup kernel's per-channel status slots and report how many
+     * channels came up warm, splitting the remainder into channels that declined
+     * the warmup's preconditions and channels no core reached. Takes ownership of
+     * `status_dev` and frees it. `elapsed_ms` is the launch-to-sync wall time,
+     * reported alongside the count because it is the init-time cost being traded
+     * for first-run latency.
+     */
+    void report_sdma_warmup_status(void *status_dev, uint32_t channel_count, double elapsed_ms);
+
+    /**
      * Enablement setters for the four shared diagnostics sub-features.
-     * Applied from the per-run CallConfig by `apply_call_config()` at `run()`
-     * entry; downstream `run()` paths read the corresponding `enable_*_`
+     * Applied from the per-run CallConfig by `apply_call_config()` before prepare;
+     * downstream execution paths read the corresponding `enable_*_`
      * members directly.
      *
      * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
      */
-    void set_l2_swimlane_enabled(int level) {
-        l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
-        enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
+    void set_chip_swimlane_enabled(int level) {
+        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
+        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
+    uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        host_phase_records_.finish(submitted_tasks, invocation_id);
+    }
+    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this pass's records to the swimlane reader, just before its export. */
+    void publish_host_phase_records_to_swimlane();
+    void finish_clock_correlation_session(bool capture_device_complete, bool abandon_device_resources) noexcept;
     void set_dump_args_enabled(int level) {
         dump_args_level_ = static_cast<DumpArgsLevel>(level);
         enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
@@ -554,16 +741,15 @@ public:
 
     /**
      * Latch this run's per-run diagnostic config onto the runner's `enable_*_`
-     * members before `run()` uses them. Each arch's `run()` calls this once at
-     * entry — the c_api no longer reaches in with individual set_*_enabled
-     * calls; it just threads the CallConfig through. Defined in the .cpp so this
-     * header does not need the full CallConfig definition.
+     * members before prepare uses them. The c_api applies it only when no active
+     * run can observe the runner-global collector configuration. Defined in the
+     * .cpp so this header does not need the full CallConfig definition.
      */
     void apply_call_config(const CallConfig &config);
 
     /**
      * Directory under which all diagnostic artifacts
-     * (l2_swimlane_records.json / args_dump/ / pmu.csv) land. Required
+     * (chip_swimlane_records.json / args_dump/ / pmu.csv) land. Required
      * (non-empty) when any diagnostic is enabled; `CallConfig::validate()`
      * enforces this contract upstream.
      */
@@ -633,9 +819,9 @@ protected:
      */
     int query_max_block_dim(rtStream_t stream, uint32_t *out_cube = nullptr, uint32_t *out_vector = nullptr);
 
-    // ---- run() sub-sequence helpers --------------------------------------
+    // ---- execution sub-sequence helpers ---------------------------------
     //
-    // Each arch's `run()` keeps the heavily-divergent middle (register
+    // Each arch keeps the heavily-divergent middle (register
     // address setup, profiling flag building, init_*, collector start /
     // teardown, dep_gen, ffts setup, kernel launches). These helpers
     // cover the byte-identical sub-sequences at the head and tail.
@@ -648,15 +834,23 @@ protected:
     int validate_launch_aicpu_num(int launch_aicpu_num);
 
     /**
-     * Lazy-allocate the 8-byte device-resident buffer that AICPU writes
-     * the run wall (ns) into and that `read_device_wall_ns()` pulls
-     * back after stream sync. Idempotent: a no-op once
-     * `device_wall_dev_ptr_` is non-null. Routes the alloc through
-     * `mem_alloc_`; the pointer is freed by `finalize_common()`.
-     * Failure to alloc is non-fatal (`device_wall_data_base` stays 0,
-     * subsequent `last_device_wall_ns()` reads 0).
+     * Resolve the active AICPU thread count for partial-good tolerance.
+     * requested == 0 means auto (use arch_default = 1 orch + N sched); the
+     * result is clamped to `usable` (the probed AICPU count — PG/OS cores are
+     * absent from OCCUPY) so a degraded die runs with fewer schedulers, and
+     * returns <0 if usable < 2 (need >=1 orch + >=1 sched). Returns the active
+     * total otherwise.
      */
-    void ensure_device_wall_buffer();
+    int resolve_aicpu_thread_num(int requested, int usable, int arch_default);
+
+    /**
+     * Prepare the device-phase/task-timing buffer for one run. Capture-disabled
+     * runs publish a null device base. Capture-enabled runs allocate lazily,
+     * reset every record, and publish the base for AICPU stamping. Allocation or
+     * reset failure is non-fatal; the base stays null and timing reads as 0.
+     */
+    void ensure_device_wall_buffer(KernelArgsHelper &kernel_args);
+    int arm_device_wall_buffer(KernelArgsHelper &kernel_args);
 
     /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
@@ -668,14 +862,15 @@ protected:
      * at bind time, before any stream work for the run.
      *
      * Returns the resolved block_dim on success, -1 if the ceiling was
-     * never latched. Updates `block_dim_` on success.
+     * never latched. The value is latched into runner execution state only
+     * when the prepared Runtime is launched.
      */
     int resolve_block_dim();
 
     /**
      * Rewrites each task's `function_bin_addr` from
      * `runtime.get_function_bin_addr(func_id) +
-     * CoreCallable::binary_data_offset()`. Runs inside `run()`, after the
+     * CoreCallable::binary_data_offset()`. Runs during enqueue, after the
      * bind that populates the task table.
      */
     void resolve_task_binary_addrs(Runtime &runtime);
@@ -693,16 +888,14 @@ protected:
     int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
     /**
-     * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
-     * cache it on `device_wall_ns_`. D2H copy failure is a soft warn —
-     * `device_wall_ns_` stays at 0 so `last_device_wall_ns()` returns 0
-     * to callers. No-op if `device_wall_dev_ptr_` is null (lazy alloc
-     * may have failed silently).
+     * Read and reduce the device-phase/task-timing records after stream sync.
+     * Capture-disabled runs and missing buffers leave all cached timings at 0.
+     * A D2H failure is a soft warning and also leaves timing at 0.
      */
     void read_device_wall_ns();
 
     /**
-     * H2D the Runtime struct via `kernel_args_.init_runtime_args`. Log config
+     * H2D the Runtime struct via the supplied per-execution kernel arguments. Log config
      * and device ordinal are NOT published here: they are per-device invariants
      * latched once into the AICPU SO globals by `simpler_aicpu_init`
      * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
@@ -710,11 +903,11 @@ protected:
      *
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */
-    int init_runtime_args_with_metadata(Runtime &runtime);
+    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args);
 
     /**
      * Start collector mgmt + poll threads for the four shared
-     * diagnostics collectors (`l2_swimlane_collector_`, `dump_collector_`,
+     * diagnostics collectors (`chip_swimlane_collector_`, `dump_collector_`,
      * `pmu_collector_`, `scope_stats_collector_`) that are enabled.
      * Each `start()` is gated on the corresponding `enable_*_` flag;
      * disabled collectors are not started.
@@ -730,7 +923,7 @@ protected:
      * Tear down the four shared diagnostics collectors after the launched
      * kernels have synced. Each block is gated on the corresponding
      * `enable_*_` flag and does: stop() → reconcile_counters() →
-     * export step (`l2_swimlane` writes swimlane JSON via
+     * export step (`chip_swimlane` writes swimlane JSON via
      * `read_phase_header_metadata` + `export_swimlane_json`; `dump`
      * writes dump files; `pmu` has no export step beyond reconcile;
      * `scope_stats` writes JSONL).
@@ -739,7 +932,7 @@ protected:
      * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
      * inline their own teardown after calling this helper.
      */
-    void teardown_shared_collectors_after_run();
+    void teardown_shared_collectors_after_run(bool device_execution_complete);
 
     /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`
@@ -766,6 +959,24 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
+    void release_graph_definition_buffers();
+
+    /**
+     * Drop the retained graph-definition buffers without freeing them.
+     *
+     * The fatal counterpart of release_graph_definition_buffers(): a force reset
+     * has already invalidated every allocation, so only the host-side map is
+     * cleared.
+     */
+    void abandon_graph_definition_buffers();
+
+    /**
+     * Clear host-side ownership after a fatal device failure without issuing
+     * per-resource RTS calls. The caller must first attempt a force reset.
+     */
+    int abandon_common_after_device_failure();
+
+    int finalize_common_impl(bool abandon_device_resources);
 
     /**
      * Stamp the active callable_id onto a Runtime so the AICPU knows which
@@ -806,6 +1017,7 @@ protected:
         // chip_buffer_hash, which keys the retained buffer.
         uint64_t hash{0};
         uint64_t chip_buffer_hash{0};
+        uint64_t aicore_image_hash{0};
         uint64_t dev_orch_so_addr{0};
         size_t dev_orch_so_size{0};
         std::string func_name;
@@ -839,14 +1051,20 @@ protected:
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
+    struct NativeRunReservation {
+        const void *owner{nullptr};
+        uint32_t pipeline_slot{0};
+        uint32_t arena_bank{0};
+        bool permits_prepared_successor{false};
+    };
+    mutable std::mutex native_run_mu_;
+    std::array<NativeRunReservation, PTO_PIPELINE_MAX_DEPTH> native_run_reservations_{};
+    std::atomic<const void *> active_native_run_{nullptr};
 
     // ---- State shared by both a2a3 and a5 ---------------------------------
     //
-    // `device_id_` is set once in `attach_current_thread()` (called from
-    // simpler_init during ChipWorker::init) and read on every subsequent
-    // op. All ChipWorker callers run on the same thread that called
-    // init, so plain int + the init→user happens-before edge is
-    // sufficient.
+    // `device_id_` is written once by simpler_init and is immutable while
+    // native prepare, execution, and collector threads attach to the runner.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
@@ -882,6 +1100,11 @@ protected:
     // `nullptr` in `finalize()`; CANN releases the device-side state
     // implicitly when the device context tears down.
     void *aicore_bin_handle_{nullptr};
+    // SDMA warmup ELF handle from `rtRegisterAllKernel`, kept separate from
+    // `aicore_bin_handle_` because it is a different (vector-only) binary. Only
+    // ever registered once, during provisioning. Reset the same way in
+    // `finalize()`.
+    void *sdma_warmup_bin_handle_{nullptr};
     // Dispatcher SO bytes — populated once via `set_dispatcher_binary()`
     // during simpler_init. Consumed exclusively by
     // `BootstrapDispatcher` on the first run and released by
@@ -895,22 +1118,50 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
-    // Retained temporary buffer slot for TRB device-arg staging (see HostApi
-    // get/set_retained_temp_buffer). Just a remembered {addr, size} reused
-    // across runs and freed in finalize; the grow/pack logic lives in trb bind.
-    void *retained_temp_addr_ = nullptr;
-    std::size_t retained_temp_size_ = 0;
-    DeviceArena gm_heap_arena_;
-    DeviceArena gm_sm_arena_;
-    DeviceArena runtime_arena_pool_;
+    // Retained temporary buffer for TRB device-arg staging, one per pipeline
+    // slot (see HostApi get/set_retained_temp_buffer). Just a remembered
+    // {addr, size} that the slot reuses across its runs and finalize frees;
+    // the grow/pack logic lives in trb bind.
+    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
+    std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    // One retained device block: the raw allocation plus the aligned address
+    // handed out. Backs the Graph Definition cache below.
+    struct RetainedGraphBuffer {
+        void *allocation{nullptr};
+        void *aligned_addr{nullptr};
+        std::size_t capacity{0};
+    };
+    // Graph Definition storage, one retained block per (pipeline slot,
+    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
+    // content identity rather than occurrence: every submission of one run
+    // references the same device-resident Definition.
+    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
+    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
 
-    // Cached arena sizes for `setup_static_arena`'s "fits" check — avoids
-    // re-allocating the same buffer when a later worker init asks for an
-    // equal-or-smaller layout on an already-committed arena. Reset by
-    // the subclass's `finalize()` alongside the other identity state.
-    size_t cached_gm_heap_size_{0};
-    size_t cached_gm_sm_size_{0};
-    size_t cached_runtime_arena_size_{0};
+    // One independently committed set of the three pooled device regions. A
+    // run reaches its set through the arena bank its lease selects, so
+    // preparing one bank never mutates a region the active run is executing
+    // out of. `cached_*` back `setup_static_arena`'s "fits" check: a later
+    // init asking for an equal-or-smaller layout on an already-committed
+    // arena reuses it instead of re-allocating.
+    struct ArenaBank {
+        ArenaBank(DeviceArena::AllocFn alloc, DeviceArena::FreeFn free_fn, void *ctx) :
+            gm_heap(alloc, free_fn, ctx),
+            gm_sm(alloc, free_fn, ctx),
+            runtime_pool(alloc, free_fn, ctx) {}
+
+        DeviceArena gm_heap;
+        DeviceArena gm_sm;
+        DeviceArena runtime_pool;
+        size_t cached_gm_heap_size{0};
+        size_t cached_gm_sm_size{0};
+        size_t cached_runtime_arena_size{0};
+    };
+    // Held by pointer because DeviceArena is non-copyable and non-movable, so
+    // the array cannot be brace-initialised without naming every bank.
+    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
+
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -927,16 +1178,12 @@ protected:
     // `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
-    KernelArgsHelper kernel_args_;
-
-    // Platform-level device phase buffer: device-resident
-    // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread (thread-
-    // major), whose address rides on `KernelArgs.device_wall_data_base`. AICPU
-    // stamps raw sys-counter cycles per phase through that pointer; subclass
-    // `run()` pulls it back via `read_device_wall_ns()` after stream sync and
-    // caches the per-phase ns spans for `last_device_phase_ns()` (and RunWall
-    // for `last_device_wall_ns()`). Allocated once at simpler_init, freed in the
-    // subclass `finalize()`.
+    // Platform-level device phase buffer: a header, thread-major phase records,
+    // and the optional task-timing tail. Its address rides on
+    // `KernelArgs.device_wall_data_base`. AICPU stamps raw sys-counter cycles;
+    // subclass drain always pulls back the header + phases after stream sync,
+    // and only pulls the tail when the header marks it used. Allocated lazily
+    // on the first capture-enabled run and freed in subclass `finalize()`.
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
     uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
@@ -957,22 +1204,24 @@ protected:
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
-    L2SwimlaneCollector l2_swimlane_collector_;
+    ChipSwimlaneCollector chip_swimlane_collector_;
+    // Not a collector: the pool the runtime's prepare path writes into, read by
+    // whichever per-event views the run enabled. Its two readers are gated
+    // independently, so it belongs to neither.
+    simpler::dfx::HostPhaseRecordStore host_phase_records_;
+    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
     // Enablement for the four shared diagnostics sub-features.
-    // Written by the c_api entry point via `set_*_enabled()` before
-    // `run()`, read inside `run()` and its helpers.
-    bool enable_l2_swimlane_{false};
+    // Written from CallConfig before enqueue and read by execution helpers.
+    bool enable_chip_swimlane_{false};
     bool enable_dump_args_{false};
     DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
-    L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
-    std::string output_prefix_{};                                   // diagnostic artifact root directory
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
+    std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
-
-#endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

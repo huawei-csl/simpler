@@ -11,24 +11,24 @@
 /**
  * Convenience layer over Arg: bundles a fixed-capacity dependency buffer with
  * an Arg and exposes an incremental add_dep(...) API on top of the runtime
- * primitive L0TaskArgs::set_dependencies(ptr, count).
+ * primitive CoreTaskArgs::set_dependencies(ptr, count).
  *
  * Layering:
  *   - Primitive:   Arg + set_dependencies(ptr, count) in pto_types.h.
  *                  No cap, caller owns the deps buffer.
- *   - Convenience: L0TaskArgsWithDeps<N> in this header. Owns a stack-sized dep
+ *   - Convenience: CoreTaskArgsWithDeps<N> in this header. Owns a stack-sized dep
  *                  buffer of capacity N (default 16); provides add_dep().
  *                  Submitted via the rt_submit_*_task overloads below, which
  *                  forward the bundled deps into the underlying Arg.
  *
  * This file is auto-included at the bottom of pto_orchestration_api.h so
- * orchestration sources see L0TaskArgsWithDeps after a single `#include
+ * orchestration sources see CoreTaskArgsWithDeps after a single `#include
  * "pto_orchestration_api.h"`. The split is purely organizational —
  * orchestration code should not include this header directly. Code generated
  * from pypto can ignore the convenience layer entirely and target Arg +
  * set_dependencies(ptr, count) directly.
  *
- * L0TaskArgsWithDeps uses private inheritance from Arg so that set_dependencies and
+ * CoreTaskArgsWithDeps uses private inheritance from Arg so that set_dependencies and
  * the explicit_dep* accessors are NOT reachable on a wrapper instance — users
  * who pick the convenience layer cannot accidentally mix it with the
  * primitive layer's dep API on the same object.
@@ -44,61 +44,64 @@
 #include "pto_orchestration_api.h"  // Arg, MixedKernels, rt_submit_* primitives
 
 template <size_t MAX_DEP_COUNT = 16>
-class L0TaskArgsWithDeps : private L0TaskArgs {
+class CoreTaskArgsWithDeps : private CoreTaskArgs {
 public:
-    // Tensor / scalar setters — forward to Arg
-    using L0TaskArgs::add_inout;
-    using L0TaskArgs::add_input;
-    using L0TaskArgs::add_no_dep;
-    using L0TaskArgs::add_output;
-    using L0TaskArgs::add_scalar;
-    using L0TaskArgs::add_scalars;
-    using L0TaskArgs::add_scalars_i32;
-    using L0TaskArgs::allow_early_resolve;  // early-dispatch hint (getter)
-    using L0TaskArgs::copy_scalars_from;
-    using L0TaskArgs::set_allow_early_resolve;  // early-dispatch hint (setter)
-    using L0TaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)
-    using L0TaskArgs::task_timing_slot;         // selective task-timing slot (getter)
+    // ChipTensor / scalar setters — forward to Arg
+    using CoreTaskArgs::add_inout;
+    using CoreTaskArgs::add_input;
+    using CoreTaskArgs::add_no_dep;
+    using CoreTaskArgs::add_output;
+    using CoreTaskArgs::add_scalar;
+    using CoreTaskArgs::add_scalars;
+    using CoreTaskArgs::add_scalars_i32;
+    using CoreTaskArgs::allow_early_resolve;  // early-dispatch hint (getter)
+    using CoreTaskArgs::copy_scalars_from;
+    using CoreTaskArgs::set_allow_early_resolve;  // early-dispatch hint (setter)
+    using CoreTaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)
+    using CoreTaskArgs::task_timing_slot;         // selective task-timing slot (getter)
 
     // Error / status — forward to Arg
-    using L0TaskArgs::error_msg;
-    using L0TaskArgs::has_error;
-    using L0TaskArgs::launch_spec;
-    using L0TaskArgs::set_error;
+    using CoreTaskArgs::error_msg;
+    using CoreTaskArgs::has_error;
+    using CoreTaskArgs::launch_spec;
+    using CoreTaskArgs::set_error;
 
     // NOT exposed: set_dependencies, explicit_dep_count, explicit_dep,
     // explicit_deps_data — these are the primitive-layer dep API. Users of
     // the convenience layer reach dependencies only through add_dep() below.
 
     /**
-     * Append one or more dependencies to the bundled buffer. May be called
-     * multiple times; deps accumulate. Variadic accepts any non-zero number
-     * of PTO2TaskId arguments.
+     * Append one or more RETAIN dependencies to the bundled buffer: the producer
+     * is kept alive (its slot/output buffer retained) until this consumer
+     * completes. This is the conservative default — use it when the consumer reads
+     * a tensor whose buffer the producer allocated. May be called multiple times;
+     * deps accumulate. Variadic accepts any non-zero number of PTO2TaskId args.
      *
      * Overflow (more than MAX_DEP_COUNT total) records an error on the
      * underlying Arg; the error surfaces at submit time.
      */
     template <typename... Ids>
     void add_dep(Ids... ids) {
-        static_assert(sizeof...(Ids) >= 1, "add_dep: at least one task id is required");
-        static_assert(
-            (std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
-        );
-        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT) {
-            L0TaskArgs::set_error(
-                "L0TaskArgsWithDeps::add_dep: dep count exceeds MAX_DEP_COUNT (bump the template arg)"
-            );
-            return;
-        }
-        ((deps_[count_++] = ids), ...);
+        add_dep_impl(DEP_WAIT | DEP_RETAIN, ids...);
+    }
+
+    /**
+     * Append one or more ordering-only (DEP_WAIT) dependencies: the producer is
+     * NOT retained and may be reclaimed as soon as it completes and notifies this
+     * consumer. Use this only when the consumer merely orders after the producer
+     * and does not read a buffer the producer allocated.
+     */
+    template <typename... Ids>
+    void add_dep_wait(Ids... ids) {
+        add_dep_impl(DEP_WAIT, ids...);
     }
 
     /**
      * Clear the bundled dep buffer and reset the underlying Arg.
-     * Use this to recycle an L0TaskArgsWithDeps across loop iterations.
+     * Use this to recycle an CoreTaskArgsWithDeps across loop iterations.
      */
     void reset() {
-        L0TaskArgs::reset();
+        CoreTaskArgs::reset();
         count_ = 0;
     }
 
@@ -111,32 +114,49 @@ public:
      * so a wrapper can be re-finalized (e.g. resubmitted) without tripping
      * the primitive layer's single-shot check.
      */
-    L0TaskArgs &finalize_for_submit() {
-        L0TaskArgs::set_dependencies(nullptr, 0);
-        L0TaskArgs::set_dependencies(deps_, count_);
+    CoreTaskArgs &finalize_for_submit() {
+        CoreTaskArgs::set_dependencies(nullptr, 0);
+        CoreTaskArgs::set_dependencies_with_kinds(deps_, kinds_, count_);
         return *this;
     }
 
 private:
+    template <typename... Ids>
+    void add_dep_impl(DepFlags kind, Ids... ids) {
+        static_assert(sizeof...(Ids) >= 1, "add_dep/add_dep_wait: at least one task id is required");
+        static_assert(
+            (std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...),
+            "add_dep/add_dep_wait: all arguments must be PTO2TaskId"
+        );
+        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT) {
+            CoreTaskArgs::set_error(
+                "CoreTaskArgsWithDeps::add_dep/add_dep_wait: dep count exceeds MAX_DEP_COUNT (bump the template arg)"
+            );
+            return;
+        }
+        ((kinds_[count_] = kind, deps_[count_] = ids, ++count_), ...);
+    }
+
     PTO2TaskId deps_[MAX_DEP_COUNT];
+    DepFlags kinds_[MAX_DEP_COUNT];
     uint32_t count_ = 0;
 };
 
 // =============================================================================
-// Submit overloads — accept L0TaskArgsWithDeps<N> transparently
+// Submit overloads — accept CoreTaskArgsWithDeps<N> transparently
 // =============================================================================
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, L0TaskArgsWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, CoreTaskArgsWithDeps<N> &awd) {
     return rt_submit_task(mixed_kernels, awd.finalize_for_submit());
 }
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, L0TaskArgsWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, CoreTaskArgsWithDeps<N> &awd) {
     return rt_submit_aic_task(kernel_id, awd.finalize_for_submit());
 }
 
 template <size_t N>
-static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, L0TaskArgsWithDeps<N> &awd) {
+static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, CoreTaskArgsWithDeps<N> &awd) {
     return rt_submit_aiv_task(kernel_id, awd.finalize_for_submit());
 }

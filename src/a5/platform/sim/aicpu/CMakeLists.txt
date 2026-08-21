@@ -67,6 +67,8 @@ endif()
 
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
+include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
+simpler_configure_profiling(aicpu_kernel)
 
 # TraCR
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)

@@ -321,13 +321,13 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
 template <typename DeviceRunnerT, typename RuntimeT>
 int DevAllocTraCR(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     const size_t size = sizeof(TraCR::Payload) * runtime.get_aicpu_thread_num() * TraCR::CAPACITY;
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
+    // LOG_INFO("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
     runtime.set_tracr_data(device_runner->allocate_tensor(size));
     if (runtime.get_tracr_data() == nullptr) {
         LOG_ERROR("runtime.tracrData_: alloc %zu bytes failed", size);
         return -1;
     }
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
+    // LOG_INFO("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
     runtime.set_tracr_data_sizes(device_runner->allocate_tensor(runtime.get_aicpu_thread_num() * sizeof(size_t)));
     if (runtime.get_tracr_data_sizes() == nullptr) {
         const size_t sizes_bytes = runtime.get_aicpu_thread_num() * sizeof(size_t);

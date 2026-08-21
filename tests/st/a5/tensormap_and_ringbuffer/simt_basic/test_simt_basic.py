@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """SIMT basic element-scatter: minimal AIV scatter kernel that exercises the SIMT launch path.
 
-Config: aicpu_thread_num=4, sequential identity indices.
+Config: default aicpu_thread_num (auto), sequential identity indices.
 Identity indices keep the golden trivially src-equals-out so a failure
 here points at the SIMT launch path itself (TLV injection, localMemorySize
 budget, sync) rather than at the scatter index semantics.
@@ -18,7 +18,7 @@ budget, sync) rather than at the scatter index semantics.
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 TILE_ROWS = 8
 TILE_COLS = 32
@@ -52,7 +52,6 @@ class TestSimtBasic(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5", "a5sim"],
-            "config": {"aicpu_thread_num": 4},
             "params": {},
         }
     ]
@@ -66,9 +65,9 @@ class TestSimtBasic(SceneTestCase):
         indices = torch.arange(DST_LEN, dtype=torch.int32)
         out = torch.zeros(DST_LEN, dtype=torch.float32)
         return TaskArgsBuilder(
-            Tensor("src", src),
-            Tensor("indices", indices),
-            Tensor("out", out),
+            TensorArg("src", src),
+            TensorArg("indices", indices),
+            TensorArg("out", out),
         )
 
     def compute_golden(self, args, params):

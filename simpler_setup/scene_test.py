@@ -26,17 +26,77 @@ import gc
 import inspect
 import logging
 import os
+import platform as host_platform
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .compile_pool import compile_slot, current_compile_workers
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from .pto_isa import ensure_pto_isa_root
+from .scene_test_cache import (
+    compile_artifact_key,
+    compile_incore_artifact_key,
+    get_or_compile,
+    get_or_compile_incore,
+)
 
 logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple, object] = {}
+
+
+class _DiagnosticOptions(NamedTuple):
+    chip_swimlane: int
+    dump_args: int
+    pmu: int
+    dep_gen: bool
+    scope_stats: bool
+    swimlane_overhead: bool
+
+
+def _validate_diagnostic_flags(*, chip_swimlane: int, swimlane_overhead: bool) -> None:
+    """Reject diagnostic combinations that can never produce their artifact.
+
+    Raises ``ValueError``; each CLI front-end translates it into that
+    front-end's own usage error (``parser.error`` standalone,
+    ``pytest.UsageError`` under pytest).
+    """
+    if swimlane_overhead and not chip_swimlane:
+        raise ValueError("--enable-swimlane-overhead requires --enable-chip-swimlane")
+
+
+def _effective_diagnostic_options(
+    rounds: int,
+    *,
+    chip_swimlane: int,
+    dump_args: int,
+    pmu: int,
+    dep_gen: bool,
+    scope_stats: bool,
+    swimlane_overhead: bool,
+    warn: bool = True,
+) -> _DiagnosticOptions:
+    """Return the diagnostics that may run for the requested round count."""
+    _validate_diagnostic_flags(chip_swimlane=chip_swimlane, swimlane_overhead=swimlane_overhead)
+    if rounds <= 1:
+        return _DiagnosticOptions(chip_swimlane, dump_args, pmu, dep_gen, scope_stats, swimlane_overhead)
+
+    disabled = (
+        ("chip swimlane", chip_swimlane),
+        ("args dump", dump_args),
+        ("PMU", pmu),
+        ("dep_gen", dep_gen),
+        ("scope_stats", scope_stats),
+        ("swimlane overhead", swimlane_overhead),
+    )
+    for name, enabled in disabled:
+        if warn and enabled:
+            logger.warning("%s disabled: --rounds > 1", name)
+    return _DiagnosticOptions(0, 0, 0, False, False, False)
 
 
 def _pto_isa_compile_cache_token() -> str:
@@ -51,7 +111,7 @@ def _pto_isa_compile_cache_token() -> str:
     return read_pto_isa_pin()
 
 
-def l3_compile_cache_key(qualname: str, name: str, platform: str, runtime: str) -> tuple:
+def l3_compile_cache_key(module: str, qualname: str, name: str, platform: str, runtime: str) -> tuple:
     """Session compile-cache key for an L3 orchestration entry.
 
     Every L3 compile path (scene-test ``test_run``, standalone worker, the
@@ -60,7 +120,7 @@ def l3_compile_cache_key(qualname: str, name: str, platform: str, runtime: str) 
     same kernels once per path. The pin token pins the key to the current
     pto-isa revision.
     """
-    return (qualname, name, platform, runtime, _pto_isa_compile_cache_token())
+    return (module, qualname, name, platform, runtime, _pto_isa_compile_cache_token())
 
 
 def clear_compile_cache() -> None:
@@ -78,13 +138,94 @@ def clear_compile_cache() -> None:
     gc.collect()
 
 
+# Goldens are torch reference implementations built from per-tile Python loops —
+# thousands of small slice, matmul and reduce calls per case. torch defaults its
+# intra-op pool to the core count, so on a many-core host every one of those
+# calls pays a fork/join across hundreds of threads to move a few KiB. Measured
+# on a 320-core box with qwen3_14b_decode's 40-layer golden (3584 slice ops per
+# layer): 6.35 s per layer at 320 threads against 1.05 s at 4 and 1.07 s at 8,
+# so the pool costs 5-8x more than the work. The curve is flat from 4 to 16 and
+# turns back up below 4, hence the cap below.
+#
+# Results are unaffected: the same fixture golden-computed at 320 and at 8
+# threads is bit-identical across `out`, `k_cache` and `v_cache`.
+def _class_wants_sdma(cls) -> bool:
+    """True when the SceneTestCase requests a Worker-global SDMA workspace.
+
+    ``@pytest.mark.sdma`` owns test selection and ordering. Its optional
+    ``worker_workspace=False`` argument keeps those marker semantics while the
+    test uses a platform-provisioned communication-domain workspace.
+
+    Read from ``cls.pytestmark`` rather than a pytest item so the standalone
+    ``python test_x.py`` path sees the same declaration the pytest path does.
+    """
+    for marker in getattr(cls, "pytestmark", ()):
+        if getattr(marker, "name", None) == "sdma":
+            return bool(getattr(marker, "kwargs", {}).get("worker_workspace", True))
+    return False
+
+
+_GOLDEN_MAX_THREADS = 8
+
+
+@contextmanager
+def _golden_thread_cap():
+    """Cap torch's intra-op threads for the duration of a golden computation.
+
+    Only ever lowers the limit — a caller who already asked for fewer keeps
+    theirs. Restores the previous value on the way out, including on exception,
+    so nothing else in the session inherits the cap.
+    """
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        yield
+        return
+
+    previous = torch.get_num_threads()
+    target = min(_GOLDEN_MAX_THREADS, previous)
+    if target == previous:
+        yield
+        return
+    torch.set_num_threads(target)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
 # ---------------------------------------------------------------------------
 # Spec types
 # ---------------------------------------------------------------------------
 
 
-class Tensor(NamedTuple):
-    """Tensor argument spec."""
+class SceneTestLevel(IntEnum):
+    CHIP = 2
+    NODE = 3
+    NETWORK1 = 4
+
+
+def _normalize_scene_level(level: int | SceneTestLevel) -> SceneTestLevel:
+    try:
+        return SceneTestLevel(level)
+    except ValueError as e:
+        supported = ", ".join(str(int(member)) for member in SceneTestLevel)
+        raise ValueError(f"Unsupported scene test level {level!r}; expected one of: {supported}") from e
+
+
+def scene_level(level: int | SceneTestLevel):
+    """Decorator attaching scene-test level metadata to a class or function."""
+    normalized = _normalize_scene_level(level)
+
+    def decorator(obj):
+        obj._st_level = normalized
+        return obj
+
+    return decorator
+
+
+class TensorArg(NamedTuple):
+    """Named torch.Tensor argument spec."""
 
     name: str
     value: Any  # torch.Tensor
@@ -111,9 +252,9 @@ class TaskArgsBuilder:
     Usage::
 
         args = TaskArgsBuilder(
-            Tensor("a", torch.full((N,), 2.0)),
-            Tensor("b", torch.full((N,), 3.0)),
-            Tensor("f", torch.zeros(N)),
+            TensorArg("a", torch.full((N,), 2.0)),
+            TensorArg("b", torch.full((N,), 3.0)),
+            TensorArg("f", torch.zeros(N)),
             Scalar("scale", ctypes.c_float(1.5)),
         )
         args.a  # → tensor
@@ -125,20 +266,20 @@ class TaskArgsBuilder:
         self._data: dict[str, Any] = {}
         self._has_scalar = False
         for spec in specs:
-            if isinstance(spec, Tensor):
+            if isinstance(spec, TensorArg):
                 self._add_tensor(spec)
             elif isinstance(spec, Scalar):
                 self._add_scalar(spec)
 
     def add_tensor(self, name: str, value: Any) -> None:
         """Add a tensor. Must be called before any add_scalar."""
-        self._add_tensor(Tensor(name, value))
+        self._add_tensor(TensorArg(name, value))
 
     def add_scalar(self, name: str, value: Any) -> None:
         """Add a scalar. After this, add_tensor is not allowed."""
         self._add_scalar(Scalar(name, value))
 
-    def _add_tensor(self, spec: Tensor) -> None:
+    def _add_tensor(self, spec: TensorArg) -> None:
         # Names are this container's lookup keys, so reject a bad name before any
         # mutation — a rejected add leaves the builder untouched.
         self._reject_bad_name(spec.name)
@@ -182,9 +323,9 @@ class TaskArgsBuilder:
         new._data = {}
         new._has_scalar = False
         for spec in self._specs:
-            if isinstance(spec, Tensor):
+            if isinstance(spec, TensorArg):
                 cloned = spec.value.clone() if isinstance(spec.value, torch.Tensor) else spec.value
-                new_spec = Tensor(spec.name, cloned)
+                new_spec = TensorArg(spec.name, cloned)
                 new._specs.append(new_spec)
                 new._data[spec.name] = cloned
             elif isinstance(spec, Scalar):
@@ -199,12 +340,12 @@ class TaskArgsBuilder:
 
     @property
     def specs(self) -> list:
-        """Ordered list of Tensor/Scalar specs."""
+        """Ordered list of TensorArg/Scalar specs."""
         return self._specs
 
     def tensor_names(self) -> list[str]:
         """Names of all tensor arguments, in order."""
-        return [s.name for s in self._specs if isinstance(s, Tensor)]
+        return [s.name for s in self._specs if isinstance(s, TensorArg)]
 
 
 class _RehostedTaskArgs:
@@ -213,7 +354,7 @@ class _RehostedTaskArgs:
     ``Worker.init()`` is eager: the L3 chip/sub children are forked in ``init()``,
     before ``generate_args()`` runs, so a plain post-init host tensor's raw VA is
     not in any child's address space. Each host tensor is rehosted into its own
-    ``create_host_buffer`` (born-shared, mapped into every direct child) with
+    ``create_buffer`` (a POSIX shm a child maps by canonical identity) with
     dtype / shape / value preserved, and the builder is rebound to a view over
     that buffer so multi-round reset, dispatch, and golden compare all read and
     write the same physical pages the children see.
@@ -230,8 +371,9 @@ class _RehostedTaskArgs:
 
         self._worker = worker
         self._torch = torch
-        self._buffers: list = []  # (HostBuffer, view) in creation order
+        self._buffers: list = []  # (Buffer, view) in creation order
         self._originals: dict[str, Any] = {}  # name -> pre-rehost tensor
+        self._handles: dict[str, Any] = {}  # name -> owning Buffer (for _build_l3_task_args refs)
         self._test_args = test_args
         self._reject_aliased_tensors(test_args)
         try:
@@ -240,14 +382,18 @@ class _RehostedTaskArgs:
                 # Only non-empty host tensors carry bytes across the process edge;
                 # an empty tensor is never dereferenced by the child, so it is
                 # left untouched rather than allocating a zero-length buffer.
-                if isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor) and spec.value.numel() > 0:
-                    view = self._rehost_one(spec.value)
+                if isinstance(spec, TensorArg) and isinstance(spec.value, torch.Tensor) and spec.value.numel() > 0:
+                    handle, view = self._rehost_one(spec.value)
                     self._originals[spec.name] = test_args._data[spec.name]
+                    self._handles[spec.name] = handle
                     test_args._data[spec.name] = view
-                    new_specs.append(Tensor(spec.name, view))
+                    new_specs.append(TensorArg(spec.name, view))
                 else:
                     new_specs.append(spec)
             test_args._specs = new_specs
+            # Expose the owning handles so the L3 arg builder can name each rehosted tensor as a
+            # TensorArg (handle.ref); the L2 chip builder keeps using the raw views.
+            test_args._rehost_handles = self._handles
         except BaseException:
             self.release()
             raise
@@ -259,7 +405,7 @@ class _RehostedTaskArgs:
         torch = self._torch
         ranges: list = []  # (name, lo, hi)
         for spec in test_args._specs:
-            if not (isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor)):
+            if not (isinstance(spec, TensorArg) and isinstance(spec.value, torch.Tensor)):
                 continue
             t = spec.value
             if t.numel() == 0:
@@ -289,15 +435,17 @@ class _RehostedTaskArgs:
                 "representable — build it contiguous in generate_args()"
             )
         nbytes = t.numel() * t.element_size()
-        buf = self._worker.create_host_buffer(nbytes)
+        handle = self._worker.create_buffer(nbytes)
         try:
-            view = torch.frombuffer(buf.buffer, dtype=t.dtype, count=t.numel()).view(t.shape)
+            shm = handle.shm
+            assert shm is not None
+            view = torch.frombuffer(shm.buf, dtype=t.dtype, count=t.numel()).view(t.shape)
             view.copy_(t)
         except BaseException:
-            self._worker.free_host_buffer(buf)
+            handle.close()
             raise
-        self._buffers.append((buf, view))
-        return view
+        self._buffers.append((handle, view))
+        return handle, view
 
     def release(self) -> None:
         # Restore the builder's original entries (dropping the born-shared view
@@ -305,21 +453,20 @@ class _RehostedTaskArgs:
         for name, orig in self._originals.items():
             self._test_args._data[name] = orig
         self._test_args._specs = [
-            Tensor(s.name, self._originals[s.name]) if isinstance(s, Tensor) and s.name in self._originals else s
+            TensorArg(s.name, self._originals[s.name]) if isinstance(s, TensorArg) and s.name in self._originals else s
             for s in self._test_args._specs
         ]
         self._originals.clear()
+        self._handles.clear()
+        if hasattr(self._test_args, "_rehost_handles"):
+            self._test_args._rehost_handles = {}
         while self._buffers:
-            buf, view = self._buffers.pop()
+            handle, view = self._buffers.pop()
             del view
             try:
-                buf.buffer.release()
-            except (ValueError, BufferError):
-                pass
-            try:
-                self._worker.free_host_buffer(buf)
+                handle.close()  # drops the view above, then closes + unlinks the POSIX shm
             except Exception as exc:  # noqa: BLE001 -- best-effort cleanup; a leak here must not mask the test result, but process-control exceptions still propagate
-                logger.warning("SceneTest rehost cleanup: free_host_buffer failed: %s", exc)
+                logger.warning("SceneTest rehost cleanup: handle.close failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -337,12 +484,13 @@ class CallableNamespace:
         callables.verify              # → CallableHandle
 
     Also provides ``keep()`` for lifetime management: L3 orch functions
-    that build transient Python objects (e.g. ChipStorageTaskArgs) whose
+    that build transient Python objects (e.g. a ``TaskArgs``) whose
     raw pointers are submitted to the C++ scheduler must register them
     via ``keep()`` so they outlive the scheduler drain::
 
         def run_dag(w, callables, task_args, config):
-            chip_args, _ = _build_chip_task_args(task_args, callables.vector_kernel_sig)
+            chip_args = TaskArgs()
+            chip_args.add_tensor(_rehosted_ref(task_args, "a"), TensorArgType.INPUT)
             callables.keep(chip_args)  # survive until drain finishes
             ...
     """
@@ -370,11 +518,55 @@ class CallableNamespace:
 # ---------------------------------------------------------------------------
 
 
+def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker):
+    """Build TensorArg `TaskArgs` from `TaskArgsBuilder` for the L2 `Worker.run` path.
+
+    An L2 leaf consumes its own args: `Worker.run(handle, args, cfg)` materializes each TensorArg to a
+    local base in-process. Each tensor is named via ``worker.make_tensor_arg`` (a host tensor;
+    at L2 there is no fork, so any host tensor resolves in-process); the direction tag is inert at L2
+    but set for parity with the L3 path.
+
+    Returns:
+        args: TaskArgs (TensorArg)
+        output_names: list of tensor names that are OUTPUT or INOUT
+    """
+    from simpler.task_interface import ArgDirection, TaskArgs, TensorArgType, scalar_to_uint64  # noqa: PLC0415
+
+    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
+
+    dir2tag = {
+        ArgDirection.IN: TensorArgType.INPUT,
+        ArgDirection.OUT: TensorArgType.OUTPUT_EXISTING,
+        ArgDirection.INOUT: TensorArgType.INOUT,
+    }
+    args = TaskArgs()
+    output_names: list[str] = []
+    tensor_idx = 0
+    for spec in test_args.specs:
+        if isinstance(spec, TensorArg):
+            if tensor_idx >= len(orch_signature):
+                raise ValueError(
+                    f"TensorArg '{spec.name}' at index {tensor_idx} has no matching entry in "
+                    f"orchestration signature (length {len(orch_signature)}). "
+                    f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
+                )
+            direction = orch_signature[tensor_idx]
+            args.add_tensor(make_tensor_arg(worker, spec.value), dir2tag.get(direction, TensorArgType.INPUT))
+            if direction in (ArgDirection.OUT, ArgDirection.INOUT):
+                output_names.append(spec.name)
+            tensor_idx += 1
+        elif isinstance(spec, Scalar):
+            args.add_scalar(scalar_to_uint64(spec.value))
+
+    return args, output_names
+
+
 def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     """Build `ChipStorageTaskArgs` (POD) from `TaskArgsBuilder`.
 
-    Used by the L2 path (`ChipWorker.run(callable, chip_args, config)`): the
-    chip worker expects the runtime.so ABI-shaped POD directly (no tags).
+    Used by the direct chip API (`ChipWorker._run_slot(slot, chip_args, config)`, e.g. the
+    prepared-callable tests): the chip worker expects the runtime.so ABI-shaped POD directly (no tags).
+    The `Worker.run` L2 path instead builds TensorArg args via `_build_l2_ref_args`.
 
     Returns:
         chip_args: ChipStorageTaskArgs (POD)
@@ -386,22 +578,24 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
         scalar_to_uint64,
     )
 
-    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
+    # make_chip_tensor_arg builds the chip POD (ChipTensor, carries an address) for the direct
+    # ChipWorker path — distinct from Worker.make_tensor_arg, which names a wire TensorArg.
+    from simpler_setup.torch_interop import make_chip_tensor_arg  # noqa: PLC0415
 
     chip_args = ChipStorageTaskArgs()
     output_names: list[str] = []
 
     tensor_idx = 0
     for spec in test_args.specs:
-        if isinstance(spec, Tensor):
+        if isinstance(spec, TensorArg):
             if tensor_idx >= len(orch_signature):
                 raise ValueError(
-                    f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
+                    f"TensorArg '{spec.name}' at index {tensor_idx} has no matching entry in "
                     f"orchestration signature (length {len(orch_signature)}). "
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
-            chip_args.add_tensor(make_tensor_arg(spec.value))
+            chip_args.add_tensor(make_chip_tensor_arg(spec.value))
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -411,12 +605,62 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     return chip_args, output_names
 
 
-def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
-    """Build a tagged `TaskArgs` (vector-backed, with `TensorArgType` tags) from
-    `TaskArgsBuilder`.
+def _rehosted_buffer_for(test_args: TaskArgsBuilder, tensor):
+    """The rehosted ``tensor``'s owning Buffer, matched by its backing address."""
+    base = int(tensor.data_ptr())
+    for handle in getattr(test_args, "_rehost_handles", {}).values():
+        if handle.base == base:
+            return handle
+    raise ValueError("tensor is not a rehosted arg (no create_buffer handle with a matching base)")
 
-    Used by the L3 path (`orch.submit_next_level(callable, args, config, worker=chip_id)`):
-    the orchestrator reads the tags to drive dependency inference.
+
+def _rehosted_ref_for(test_args: TaskArgsBuilder, tensor):
+    """A ``TensorArg`` over the rehosted ``tensor``'s owning handle, matched by its backing address.
+
+    Like ``_rehosted_ref`` but keyed by the (rehosted) tensor object a hand-written orch already holds,
+    rather than its name — the rehosted view's ``data_ptr`` is its create_buffer handle's base.
+    """
+    from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
+
+    handle = _rehosted_buffer_for(test_args, tensor)
+    return handle.tensor(shapes=tuple(tensor.shape), dtype=torch_dtype_to_datatype(tensor.dtype).value)
+
+
+def _l3_ref(test_args: TaskArgsBuilder, name: str, worker=None):
+    """A ``TensorArg`` naming the L3 tensor arg ``name``.
+
+    Two ways a scene test's host tensor becomes child-visible: the framework rehosts it into a
+    create_buffer (POSIX shm) — use that handle; or a test pre-allocates a ``share_memory_()`` tensor
+    before ``init()`` (fork-inherited MAP_SHARED) — name it via ``worker.make_tensor_arg`` (FORK_SHM).
+    """
+    from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
+
+    t = getattr(test_args, name)
+    dtype = torch_dtype_to_datatype(t.dtype).value
+    handle = getattr(test_args, "_rehost_handles", {}).get(name)
+    if handle is not None:
+        return handle.tensor(shapes=tuple(t.shape), dtype=dtype)
+    if worker is not None:
+        return worker.make_tensor_arg(t, shapes=tuple(t.shape), dtype=dtype)
+    raise ValueError(
+        f"L3 tensor arg '{name}' has no rehosted handle; rehost the args or pass worker= "
+        f"so it can be named via Worker.make_tensor_arg"
+    )
+
+
+def _rehosted_ref(test_args: TaskArgsBuilder, name: str):
+    """A ``TensorArg`` over the rehosted tensor ``name`` (framework rehost only). For a hand-written
+    L3 orch naming one rehosted tensor as a task arg (e.g. the chip output as a sub-task INPUT)."""
+    return _l3_ref(test_args, name, worker=None)
+
+
+def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list, worker=None):
+    """Build a tagged `TaskArgs` (Tensors) from a `TaskArgsBuilder` for the L3 path
+    (`orch.submit_next_level`); the tags drive dependency inference.
+
+    Names each tensor as a TensorArg over its framework-rehosted create_buffer handle, or — for a test
+    that pre-allocates ``share_memory_()`` tensors before ``init()`` — via ``worker.make_tensor_arg`` when
+    ``worker`` is passed.
 
     Returns:
         chip_args: TaskArgs (tagged)
@@ -429,29 +673,29 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
         scalar_to_uint64,
     )
 
-    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
-
     _DIR_TO_TAG = {
         ArgDirection.IN: TensorArgType.INPUT,
         ArgDirection.OUT: TensorArgType.OUTPUT_EXISTING,
         ArgDirection.INOUT: TensorArgType.INOUT,
     }
 
+    # Each rehosted tensor is named as a TensorArg over its owning create_buffer handle (the child
+    # maps it by canonical identity); tags drive dependency inference.
     chip_args = TaskArgs()
     output_names: list[str] = []
 
     tensor_idx = 0
     for spec in test_args.specs:
-        if isinstance(spec, Tensor):
+        if isinstance(spec, TensorArg):
             if tensor_idx >= len(orch_signature):
                 raise ValueError(
-                    f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
+                    f"TensorArg '{spec.name}' at index {tensor_idx} has no matching entry in "
                     f"orchestration signature (length {len(orch_signature)}). "
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
             tag = _DIR_TO_TAG.get(direction, TensorArgType.INPUT)
-            chip_args.add_tensor(make_tensor_arg(spec.value), tag)
+            chip_args.add_tensor(_l3_ref(test_args, spec.name, worker), tag)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -637,6 +881,20 @@ def _match_selectors(cls_name: str, case_name: str, selectors: list[tuple]) -> b
     return False
 
 
+def is_manual_for_platform(manual, platform: str | None) -> bool:
+    """Whether a case's manual value applies to the selected platform.
+
+    ``True`` keeps the original all-platform behavior. A platform name or a
+    collection of platform names moves only those executions to the manual
+    sweep while leaving the same case in Per-PR coverage elsewhere.
+    """
+    if isinstance(manual, str):
+        return manual == platform
+    if isinstance(manual, (list, tuple, set, frozenset)):
+        return platform in manual
+    return bool(manual)
+
+
 def _select_cases(test_classes, platform: str, selectors: list[tuple], manual_mode: str):
     """Resolve (class, case) pairs to run. Validates selectors strictly.
 
@@ -663,7 +921,7 @@ def _select_cases(test_classes, platform: str, selectors: list[tuple], manual_mo
                 continue
             if not _match_selectors(cls.__name__, case["name"], selectors):
                 continue
-            is_manual = bool(case.get("manual"))
+            is_manual = is_manual_for_platform(case.get("manual"), platform)
             if manual_mode == "exclude" and is_manual:
                 continue
             if manual_mode == "only" and not is_manual:
@@ -679,6 +937,19 @@ def _select_cases(test_classes, platform: str, selectors: list[tuple], manual_mo
     return selected
 
 
+def _discover_module_test_classes(module):
+    """Return scene-test classes defined by ``module``, excluding imported helpers."""
+    return [
+        value
+        for value in vars(module).values()
+        if isinstance(value, type)
+        and issubclass(value, SceneTestCase)
+        and value is not SceneTestCase
+        and value.__module__ == module.__name__
+        and hasattr(value, "CASES")
+    ]
+
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -692,7 +963,7 @@ def _build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
-    runtime writes ``l2_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
+    runtime writes ``chip_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
@@ -719,7 +990,7 @@ def _run_swimlane_converter(
 
     When ``input_path`` is given, the converter derives its output filename from
     the input's timestamp (see ``swimlane_converter._resolve_output_path``).
-    Without it, the converter auto-selects the latest ``l2_swimlane_records_*.json``.
+    Without it, the converter auto-selects the latest ``chip_swimlane_records_*.json``.
 
     ``enable_overhead`` forwards the converter's ``--overhead`` flag — adds the
     8 Overhead Analysis counter tracks (per-engine idle/ready/overhead + system
@@ -761,13 +1032,13 @@ def _convert_case_swimlane(
     enable_overhead: bool = False,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
-    just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
+    just wrote into ``<output_prefix>/chip_swimlane_records.json``. No diff/rename
     dance — the path is known a priori from CallConfig.output_prefix.
     """
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
-    perf_file = output_prefix / "l2_swimlane_records.json"
+    perf_file = output_prefix / "chip_swimlane_records.json"
     if not perf_file.exists():
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
@@ -874,7 +1145,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     sub_handles,
     rounds,
     skip_golden,
-    enable_l2_swimlane,
+    enable_chip_swimlane,
     enable_dump_args,
     enable_pmu,
     enable_dep_gen,
@@ -889,14 +1160,20 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
+    diagnostics_on = (
+        enable_chip_swimlane
+        or enable_dump_args
+        or enable_pmu
+        or enable_dep_gen
+        or enable_scope_stats
+        or enable_swimlane_overhead
+    )
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
-        # scope_stats now writes <prefix>/scope_stats/scope_stats.jsonl (sibling of
-        # l2_swimlane_records.json / deps.json), so it pulls output_prefix the
-        # same way the other DFX flags do.
+        # scope_stats writes below the per-case output prefix, so it uses the
+        # same output-prefix allocation as the other diagnostics.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
         try:
             cls_inst._run_and_validate(
@@ -906,7 +1183,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 sub_handles=sub_handles,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_l2_swimlane=enable_l2_swimlane,
+                enable_chip_swimlane=enable_chip_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -914,7 +1191,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         finally:
-            if enable_l2_swimlane:
+            if enable_chip_swimlane:
                 _convert_case_swimlane(
                     case_label,
                     prefix,
@@ -940,7 +1217,7 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
 
 
 def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
-    """Compile a chip entry spec (orchestration + incores) -> ChipCallable. Session-cached."""
+    """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``."""
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -956,36 +1233,120 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     pto_isa_root = ensure_pto_isa_root()
     kc = KernelCompiler(platform=platform)
     is_sim = platform.endswith("sim")
-
-    orch_binary = kc.compile_orchestration(runtime, orch["source"])
     inc_dirs = kc.get_orchestration_include_dirs(runtime)
-
-    kernel_binaries = []
+    orch_include_dirs, orch_sources = kc.get_orchestration_cache_inputs(runtime)
+    orch_units = [orch["source"], *orch_sources]
+    orchestration_units: list[tuple[str | Path, list[str | Path]]] = [
+        (source, orch_include_dirs) for source in orch_units
+    ]
+    resolved_extra_dirs = []
+    incore_artifact_keys = []
     for k in incores:
-        signature = k.get("signature", [])
         extra = _resolve_incore_include_dirs(k["extra_include_dirs"], k) if k.get("extra_include_dirs") else []
-        incore = kc.compile_incore(
-            k["source"],
-            core_type=k["core_type"],
-            pto_isa_root=pto_isa_root,
-            extra_include_dirs=inc_dirs + extra,
-        )
-        if not is_sim:
-            incore = extract_text_section(incore)
-        kernel_binaries.append(
-            (
-                k["func_id"],
-                CoreCallable.build(signature=signature, binary=incore),
+        resolved_extra_dirs.append(extra)
+        include_dirs = [
+            Path(pto_isa_root) / "include",
+            Path(pto_isa_root) / "include" / "pto",
+            *kc.get_incore_include_dirs(),
+            *inc_dirs,
+            *extra,
+        ]
+        incore_artifact_keys.append(
+            compile_incore_artifact_key(
+                {
+                    "platform": platform,
+                    "host_platform": sys.platform,
+                    "host_machine": host_platform.machine(),
+                    "compiler": kc.incore_compile_cache_token(k["core_type"]),
+                },
+                k["source"],
+                include_dirs,
             )
         )
-
-    chip_callable = ChipCallable.build(
-        signature=orch.get("signature", []),
-        func_name=orch["function_name"],
-        binary=orch_binary,
-        children=kernel_binaries,
-        config_name=orch.get("config_name", ""),
+    compiler_token = kc.compile_cache_token(runtime, [k["core_type"] for k in incores])
+    artifact_key = compile_artifact_key(
+        {
+            "cache_key": cache_key,
+            "platform": platform,
+            "runtime": runtime,
+            "host_platform": sys.platform,
+            "host_machine": host_platform.machine(),
+            "sanitizers": KernelCompiler._sanitizers,
+            "compiler": compiler_token,
+            "orchestration": {
+                "function_name": orch["function_name"],
+                "config_name": orch.get("config_name", ""),
+                "signature": orch.get("signature", []),
+            },
+            "incores": [
+                {
+                    "func_id": k["func_id"],
+                    "core_type": k["core_type"],
+                    "signature": k.get("signature", []),
+                    "artifact_key": incore_artifact_key,
+                }
+                for k, incore_artifact_key in zip(incores, incore_artifact_keys, strict=True)
+            ],
+        },
+        orchestration_units,
     )
+
+    def compile_callable():
+        def compile_orchestration():
+            with compile_slot():
+                return kc.compile_orchestration(runtime, orch["source"])
+
+        def compile_one_incore(k, extra, incore_artifact_key):
+            def compile_missing_incore():
+                with compile_slot():
+                    binary = kc.compile_incore(
+                        k["source"],
+                        core_type=k["core_type"],
+                        pto_isa_root=pto_isa_root,
+                        extra_include_dirs=inc_dirs + extra,
+                    )
+                # The cached representation is determined only by platform, which is in the artifact key.
+                return binary if is_sim else extract_text_section(binary)
+
+            return get_or_compile_incore(incore_artifact_key, compile_missing_incore)
+
+        max_workers = min(current_compile_workers(), len(incores) + 1)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            orch_future = executor.submit(compile_orchestration)
+            incore_futures = [
+                executor.submit(
+                    compile_one_incore,
+                    k,
+                    extra,
+                    incore_artifact_key,
+                )
+                for k, extra, incore_artifact_key in zip(
+                    incores, resolved_extra_dirs, incore_artifact_keys, strict=True
+                )
+            ]
+            orch_binary = orch_future.result()
+            incores_binary = [future.result() for future in incore_futures]
+
+        if len(incores_binary) != len(incores):
+            raise AssertionError("compiled incore binaries must match the incore specification")
+        kernel_binaries = []
+        for k, incore in zip(incores, incores_binary):
+            kernel_binaries.append(
+                (
+                    k["func_id"],
+                    CoreCallable.build(signature=k.get("signature", []), binary=incore),
+                )
+            )
+
+        return ChipCallable.build(
+            signature=orch.get("signature", []),
+            func_name=orch["function_name"],
+            binary=orch_binary,
+            children=kernel_binaries,
+            config_name=orch.get("config_name", ""),
+        )
+
+    chip_callable = get_or_compile(artifact_key, compile_callable)
     _compile_cache[cache_key] = chip_callable
     return chip_callable
 
@@ -995,14 +1356,15 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
 # ---------------------------------------------------------------------------
 
 
-def scene_test(level: int, runtime: str):
+def scene_test(level: int | SceneTestLevel, runtime: str):
     """Decorator marking a SceneTestCase with level and runtime.
 
     Platforms are declared per-case in CASES, not here.
     """
+    level_decorator = scene_level(level)
 
     def decorator(cls):
-        cls._st_level = level
+        level_decorator(cls)
         cls._st_runtime = runtime
         cls_dir = Path(inspect.getfile(cls)).parent
         if hasattr(cls, "CALLABLE"):
@@ -1037,7 +1399,7 @@ class SceneTestCase:
     RUNTIME_ENV: dict = {}
 
     def generate_args(self, params) -> TaskArgsBuilder:
-        """Return TaskArgsBuilder with ordered Tensor/Scalar specs."""
+        """Return TaskArgsBuilder with ordered TensorArg/Scalar specs."""
         raise NotImplementedError
 
     def compute_golden(self, args: TaskArgsBuilder, params) -> None:
@@ -1062,7 +1424,7 @@ class SceneTestCase:
     @classmethod
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
-        cache_key = (cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
+        cache_key = (cls.__module__, cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
         return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
@@ -1072,7 +1434,7 @@ class SceneTestCase:
         for entry in cls.CALLABLE["callables"]:
             if "orchestration" in entry:
                 name = entry["name"]
-                cache_key = l3_compile_cache_key(cls.__qualname__, name, platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
@@ -1093,7 +1455,13 @@ class SceneTestCase:
         """
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime)
+        w = Worker(
+            level=2,
+            device_id=device_id,
+            platform=platform,
+            runtime=cls._st_runtime,
+            enable_sdma=_class_wants_sdma(cls),
+        )
         w.init()
         return w
 
@@ -1116,7 +1484,7 @@ class SceneTestCase:
     def _build_config(
         self,
         config_dict,
-        enable_l2_swimlane=0,
+        enable_chip_swimlane=0,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -1127,7 +1495,8 @@ class SceneTestCase:
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
         config = CallConfig()
-        config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        # 0 = auto: DeviceRunner uses the architecture default.
+        config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 0)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
         # PTO2_RING_* env vars / RUNTIME_ENV. Each value is either a scalar
@@ -1137,7 +1506,7 @@ class SceneTestCase:
         config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
-        config.enable_l2_swimlane = enable_l2_swimlane
+        config.enable_chip_swimlane = enable_chip_swimlane
         config.enable_dump_args = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
@@ -1174,7 +1543,7 @@ class SceneTestCase:
         sub_handles=None,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=0,
+        enable_chip_swimlane=0,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -1188,7 +1557,7 @@ class SceneTestCase:
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_l2_swimlane=enable_l2_swimlane,
+                enable_chip_swimlane=enable_chip_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -1203,7 +1572,7 @@ class SceneTestCase:
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_l2_swimlane=enable_l2_swimlane,
+                enable_chip_swimlane=enable_chip_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -1218,7 +1587,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=0,
+        enable_chip_swimlane=0,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -1239,13 +1608,14 @@ class SceneTestCase:
 
         # Build args
         test_args = self.generate_args(params)
-        chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
+        chip_args, output_names = _build_l2_ref_args(test_args, orch_sig, worker)
 
         # Compute golden (unless skip_golden)
         golden_args = None
         if not skip_golden:
             golden_args = test_args.clone()
-            self.compute_golden(golden_args, params)
+            with _golden_thread_cap():
+                self.compute_golden(golden_args, params)
 
         # Save initial output tensor values for reset between rounds
         initial_outputs = {}
@@ -1264,14 +1634,12 @@ class SceneTestCase:
                 for name, initial in initial_outputs.items():
                     getattr(test_args, name).copy_(initial)
 
-            # enable_l2_swimlane / enable_dep_gen are already forced False by
-            # the upstream gate in test_run / run_module when rounds > 1, so an
-            # extra `and round_idx == 0` here is dead code; pass them through
-            # verbatim. (If the upstream gate is ever relaxed, restore the
-            # per-round masking here.)
+            # Every diagnostic reaching this loop is already multi-round-safe:
+            # _effective_diagnostic_options zeroes all of them when rounds > 1,
+            # so no per-round masking belongs here.
             config = self._build_config(
                 config_dict,
-                enable_l2_swimlane=enable_l2_swimlane,
+                enable_chip_swimlane=enable_chip_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -1293,7 +1661,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_l2_swimlane=0,
+        enable_chip_swimlane=0,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -1301,11 +1669,11 @@ class SceneTestCase:
         output_prefix="",
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
-        # block --enable-l2-swimlane for L3 at the CLI boundary. Catch any code
+        # block --enable-chip-swimlane for L3 at the CLI boundary. Catch any code
         # path that reaches here with the flag on anyway (direct API use,
         # future refactors) so we fail loud rather than produce garbage perf
         # files. Lift once the runtime embeds device_id in the perf filename.
-        if enable_l2_swimlane:
+        if enable_chip_swimlane:
             raise NotImplementedError(
                 "L3 profiling is not supported yet (multi-chip-process perf "
                 "filename collision). Gate at the CLI level in "
@@ -1323,7 +1691,8 @@ class SceneTestCase:
         golden_args = None
         if not skip_golden:
             golden_args = test_args.clone()
-            self.compute_golden(golden_args, params)
+            with _golden_thread_cap():
+                self.compute_golden(golden_args, params)
 
         # Eager Worker.init() forked the chip/sub children before generate_args
         # ran, so move test_args' host tensors into born-shared buffers the
@@ -1358,7 +1727,7 @@ class SceneTestCase:
                 # under the existing upstream gate. Keep parity by passing through.
                 config = self._build_config(
                     config_dict,
-                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_chip_swimlane=enable_chip_swimlane,
                     enable_dump_args=enable_dump_args,
                     enable_pmu=enable_pmu,
                     enable_dep_gen=enable_dep_gen,
@@ -1384,50 +1753,58 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _effective_enable_dep_gen(request, *, warn: bool = False) -> bool:
-        """``--enable-dep-gen`` CLI value after applying the ``--rounds > 1``
-        disable. Single source of truth so the framework's ``test_run`` loop
-        and any subclass override (e.g. ``TestDepGenCapture``'s post-validate
-        hook) can't drift on the gating rule. Pass ``warn=True`` from the
-        framework's first call — it owns the user-facing "disabled because
-        rounds > 1" message; subclass overrides leave ``warn`` off since
-        ``super().test_run()`` already warned."""
-        if not request.config.getoption("--enable-dep-gen", default=False):
-            return False
-        if request.config.getoption("--rounds", default=1) > 1:
-            if warn:
-                logger.warning("dep_gen disabled: --rounds > 1")
-            return False
-        return True
+    def _effective_enable_dep_gen(request) -> bool:
+        """Return the multi-round-safe dep-gen setting for extension hooks.
+
+        Subclass hooks use the same effective-value rule as the main run path
+        without emitting an additional user-facing warning.
+        """
+        return _effective_diagnostic_options(
+            request.config.getoption("--rounds", default=1),
+            chip_swimlane=0,
+            dump_args=0,
+            pmu=0,
+            dep_gen=request.config.getoption("--enable-dep-gen", default=False),
+            scope_stats=False,
+            swimlane_overhead=False,
+            warn=False,
+        ).dep_gen
 
     def test_run(self, st_platform, st_worker, request):
         """Auto test method — runs matching cases for the current platform."""
-        raw_selectors = request.config.getoption("--case", default=None) or []
-        selectors = [_parse_case_selector(v) for v in raw_selectors]
+        matched = self._matching_cases(st_platform, request)
         manual_mode = request.config.getoption("--manual", default="exclude")
+        if not matched:
+            # Skip before building and before control returns to subclass
+            # overrides: no case ran, so their post-run validators must not run.
+            import pytest  # noqa: PLC0415
+
+            pytest.skip(f"No cases matched {type(self).__name__} (platform={st_platform}, manual={manual_mode})")
+
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
-        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
+        enable_chip_swimlane = request.config.getoption("--enable-chip-swimlane", default=0)
         enable_dump_args = request.config.getoption("--dump-args", default=0)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
-        enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
+        enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
         enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
-        if rounds > 1:
-            if enable_l2_swimlane:
-                logger.warning("Profiling disabled: --rounds > 1")
-                enable_l2_swimlane = 0
-            if enable_dump_args:
-                logger.warning("Dump args disabled: --rounds > 1")
-                enable_dump_args = 0
-            if enable_pmu:
-                logger.warning("PMU disabled: --rounds > 1")
-                enable_pmu = 0
-            if enable_scope_stats:
-                logger.warning("scope_stats disabled: --rounds > 1")
-                enable_scope_stats = False
+        diagnostics = _effective_diagnostic_options(
+            rounds,
+            chip_swimlane=enable_chip_swimlane,
+            dump_args=enable_dump_args,
+            pmu=enable_pmu,
+            dep_gen=enable_dep_gen,
+            scope_stats=enable_scope_stats,
+            swimlane_overhead=enable_swimlane_overhead,
+        )
+        enable_chip_swimlane = diagnostics.chip_swimlane
+        enable_dump_args = diagnostics.dump_args
+        enable_pmu = diagnostics.pmu
+        enable_dep_gen = diagnostics.dep_gen
+        enable_scope_stats = diagnostics.scope_stats
+        enable_swimlane_overhead = diagnostics.swimlane_overhead
 
-        cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
         sub_handles = getattr(type(self), "_st_sub_handles", {})
         # For L3, use registered chip handles instead of raw ChipCallable
@@ -1435,24 +1812,6 @@ class SceneTestCase:
         chip_handles = getattr(type(self), "_st_chip_handles", {})
         if self._st_level == 3 and chip_handles:
             callable_obj = {**chip_handles}
-
-        matched = []
-        for case in self.CASES:
-            if st_platform not in case["platforms"]:
-                continue
-            if not _match_selectors(cls_name, case["name"], selectors):
-                continue
-            is_manual = bool(case.get("manual"))
-            if manual_mode == "exclude" and is_manual:
-                continue
-            if manual_mode == "only" and not is_manual:
-                continue
-            matched.append(case)
-
-        if not matched:
-            import pytest  # noqa: PLC0415
-
-            pytest.skip(f"No cases matched {cls_name} (platform={st_platform}, manual={manual_mode})")
 
         run_class_cases(
             st_worker,
@@ -1462,13 +1821,33 @@ class SceneTestCase:
             sub_handles=sub_handles,
             rounds=rounds,
             skip_golden=skip_golden,
-            enable_l2_swimlane=enable_l2_swimlane,
+            enable_chip_swimlane=enable_chip_swimlane,
             enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
             enable_swimlane_overhead=enable_swimlane_overhead,
         )
+
+    def _matching_cases(self, st_platform, request):
+        """Return cases selected by the platform, case, and manual filters."""
+        raw_selectors = request.config.getoption("--case", default=None) or []
+        selectors = [_parse_case_selector(v) for v in raw_selectors]
+        manual_mode = request.config.getoption("--manual", default="exclude")
+        cls_name = type(self).__name__
+        matched = []
+        for case in self.CASES:
+            if st_platform not in case["platforms"]:
+                continue
+            if not _match_selectors(cls_name, case["name"], selectors):
+                continue
+            is_manual = is_manual_for_platform(case.get("manual"), st_platform)
+            if manual_mode == "exclude" and is_manual:
+                continue
+            if manual_mode == "only" and not is_manual:
+                continue
+            matched.append(case)
+        return matched
 
     # ------------------------------------------------------------------
     # Standalone entry point
@@ -1519,13 +1898,13 @@ class SceneTestCase:
         parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument(
-            "--enable-l2-swimlane",
+            "--enable-chip-swimlane",
             nargs="?",
             const=4,
             default=0,
             type=int,
             metavar="PERF_LEVEL",
-            help="Enable L2 swimlane. Bare flag=level 4 (full). "
+            help="Enable chip swimlane. Bare flag=level 4 (full). "
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
         parser.add_argument(
@@ -1535,13 +1914,15 @@ class SceneTestCase:
             type=int,
             default=0,
             help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
-            "tasks marked via Arg::dump(...), default when given without a value), "
-            "2=full (all tasks), 3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
+            "args selected via Arg::dump(...), default when given without a value), "
+            "2=full (all args), 3=hybrid (all tasks' JSON metadata; args marked "
+            "via Arg::dump(...) also write payload; used by "
+            "simpler_setup.tools.core_swimlane for Core swimlane simulator replay).",
         )
         parser.add_argument(
             "--enable-dep-gen",
             action="store_true",
-            help="Enable dep_gen capture (SubmitTrace ring, first round only)",
+            help="Enable dep_gen capture (disabled when --rounds > 1)",
         )
         parser.add_argument(
             "--enable-pmu",
@@ -1566,7 +1947,7 @@ class SceneTestCase:
             default=False,
             help="Add the 8 Overhead Analysis counter tracks (per-engine "
             "idle/ready/overhead + system all/has overhead) to the swimlane "
-            "JSON. Requires --enable-l2-swimlane + deps.json (re-run with "
+            "JSON. Requires --enable-chip-swimlane + deps.json (re-run with "
             "--enable-dep-gen if absent).",
         )
         parser.add_argument(
@@ -1599,7 +1980,7 @@ class SceneTestCase:
             "--log-level",
             choices=LOG_LEVEL_CHOICES,
             default=DEFAULT_LOG_LEVEL,
-            help=f"Simpler logger level (debug/V0..V9/info/warn/error/null; default {DEFAULT_LOG_LEVEL})",
+            help=f"Simpler logger level (debug/info/timing/warn/error/null; default {DEFAULT_LOG_LEVEL})",
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
@@ -1625,19 +2006,30 @@ class SceneTestCase:
                     f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
                 )
 
+        # Resolved before the eager PTO-ISA checkout below so a rejected flag
+        # combination costs no clone.
+        try:
+            diagnostics = _effective_diagnostic_options(
+                args.rounds,
+                chip_swimlane=args.enable_chip_swimlane,
+                dump_args=args.dump_args,
+                pmu=args.enable_pmu,
+                dep_gen=args.enable_dep_gen,
+                scope_stats=args.enable_scope_stats,
+                swimlane_overhead=args.enable_swimlane_overhead,
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        args.enable_chip_swimlane = diagnostics.chip_swimlane
+        args.dump_args = diagnostics.dump_args
+        args.enable_pmu = diagnostics.pmu
+        args.enable_dep_gen = diagnostics.dep_gen
+        args.enable_scope_stats = diagnostics.scope_stats
+        args.enable_swimlane_overhead = diagnostics.swimlane_overhead
+
         # Eager pin checkout for kernel/orchestration compiles that pass
         # pto_isa_root explicitly. Do not export PTO_ISA_ROOT (#1403).
         ensure_pto_isa_root(verbose=True)
-
-        if args.rounds > 1 and args.enable_l2_swimlane:
-            logger.warning("Profiling disabled: --rounds > 1")
-            args.enable_l2_swimlane = 0
-        if args.rounds > 1 and args.enable_dep_gen:
-            logger.warning("dep_gen disabled: --rounds > 1")
-            args.enable_dep_gen = False
-        if args.rounds > 1 and args.enable_scope_stats:
-            logger.warning("scope_stats disabled: --rounds > 1")
-            args.enable_scope_stats = False
 
         from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
 
@@ -1669,11 +2061,7 @@ class SceneTestCase:
         # artifacts land in distinct directories with no shared filenames.
 
         module = sys.modules[module_name]
-        test_classes = [
-            v
-            for v in vars(module).values()
-            if isinstance(v, type) and issubclass(v, SceneTestCase) and v is not SceneTestCase and hasattr(v, "CASES")
-        ]
+        test_classes = _discover_module_test_classes(module)
 
         # Apply --runtime/--level filters (child mode sets both; parent may also
         # use them when the user wants a narrow run).
@@ -1701,14 +2089,14 @@ class SceneTestCase:
 
         # L3 profiling not supported yet (multi-chip-process filename collision).
         # Mirror the pytest-side guard so standalone users get the same early-fail.
-        if args.enable_l2_swimlane:
+        if args.enable_chip_swimlane:
             l3_classes = sorted(cls.__name__ for cls in selected_by_cls if cls._st_level == 3)
             if l3_classes:
                 print(
-                    f"ERROR: --enable-l2-swimlane is not supported for L3 tests yet — "
+                    f"ERROR: --enable-chip-swimlane is not supported for L3 tests yet — "
                     f"multi-chip-process filename collision unresolved. "
                     f"L3 classes selected: {', '.join(l3_classes)}. "
-                    f"Either drop --enable-l2-swimlane or scope to L2 with --level 2.",
+                    f"Either drop --enable-chip-swimlane or scope to L2 with --level 2.",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -1767,7 +2155,7 @@ class SceneTestCase:
                                 sub_handles=sub_handles,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
-                                enable_l2_swimlane=args.enable_l2_swimlane,
+                                enable_chip_swimlane=args.enable_chip_swimlane,
                                 enable_dump_args=args.dump_args,
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
@@ -1808,10 +2196,12 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common += ["--rounds", str(args.rounds)]
     if args.skip_golden:
         common.append("--skip-golden")
-    if args.enable_l2_swimlane:
-        common += ["--enable-l2-swimlane", str(args.enable_l2_swimlane)]
+    if args.enable_chip_swimlane:
+        common += ["--enable-chip-swimlane", str(args.enable_chip_swimlane)]
     if args.dump_args:
         common += ["--dump-args", str(args.dump_args)]
+    if args.enable_pmu:
+        common += ["--enable-pmu", str(args.enable_pmu)]
     if args.enable_dep_gen:
         common.append("--enable-dep-gen")
     if args.enable_scope_stats:
@@ -2023,6 +2413,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         num_sub_workers=max_subs,
         platform=args.platform,
         runtime=first_cls._st_runtime,
+        enable_sdma=any(_class_wants_sdma(c) for c in group),
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}
@@ -2038,7 +2429,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
-                cache_key = l3_compile_cache_key(cls.__qualname__, name, args.platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle

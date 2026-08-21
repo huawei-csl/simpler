@@ -37,12 +37,12 @@
  * specific host/device copy mechanics live outside these shared structures.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 
+#include "common/args_dump_task_metadata.h"
 #include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
@@ -75,16 +75,6 @@ enum class ArgsDumpKind : uint8_t {
     TENSOR = 0,
     SCALAR = 1,
 };
-
-using ArgsDumpArgMask = uint64_t;
-
-// Bitmask stored in the platform-owned mask pool when orchestration selects
-// specific task tensor/scalar arguments for dump. Bit N corresponds to the
-// payload arg index: tensors first, then scalars.
-// Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
-constexpr ArgsDumpArgMask ARGS_DUMP_ARG_MASK_NONE = 0;
-constexpr uint32_t ARGS_DUMP_ARG_MASK_BITS = 64;
-constexpr uint8_t ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
 
 // Max kernel ids a record carries: one per active subtask of a task (its mix
 // membership). Must equal the runtime's PTO2_SUBTASK_SLOT_COUNT (1C2V => 3);
@@ -180,27 +170,30 @@ static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
  * - free_queue.head: Device writes (pops buffers)
  * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
  * - current_buf_seq: Device writes (monotonic counter)
- * - arena_write_offset: Device writes (monotonic), Host reads (for overwrite detection)
+ * - arena_write_offset: Device writes (monotonic), Host reads for overwrite detection
+ * - published_payload_count: Device counts payload records committed to the ready queue
+ * - completed_payload_count: Host acknowledges payloads after writer completion
  * - dropped_record_count: Device writes (records lost before host export)
  */
 struct DumpBufferState {
-    DumpFreeQueue free_queue;                // SPSC queue of free DumpMetaBuffer addresses
-    volatile uint64_t current_buf_ptr;       // Current active DumpMetaBuffer (0 = none)
-    volatile uint32_t current_buf_seq;       // Sequence number for ordering
-    uint32_t pad0;                           // Alignment
-    volatile uint64_t arena_base;            // Device pointer to this thread's arena
-    volatile uint64_t arena_size;            // Arena size in bytes
-    volatile uint64_t arena_write_offset;    // Monotonic write cursor (host computes % arena_size)
-    volatile uint32_t dropped_record_count;  // Records dropped before host export
-    uint8_t pad1[84];                        // Pad to 256 bytes (172 + 84 = 256)
+    DumpFreeQueue free_queue;                   // SPSC queue of free DumpMetaBuffer addresses
+    volatile uint64_t current_buf_ptr;          // Current active DumpMetaBuffer (0 = none)
+    volatile uint32_t current_buf_seq;          // Sequence number for ordering
+    uint32_t pad0;                              // Alignment
+    volatile uint64_t arena_base;               // Device pointer to this thread's arena
+    volatile uint64_t arena_size;               // Arena size in bytes
+    volatile uint64_t arena_write_offset;       // Monotonic write cursor (host computes % arena_size)
+    volatile uint64_t published_payload_count;  // Payload records committed to the ready queue
+    volatile uint64_t completed_payload_count;  // Host-acknowledged published payload count
+    volatile uint32_t dropped_record_count;     // Records dropped before host export
+    uint8_t pad1[68];                           // Pad to 256 bytes (188 + 68 = 256)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
 static_assert(offsetof(DumpBufferState, current_buf_ptr) == 128, "DumpBufferState current_buf_ptr offset changed");
 static_assert(offsetof(DumpBufferState, arena_base) == 144, "DumpBufferState arena_base offset changed");
-static_assert(
-    offsetof(DumpBufferState, dropped_record_count) == 168, "DumpBufferState dropped_record_count offset changed"
-);
+static_assert(offsetof(DumpBufferState, completed_payload_count) == 176, "completed payload offset changed");
+static_assert(offsetof(DumpBufferState, dropped_record_count) == 184, "dropped record offset changed");
 
 // =============================================================================
 // DumpReadyQueueEntry - Ready Queue Entry
@@ -239,13 +232,13 @@ static_assert(sizeof(DumpReadyQueueEntry) == 32, "DumpReadyQueueEntry must be 32
  * - Queue full: (tail + 1) % capacity == head
  */
 
-// Args-dump level. Carried in DumpDataHeader so the
-// AICPU latches the mode in dump_args_init() before any task is dispatched.
+// Args-dump level. Carried in DumpDataHeader so the AICPU can latch the mode
+// before any task is dispatched.
 enum class DumpArgsLevel : uint32_t {
-    OFF = 0,             // no dump
-    PARTIAL = 1,         // only args marked with Arg::dump(...)
-    FULL = 2,            // every task's tensor/scalar I/O (JSON manifest + BIN payload)
-    FULL_JSON_ONLY = 3,  // every task's tensor/scalar metadata to JSON; no BIN
+    OFF = 0,      // no dump
+    PARTIAL = 1,  // only args marked with Arg::dump(...)
+    FULL = 2,     // every task's tensor/scalar I/O (JSON manifest + BIN payload)
+    HYBRID = 3,   // every task's metadata; payload only for Arg::dump()-marked tensors
 };
 
 struct DumpDataHeader {
@@ -259,7 +252,7 @@ struct DumpDataHeader {
     uint32_t records_per_buffer;
     uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=full_json_only
+    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=hybrid
     // DFX backpressure coordination (unified across all DFX subsystems).
     DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
@@ -270,7 +263,7 @@ struct DumpDataHeader {
 
 /**
  * Caller fills this struct from runtime-specific tensor types.
- * Platform layer is agnostic to runtime-specific types (Tensor, PTO2TaskPayload, etc.).
+ * Platform layer is agnostic to runtime-specific types (ChipTensor, PTO2TaskPayload, etc.).
  */
 struct ArgsDumpInfo {
     uint64_t task_id;
@@ -285,7 +278,8 @@ struct ArgsDumpInfo {
     int32_t func_count;
     uint8_t kind;
     uint8_t flags;
-    uint8_t pad[6];
+    uint8_t capture_payload;
+    uint8_t pad[5];
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
@@ -351,5 +345,3 @@ inline DumpBufferState *get_dump_buffer_state(void *base_ptr, int thread_idx) {
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_

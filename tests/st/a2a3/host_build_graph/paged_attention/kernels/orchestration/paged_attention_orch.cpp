@@ -66,14 +66,15 @@ inline uint64_t get_sys_cnt_aicpu() {
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -105,7 +106,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     CYCLE_COUNT_LAP(prof_param_extract);
 
-    LOG_INFO_V9(">>>>>> batch = %" PRIu64, batch);
+    LOG_INFO(">>>>>> batch = %" PRIu64, batch);
 
     // Reshape tensors for kernel consumption (2D flattened)
     void *query_ptr = orch_args.tensor(0).ref().data_as<void>();
@@ -123,17 +124,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         static_cast<uint32_t>(total_blocks_count * block_size), static_cast<uint32_t>(head_dim)
     };
     uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    ChipTensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    ChipTensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    ChipTensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
+    ChipTensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
-    Tensor block_table =
+    ChipTensor block_table =
         make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
-    Tensor context_lens =
+    ChipTensor context_lens =
         make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
@@ -158,17 +159,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor qi = query.view(tile2d_shapes, qi_offsets);
+                ChipTensor qi = query.view(tile2d_shapes, qi_offsets);
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
+                ChipTensor out_view = out.view(tile2d_shapes, out_view_offsets);
                 PROF_INC(prof_view_count, 2);
                 CYCLE_COUNT_LAP(prof_tensor_view);
 
                 CYCLE_COUNT_LAP(prof_param_setup);
                 TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
-                const Tensor &oi = alloc_outs.get_ref(0);
-                const Tensor &li_update = alloc_outs.get_ref(1);
-                const Tensor &mi_update = alloc_outs.get_ref(2);
+                const ChipTensor &oi = alloc_outs.get_ref(0);
+                const ChipTensor &li_update = alloc_outs.get_ref(1);
+                const ChipTensor &mi_update = alloc_outs.get_ref(2);
                 PROF_INC(prof_submit_count, 1);
                 CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -182,28 +183,28 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 
                     uint32_t kv_shapes[2] = {static_cast<uint32_t>(block_size), static_cast<uint32_t>(head_dim)};
                     uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
-                    Tensor kj = key_cache.view(kv_shapes, kv_offsets);
-                    Tensor vj = value_cache.view(kv_shapes, kv_offsets);
+                    ChipTensor kj = key_cache.view(kv_shapes, kv_offsets);
+                    ChipTensor vj = value_cache.view(kv_shapes, kv_offsets);
                     PROF_INC(prof_view_count, 2);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    L0TaskArgs params_qk;
+                    CoreTaskArgs params_qk;
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    const Tensor &sij = qk_outs.get_ref(0);
+                    const ChipTensor &sij = qk_outs.get_ref(0);
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
 
                     uint32_t sij_valid_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)};
                     uint32_t sij_valid_offsets[2] = {0, 0};
-                    Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
+                    ChipTensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
                     PROF_INC(prof_view_count, 1);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    L0TaskArgs params_sf;
+                    CoreTaskArgs params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
@@ -211,19 +212,19 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor &pij_f16 = sf_outs.get_ref(0);
-                    const Tensor &mi = sf_outs.get_ref(1);
-                    const Tensor &li = sf_outs.get_ref(2);
+                    const ChipTensor &pij_f16 = sf_outs.get_ref(0);
+                    const ChipTensor &mi = sf_outs.get_ref(1);
+                    const ChipTensor &li = sf_outs.get_ref(2);
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
 
-                    L0TaskArgs params_pv;
+                    CoreTaskArgs params_pv;
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    const Tensor &oi_tmp = pv_outs.get_ref(0);
+                    const ChipTensor &oi_tmp = pv_outs.get_ref(0);
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -231,7 +232,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    L0TaskArgs params_up;
+                    CoreTaskArgs params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);
@@ -254,33 +255,33 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 #ifdef ENABLE_PROFILING
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor + prof_tensor_view + prof_param_setup +
                      prof_submit_task + prof_scope;
-    LOG_INFO_V9(
+    LOG_INFO(
         "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===", prof_submit_count,
         prof_make_count, prof_view_count, cycles_to_us(total)
     );
     if (total > 0) {
-        LOG_INFO_V9(
+        LOG_INFO(
             "  param_extract    : %7.3fus (%5.1f%%)", cycles_to_us(prof_param_extract),
             prof_param_extract * 100.0 / total
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  ext_tensor(x4)   : %7.3fus (%5.1f%%)", cycles_to_us(prof_ext_tensor), prof_ext_tensor * 100.0 / total
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  create_info(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_make_count, cycles_to_us(prof_make_tensor),
             prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? cycles_to_us(prof_make_tensor) / prof_make_count : 0.0
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_view_count, cycles_to_us(prof_tensor_view),
             prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? cycles_to_us(prof_tensor_view) / prof_view_count : 0.0
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  param_setup      : %7.3fus (%5.1f%%)", cycles_to_us(prof_param_setup), prof_param_setup * 100.0 / total
         );
-        LOG_INFO_V9("  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
-        LOG_INFO_V9(
+        LOG_INFO("  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
+        LOG_INFO(
             "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", prof_submit_count, cycles_to_us(prof_submit_task),
             prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0

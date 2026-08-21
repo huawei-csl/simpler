@@ -27,11 +27,11 @@ Task IDs are widened from 32-bit to 64-bit to carry the ring identity:
 task_id.raw = (ring_id << 32) | local_id
 ```
 
-`PTO2TaskId` exposes direct accessors in `pto_runtime2_types.h`:
+`PTO2TaskId` exposes direct accessors in `src/common/task_interface/pto_task_id.h`:
 
 | API | Purpose |
 | --- | ------- |
-| `pto2_make_task_id(ring_id, local_id)` | Compose a 64-bit task ID (`PTO2TaskId`) |
+| `PTO2TaskId::make(ring_id, local_id)` | Compose a 64-bit task ID (`PTO2TaskId`) |
 | `task_id.ring()` | Extract `ring_id` (bits 63-32) |
 | `task_id.local()` | Extract `local_id` (bits 31-0) |
 | `task_id.raw` | Access the packed 64-bit encoding |
@@ -93,7 +93,7 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     uint64_t heap_size;
     uint64_t task_descriptors_offset;
 
-    // Per-ring data pointers (host-side, set by PTO2SharedMemoryHandle::setup_pointers)
+    // Per-ring data pointers (host-side, set by setup_pointers)
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
@@ -185,7 +185,11 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
     sync_to_sm()  // release-store last_task_alive
 ```
 
-Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving heap_tail writes within the same ring.
+Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving heap_tail writes within the same ring. A scheduler thread that changes a ring head to `CONSUMED` but fails to acquire that ring's `advance_lock` records a coalesced request in `advance_pending_mask`. Scheduler no-progress iterations retry pending rings under the same lock; a busy lock leaves the bit set, and a successful retry clears the bit before rescanning.
+
+Orchestrator reclaim consumers that see no reclaim progress for 10 ms use the separate `publication_request_mask`. Scheduler thread 0 polls only this mask in productive and no-progress iterations, force-publishes the requested ring watermark, and sets `publication_ack_mask`. Scheduler lock-contention retries never acknowledge an orchestrator request. K=16 batching is enabled only after every reclaim consumer is wired to the current request/ack masks; otherwise each local advance is published.
+
+For ring-heap stall triage, a `CONSUMED` head whose ring bit remains set means the deferred request has not yet been cleared by a retry that acquired `advance_lock`. If the bit clears and `last_task_alive` is still pinned, the stall is not caused by this deferred advance path.
 
 ### 5.2 Cross-Ring Dependencies
 

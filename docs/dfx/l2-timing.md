@@ -6,9 +6,9 @@ from **`[STRACE]` markers** (gated on `SIMPLER_HOST_STRACE`, default on in
 line per stage to stderr, and `simpler_setup.tools.strace_timing` parses them
 offline. Normal execution only *emits*; parsing is a separate, opt-in step.
 
-A richer channel — the **L2 swimlane** per-task / scheduler-phase capture — is
-opt-in (`--enable-l2-swimlane`) and documented separately in
-[l2-swimlane-profiling.md](l2-swimlane-profiling.md).
+A richer channel — the **chip swimlane** per-task / scheduler-phase capture — is
+opt-in (`--enable-chip-swimlane`) and documented separately in
+[chip-swimlane-profiling.md](chip-swimlane-profiling.md).
 
 > Don't confuse any of these with the host-side runtime-stage seconds a test
 > harness prints (`[RUN] runtime done (Ns)`): that is wall-clock around JIT
@@ -21,24 +21,29 @@ opt-in (`--enable-l2-swimlane`) and documented separately in
 
 | Span | What it measures | Source |
 | ---- | ---------------- | ------ |
-| **`simpler_run`** (host_wall) | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
-| **`simpler_run.runner_run.device_wall`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own `AicpuPhase::RunWall` slot in the per-thread `AicpuPhaseRecord` buffer (`KernelArgs.device_wall_data_base`, see `src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
+| **`chip.run`** (host_wall) | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
+| **`chip.run.runner_run.device_wall`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own `AicpuPhase::RunWall` slot in the per-thread `AicpuPhaseRecord` buffer (`KernelArgs.device_wall_data_base`, see `src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
 
 Both are emitted whenever the runtime was built with `SIMPLER_HOST_STRACE` (the
-default) — **independent of `--enable-l2-swimlane`**. The `device_wall` marker is
+default) — **independent of `--enable-chip-swimlane`**. The `device_wall` marker is
 absent only on a `SIMPLER_HOST_STRACE`-off build.
 
-Nested under `device_wall` are the AICPU orchestrator / scheduler sub-spans
-(`clk=dev`; captured on both onboard and sim):
+For `tensormap_and_ringbuffer`, nested under `device_wall` are the AICPU
+orchestrator / scheduler sub-spans (`clk=dev`; captured on both onboard and
+sim):
 
 | Span | Window |
 | ---- | ------ |
 | **`…device_wall.orch`** (Orch) | orchestrator run window — graph construction on the AICPU. |
 | **`…device_wall.sched`** (Sched) | scheduler dispatch/execution window. |
 
-**`device_wall` is the full kernel wall, NOT the orchestration span** — it is
-strictly larger than Orch/Sched/Effective below, because it also covers AICPU
-init and exec teardown around the orchestrate+schedule work.
+`host_build_graph` also emits `device_wall`, but its orchestration runs on the
+host and it stamps no device-side Orch/Sched phases. Its rounds table therefore
+contains Host / Device only.
+
+**`device_wall` is the full kernel wall, NOT the orchestration span** — on TMR
+it is strictly larger than Orch/Sched/Effective below, because it also covers
+AICPU init and exec teardown around the orchestrate+schedule work.
 
 For a finer per-stage breakdown of `device_wall` (preamble / SO-load /
 graph-build / post-orch) and of the host side (`bind` / `runner_run` /
@@ -65,22 +70,22 @@ python -m simpler_setup.tools.strace_timing run.log --rounds-table
 ```
 
 One column per `[STRACE]` wall found — **Host** always, plus **Device** /
-**Orch** / **Sched** / **Effective** whenever those markers were captured
-(onboard and sim both capture the device-domain subdivision). A column is hidden
-when every round read 0, and an individual phase whose duration rounds to 0 is
-not emitted. Because the offline tool groups markers by `(pid, inv)`, this works
-for **L3 multi-round too** (each chip-child's `simpler_run` is its own
+**Orch** / **Sched** / **Effective** whenever those markers were captured. TMR
+captures all five on onboard and sim; HBG captures Host / Device. A column is
+hidden when every round read 0, and an individual phase whose duration rounds
+to 0 is not emitted. Because the offline tool groups markers by `(pid, inv)`,
+this works for **L3 multi-round too** (each chip-child's `simpler_run` is its own
 invocation).
 
 ### Column meanings
 
 | Column | Definition |
 | ------ | ---------- |
-| **Host** | `simpler_run` span — host wall incl. Python/dispatch overhead. |
+| **Host** | `chip.run` span — host wall incl. Python/dispatch overhead. |
 | **Device** | `device_wall` span — full on-NPU wall incl. init/teardown. |
-| **Effective** | `max(orch_end, sched_end) − min(orch_start, sched_start)` — the orch∪sched merged window (the effective on-device execution window). Computed from the orch/sched markers' **device-domain** `ts`+`dur` (the device spans carry a device-clock start offset, not the host emit time). This is the old device-log "Total", now derived purely from the markers — no device log needed. |
-| **Orch** | `…device_wall.orch` span — orchestrator (graph-build) window. |
-| **Sched** | `…device_wall.sched` span — scheduler dispatch/execution window. |
+| **Effective** | TMR only: `max(orch_end, sched_end) − min(orch_start, sched_start)` — the orch∪sched merged window (the effective on-device execution window). Computed from the orch/sched markers' **device-domain** `ts`+`dur` (the device spans carry a device-clock start offset, not the host emit time). This is the old device-log "Total", now derived purely from the markers — no device log needed. |
+| **Orch** | TMR only: `…device_wall.orch` span — device orchestrator (graph-build) window. |
+| **Sched** | TMR only: `…device_wall.sched` span — scheduler dispatch/execution window. |
 
 ```text
 device_wall  =  init  +  [ orchestrate + schedule/execute ≈ Effective ]  +  teardown
@@ -88,9 +93,9 @@ device_wall  =  init  +  [ orchestrate + schedule/execute ≈ Effective ]  +  te
                  only in device_wall, not in Effective/Orch/Sched
 ```
 
-Use Orch/Sched/Effective to see *where inside the run* time went (graph build vs
-scheduling); use `device_wall` for the end-to-end on-NPU cost including
-init/teardown.
+For TMR, use Orch/Sched/Effective to see *where inside the run* time went (graph
+build vs scheduling). For both runtimes, use `device_wall` for the end-to-end
+on-NPU cost including init/teardown.
 
 `tools/benchmark_rounds.sh` runs this tool for you across a set of examples (it
 tees each run and renders the table, then builds a cross-example summary).
@@ -131,10 +136,10 @@ instead (see Related docs).
 
 When you only need the dispatch→finish window of a specific task (or the
 interval between two tasks) and not a full timeline, tag the task with
-`L0TaskArgs::set_task_timing_slot(0..15)`. The Scheduler folds that task's AICPU
+`CoreTaskArgs::set_task_timing_slot(0..15)`. The Scheduler folds that task's AICPU
 dispatch/finish (same points as the swimlane's `finish_time`) into one of 16
 fixed slots and the host emits `…device_wall.task_slot_<N>` `[STRACE]` spans —
-with the L2 swimlane **off**, no collector threads, and in `SIMPLER_DFX=0`
+with the chip swimlane **off**, no collector threads, and in `SIMPLER_DFX=0`
 builds. Reuse one slot across tasks for a merged window, or distinct slots to
 recover `finish(B) − dispatch(A)`. Full semantics in
 [device-phases.md](device-phases.md#selective-task-timing-slots-implemented).
@@ -145,6 +150,6 @@ recover `finish(B) − dispatch(A)`. Full semantics in
   device per-stage spans.
 - [device-phases.md](device-phases.md) — how the AICPU phase windows
   (`RunWall` / orch / sched / …) are stamped and read back.
-- [l2-swimlane-profiling.md](l2-swimlane-profiling.md) — the per-task /
+- [chip-swimlane-profiling.md](chip-swimlane-profiling.md) — the per-task /
   scheduler-phase deep dive.
 - `simpler_setup/tools/README.md` — `strace_timing` CLI reference.

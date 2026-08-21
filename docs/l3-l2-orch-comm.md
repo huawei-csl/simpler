@@ -11,7 +11,7 @@ The intended use case is in-flight interaction: L3 can write input payload,
 publish a data-ready counter, wait for L2/AICore completion, and read output
 payload without ending the L2 orchestration task. For where L3 and L2 sit in
 the runtime stack, see
-[hierarchical_level_runtime.md](hierarchical_level_runtime.md). For dynamic
+[hierarchical-level-runtime.md](hierarchical-level-runtime.md). For dynamic
 cross-rank communication domains, see [comm-domain.md](comm-domain.md).
 
 ## 1. API
@@ -19,7 +19,7 @@ cross-rank communication domains, see [comm-domain.md](comm-domain.md).
 L3 creates a GM communication region for one chip worker:
 
 ```python
-region = orch.create_l3_l2_region(
+region = orch.create_worker_chip_region(
     worker_id=0,
     payload_bytes=payload_bytes,
     counter_bytes=128,
@@ -57,7 +57,7 @@ address-based `int32_t` counters.
 On L2, orchestration code consumes the descriptor and builds an endpoint:
 
 ```cpp
-L3L2OrchEndpoint ep(desc);
+WorkerChipOrchEndpoint ep(desc);
 
 uint64_t data_ready_addr = 0;
 uint64_t completion_addr = 0;
@@ -66,14 +66,14 @@ ep.counter_addr(completion_offset, completion_addr);
 
 int32_t observed = 0;
 bool ok = ep.signal_wait(
-              data_ready_addr, seq, L3L2OrchWaitCmp::GE, timeout, observed) &&
+              data_ready_addr, seq, WorkerChipOrchWaitCmp::GE, timeout, observed) &&
           ep.payload_read(input_offset, input_nbytes, input) &&
           ep.payload_read(output_offset, output_nbytes, output);
 
 // The wrapper combines gm_addr/nbytes with task-level dtype and shape.
 launch_aicore(input, output);
 wait_aicore_done();
-ep.signal_notify(completion_addr, seq, L3L2OrchNotifyOp::Set);
+ep.signal_notify(completion_addr, seq, WorkerChipOrchNotifyOp::Set);
 ```
 
 The L2 endpoint `signal_wait` timeout argument is in nanoseconds. The Python
@@ -148,7 +148,27 @@ addresses.
 On onboard platforms, region create allocates one child-owned VMM GM range,
 exports it through a shareable handle, and returns the import metadata to the
 parent. The parent imports that region and closes the mapped VMM import before
-the child frees the physical allocation.
+the child frees the physical allocation. The native import remains
+provisionally owned until the Python region is published into its run. An
+interruption during import, wrapper construction, or run publication closes
+the parent mapping and rolls back the child region instead of leaving either
+resource untracked.
+
+Every native payload, counter, and wait operation holds a lease on that parent
+mapping for the complete GIL-released access. Closing first rejects new leases,
+then waits for all active leases and the physical unmap to finish before it
+returns; concurrent duplicate closes join that same completion. The Worker can
+therefore release the child allocation only after no parent operation can still
+touch it.
+
+If an unadopted native owner reports a cleanup failure while an import unwinds,
+the owner records the diagnostic under its Worker's stable owner token. The
+owning Worker consumes that diagnostic at its next admission, create rollback,
+or close boundary and poisons itself. Transfer is two-phase: native storage is
+read non-destructively and acknowledged only after the Python poison is
+published, so an interruption at that boundary cannot lose the diagnostic.
+Another Worker cannot consume or be poisoned by that error, even when both
+Workers run on the same thread.
 
 ## 4. Signal Counters
 
@@ -169,10 +189,10 @@ L2 endpoint methods expose the same primitive shape over explicit GM counter
 addresses:
 
 ```cpp
-ep.signal_notify(counter_addr, value, L3L2OrchNotifyOp::Set);
-ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, result);
+ep.signal_notify(counter_addr, value, WorkerChipOrchNotifyOp::Set);
+ep.signal_test(counter_addr, cmp_value, WorkerChipOrchWaitCmp::GE, result);
 ep.signal_wait(
-    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, observed);
+    counter_addr, cmp_value, WorkerChipOrchWaitCmp::GE, timeout, observed);
 ```
 
 `NotifyOp` supports:
@@ -359,7 +379,7 @@ followed by input and output tensor slices. It can use counter offset `0` for
 `{seq + 1, STOP}` and publish it through `data_ready`.
 
 The related example lives in
-`examples/workers/l3/l3_l2_orch_comm_stream` and is marked for `a2a3sim`,
+`examples/workers/l3/worker_chip_orch_comm_stream` and is marked for `a2a3sim`,
 `a2a3`, `a5sim`, and `a5`. It creates one region, submits one persistent L2
 orchestration task, and drives three DATA
 rounds from L3 while the L2 task stays in flight. Each round copies a

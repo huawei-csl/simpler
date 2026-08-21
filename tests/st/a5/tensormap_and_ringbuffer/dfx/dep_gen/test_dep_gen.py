@@ -20,7 +20,7 @@ Verifies the end-to-end dep_gen pipeline on a5sim:
   implicitly: if it broke, deps.json would be empty or wrong.
 
 deps.json is now the sole source of truth for fanout edges — the device
-hot path no longer records L2SwimlaneAicpuTaskRecord::fanout[], so there is no
+hot path no longer records ChipSwimlaneAicpuTaskRecord::fanout[], so there is no
 "fanout ⊆ deps" cross-check to run. swimlane_converter.py joins
 deps.json into the Perfetto trace at post-process time.
 
@@ -38,7 +38,7 @@ import time
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
 KERNELS_BASE = "../../../../../../examples/a5/tensormap_and_ringbuffer/vector_example/kernels"
@@ -88,7 +88,7 @@ class TestDepGen(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4},
+            "manual": ["a5sim"],
             "params": {},
         },
     ]
@@ -96,9 +96,9 @@ class TestDepGen(SceneTestCase):
     def generate_args(self, params):
         SIZE = 128 * 128
         return TaskArgsBuilder(
-            Tensor("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
-            Tensor("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
-            Tensor("f", torch.zeros(SIZE, dtype=torch.float32)),
+            TensorArg("a", torch.full((SIZE,), 2.0, dtype=torch.float32)),
+            TensorArg("b", torch.full((SIZE,), 3.0, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(SIZE, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
@@ -118,15 +118,15 @@ class TestDepGen(SceneTestCase):
         super().test_run(st_platform, st_worker, request)
         if not self._effective_enable_dep_gen(request):
             return
-        for case in self.CASES:
-            if st_platform in case.get("platforms", []):
-                self._post_validate(case, run_marker)
+        for case in self._matching_cases(st_platform, request):
+            self._post_validate(case, run_marker)
 
     def _post_validate(self, case, run_marker):
         """Assert deps.json for this invocation contains the 6 edges documented
         in example_orchestration.cpp. Reached only with dep_gen effectively on
-        and the case's platform matching, so the run must have produced an
-        output dir; a missing one is a capture regression, not a skip.
+        and the case selected by the active filters, so the run must have
+        produced an output dir; a missing one is a capture regression, not a
+        skip.
         """
         case_name = case["name"]
         safe_label = _sanitize_for_filename(f"TestDepGen_{case_name}")
@@ -154,7 +154,7 @@ class TestDepGen(SceneTestCase):
         )
         with deps_path.open() as f:
             deps = json.load(f)
-        # Strided-Tensor schema: annotated edges with tasks[] / tensors[]
+        # Strided-TensorArg schema: annotated edges with tasks[] / tensors[]
         # sidecars carrying strided slice descriptors (start_offset +
         # stride[]). Project annotated edges down to a (pred, succ) set for
         # the existing structural checks; the annotation sanity check below

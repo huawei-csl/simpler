@@ -22,12 +22,15 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "common/host_span_names.h"
+#include "common/host_span_scope.h"
 #include "ring.h"
 
 namespace {
@@ -54,6 +57,54 @@ std::string format_digest(const uint8_t *digest) {
     }
     return out;
 }
+
+#if SIMPLER_HOST_STRACE
+const char *endpoint_kind_name(WorkerEndpointKind kind) {
+    switch (kind) {
+    case WorkerEndpointKind::LOCAL_MAILBOX:
+        return "local_mailbox";
+    case WorkerEndpointKind::REMOTE_L3:
+        return "remote_l3";
+    }
+    return "unknown";
+}
+
+RunId trace_run_id(Ring *ring, TaskSlot task_slot) {
+    if (ring == nullptr) return INVALID_RUN_ID;
+    TaskSlotState *state = ring->slot_state(task_slot);
+    return state == nullptr ? INVALID_RUN_ID : state->run_id;
+}
+
+uint64_t trace_callable_hash(Ring *ring, TaskSlot task_slot) {
+    if (ring == nullptr) return 0;
+    TaskSlotState *state = ring->slot_state(task_slot);
+    if (state == nullptr) return 0;
+    uint64_t hash = 0;
+    std::memcpy(&hash, state->callable.digest.data(), sizeof(hash));
+    return hash;
+}
+
+std::string
+trace_dispatch_attrs(RunId run_id, const WorkerDispatch &dispatch, const WorkerEndpointCaps &caps, const char *role) {
+    std::ostringstream attrs;
+    attrs << "run_id=" << run_id << " task_slot=" << dispatch.task_slot << " group_index=" << dispatch.group_index
+          << " worker_id=" << caps.worker_id << " dispatch_id=" << dispatch.dispatch_id
+          << " endpoint_kind=" << endpoint_kind_name(caps.kind)
+          << " prepare_only=" << static_cast<int>(dispatch.prepare_only) << " role=" << role;
+    return attrs.str();
+}
+
+// The lease the dispatch's slot holds, read from the ring. Callers read this
+// before publishing the frame: past that point the endpoint may retire the slot.
+std::string trace_lease_attrs(Ring *ring, TaskSlot task_slot) {
+    if (ring == nullptr) return "";
+    const TaskSlotState *state = ring->slot_state(task_slot);
+    if (state == nullptr) return "";
+    std::ostringstream attrs;
+    attrs << " slot_id=" << state->pipeline_lease.slot_id << " generation=" << state->pipeline_lease.generation;
+    return attrs.str();
+}
+#endif
 
 // Wall-clock period between child liveness samples. Every mailbox wait spins,
 // so an iteration count would not map to a bounded wall time.
@@ -82,9 +133,16 @@ namespace {
 }  // namespace
 
 uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("control_malloc"); }
+uint64_t WorkerEndpoint::control_committed_device_memory() {
+    throw_unsupported_control("control_committed_device_memory");
+}
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
-void WorkerEndpoint::control_copy_to(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_to"); }
-void WorkerEndpoint::control_copy_from(uint64_t, uint64_t, size_t) { throw_unsupported_control("control_copy_from"); }
+void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+    throw_unsupported_control("control_copy_to");
+}
+void WorkerEndpoint::control_copy_from(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+    throw_unsupported_control("control_copy_from");
+}
 void WorkerEndpoint::control_prepare(const uint8_t *) { throw_unsupported_control("control_prepare"); }
 void WorkerEndpoint::control_register(const char *, size_t, const uint8_t *) {
     throw_unsupported_control("control_register");
@@ -124,6 +182,9 @@ RemoteBufferHandle WorkerEndpoint::control_remote_import(int32_t, const RemoteBu
 void WorkerEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
     throw_unsupported_control("control_remote_release_import");
 }
+std::vector<uint8_t> WorkerEndpoint::control_remote_domain(remote_l3::ControlName, const std::vector<uint8_t> &, bool) {
+    throw_unsupported_control("control_remote_domain");
+}
 void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, const uint8_t *) {
     throw_unsupported_control("control_generic");
 }
@@ -132,25 +193,45 @@ void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
 }
 void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
 void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
-void WorkerEndpoint::control_l3_l2_region_create(const char *, const char *) {
-    throw_unsupported_control("control_l3_l2_region_create");
+void WorkerEndpoint::control_worker_chip_region_create(const char *, const char *) {
+    throw_unsupported_control("control_worker_chip_region_create");
 }
-void WorkerEndpoint::control_l3_l2_region_release(uint64_t) {
-    throw_unsupported_control("control_l3_l2_region_release");
+void WorkerEndpoint::control_worker_chip_region_release(uint64_t) {
+    throw_unsupported_control("control_worker_chip_region_release");
+}
+
+void WorkerEndpoint::submit_progress(Ring *, const WorkerDispatch &) {
+    throw std::runtime_error("progress submission is not supported by this WorkerEndpoint");
+}
+bool WorkerEndpoint::poll_progress(WorkerEndpointProgress &) { return false; }
+bool WorkerEndpoint::activate_progress(RunId) { return false; }
+void WorkerEndpoint::request_progress_stop() noexcept {}
+void WorkerEndpoint::report_progress_error(const std::string &) { request_progress_stop(); }
+bool WorkerEndpoint::report_submission_error(const WorkerDispatch &, const std::string &reason) {
+    report_progress_error(reason);
+    return false;
 }
 
 // =============================================================================
 // LocalMailboxEndpoint — mailbox helpers
 // =============================================================================
 
-LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid) :
+LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) :
     mailbox_(mailbox),
+    task_frame_count_(task_frame_count),
     child_pid_(child_pid) {
     if (mailbox == nullptr) throw std::invalid_argument("LocalMailboxEndpoint: null mailbox");
+    if (task_frame_count == 0 || task_frame_count > MAILBOX_TASK_FRAME_COUNT) {
+        throw std::invalid_argument("LocalMailboxEndpoint: invalid task frame count");
+    }
     caps_.worker_id = worker_id;
+    caps_.max_inflight_tasks = task_frame_count;
+    caps_.supports_frame_staging = task_frame_count > 1;
+    next_liveness_check_ = std::chrono::steady_clock::now() + kChildLivenessPollPeriod;
 }
 
 std::string LocalMailboxEndpoint::check_child_death() {
+    std::lock_guard<std::mutex> child_lk(child_mu_);
     if (child_dead_) return child_death_reason_;
     if (child_pid_ <= 0) return {};
 
@@ -178,8 +259,9 @@ std::string LocalMailboxEndpoint::check_child_death() {
     return child_death_reason_;
 }
 
-MailboxState LocalMailboxEndpoint::read_mailbox_state() const {
-    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
+MailboxState LocalMailboxEndpoint::read_mailbox_state(const char *frame) const {
+    const char *base = frame == nullptr ? mbox() : frame;
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(const_cast<char *>(base) + MAILBOX_OFF_STATE);
     int32_t v;
 #if defined(__aarch64__)
     __asm__ volatile("ldar %w0, [%1]" : "=r"(v) : "r"(ptr) : "memory");
@@ -192,8 +274,9 @@ MailboxState LocalMailboxEndpoint::read_mailbox_state() const {
     return static_cast<MailboxState>(v);
 }
 
-void LocalMailboxEndpoint::write_mailbox_state(MailboxState s) {
-    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
+void LocalMailboxEndpoint::write_mailbox_state(MailboxState s, char *frame) {
+    char *base = frame == nullptr ? mbox() : frame;
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(base + MAILBOX_OFF_STATE);
     int32_t v = static_cast<int32_t>(s);
 #if defined(__aarch64__)
     __asm__ volatile("stlr %w0, [%1]" : : "r"(v), "r"(ptr) : "memory");
@@ -205,38 +288,262 @@ void LocalMailboxEndpoint::write_mailbox_state(MailboxState s) {
 #endif
 }
 
-void LocalMailboxEndpoint::shutdown_child() { write_mailbox_state(MailboxState::SHUTDOWN); }
+bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxState desired) noexcept {
+    auto *ptr = reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_STATE);
+    int32_t expected_value = static_cast<int32_t>(expected);
+    return __atomic_compare_exchange_n(
+        ptr, &expected_value, static_cast<int32_t>(desired), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
+    );
+}
+
+bool LocalMailboxEndpoint::read_task_accepted(const char *frame) const {
+    const char *base = frame == nullptr ? mbox() : frame;
+    const int32_t *ptr = reinterpret_cast<const int32_t *>(base + MAILBOX_OFF_ACCEPTED);
+    int32_t v = 0;
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+    return v == MAILBOX_TASK_ACCEPTED;
+}
+
+void LocalMailboxEndpoint::clear_task_accepted(char *frame) {
+    char *base = frame == nullptr ? mbox() : frame;
+    int32_t *ptr = reinterpret_cast<int32_t *>(base + MAILBOX_OFF_ACCEPTED);
+    int32_t v = 0;
+    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+}
+
+void LocalMailboxEndpoint::shutdown_child() {
+    // Sticky word first: a child that samples it between the two stores leaves
+    // by the shutdown path even though the state word still reads IDLE.
+    int32_t *ptr = reinterpret_cast<int32_t *>(mbox() + MAILBOX_OFF_SHUTDOWN);
+    int32_t requested = MAILBOX_SHUTDOWN_REQUESTED;
+    __atomic_store(ptr, &requested, __ATOMIC_RELEASE);
+    write_mailbox_state(MailboxState::SHUTDOWN);
+}
+
+char *LocalMailboxEndpoint::task_frame(size_t index) const {
+    return mbox() +
+           static_cast<ptrdiff_t>(MAILBOX_FIRST_TASK_FRAME + index) * static_cast<ptrdiff_t>(MAILBOX_FRAME_SIZE);
+}
 
 // =============================================================================
 // WorkerThread — lifecycle
 // =============================================================================
 
 void WorkerThread::start(
-    Ring *ring, const std::function<void(WorkerCompletion)> &on_complete, std::unique_ptr<WorkerEndpoint> endpoint
+    Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
+    const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
 ) {
     if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
     on_complete_ = on_complete;
+    on_accept_ = on_accept;
     endpoint_ = std::move(endpoint);
     shutdown_ = false;
-    idle_.store(true, std::memory_order_relaxed);
-    thread_ = std::thread(&WorkerThread::loop, this);
+    if (endpoint_->caps().max_inflight_tasks == 0) {
+        throw std::invalid_argument("WorkerThread::start: endpoint capacity is zero");
+    }
+    inflight_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        lanes_ = {};
+    }
 }
 
 void WorkerThread::dispatch(WorkerDispatch d) {
-    idle_.store(false, std::memory_order_release);
-    std::lock_guard<std::mutex> lk(mu_);
-    queue_.push(d);
-    cv_.notify_one();
+    d.prepare_only = false;
+    bool lane_occupied = false;
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        LaneState &active = lane(LaneKind::ACTIVE);
+        if (active.occupied) {
+            lane_occupied = true;
+        } else {
+            active.occupied = true;
+        }
+    }
+    if (lane_occupied) {
+        complete_unpublished(d, "WorkerThread::dispatch: active lane is occupied");
+        return;
+    }
+    SubmitDispatchResult result;
+    try {
+        result = submit_dispatch(d, LaneKind::ACTIVE);
+    } catch (const std::exception &e) {
+        release_lane_unconditional(LaneKind::ACTIVE);
+        complete_unpublished(d, std::string("WorkerThread::dispatch: submit failed: ") + e.what());
+        return;
+    } catch (...) {
+        release_lane_unconditional(LaneKind::ACTIVE);
+        complete_unpublished(d, "WorkerThread::dispatch: submit failed");
+        return;
+    }
+    if (result == SubmitDispatchResult::SUBMITTED) return;
+    release_lane_unconditional(LaneKind::ACTIVE);
+    if (result == SubmitDispatchResult::STOPPING) {
+        complete_unpublished(d, "WorkerThread::dispatch: worker is stopping");
+    } else {
+        complete_unpublished(d, "WorkerThread::dispatch: endpoint capacity exceeded");
+    }
+}
+
+void WorkerThread::dispatch_prepared(WorkerDispatch d) {
+    d.prepare_only = true;
+    if (!caps().supports_frame_staging) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: endpoint does not support frame staging");
+        return;
+    }
+    if (ring_ == nullptr) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: null ring");
+        return;
+    }
+    TaskSlotState *slot = ring_->slot_state(d.task_slot);
+    if (slot == nullptr || slot->run_id == INVALID_RUN_ID) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: dispatch has no run identity");
+        return;
+    }
+    bool staged_lane_occupied = false;
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        LaneState &staged = lane(LaneKind::STAGED);
+        if (staged.occupied) {
+            staged_lane_occupied = true;
+        } else {
+            staged.occupied = true;
+            staged.run_id = slot->run_id;
+        }
+    }
+    if (staged_lane_occupied) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker already owns a staged run");
+        return;
+    }
+    SubmitDispatchResult result;
+    try {
+        result = submit_dispatch(d, LaneKind::STAGED, slot->run_id);
+    } catch (const std::exception &e) {
+        release_lane_unconditional(LaneKind::STAGED);
+        complete_unpublished(d, std::string("WorkerThread::dispatch_prepared: submit failed: ") + e.what());
+        return;
+    } catch (...) {
+        release_lane_unconditional(LaneKind::STAGED);
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: submit failed");
+        return;
+    }
+    if (result == SubmitDispatchResult::SUBMITTED) return;
+    release_lane_unconditional(LaneKind::STAGED);
+    if (result == SubmitDispatchResult::STOPPING) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker is stopping");
+    } else if (result == SubmitDispatchResult::CAPACITY_EXCEEDED) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: endpoint capacity exceeded");
+    } else {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: staged lane identity changed before submission");
+    }
+}
+
+WorkerThread::SubmitDispatchResult
+WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expected_run_id) {
+#if SIMPLER_HOST_STRACE
+    const int64_t trace_start_ns = simpler::host_trace::now_ns();
+#endif
+    std::unique_lock<std::mutex> admission_lk(admission_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) {
+        return SubmitDispatchResult::STOPPING;
+    }
+    if (inflight_.load(std::memory_order_acquire) >= endpoint_->caps().max_inflight_tasks) {
+        return SubmitDispatchResult::CAPACITY_EXCEEDED;
+    }
+    d.dispatch_id = next_dispatch_id_;
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        LaneState &dispatch_lane = lane(lane_kind);
+        if (!dispatch_lane.occupied || dispatch_lane.dispatch_id != 0 ||
+            (expected_run_id != INVALID_RUN_ID && dispatch_lane.run_id != expected_run_id)) {
+            return SubmitDispatchResult::STAGED_IDENTITY_CHANGED;
+        }
+        dispatch_lane.dispatch_id = d.dispatch_id;
+    }
+    ++next_dispatch_id_;
+    inflight_.fetch_add(1, std::memory_order_release);
+#if SIMPLER_HOST_STRACE
+    const RunId trace_run = trace_run_id(ring_, d.task_slot);
+    const uint64_t trace_hash = trace_callable_hash(ring_, d.task_slot);
+    const std::string trace_lease = trace_lease_attrs(ring_, d.task_slot);
+#endif
+    try {
+        endpoint_->submit_progress(ring_, d);
+    } catch (const std::exception &e) {
+        fail_submission(d, std::string("submit_progress failed: ") + e.what());
+    } catch (...) {
+        fail_submission(d, "submit_progress failed with unknown exception");
+    }
+    admission_lk.unlock();
+#if SIMPLER_HOST_STRACE
+    const int64_t trace_end_ns = simpler::host_trace::now_ns();
+    const std::string trace_attrs = trace_dispatch_attrs(trace_run, d, endpoint_->caps(), "scheduler") + trace_lease;
+    simpler::host_trace::emit(
+        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Dispatch), trace_run, trace_hash, 0,
+        trace_start_ns, trace_end_ns - trace_start_ns, trace_attrs.c_str()
+    );
+#endif
+    return SubmitDispatchResult::SUBMITTED;
+}
+
+bool WorkerThread::activate_prepared(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return false;
+    std::lock_guard<std::mutex> admission_lk(admission_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    LaneState &active = lane(LaneKind::ACTIVE);
+    LaneState &staged = lane(LaneKind::STAGED);
+    if (!staged.occupied || staged.run_id != run_id || staged.dispatch_id == 0 || active.occupied) {
+        return false;
+    }
+    active = staged;
+    active.activation_requested = true;
+    staged = {};
+    return true;
+}
+
+bool WorkerThread::has_staged_run(RunId run_id) const {
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    const LaneState &staged = lane(LaneKind::STAGED);
+    return staged.occupied && staged.run_id == run_id;
+}
+
+bool WorkerThread::can_stage() const {
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    return caps().supports_frame_staging && !lane(LaneKind::STAGED).occupied;
+}
+
+bool WorkerThread::idle() const {
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    return !lane(LaneKind::ACTIVE).occupied;
+}
+
+void WorkerThread::release_lane(LaneKind kind, uint64_t dispatch_id) {
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    LaneState &dispatch_lane = lane(kind);
+    if (dispatch_lane.dispatch_id == dispatch_id) dispatch_lane = {};
+}
+
+void WorkerThread::release_lane_unconditional(LaneKind kind) {
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    lane(kind) = {};
+}
+
+void WorkerThread::complete_unpublished(WorkerDispatch dispatch, const std::string &error_message) {
+    try {
+        if (on_accept_) on_accept_(dispatch);
+    } catch (...) {
+        // The endpoint-publication error remains the primary task failure.
+    }
+    on_complete_(
+        WorkerCompletion{dispatch.task_slot, dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE, error_message}
+    );
 }
 
 void WorkerThread::stop() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        shutdown_ = true;
-    }
-    cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
+    std::lock_guard<std::mutex> admission_lk(admission_mu_);
+    shutdown_.store(true, std::memory_order_release);
 }
 
 void WorkerThread::shutdown_child() {
@@ -251,171 +558,482 @@ const WorkerEndpointCaps &WorkerThread::caps() const {
 int32_t WorkerThread::worker_id() const { return caps().worker_id; }
 
 // =============================================================================
-// WorkerThread — main loop + per-mode dispatch
+// WorkerThread — Scheduler-owned endpoint progress
 // =============================================================================
 
-void WorkerThread::loop() {
-    while (true) {
-        WorkerDispatch d;
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [this] {
-                return !queue_.empty() || shutdown_;
-            });
-            if (queue_.empty()) break;
-            d = queue_.front();
-            queue_.pop();
-        }
-
-        WorkerCompletion completion;
-        try {
-            completion = dispatch_process(d);
-        } catch (const std::exception &e) {
-            completion.task_slot = d.task_slot;
-            completion.group_index = d.group_index;
-            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-            completion.error_message = std::string("WorkerThread endpoint failed: ") + e.what();
-        } catch (...) {
-            completion.task_slot = d.task_slot;
-            completion.group_index = d.group_index;
-            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-            completion.error_message = "WorkerThread endpoint failed with unknown exception";
-        }
-
-        idle_.store(true, std::memory_order_release);
-        on_complete_(std::move(completion));
-    }
-}
-
-WorkerCompletion WorkerThread::dispatch_process(WorkerDispatch d) {
-    if (!endpoint_) throw std::runtime_error("WorkerThread::dispatch_process: null endpoint");
-    return endpoint_->run(ring_, d);
-}
-
-WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dispatch) {
-    if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::run: null ring");
-    TaskSlotState &s = *ring->slot_state(dispatch.task_slot);
-    int32_t group_index = dispatch.group_index;
-    TaskArgsView view = s.args_view(group_index);
-    if (!s.remote_sidecar_for(group_index).empty()) {
-        WorkerCompletion completion;
-        completion.task_slot = dispatch.task_slot;
-        completion.group_index = group_index;
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message = "LocalMailboxEndpoint::run: remote task sidecar is not supported by local mailbox";
-        return completion;
-    }
-    WorkerCompletion completion;
-    completion.task_slot = dispatch.task_slot;
-    completion.group_index = group_index;
-
-    // Hold mailbox_mu_ for the entire round trip (write payload + state +
-    // spin-poll TASK_DONE + reset to IDLE). Any control_* request from the
-    // orch thread waits for the dispatch to finish before claiming the
-    // mailbox; without this they would race on MAILBOX_OFF_STATE.
-    std::lock_guard<std::mutex> lk(mailbox_mu_);
-    if (mailbox_control_timed_out_) {
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message = "LocalMailboxEndpoint::run: mailbox has an unresolved timed-out control command";
-        return completion;
+void WorkerThread::progress() {
+    if (shutdown_.load(std::memory_order_acquire)) {
+        // A child finishing a control handler may overwrite an earlier stop
+        // state, so the request remains level-triggered until terminalization.
+        endpoint_->request_progress_stop();
     }
 
-    // Clear the child-writable error fields so stale bytes from a prior
-    // dispatch cannot masquerade as a fresh failure.
-    int32_t zero_err = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
-    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-
-    uint64_t reserved_callable = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(uint64_t));
-
-    // Write config as a single packed POD block (see call_config.h).
-    std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
-
-    // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
-    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
-                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
-    if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message =
-            "LocalMailboxEndpoint::run: args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) +
-            " bytes, capacity " + std::to_string(MAILBOX_ARGS_CAPACITY) +
-            " bytes, tensors=" + std::to_string(view.tensor_count) + ", scalars=" + std::to_string(view.scalar_count);
-        return completion;
-    }
-    uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
-    std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
-
-    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
-    std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
-    std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
-    if (view.tensor_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
-        );
-    }
-    if (view.scalar_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
-            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
-        );
-    }
-
-    // Signal child process.
-    write_mailbox_state(MailboxState::TASK_READY);
-
-    // Spin-poll until child signals TASK_DONE. The task's latency runs through
-    // this wait, so it never sleeps (codestyle rule 5). A child that dies
-    // without publishing TASK_DONE would otherwise leave the loop spinning
-    // forever, so its liveness is sampled on a kChildLivenessPollPeriod wall
-    // clock rather than an iteration count, which no longer maps to a wall
-    // time once the loop runs at spin speed.
-    auto next_liveness_check = std::chrono::steady_clock::now() + kChildLivenessPollPeriod;
-    while (read_mailbox_state() != MailboxState::TASK_DONE) {
-        auto now = std::chrono::steady_clock::now();
-        if (now >= next_liveness_check) {
-            next_liveness_check = now + kChildLivenessPollPeriod;
-            std::string death = check_child_death();
-            if (!death.empty()) {
-                completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-                completion.error_message = "LocalMailboxEndpoint::run: " + death;
-                return completion;
+    RunId activated = INVALID_RUN_ID;
+    {
+        std::lock_guard<std::mutex> admission_lk(admission_mu_);
+        if (!shutdown_.load(std::memory_order_acquire)) {
+            {
+                std::lock_guard<std::mutex> lane_lk(lane_mu_);
+                const LaneState &active = lane(LaneKind::ACTIVE);
+                if (active.occupied && active.activation_requested) activated = active.run_id;
+            }
+            if (activated != INVALID_RUN_ID) {
+                try {
+                    if (endpoint_->activate_progress(activated)) {
+                        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+                        LaneState &active = lane(LaneKind::ACTIVE);
+                        if (active.occupied && active.run_id == activated) active.activation_requested = false;
+                    }
+                } catch (const std::exception &e) {
+                    fail_progress_driver(std::string("activate_progress failed: ") + e.what());
+                } catch (...) {
+                    fail_progress_driver("activate_progress failed with unknown exception");
+                }
             }
         }
     }
 
-    // Inspect the child's error report before releasing the mailbox back
-    // to IDLE. Non-zero error_code means the child-side Python loop
-    // caught an exception and filled OFF_ERROR_MSG with
-    // `f"{type(e).__name__}: {e}"` (truncated to MAILBOX_ERROR_MSG_SIZE).
-    int32_t error_code = 0;
-    std::memcpy(&error_code, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
-    if (error_code != 0) {
-        std::string msg = read_error_msg(mbox());
-        write_mailbox_state(MailboxState::IDLE);
-        completion.outcome = EndpointOutcome::TASK_FAILURE;
-        completion.error_message =
-            "LocalMailboxEndpoint::run: child failed (worker_id=" + std::to_string(caps_.worker_id) +
-            ", code=" + std::to_string(error_code) + "): " + msg;
-        return completion;
+    WorkerEndpointProgress progress;
+    try {
+        if (endpoint_->poll_progress(progress)) finish_progress_dispatch(progress);
+    } catch (const std::exception &e) {
+        fail_progress_driver(std::string("poll_progress failed: ") + e.what());
+    } catch (...) {
+        fail_progress_driver("poll_progress failed with unknown exception");
+    }
+}
+
+void WorkerThread::fail_submission(const WorkerDispatch &dispatch, const std::string &reason) {
+    shutdown_.store(true, std::memory_order_release);
+    bool endpoint_owned = false;
+    try {
+        endpoint_owned = endpoint_->report_submission_error(dispatch, reason);
+    } catch (...) {
+        endpoint_->request_progress_stop();
+    }
+    if (endpoint_owned) return;
+
+    WorkerEndpointProgress progress;
+    progress.kind = WorkerProgressKind::COMPLETED;
+    progress.dispatch = dispatch;
+    progress.completion = WorkerCompletion{
+        dispatch.task_slot, dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE,
+        "WorkerThread endpoint rejected publication: " + reason
+    };
+    finish_progress_dispatch(progress);
+}
+
+void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progress) {
+    const WorkerDispatch &dispatch = progress.dispatch;
+    if (progress.kind == WorkerProgressKind::FRAME_STAGED) {
+        // The endpoint already owns the prepared frame. This cursor-only event
+        // keeps the progress poll moving; acceptance, completion, and inflight
+        // ownership intentionally remain unchanged until activation/terminal.
+        return;
     }
 
-    write_mailbox_state(MailboxState::IDLE);
-    completion.outcome = EndpointOutcome::SUCCESS;
-    return completion;
+    if (progress.kind == WorkerProgressKind::ACCEPTED) {
+        if (!accepted_dispatch_ids_.insert(dispatch.dispatch_id).second) return;
+        try {
+            if (on_accept_) on_accept_(dispatch);
+        } catch (const std::exception &e) {
+            accept_errors_[dispatch.dispatch_id] = std::string("WorkerThread accept fence failed: ") + e.what();
+        } catch (...) {
+            accept_errors_[dispatch.dispatch_id] = "WorkerThread accept fence failed with unknown exception";
+        }
+        return;
+    }
+
+#if SIMPLER_HOST_STRACE
+    const RunId trace_run = trace_run_id(ring_, dispatch.task_slot);
+    const uint64_t trace_hash = trace_callable_hash(ring_, dispatch.task_slot);
+    std::string complete_attrs = trace_dispatch_attrs(trace_run, dispatch, endpoint_->caps(), "worker");
+#endif
+    WorkerCompletion completion = progress.completion;
+    if (accepted_dispatch_ids_.erase(dispatch.dispatch_id) == 0) {
+        // This advances only the run-level waiter after a terminal endpoint
+        // result. It does not manufacture the per-frame launch marker: that
+        // sticky word is published exclusively by the native launch path.
+        try {
+            if (on_accept_) on_accept_(dispatch);
+        } catch (const std::exception &e) {
+            accept_errors_[dispatch.dispatch_id] = std::string("WorkerThread accept fence failed: ") + e.what();
+        } catch (...) {
+            accept_errors_[dispatch.dispatch_id] = "WorkerThread accept fence failed with unknown exception";
+        }
+    }
+    auto accept_error = accept_errors_.find(dispatch.dispatch_id);
+    if (accept_error != accept_errors_.end()) {
+        if (completion.outcome == EndpointOutcome::SUCCESS) {
+            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+            completion.error_message = accept_error->second;
+        }
+        accept_errors_.erase(accept_error);
+    }
+
+#if SIMPLER_HOST_STRACE
+    complete_attrs += " outcome=" + std::to_string(static_cast<int32_t>(completion.outcome));
+    simpler::host_trace::SpanScope complete_trace(
+        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Complete), trace_run, trace_hash, 0,
+        std::move(complete_attrs)
+    );
+#endif
+    on_complete_(std::move(completion));
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        for (LaneState &dispatch_lane : lanes_) {
+            if (dispatch_lane.occupied && dispatch_lane.dispatch_id == dispatch.dispatch_id) {
+                dispatch_lane = {};
+                break;
+            }
+        }
+    }
+    inflight_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void WorkerThread::fail_progress_driver(const std::string &reason) noexcept {
+    shutdown_.store(true, std::memory_order_release);
+    try {
+        endpoint_->report_progress_error(reason);
+    } catch (...) {
+        endpoint_->request_progress_stop();
+    }
+}
+
+void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatch) {
+    if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::submit_progress: null ring");
+    TaskSlotState *slot_state = ring->slot_state(dispatch.task_slot);
+    if (slot_state == nullptr) throw std::out_of_range("LocalMailboxEndpoint::submit_progress: invalid task slot");
+    TaskSlotState &state = *slot_state;
+    const TaskArgs &a = state.args(dispatch.group_index);
+    if (!state.remote_sidecar_for(dispatch.group_index).empty()) {
+        throw std::runtime_error("remote task sidecar is not supported by local mailbox");
+    }
+    if (state.run_id == INVALID_RUN_ID || state.pipeline_lease.reserved != 0 || state.pipeline_lease.generation == 0 ||
+        (task_frame_count_ > 1 && state.pipeline_lease.slot_id >= task_frame_count_)) {
+        throw std::runtime_error("task frame has an invalid pipeline lease identity");
+    }
+    const size_t blob_bytes = task_args_blob_size(a);
+    if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
+        throw std::runtime_error(
+            "args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) + ", capacity " +
+            std::to_string(MAILBOX_ARGS_CAPACITY)
+        );
+    }
+
+#if SIMPLER_HOST_STRACE
+    simpler::host_trace::SpanScope frame_submit_trace(
+        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::FrameSubmit), state.run_id,
+        trace_callable_hash(ring, dispatch.task_slot), 0, trace_dispatch_attrs(state.run_id, dispatch, caps_, "worker")
+    );
+#endif
+
+    // The lease slot id is a native pipeline slot bounded by the runtime's
+    // PipelineContract, not a mailbox frame number. A two-frame endpoint maps
+    // the two 1:1; a single-frame endpoint always publishes to frame 0.
+    const size_t frame_index = task_frame_count_ == 1 ? 0 : state.pipeline_lease.slot_id;
+    // Linearize task-frame publication against base-frame controls. The
+    // control mutex is released immediately after the task state release-store;
+    // controls may still execute while the native run is active, subject to
+    // the child-side registry lifetime gate.
+    //
+    // Acquiring it is not always cheap, and the cost is shared. This runs on
+    // the Scheduler thread, which holds loop_mu_ and is the sole progress owner
+    // for every endpoint; run_control_command holds this same mutex while it
+    // blocks on the child, with no deadline by default. So while a control
+    // command is outstanding on any one endpoint, no endpoint makes progress
+    // and loop_mu_ stays held — and Orchestrator shares loop_mu_ with allocator
+    // compaction. Blocking here is bounded only by the child's control latency,
+    // not by anything this function does.
+    std::lock_guard<std::mutex> mailbox_lk(mailbox_mu_);
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    if (endpoint_poisoned_) {
+        throw std::runtime_error("endpoint is poisoned: " + endpoint_poison_reason_);
+    }
+    FrameRecord &record = frames_[frame_index];
+    char *frame = task_frame(frame_index);
+    if (record.occupied || read_mailbox_state(frame) != MailboxState::IDLE) {
+        poison_progress("pipeline-slot task frame is not reusable");
+        throw std::runtime_error("pipeline-slot task frame is not reusable");
+    }
+
+    int32_t zero_err = 0;
+    std::memcpy(frame + MAILBOX_OFF_ERROR, &zero_err, sizeof(zero_err));
+    std::memset(frame + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+    clear_task_accepted(frame);
+    const int32_t no_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
+    std::memcpy(frame + MAILBOX_OFF_PREPARATION_DISPOSITION, &no_disposition, sizeof(no_disposition));
+    uint64_t reserved_callable = 0;
+    std::memcpy(frame + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(reserved_callable));
+    std::memcpy(frame + MAILBOX_OFF_CONFIG, &state.config, sizeof(CallConfig));
+    std::memcpy(frame + MAILBOX_OFF_PIPELINE_LEASE, &state.pipeline_lease, sizeof(PipelineSlotLease));
+    std::memcpy(
+        frame + MAILBOX_OFF_TASK_CALLABLE_HASH, state.callable.digest.data(),
+        static_cast<size_t>(CALLABLE_HASH_DIGEST_SIZE)
+    );
+
+    // The versioned, length-prefixed Tensor blob (the L3->L2 wire; the child
+    // materializes it to a ChipTensor blob before run).
+    uint8_t *blob = reinterpret_cast<uint8_t *>(frame + MAILBOX_OFF_TASK_ARGS_BLOB);
+    write_blob(blob, a);
+
+    const uint64_t protocol = MAILBOX_TASK_PROTOCOL_VERSION;
+    const uint64_t slot_id = state.pipeline_lease.slot_id;
+    std::memcpy(frame + MAILBOX_OFF_FRAME_PROTOCOL, &protocol, sizeof(protocol));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_RUN_ID, &state.run_id, sizeof(state.run_id));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_SLOT_ID, &slot_id, sizeof(slot_id));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_GENERATION, &state.pipeline_lease.generation, sizeof(uint64_t));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_DISPATCH_ID, &dispatch.dispatch_id, sizeof(dispatch.dispatch_id));
+
+    record.occupied = true;
+    record.dispatch = dispatch;
+    record.run_id = state.run_id;
+    record.slot_id = slot_id;
+    record.generation = state.pipeline_lease.generation;
+    write_mailbox_state(dispatch.prepare_only ? MailboxState::PREPARE_READY : MailboxState::TASK_READY, frame);
+}
+
+bool LocalMailboxEndpoint::frame_identity_matches(const FrameRecord &record, const char *frame) const {
+    uint64_t protocol = 0;
+    RunId run_id = INVALID_RUN_ID;
+    uint64_t slot_id = 0;
+    uint64_t generation = 0;
+    uint64_t dispatch_id = 0;
+    PipelineSlotLease lease{};
+    std::memcpy(&protocol, frame + MAILBOX_OFF_FRAME_PROTOCOL, sizeof(protocol));
+    std::memcpy(&run_id, frame + MAILBOX_OFF_FRAME_RUN_ID, sizeof(run_id));
+    std::memcpy(&slot_id, frame + MAILBOX_OFF_FRAME_SLOT_ID, sizeof(slot_id));
+    std::memcpy(&generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(generation));
+    std::memcpy(&dispatch_id, frame + MAILBOX_OFF_FRAME_DISPATCH_ID, sizeof(dispatch_id));
+    std::memcpy(&lease, frame + MAILBOX_OFF_PIPELINE_LEASE, sizeof(lease));
+    return protocol == MAILBOX_TASK_PROTOCOL_VERSION && run_id == record.run_id && slot_id == record.slot_id &&
+           generation == record.generation && dispatch_id == record.dispatch.dispatch_id &&
+           lease.slot_id == record.slot_id && lease.reserved == 0 && lease.generation == record.generation;
+}
+
+bool LocalMailboxEndpoint::try_publish_activation(FrameRecord &record, char *frame) {
+    if (!record.activation_requested || record.activation_published) return record.activation_published;
+    if (!frame_identity_matches(record, frame)) {
+        poison_progress("stale staged frame identity before activation");
+        return false;
+    }
+    if (mailbox_compare_exchange_state(frame, MailboxState::FRAME_STAGED, MailboxState::ACTIVATE)) {
+        record.activation_published = true;
+    }
+    return record.activation_published;
+}
+
+void LocalMailboxEndpoint::poison_progress(const std::string &reason) {
+    if (endpoint_poisoned_) return;
+    endpoint_poisoned_ = true;
+    endpoint_poison_reason_ = reason;
+}
+
+bool LocalMailboxEndpoint::poisoned_progress_quiesced() {
+    // SHUTDOWN is deliberately repeated. A child already inside a control
+    // handler may publish CONTROL_DONE after the first store; the next store
+    // restores the stop request and prevents a live native run from being
+    // mistaken for a terminal parent completion.
+    shutdown_child();
+    if (child_pid_ > 0) return !check_child_death().empty();
+    for (size_t index = 0; index < task_frame_count_; ++index) {
+        if (!frames_[index].occupied) continue;
+        MailboxState state = read_mailbox_state(task_frame(index));
+        if (state != MailboxState::TASK_DONE && state != MailboxState::TASK_FAILED) return false;
+    }
+    return true;
+}
+
+WorkerCompletion LocalMailboxEndpoint::poisoned_completion(const FrameRecord &record) const {
+    return WorkerCompletion{
+        record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE,
+        "LocalMailboxEndpoint progress failed: " + endpoint_poison_reason_
+    };
+}
+
+bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    progress.preparation_disposition = MailboxPreparationDisposition::NONE;
+    bool any_occupied = false;
+    for (const FrameRecord &record : frames_)
+        any_occupied = any_occupied || record.occupied;
+    if (!any_occupied) return false;
+
+    if (!endpoint_poisoned_ && mailbox_control_timed_out_.load(std::memory_order_acquire)) {
+        poison_progress("mailbox has an unresolved timed-out control command");
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!endpoint_poisoned_ && now >= next_liveness_check_) {
+        next_liveness_check_ = now + kChildLivenessPollPeriod;
+        std::string death = check_child_death();
+        if (!death.empty()) poison_progress(death);
+    }
+
+    if (endpoint_poisoned_) {
+        if (!poisoned_progress_quiesced()) return false;
+        for (size_t offset = 0; offset < task_frame_count_; ++offset) {
+            size_t index = (poll_cursor_ + offset) % task_frame_count_;
+            FrameRecord &record = frames_[index];
+            if (!record.occupied) continue;
+            progress.kind = WorkerProgressKind::COMPLETED;
+            progress.dispatch = record.dispatch;
+            progress.completion = poisoned_completion(record);
+            record = FrameRecord{};
+            poll_cursor_ = (index + 1) % task_frame_count_;
+            return true;
+        }
+        return false;
+    }
+
+    for (size_t offset = 0; offset < task_frame_count_; ++offset) {
+        size_t index = (poll_cursor_ + offset) % task_frame_count_;
+        FrameRecord &record = frames_[index];
+        if (!record.occupied) continue;
+        char *frame = task_frame(index);
+        MailboxState state = read_mailbox_state(frame);
+
+        if (!record.accepted_reported && read_task_accepted(frame)) {
+            if (!frame_identity_matches(record, frame)) {
+                poison_progress("stale frame identity at launch acceptance");
+                break;
+            }
+            record.accepted_reported = true;
+            progress.kind = WorkerProgressKind::ACCEPTED;
+            progress.dispatch = record.dispatch;
+            poll_cursor_ = (index + 1) % task_frame_count_;
+            return true;
+        }
+
+        if (state == MailboxState::FRAME_STAGED) {
+            if (!frame_identity_matches(record, frame)) {
+                poison_progress("stale frame identity at endpoint staging");
+                break;
+            }
+            if (record.activation_requested) {
+                (void)try_publish_activation(record, frame);
+                if (endpoint_poisoned_) break;
+            }
+            if (!record.staged_reported) {
+                int32_t disposition_value = 0;
+                std::memcpy(&disposition_value, frame + MAILBOX_OFF_PREPARATION_DISPOSITION, sizeof(disposition_value));
+                const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
+                if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
+                    disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
+                    poison_progress("invalid preparation disposition at endpoint staging");
+                    break;
+                }
+                record.staged_reported = true;
+                progress.kind = WorkerProgressKind::FRAME_STAGED;
+                progress.dispatch = record.dispatch;
+                progress.preparation_disposition = disposition;
+                poll_cursor_ = (index + 1) % task_frame_count_;
+                return true;
+            }
+            continue;
+        }
+
+        if (state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED) {
+            if (!frame_identity_matches(record, frame)) {
+                poison_progress("stale frame identity at terminal completion");
+                break;
+            }
+            int32_t error_code = 0;
+            std::memcpy(&error_code, frame + MAILBOX_OFF_ERROR, sizeof(error_code));
+            progress.kind = WorkerProgressKind::COMPLETED;
+            progress.dispatch = record.dispatch;
+            progress.completion.task_slot = record.dispatch.task_slot;
+            progress.completion.group_index = record.dispatch.group_index;
+            if (state == MailboxState::TASK_FAILED || error_code != 0) {
+                progress.completion.outcome = EndpointOutcome::TASK_FAILURE;
+                progress.completion.error_message =
+                    "LocalMailboxEndpoint child failed (worker_id=" + std::to_string(caps_.worker_id) +
+                    ", code=" + std::to_string(error_code) + "): " + read_error_msg(frame);
+            } else {
+                progress.completion.outcome = EndpointOutcome::SUCCESS;
+            }
+            write_mailbox_state(MailboxState::IDLE, frame);
+            record = FrameRecord{};
+            poll_cursor_ = (index + 1) % task_frame_count_;
+            return true;
+        }
+
+        if (state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
+            state != MailboxState::ACTIVATE && state != MailboxState::TASK_LAUNCHED) {
+            poison_progress("task frame entered an invalid state " + std::to_string(static_cast<int32_t>(state)));
+            break;
+        }
+    }
+
+    if (!endpoint_poisoned_) return false;
+    if (!poisoned_progress_quiesced()) return false;
+    for (size_t index = 0; index < task_frame_count_; ++index) {
+        FrameRecord &record = frames_[index];
+        if (!record.occupied) continue;
+        progress.kind = WorkerProgressKind::COMPLETED;
+        progress.dispatch = record.dispatch;
+        progress.completion = poisoned_completion(record);
+        record = FrameRecord{};
+        poll_cursor_ = (index + 1) % task_frame_count_;
+        return true;
+    }
+    return false;
+}
+
+bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
+    std::unique_lock<std::mutex> lk(progress_mu_);
+    if (endpoint_poisoned_) return false;
+    for (size_t index = 0; index < task_frame_count_; ++index) {
+        FrameRecord &record = frames_[index];
+        if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id) continue;
+#if SIMPLER_HOST_STRACE
+        std::ostringstream activate_attrs;
+        activate_attrs << "run_id=" << run_id << " task_slot=" << record.dispatch.task_slot
+                       << " group_index=" << record.dispatch.group_index << " worker_id=" << caps_.worker_id
+                       << " dispatch_id=" << record.dispatch.dispatch_id
+                       << " endpoint_kind=" << endpoint_kind_name(caps_.kind)
+                       << " prepare_only=" << static_cast<int>(record.dispatch.prepare_only) << " role=worker";
+        simpler::host_trace::SpanScope activate_trace(
+            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Activate), run_id, 0, 0,
+            activate_attrs.str()
+        );
+#endif
+        record.activation_requested = true;
+        char *frame = task_frame(index);
+        (void)try_publish_activation(record, frame);
+        lk.unlock();
+        return true;
+    }
+    return false;
+}
+
+void LocalMailboxEndpoint::request_progress_stop() noexcept { shutdown_child(); }
+
+void LocalMailboxEndpoint::report_progress_error(const std::string &reason) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    poison_progress("endpoint progress driver failed: " + reason);
+}
+
+bool LocalMailboxEndpoint::report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    bool endpoint_owned = false;
+    for (const FrameRecord &record : frames_) {
+        endpoint_owned = endpoint_owned || (record.occupied && record.dispatch.dispatch_id == dispatch.dispatch_id);
+    }
+    poison_progress("endpoint submission failed: " + reason);
+    return endpoint_owned;
 }
 
 // =============================================================================
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox, int child_pid) {
-    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, child_pid);
+void WorkerManager::add_next_level(void *mailbox, int child_pid, uint32_t task_frame_count) {
+    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, child_pid, task_frame_count);
 }
 
-void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, int child_pid) {
+void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) {
     if (worker_id < 0) throw std::invalid_argument("WorkerManager::add_next_level_at: negative worker_id");
-    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, child_pid});
+    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, child_pid, task_frame_count});
 }
 
 void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
@@ -425,7 +1043,7 @@ void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endp
 
 void WorkerManager::add_sub(void *mailbox, int child_pid) { sub_entries_.push_back(LocalSubEntry{mailbox, child_pid}); }
 
-void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
+void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
     std::vector<int32_t> next_level_worker_ids;
@@ -452,8 +1070,10 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     auto make_next_level_threads = [&]() {
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
-            auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox, entry.child_pid);
-            wt->start(ring, on_complete, std::move(endpoint));
+            auto endpoint = std::make_unique<LocalMailboxEndpoint>(
+                entry.worker_id, entry.mailbox, entry.child_pid, entry.task_frame_count
+            );
+            wt->start(ring, on_complete, on_accept, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -464,27 +1084,38 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
                 static_cast<int32_t>(i), entries[i].mailbox, entries[i].child_pid
             );
-            wt->start(ring, on_complete, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
     make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        wt->start(ring, on_complete, std::move(endpoint));
+        wt->start(ring, on_complete, on_accept, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
     make_sub_threads(sub_entries_, sub_threads_);
 }
 
-void WorkerManager::stop() {
+void WorkerManager::stop_workers() {
     for (auto &wt : next_level_threads_)
         wt->stop();
     for (auto &wt : sub_threads_)
         wt->stop();
+}
+
+void WorkerManager::stop() {
+    stop_workers();
     next_level_threads_.clear();
     sub_threads_.clear();
+}
+
+void WorkerManager::progress() {
+    for (auto &worker : next_level_threads_)
+        worker->progress();
+    for (auto &worker : sub_threads_)
+        worker->progress();
 }
 
 WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id) const {
@@ -520,14 +1151,12 @@ WorkerThread *WorkerManager::pick_idle_sub_excluding(const std::vector<WorkerThr
 }
 
 // =============================================================================
-// LocalMailboxEndpoint — memory control (orch thread, concurrent with worker thread)
+// LocalMailboxEndpoint — memory control (orch thread, concurrent with Scheduler progress)
 // =============================================================================
 
-static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0) {
+static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0) {
     std::memcpy(mbox + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     std::memcpy(mbox + CTRL_OFF_ARG0, &a0, sizeof(uint64_t));
-    std::memcpy(mbox + CTRL_OFF_ARG1, &a1, sizeof(uint64_t));
-    std::memcpy(mbox + CTRL_OFF_ARG2, &a2, sizeof(uint64_t));
 }
 
 static uint64_t read_control_result(const char *mbox) {
@@ -545,10 +1174,14 @@ static void write_control_digest(char *mbox, const uint8_t *digest) {
 }
 
 // Issue a control sub-command and block until the child publishes
-// CONTROL_DONE. Caller must hold `mailbox_mu_`. On a non-zero error code
-// from the child, throws and leaves the mailbox in IDLE before unwinding
-// (so the next claim starts from a clean state). The `op_name` is used
-// only for the exception message.
+// CONTROL_DONE. Caller must hold `mailbox_mu_`. Registry controls may remain
+// in CONTROL_REQUEST while the child owns an active native run or a live frame
+// references the callable digest. The default infinite timeout waits for that
+// deferral subject to child-liveness checks; an explicit timeout includes the
+// deferred interval, and expiry poisons the endpoint. On a non-zero error code
+// from the child, throws and leaves the mailbox in IDLE before unwinding (so
+// the next claim starts from a clean state). The `op_name` is used only for the
+// exception message.
 void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeout_s) {
     if (mailbox_control_timed_out_) {
         throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
@@ -567,7 +1200,11 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
     while (read_mailbox_state() != MailboxState::CONTROL_DONE) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
-            mailbox_control_timed_out_ = true;
+            mailbox_control_timed_out_.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> progress_lk(progress_mu_);
+                poison_progress(std::string(op_name) + " timed out waiting for CONTROL_DONE");
+            }
             throw std::runtime_error(std::string(op_name) + " timed out waiting for CONTROL_DONE");
         }
         if (now >= next_liveness_check) {
@@ -577,7 +1214,11 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
                 // The mailbox is poisoned rather than reset to IDLE: with the
                 // child gone no later command can complete, so admitting one
                 // would restore the hang this check exists to break.
-                mailbox_control_timed_out_ = true;
+                mailbox_control_timed_out_.store(true, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> progress_lk(progress_mu_);
+                    poison_progress(death);
+                }
                 throw std::runtime_error(std::string(op_name) + ": " + death);
             }
         }
@@ -596,6 +1237,13 @@ uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     run_control_command("control_malloc");
+    return read_control_result(mbox());
+}
+
+uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_COMMITTED_DEVICE_MEMORY);
+    run_control_command("control_committed_device_memory");
     return read_control_result(mbox());
 }
 
@@ -709,15 +1357,17 @@ void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     run_control_command("control_free");
 }
 
-void LocalMailboxEndpoint::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
+void LocalMailboxEndpoint::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_COPY_TO, dst, src, static_cast<uint64_t>(size));
+    write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, nbytes);
     run_control_command("control_copy_to");
 }
 
-void LocalMailboxEndpoint::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
+void LocalMailboxEndpoint::control_copy_from(
+    const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes
+) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_COPY_FROM, dst, src, static_cast<uint64_t>(size));
+    write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, nbytes);
     run_control_command("control_copy_from");
 }
 
@@ -771,26 +1421,31 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
     run_control_command("control_comm_init");
 }
 
-void LocalMailboxEndpoint::control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) {
+void LocalMailboxEndpoint::control_worker_chip_region_create(const char *request_shm_name, const char *reply_shm_name) {
     if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
-        throw std::runtime_error("control_l3_l2_region_create: request and reply shm names must be non-empty");
+        throw std::runtime_error("control_worker_chip_region_create: request and reply shm names must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    uint64_t sub_cmd = CTRL_L3_L2_REGION_CREATE;
+    uint64_t sub_cmd = CTRL_WORKER_CHIP_REGION_CREATE;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
-    run_control_command("control_l3_l2_region_create");
+    run_control_command("control_worker_chip_region_create");
 }
 
-void LocalMailboxEndpoint::control_l3_l2_region_release(uint64_t region_id) {
+void LocalMailboxEndpoint::control_worker_chip_region_release(uint64_t region_id) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_L3_L2_REGION_RELEASE, region_id);
-    run_control_command("control_l3_l2_region_release");
+    write_control_args(mbox(), CTRL_WORKER_CHIP_REGION_RELEASE, region_id);
+    run_control_command("control_worker_chip_region_release");
 }
 
 uint64_t WorkerThread::control_malloc(size_t size) {
     if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
     return endpoint_->control_malloc(size);
+}
+
+uint64_t WorkerThread::control_committed_device_memory() {
+    if (!endpoint_) throw std::runtime_error("control_committed_device_memory: null endpoint");
+    return endpoint_->control_committed_device_memory();
 }
 
 void WorkerThread::control_prepare(const uint8_t *digest) {
@@ -879,6 +1534,13 @@ void WorkerThread::control_remote_release_import(const RemoteBufferHandle &handl
     endpoint_->control_remote_release_import(handle);
 }
 
+std::vector<uint8_t> WorkerThread::control_remote_domain(
+    remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target
+) {
+    if (!endpoint_) throw std::runtime_error("control_remote_domain: null endpoint");
+    return endpoint_->control_remote_domain(control_name, command_bytes, group_target);
+}
+
 void WorkerThread::control_generic(
     uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
 ) {
@@ -891,14 +1553,14 @@ void WorkerThread::control_free(uint64_t ptr) {
     endpoint_->control_free(ptr);
 }
 
-void WorkerThread::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
+void WorkerThread::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
     if (!endpoint_) throw std::runtime_error("control_copy_to: null endpoint");
-    endpoint_->control_copy_to(dst, src, size);
+    endpoint_->control_copy_to(dst, src, nbytes);
 }
 
-void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
+void WorkerThread::control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
     if (!endpoint_) throw std::runtime_error("control_copy_from: null endpoint");
-    endpoint_->control_copy_from(dst, src, size);
+    endpoint_->control_copy_from(dst, src, nbytes);
 }
 
 void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
@@ -916,22 +1578,35 @@ void WorkerThread::control_comm_init(const char *request_shm_name) {
     endpoint_->control_comm_init(request_shm_name);
 }
 
-void WorkerThread::control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) {
-    if (!endpoint_) throw std::runtime_error("control_l3_l2_region_create: null endpoint");
-    endpoint_->control_l3_l2_region_create(request_shm_name, reply_shm_name);
+void WorkerThread::control_worker_chip_region_create(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_worker_chip_region_create: null endpoint");
+    endpoint_->control_worker_chip_region_create(request_shm_name, reply_shm_name);
 }
 
-void WorkerThread::control_l3_l2_region_release(uint64_t region_id) {
-    if (!endpoint_) throw std::runtime_error("control_l3_l2_region_release: null endpoint");
-    endpoint_->control_l3_l2_region_release(region_id);
+void WorkerThread::control_worker_chip_region_release(uint64_t region_id) {
+    if (!endpoint_) throw std::runtime_error("control_worker_chip_region_release: null endpoint");
+    endpoint_->control_worker_chip_region_release(region_id);
 }
 
 bool WorkerManager::any_busy() const {
     for (auto &wt : next_level_threads_)
-        if (!wt->idle()) return true;
+        if (wt->busy()) return true;
     for (auto &wt : sub_threads_)
-        if (!wt->idle()) return true;
+        if (wt->busy()) return true;
     return false;
+}
+
+bool WorkerManager::has_staged_run(RunId run_id) const {
+    for (const auto &worker : next_level_threads_)
+        if (worker->has_staged_run(run_id)) return true;
+    return false;
+}
+
+bool WorkerManager::activate_prepared_run(RunId run_id) {
+    bool activated = false;
+    for (const auto &worker : next_level_threads_)
+        activated = worker->activate_prepared(run_id) || activated;
+    return activated;
 }
 
 // =============================================================================
@@ -1055,22 +1730,22 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
     wt->control_comm_init(request_shm_name);
 }
 
-void WorkerManager::control_l3_l2_region_create(
+void WorkerManager::control_worker_chip_region_create(
     int worker_id, const char *request_shm_name, const char *reply_shm_name
 ) {
     auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_l3_l2_region_create: invalid worker_id " + std::to_string(worker_id));
+        throw std::runtime_error("control_worker_chip_region_create: invalid worker_id " + std::to_string(worker_id));
     }
-    wt->control_l3_l2_region_create(request_shm_name, reply_shm_name);
+    wt->control_worker_chip_region_create(request_shm_name, reply_shm_name);
 }
 
-void WorkerManager::control_l3_l2_region_release(int worker_id, uint64_t region_id) {
+void WorkerManager::control_worker_chip_region_release(int worker_id, uint64_t region_id) {
     auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_l3_l2_region_release: invalid worker_id " + std::to_string(worker_id));
+        throw std::runtime_error("control_worker_chip_region_release: invalid worker_id " + std::to_string(worker_id));
     }
-    wt->control_l3_l2_region_release(region_id);
+    wt->control_worker_chip_region_release(region_id);
 }
 
 ControlResult WorkerManager::control_digest_only(
@@ -1090,6 +1765,24 @@ ControlResult WorkerManager::control_digest_only(
         result.error_message = strip_control_prefix(e.what(), "control_generic");
     }
     return result;
+}
+
+std::vector<uint8_t> WorkerManager::control_payload(
+    WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+) {
+    if (payload == nullptr || payload_size == 0) {
+        throw std::runtime_error("control_payload: payload must be non-empty");
+    }
+    WorkerThread *wt = get_worker_by_id(type, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_payload: invalid worker_id " + std::to_string(worker_id));
+    }
+    std::string shm_name = make_shm_name();
+    PosixShmHolder shm(shm_name, payload_size);
+    std::memcpy(shm.addr(), payload, payload_size);
+    wt->control_generic(sub_cmd, shm_name.c_str(), payload_size, timeout_s, nullptr);
+    auto *begin = static_cast<const uint8_t *>(shm.addr());
+    return {begin, begin + payload_size};
 }
 
 ControlResult WorkerManager::control_remote_prepare_register(
@@ -1234,6 +1927,25 @@ void WorkerManager::control_remote_release_import(const RemoteBufferHandle &hand
     wt->control_remote_release_import(handle);
 }
 
+std::vector<uint8_t> WorkerManager::control_remote_domain(
+    int worker_id, remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target
+) {
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_domain: invalid worker_id " + std::to_string(worker_id));
+    }
+    switch (control_name) {
+    case remote_l3::ControlName::COMM_INIT:
+    case remote_l3::ControlName::ALLOC_DOMAIN:
+    case remote_l3::ControlName::RELEASE_DOMAIN:
+    case remote_l3::ControlName::COPY_TO_DOMAIN:
+    case remote_l3::ControlName::COPY_FROM_DOMAIN:
+        return wt->control_remote_domain(control_name, command_bytes, group_target);
+    default:
+        throw std::runtime_error("control_remote_domain: control name is not a domain operation");
+    }
+}
+
 std::vector<ControlResult>
 WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, const uint8_t *digest) {
     std::vector<ControlResult> results;
@@ -1247,7 +1959,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     PosixShmHolder shm(shm_name, blob_size);
     std::memcpy(shm.addr(), blob_ptr, blob_size);
 
-    // Fan out to every WorkerThread in parallel. Per-WorkerThread mailbox_mu_
+    // Fan out to every endpoint lane in parallel. Per-endpoint mailbox_mu_
     // is independent, so N control_register calls run concurrently — latency
     // is 1 × prepare_cost instead of N × prepare_cost.
     std::vector<std::thread> workers;

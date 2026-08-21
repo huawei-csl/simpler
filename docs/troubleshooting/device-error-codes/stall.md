@@ -7,9 +7,9 @@
 Three watchdogs compete, and whichever fires first determines whether you get a
 clean `-100` with a `sub_class`, or a masked `507018`:
 
-- the scheduler no-progress timeout (`PTO2_SCHEDULER_TIMEOUT_MS`),
-- the STARS op-execute timeout (`PTO2_OP_EXECUTE_TIMEOUT_US`, ~45 s, kills `aicpu-sd`),
-- the host stream-sync timeout (`PTO2_STREAM_SYNC_TIMEOUT_MS`).
+- the scheduler no-progress timeout (`SIMPLER_SCHEDULER_TIMEOUT_MS`),
+- the STARS op-execute timeout (`SIMPLER_OP_EXECUTE_TIMEOUT_US`, ~45 s, kills `aicpu-sd`),
+- the host stream-sync timeout (`SIMPLER_STREAM_SYNC_TIMEOUT_MS`).
 
 **A 45 s op-execute kill is not proof of a deadlock** — the kernel may simply be
 slow. To find out which, order the race deliberately. The STs do exactly this, and
@@ -33,7 +33,7 @@ The `sub_class=` line gives you `stuck_task_id` and `stuck_core`. Map the task i
 back to your orchestration and look at that kernel for an infinite loop, a wait on
 a signal that never arrives, or simply too much work.
 
-When the task id is not enough, raise the log level to **V0** and the device log
+When the task id is not enough, lower the log threshold to **DEBUG** and the device log
 prints a task snapshot at the moment of the stall:
 
 ```text
@@ -48,12 +48,13 @@ kernel, on which core".
 
 Setting the level:
 
-- **Worker directly**: `logging.getLogger("simpler").setLevel("V0")` **before**
+- **Worker directly**: `logging.getLogger("simpler").setLevel("DEBUG")` **before**
   `worker.init()` — the level is snapshotted at init and pushed to the device, so
   setting it between `run()` calls has no effect.
-- **pytest / scene test**: `--log-level v0`.
+- **pytest / scene test**: `--log-level debug`.
 
-V0 is the most verbose level (V0 verbose … V9 terse, default V5). Device logs land
+`DEBUG` is the most verbose level (`DEBUG`, `INFO`, `TIMING`, `WARN`, `ERROR`;
+default `TIMING`). Device logs land
 in the shared `~/ascend/log/debug/device-<id>/` by default, where several processes
 interleave; redirect them per-run with `ASCEND_PROCESS_LOG_PATH` (the directory must
 exist) before reading. See the "Device logs" section of

@@ -19,34 +19,29 @@ from typing import Optional
 
 from .environment import PROJECT_ROOT
 from .platform_info import TARGETS, load_build_config, parse_platform
-from .runtime_compiler import (
-    RuntimeCompiler,
-    _sdma_workspace_enabled,
-    _urma_workspace_enabled,
-)
+from .runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
+_DEFAULT_SIM_PROFILING_CONFIG = {
+    "SIMPLER_DFX": "1",
+    "SIMPLER_ORCH_PROFILING": "0",
+    "SIMPLER_SCHED_PROFILING": "0",
+    "SIMPLER_TENSORMAP_PROFILING": "0",
+}
 
 
 def platform_embeds_pto_isa(platform: str) -> bool:
     """Return True when this platform's onboard host embeds PTO-ISA headers.
 
-    a2a3 onboard always embeds (workspace forced ON in CMake). a5 onboard
-    embeds only when the SDMA or URMA async workspace overlay is opted in
-    (``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE`` / ``SIMPLER_ENABLE_PTO_URMA_WORKSPACE``
-    truthy) — the overlays are opt-in, so default-OFF a5 builds must not pull
-    in pin/metadata machinery. See issues #1351 (SDMA) and #1392 (URMA).
+    a2a3 and a5 onboard always embed a PTO-ISA async workspace. Simulation
+    platforms do not embed PTO-ISA host headers.
     """
     arch, variant = parse_platform(platform)
     if variant != "onboard":
         return False
-    if arch == "a2a3":
-        return True
-    if arch == "a5":
-        return _sdma_workspace_enabled() or _urma_workspace_enabled()
-    return False
+    return arch in {"a2a3", "a5"}
 
 
 def _get_git_head(repo_root: Path) -> str:
@@ -126,14 +121,20 @@ class RuntimeBinaries:
     them to the device alongside the inner SO). Sim platforms have no
     dispatcher; the field is ``None`` there. ``_lookup_binaries`` resolves
     and validates the path against the build output directory.
+
+    ``sdma_warmup_path`` points at ``sdma_warmup_kernel.o``, the vector-only ELF
+    that warms the SDMA control path once at worker init. Unlike the dispatcher
+    it is optional: only arches whose aicore CMakeLists builds it have one, and
+    a missing warmup ELF costs latency on the first TPREFETCH_ASYNC rather than
+    breaking the worker, so the field is left ``None`` instead of raising.
     """
 
     host_path: Path
     aicpu_path: Path
     aicore_path: Path
-    simpler_log_path: Path
     sim_context_path: Optional[Path] = None
     dispatcher_path: Optional[Path] = None
+    sdma_warmup_path: Optional[Path] = None
 
 
 class RuntimeBuilder:
@@ -204,19 +205,16 @@ class RuntimeBuilder:
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
-        Driven by :func:`platform_embeds_pto_isa`: a2a3 onboard always (CMake
-        forces the SDMA workspace ON), a5 onboard only when the SDMA or URMA
-        async workspace overlay is truthy. a5 must key on the overlay env/CMake
-        option — not bare ``arch == "a5"`` — so default-OFF a5 builds never
-        clone pto-isa or write metadata for nothing (#1351).
+        Driven by :func:`platform_embeds_pto_isa`: a2a3 and a5 onboard always
+        embed one async workspace backend; simulation platforms do not.
         """
         return platform_embeds_pto_isa(self.platform)
 
     def _resolve_build_pto_isa_commit(self) -> str:
         """Return the pinned pto-isa commit baked into this build.
 
-        When host code embeds pto-isa headers (a2a3 onboard, or a5 onboard
-        with the SDMA or URMA overlay ON), a pto-isa bump must invalidate that build's
+        When host code embeds pto-isa headers (a2a3 or a5 onboard), a pto-isa
+        bump must invalidate that build's
         cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
         survives a reinstall). For every other arch/variant the pto-isa
@@ -236,9 +234,9 @@ class RuntimeBuilder:
     def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
         """Stamp identifying the sources this build was compiled from.
 
-        Combines the runtime repo HEAD with the pto-isa commit (a2a3 onboard
-        only) so the cmake cache is invalidated whenever either changes. An
-        empty runtime HEAD is preserved verbatim so the
+        Combines the runtime repo HEAD with the pto-isa commit for a2a3 and a5
+        onboard builds so the cmake cache is invalidated whenever either
+        changes. An empty runtime HEAD is preserved verbatim so the
         ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
         fires rather than being masked by a present pto-isa commit.
         """
@@ -292,14 +290,6 @@ class RuntimeBuilder:
                 "Run 'pip install --no-build-isolation .' to compile it."
             )
 
-        # Validate libsimpler_log.so exists (built once per arch/variant).
-        simpler_log_path = self._resolve_simpler_log_path()
-        if not simpler_log_path.is_file():
-            raise FileNotFoundError(
-                f"Pre-built libsimpler_log.so not found at {simpler_log_path}.\n"
-                "Run 'pip install --no-build-isolation .' to compile it."
-            )
-
         # Resolve and validate libsimpler_aicpu_dispatcher.so for onboard
         # platforms. runtime_compiler stages one copy per arch into
         # <LIB_DIR>/<arch>/dispatcher/ (shared across all runtimes); sim
@@ -315,12 +305,19 @@ class RuntimeBuilder:
             host_path=paths["host"],
             aicpu_path=paths["aicpu"],
             aicore_path=paths["aicore"],
-            simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
+            sdma_warmup_path=self._resolve_sdma_warmup_path(),
         )
 
-    def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
+    def get_binaries(
+        self,
+        name: str,
+        build: bool = False,
+        *,
+        build_shared: bool = True,
+        profiling_config: Optional[dict[str, str]] = None,
+    ) -> RuntimeBinaries:
         """Return paths to compiled runtime binaries.
 
         By default, looks up pre-built binaries from build/lib/. When
@@ -331,6 +328,13 @@ class RuntimeBuilder:
             name: Name of the runtime implementation (e.g. 'host_build_graph')
             build: If True, compile the runtime before returning paths.
                 If False (default), return pre-built binary paths.
+            build_shared: If True (default), build the process-global helper
+                libraries as part of this call. ``build_runtimes.py`` sets this
+                to False after pre-building them once for the whole batch.
+            profiling_config: Complete profiling macro configuration passed to
+                each runtime target's CMake configure step. Simulation builds
+                explicitly use source defaults when this is omitted, preventing
+                values from an earlier profiling build remaining in CMake cache.
 
         Returns:
             RuntimeBinaries with paths to host, aicpu, and aicore binaries.
@@ -347,6 +351,9 @@ class RuntimeBuilder:
         # arch reuse the same SO instead of carrying a copy each (~50 KB × N).
         # None on sim — sim variants have no dispatcher.
         dispatcher_staging_dir = self._LIB_DIR / arch / "dispatcher" if variant != "sim" else None
+        # Same reasoning for the vector-only SDMA warmup ELF: no runtime-specific
+        # code, so one copy per arch. None on sim — sim has no device SDMA.
+        sdma_warmup_staging_dir = self._LIB_DIR / arch / "sdma_warmup" if variant != "sim" else None
 
         if not build:
             return self._lookup_binaries(name, output_dir)
@@ -359,32 +366,32 @@ class RuntimeBuilder:
 
         build_pto_isa_commit = self._resolve_build_pto_isa_commit()
         cache_stamp = self._build_cache_stamp(build_pto_isa_commit)
+        effective_profiling_config = profiling_config
+        if variant == "sim" and effective_profiling_config is None:
+            effective_profiling_config = _DEFAULT_SIM_PROFILING_CONFIG
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
-            cmake_defines = None
+            defines = dict(effective_profiling_config or {})
+            # Pin-resolved checkout path for CMake include dirs (#1403). Needed by
+            # host (SDMA workspace manager) and by aicore (the SDMA warmup kernel's
+            # vector-only target). Prefer the path already resolved on the
+            # RuntimeCompiler; fall back to ensure_pto_isa_root when embedding but
+            # the compiler field is unset (e.g. mocked UT / partial construction).
+            if target in ("host", "aicore") and self._requires_pto_isa_metadata_validation():
+                pto_root = getattr(compiler, "pto_isa_root", None)
+                if not isinstance(pto_root, str) or not pto_root:
+                    from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+                    pto_root = ensure_pto_isa_root(verbose=True)
+                defines["PTO_ISA_ROOT"] = pto_root
             if target == "host":
-                defines: dict[str, str] = {}
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
-                # Pin-resolved checkout path for host CMake include dirs (#1403).
-                # Prefer the path already resolved on the RuntimeCompiler; fall
-                # back to ensure_pto_isa_root when embedding but the compiler
-                # field is unset (e.g. mocked UT / partial construction).
-                if self._requires_pto_isa_metadata_validation():
-                    pto_root = getattr(compiler, "pto_isa_root", None)
-                    if not isinstance(pto_root, str) or not pto_root:
-                        from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
-                        pto_root = ensure_pto_isa_root(verbose=True)
-                    defines["PTO_ISA_ROOT"] = pto_root
-                for opt_in_define in (
-                    "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
-                    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
-                ):
+                for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
                     if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
                         defines[opt_in_define] = "ON"
-                cmake_defines = defines or None
+            cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -403,20 +410,17 @@ class RuntimeBuilder:
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
                     dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
+                    sdma_warmup_dest=sdma_warmup_staging_dir if target == "aicore" else None,
                     cmake_defines=cmake_defines,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
 
-        # libsimpler_log.so must finish before the host runtime is built —
-        # the host CMake links against it via -lsimpler_log -L<output_dir>.
-        simpler_log_path = self.ensure_simpler_log(build=True)
-
         with ThreadPoolExecutor(max_workers=4) as executor:
             fut_host = executor.submit(_compile_target, "host")
             fut_aicpu = executor.submit(_compile_target, "aicpu")
             fut_aicore = executor.submit(_compile_target, "aicore")
-            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=True) if variant == "sim" else None
+            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
 
             host_path = fut_host.result()
             aicpu_path = fut_aicpu.result()
@@ -445,10 +449,39 @@ class RuntimeBuilder:
             host_path=host_path,
             aicpu_path=aicpu_path,
             aicore_path=aicore_path,
-            simpler_log_path=simpler_log_path,
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
+            sdma_warmup_path=self._resolve_sdma_warmup_path(),
         )
+
+    def _resolve_sdma_warmup_path(self) -> Optional[Path]:
+        """Return path to sdma_warmup_kernel.o, or None when this build has none.
+
+        Staged per arch under ``build/lib/<arch>/sdma_warmup/`` by
+        runtime_compiler when the arch's aicore CMakeLists builds the vector-only
+        warmup ELF. Returns ``None`` for sim and whenever the file is absent:
+        without it the first TPREFETCH_ASYNC pays the cold SDMA control path
+        (~4.4 ms) but nothing breaks, so this is deliberately not validated the
+        way ``_resolve_dispatcher_path`` is.
+
+        A missing ELF for an arch that *does* carry the source is a build or
+        staging regression, and every consumer of it degrades silently, so it is
+        warned about here rather than left to be noticed as lost performance.
+        """
+        if self._variant == "sim":
+            return None
+        path = self._LIB_DIR / self._arch / "sdma_warmup" / "sdma_warmup_kernel.o"
+        if path.is_file():
+            return path
+        source = PROJECT_ROOT / "src" / self._arch / "platform" / "onboard" / "aicore" / "sdma_warmup_kernel.cpp"
+        if source.is_file():
+            logger.warning(
+                "SDMA warmup ELF not staged at %s though %s carries its source; "
+                "an enable_sdma Worker will pay the cold SDMA control path on its first TPREFETCH_ASYNC",
+                path,
+                self._arch,
+            )
+        return None
 
     def _resolve_dispatcher_path(self) -> Optional[Path]:
         """Return path to libsimpler_aicpu_dispatcher.so for onboard variants.
@@ -466,46 +499,13 @@ class RuntimeBuilder:
     def _resolve_sim_context_path(self) -> Optional[Path]:
         """Return path to libcpu_sim_context.so for sim platforms, None for onboard.
 
-        Like libsimpler_log.so, the library is process-global — its source has
-        no arch-specific code, so one shared copy per host toolchain is enough.
+        The library is process-global and has no arch-specific code, so one
+        shared copy per host toolchain is enough.
         Lives at build/lib/libcpu_sim_context.so.
         """
         if self._variant != "sim":
             return None
         return self._LIB_DIR / "libcpu_sim_context.so"
-
-    def _resolve_simpler_log_path(self) -> Path:
-        """Return path to libsimpler_log.so.
-
-        Process-global, not arch- or variant-specific — the source is plain
-        C++ with no platform conditionals, so one shared copy per host
-        toolchain is sufficient. Lives at build/lib/libsimpler_log.so.
-        """
-        return self._LIB_DIR / "libsimpler_log.so"
-
-    def ensure_simpler_log(self, build: bool = False) -> Path:
-        """Build or locate the process-global libsimpler_log.so."""
-        output_dir = self._LIB_DIR
-        so_path = output_dir / "libsimpler_log.so"
-
-        if not build and so_path.is_file():
-            return so_path
-        if not build:
-            raise FileNotFoundError(
-                f"Pre-built libsimpler_log.so not found at {so_path}.\n"
-                "Run 'pip install --no-build-isolation .' to compile it."
-            )
-
-        cache_dir = self._CACHE_DIR
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = cache_dir / ".simpler_log.lock"
-        with open(lock_path, "w") as lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            result = self._runtime_compiler.compile_simpler_log(
-                build_dir=str(cache_dir),
-                output_dir=output_dir,
-            )
-            return Path(result)  # type: ignore[arg-type]
 
     def ensure_sim_context(self, build: bool = False) -> Optional[Path]:
         """Build or locate the process-global cpu_sim_context SO (sim only)."""

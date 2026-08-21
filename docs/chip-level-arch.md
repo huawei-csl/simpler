@@ -3,7 +3,7 @@
 This document describes the **single-chip (L2) architecture** — how a host
 program, AICPU kernel, and AICore kernel cooperate on one Ascend NPU chip. For
 the multi-chip hierarchy (L3+: Orchestrator / Scheduler / Worker composition)
-see [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For how task
+see [hierarchical-level-runtime.md](hierarchical-level-runtime.md). For how task
 data (Callable / TaskArgs / CallConfig) flows through all levels, see
 [task-flow.md](task-flow.md).
 
@@ -106,29 +106,47 @@ DeviceRunner runner;
 void *ptr = runner.allocate_tensor(bytes);
 runner.copy_to_device(dev_ptr, host_ptr, bytes);
 runner.set_executors(aicpu_binary, aicore_binary);   // once, at init time
-runner.run(runtime, config);                         // config carries aicpu_thread_num, diagnostics
+std::unique_ptr<DeviceRunnerBase::PreparedExecution> prepared;
+runner.prepare_execution(runtime, config, pipeline_slot, identity, &prepared);
+auto launched = runner.launch_execution(std::move(prepared), std::move(permit));
+runner.drain_execution(*launched.active);            // child progress path owns progress
 runner.finalize();
 ```
 
 ### Layer 2: C API (`src/common/worker/pto_runtime_c_api.h`)
 
 ```c
-// libsimpler_log.so (RTLD_GLOBAL, loaded first by the Python wrapper):
-simpler_log_init(log_level, log_info_v);              // seed HostLogger once
+// _task_interface owns this process's SimplerHostLogState. Python seeds its
+// threshold before entering the C++ worker.
 
-// host_runtime.so (RTLD_LOCAL, loaded after):
+// host_runtime.so is self-contained and loaded RTLD_LOCAL:
+SimplerHostLogBindStateFn bind_host_log_state =
+    (SimplerHostLogBindStateFn)dlsym(host_runtime,
+                                    "simpler_host_log_bind_state");
+bind_host_log_state(host_log_state);
 DeviceContextHandle ctx = create_device_context();
 simpler_init(ctx, device_id,                          // attach + binary takeover
              aicpu_binary, aicpu_size,
-             aicore_binary, aicore_size);
+             aicore_binary, aicore_size,
+             dispatcher_binary, dispatcher_size,
+             prewarm_config);
 size_t size = get_runtime_size();
-register_callable(ctx, cid, callable);                 // one-time per callable
-simpler_run(ctx, runtime, cid, args, config);        // per-launch — no binaries; config
-                                                       // carries aicpu_thread_num,
-                                                       // diagnostics + ring overrides
-unregister_callable(ctx, cid);
+size_t alignment = get_runtime_alignment();
+void *runtime = allocate_zeroed_aligned(size, alignment); // stable until finalize
+simpler_register_callable(ctx, cid, callable);        // one-time per callable
+
+// Progressable form; simpler_run(...) composes these phases synchronously.
+// `descriptor` carries this run's slot/bank/identity and the optional
+// launch-acceptance target published at the kernel-launch marker.
+simpler_prepare_run(ctx, runtime, cid, args, config, &descriptor); // bind, no device launch
+simpler_launch_run(ctx, runtime);  // publishes descriptor acceptance and returns after launch fence
+simpler_wait_run(ctx, runtime);                                    // or poll until complete
+simpler_finalize_run(ctx, runtime);                                // validate, copy back, destroy
+
+simpler_unregister_callable(ctx, cid);
 finalize_device(ctx);
 destroy_device_context(ctx);
+free(runtime);
 ```
 
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
@@ -141,7 +159,7 @@ worker.init(device_id=0, bins=bins)   # bins = RuntimeBuilder(platform).get_bina
 
 config = CallConfig()
 # A run always takes the whole device; there is no per-call width knob.
-config.aicpu_thread_num = 3
+config.aicpu_thread_num = 0  # auto
 config.enable_pmu = 0
 worker.run(callable, args, config)
 worker.finalize()
@@ -150,7 +168,7 @@ worker.finalize()
 ### Python Type Naming Convention
 
 Layer 3 Python types use a **level-prefixed naming convention** that mirrors the
-level model (see [hierarchical_level_runtime.md](hierarchical_level_runtime.md)):
+level model (see [hierarchical-level-runtime.md](hierarchical-level-runtime.md)):
 
 | Concept | L2 (Chip) type | L3+ (Distributed) type | Unified factory |
 | ------- | -------------- | ---------------------- | --------------- |
@@ -179,14 +197,16 @@ Python test_*.py (SceneTestCase)
   │
   └─→ ChipWorker()
        └─→ init(device_id, bins)                          # Python wrapper
-            ├─→ ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)   # once per process
-            ├─→ simpler_log_init(log_level, log_info_v) → HostLogger seeded
-            ├─→ ctypes.CDLL(libcpu_sim_context.so, RTLD_GLOBAL)  # sim only, once
-            └─→ _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)  # C++
+            ├─→ _initialize_host_log(log_level) → seed extension-owned state
+            └─→ _ChipWorker.init(host_path, aicpu_path, aicore_path,
+                                    dispatcher_path, device_id, ...,
+                                    sim_context_path)  # C++
+                 ├─→ process-registry sim_context.so + bind state     # sim PTO hooks
                  ├─→ dlopen(host.so, RTLD_LOCAL) → resolve C API symbols via dlsym
+                 ├─→ simpler_host_log_bind_state(host_log_state)
                  ├─→ create_device_context() → DeviceContextHandle
-                 └─→ simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
-                      ├─→ (onboard) dlog_setlevel(HostLogger.level())   # before context open
+                 └─→ simpler_init(ctx, device_id, binaries...)
+                      ├─→ (onboard) dlog_setlevel(HostLogger.cann_level())   # before context open
                       ├─→ DeviceRunner::attach_current_thread(device_id)
                       │    ├─→ rtSetDevice(device_id) on onboard
                       │    └─→ pto_cpu_sim_bind+acquire on sim

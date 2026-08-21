@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Paged Attention Orchestration Function V2 - N_UNROLL=8, 4 Tasks Per Group
+ * Paged Attention Orchestration Function V2 - 4 Tasks Per Group
  *
  * Batches up to N_UNROLL blocks per group. Each group submits exactly 4 tasks:
  *   1. QK matmul:  qi @ K^T for n_blocks → sij_buf (q_tile, n_blocks * block_size)
@@ -83,10 +83,10 @@ static ProfCounters g_prof;
  *
  * All context is passed positionally through a transport `Arg` (built by the
  * caller, never submitted — only its slots are read back here). Every tensor
- * slot is a materialized Tensor; the Arg carries no TensorCreateInfo (the
+ * slot is a materialized ChipTensor; the Arg carries no TensorCreateInfo (the
  * scope's create-infos are rebuilt locally from the q_tile/head_dim scalars):
  *   tensors: 0 query, 1 key_cache, 2 value_cache, 3 block_table (inputs),
- *            4 out (output buffer the update task writes — add_output(Tensor))
+ *            4 out (output buffer the update task writes — add_output(ChipTensor))
  *   scalars: 0 b_idx, 1 q_idx, 2 q_head_num, 3 q_tile, 4 head_dim,
  *            5 block_size, 6 block_num, 7 scale_value, 8 bn_this_batch,
  *            9 cur_seq, 10 data_type
@@ -95,12 +95,12 @@ static ProfCounters g_prof;
  * Must run inside a PTO2_SCOPE: the alloc'd / submitted tensors it references
  * do not outlive that scope.
  */
-static void process_qtile_scope(const L0TaskArgs &ctx) {
-    const Tensor &query = ctx.tensor(0).ref();
-    const Tensor &key_cache = ctx.tensor(1).ref();
-    const Tensor &value_cache = ctx.tensor(2).ref();
-    const Tensor &block_table = ctx.tensor(3).ref();
-    const Tensor &out = ctx.tensor(4).ref();
+static void process_qtile_scope(const CoreTaskArgs &ctx) {
+    const ChipTensor &query = ctx.tensor(0).ref();
+    const ChipTensor &key_cache = ctx.tensor(1).ref();
+    const ChipTensor &value_cache = ctx.tensor(2).ref();
+    const ChipTensor &block_table = ctx.tensor(3).ref();
+    const ChipTensor &out = ctx.tensor(4).ref();
     uint64_t b_idx = ctx.scalar(0);
     uint64_t q_idx = ctx.scalar(1);
     uint64_t q_head_num = ctx.scalar(2);
@@ -117,7 +117,7 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
 
     // Create infos for the per-scope accumulators — shapes depend only on
     // q_tile/head_dim, so build once before the block loop. Kept out of the
-    // transport Arg, which carries only materialized Tensors.
+    // transport Arg, which carries only materialized ChipTensors.
     uint32_t oi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
     uint32_t li_shapes[1] = {static_cast<uint32_t>(q_tile)};
     TensorCreateInfo tile2d_ci(oi_shapes, 2, DataType::FLOAT32);
@@ -131,19 +131,19 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
 
     uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
     uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-    Tensor qi = query.view(qi_shapes, qi_offsets);
+    ChipTensor qi = query.view(qi_shapes, qi_offsets);
     uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
     uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-    Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
+    ChipTensor out_view = out.view(out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
     g_prof.view_count += 2;
     CYCLE_COUNT_LAP(g_prof.tensor_view);
 #endif
     CYCLE_COUNT_LAP(g_prof.param_setup);
     TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
-    const Tensor &oi = alloc_outs.get_ref(0);
-    const Tensor &li_update = alloc_outs.get_ref(1);
-    const Tensor &mi_update = alloc_outs.get_ref(2);
+    const ChipTensor &oi = alloc_outs.get_ref(0);
+    const ChipTensor &li_update = alloc_outs.get_ref(1);
+    const ChipTensor &mi_update = alloc_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
     g_prof.submit_count++;
     CYCLE_COUNT_LAP(g_prof.submit_task);
@@ -151,7 +151,7 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
 
     // Reusable Arg objects — reset() before each use avoids
     // repeated stack-frame construction in the inner loop.
-    L0TaskArgs params_qk, params_sf, params_pv, params_up;
+    CoreTaskArgs params_qk, params_sf, params_pv, params_up;
 
     for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
         uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
@@ -175,7 +175,7 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
         params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
         CYCLE_COUNT_LAP(g_prof.param_setup);
         TaskOutputTensors qk_outs = rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-        const Tensor &sij_buf = qk_outs.get_ref(0);
+        const ChipTensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
         g_prof.submit_count++;
         CYCLE_COUNT_LAP(g_prof.submit_task);
@@ -195,9 +195,9 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
         params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
         CYCLE_COUNT_LAP(g_prof.param_setup);
         TaskOutputTensors sf_outs = rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-        const Tensor &pij_buf = sf_outs.get_ref(0);
-        const Tensor &mi = sf_outs.get_ref(1);
-        const Tensor &li = sf_outs.get_ref(2);
+        const ChipTensor &pij_buf = sf_outs.get_ref(0);
+        const ChipTensor &mi = sf_outs.get_ref(1);
+        const ChipTensor &li = sf_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
         g_prof.submit_count++;
         CYCLE_COUNT_LAP(g_prof.submit_task);
@@ -210,7 +210,7 @@ static void process_qtile_scope(const L0TaskArgs &ctx) {
         params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
         CYCLE_COUNT_LAP(g_prof.param_setup);
         TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-        const Tensor &oi_new = pv_outs.get_ref(0);
+        const ChipTensor &oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
         g_prof.submit_count++;
         CYCLE_COUNT_LAP(g_prof.submit_task);
@@ -238,14 +238,15 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     g_prof = ProfCounters{};  // reset per entry — single-threaded orchestration
 #endif
@@ -288,16 +289,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
         static_cast<uint32_t>(total_blocks_count * block_size), static_cast<uint32_t>(head_dim)
     };
     uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type, false);
-    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type, false);
-    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    ChipTensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type, false);
+    ChipTensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type, false);
+    ChipTensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
+    ChipTensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
-    Tensor block_table =
+    ChipTensor block_table =
         make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
-    Tensor context_lens =
+    ChipTensor context_lens =
         make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
 #ifdef ENABLE_PROFILING
@@ -306,9 +307,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 
     // Transport Arg reused across iterations — packs the scope's context for
     // process_qtile_scope(); see that function for the positional slot layout.
-    // It carries only materialized Tensors (no TensorCreateInfo); the scope's
+    // It carries only materialized ChipTensors (no TensorCreateInfo); the scope's
     // create-infos are rebuilt inside the helper from the q_tile/head_dim scalars.
-    L0TaskArgs ctx;
+    CoreTaskArgs ctx;
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
@@ -334,38 +335,38 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 #ifdef ENABLE_PROFILING
     uint64_t total = g_prof.param_extract + g_prof.ext_tensor + g_prof.make_tensor + g_prof.tensor_view +
                      g_prof.param_setup + g_prof.submit_task + g_prof.scope_and_loop;
-    LOG_INFO_V9(
+    LOG_INFO(
         "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===", g_prof.submit_count,
         g_prof.make_count, g_prof.view_count, cycles_to_us(total)
     );
     if (total > 0) {
-        LOG_INFO_V9(
+        LOG_INFO(
             "  param_extract    : %7.3fus (%5.1f%%)", cycles_to_us(g_prof.param_extract),
             g_prof.param_extract * 100.0 / total
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  ext_tensor(x4)   : %7.3fus (%5.1f%%)", cycles_to_us(g_prof.ext_tensor), g_prof.ext_tensor * 100.0 / total
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  create_info(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", g_prof.make_count, cycles_to_us(g_prof.make_tensor),
             g_prof.make_tensor * 100.0 / total,
             g_prof.make_count > 0 ? cycles_to_us(g_prof.make_tensor) / g_prof.make_count : 0.0
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", g_prof.view_count, cycles_to_us(g_prof.tensor_view),
             g_prof.tensor_view * 100.0 / total,
             g_prof.view_count > 0 ? cycles_to_us(g_prof.tensor_view) / g_prof.view_count : 0.0
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  param_setup      : %7.3fus (%5.1f%%)", cycles_to_us(g_prof.param_setup),
             g_prof.param_setup * 100.0 / total
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus", g_prof.submit_count, cycles_to_us(g_prof.submit_task),
             g_prof.submit_task * 100.0 / total,
             g_prof.submit_count > 0 ? cycles_to_us(g_prof.submit_task) / g_prof.submit_count : 0.0
         );
-        LOG_INFO_V9(
+        LOG_INFO(
             "  scope_and_loop   : %7.3fus (%5.1f%%)", cycles_to_us(g_prof.scope_and_loop),
             g_prof.scope_and_loop * 100.0 / total
         );

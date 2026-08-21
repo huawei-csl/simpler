@@ -14,6 +14,8 @@ cmake_minimum_required(VERSION 3.16.3)
 
 project(host_runtime LANGUAGES C CXX)
 
+include("${SIMPLER_CMAKE_DIR}/host_log_sources.cmake")
+
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
@@ -34,36 +36,29 @@ else()
 endif()
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
-# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: opt-in overlay that wires the PTO-ISA
-# async-SDMA workspace into comm_alloc_windows. When ON it pulls in pto-isa
-# headers and CANN-9.0+ aclnn symbols (aclnnShmemSdmaStarsQuery*) and links
-# libnnopbase, so it requires a CANN drop that actually exposes working a5
-# SDMA primitives. Default OFF because the available a5 CANN drops break
-# (AICPU exception -> 507018, or HCCL_E_INTERNAL). See
-# docs/a5-sdma-overlay.md for the full isolation status and re-enable steps
-# (#1315).
-# Flip ON via -DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON (or the env var of the
-# same name, forwarded by simpler_setup/runtime_builder.py).
-option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
 option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE AND SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+# SDMA is the default a5 async-workspace backend. URMA remains an explicit
+# alternative because CommContext exposes one workSpace/workSpaceSize pair.
+# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is an internal compile marker, not a
+# user-configurable option.
+if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
+else()
+    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
+endif()
+
+# Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
+# (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
+if(NOT PTO_ISA_ROOT)
     message(FATAL_ERROR
-        "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE and SIMPLER_ENABLE_PTO_URMA_WORKSPACE are mutually exclusive "
-        "because CommContext exposes a single workSpace/workSpaceSize pair")
+        "a5 onboard host_runtime PTO async workspace requires "
+        "-DPTO_ISA_ROOT=<pin-resolved path> (needs pto-isa host headers)")
 endif()
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OR SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
-    # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
-    if(NOT PTO_ISA_ROOT)
-        message(FATAL_ERROR
-            "a5 onboard host_runtime PTO async workspace overlays require "
-            "-DPTO_ISA_ROOT=<pin-resolved path> (needs pto-isa host headers)")
-    endif()
-    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
-endif()
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
+list(APPEND HOST_RUNTIME_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
@@ -72,7 +67,9 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l2_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/clock_correlation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_collector.cpp"
@@ -84,9 +81,10 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/host/load_aicpu_op.cpp"
 )
 # Add common/platform/onboard/host sources (shared between a2a3 / a5 onboard).
-# See .docs/ONBOARD_HOST_COMMON_REFACTOR.md for the migration plan.
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_helpers.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_phase_capture.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/clock_correlation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
 )
@@ -104,6 +102,11 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+add_custom_command(TARGET host_runtime POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_cpu_topo_fallback.json"
+        "$<TARGET_FILE_DIR:host_runtime>/aicpu_cpu_topo_fallback.json"
+)
 
 # TraCR
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
@@ -145,12 +148,12 @@ if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1)
 endif()
 
-# Bake the resolved pto-isa commit into the compile command when an overlay
-# embeds pto-isa headers into this .so. A pto-isa pin bump leaves runtime HEAD
+# Bake the resolved pto-isa commit into the compile command because the
+# selected async-workspace backend embeds pto-isa headers into this .so. A
+# pto-isa pin bump leaves runtime HEAD
 # — and often header mtimes — untouched, so without this define ccache
 # (compiler_check=mtime) can serve a stale object. Mirror of the a2a3 block
-# (#1351); the cache var stays empty for default-OFF a5 builds, so this is a
-# no-op unless the SDMA or URMA overlay is on.
+# (#1351).
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
 if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
@@ -235,6 +238,7 @@ target_link_libraries(host_runtime
         c_sec
         nnopbase
         dl
+        pthread
 )
 
 target_link_directories(host_runtime
@@ -245,11 +249,6 @@ target_link_directories(host_runtime
         ${ASCEND_ARCH_HOME}/lib64
         ${ASCEND_ARCH_HOME}/runtime/lib64
 )
-
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
-    target_link_libraries(host_runtime PRIVATE nnopbase)
-endif()
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")
 
