@@ -23,21 +23,20 @@
 #include "aicpu/device_time.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "callable_protocol.h"
-#include "pto2_dispatch_payload.h"
+#include "dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
 
-// Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
-#include "pto_runtime2.h"
-#include "pto_runtime2_types.h"
-#include "pto_shared_memory.h"
+// Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
+#include "runtime_core.h"
+#include "runtime_types.h"
+#include "shared_memory.h"
 
 // Performance profiling headers
 #include "aicpu/chip_swimlane_collector_aicpu.h"
-#include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
@@ -62,7 +61,7 @@
 
 // From orchestration/common.cpp linked into this DSO — updates g_current_runtime
 // here (cleared on teardown before runtime_destroy).
-extern "C" void framework_bind_runtime(PTO2Runtime *rt);
+extern "C" void framework_bind_runtime(RuntimeContext *rt);
 
 static int32_t read_pto2_runtime_status(Runtime *runtime) {
     if (runtime == nullptr) {
@@ -80,7 +79,7 @@ static int32_t read_pto2_runtime_status(Runtime *runtime) {
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
-static PTO2Runtime *rt{nullptr};
+static RuntimeContext *rt{nullptr};
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -113,7 +112,7 @@ struct AicpuExecutor {
     simpler::ThreadCompletionGate completion_gate_;
     std::atomic<bool> runtime_init_ready_{false};
 
-    // Per-Worker arena backing the PTO2Runtime + sm_handle + orch/sched/mailbox
+    // Per-Worker arena backing the RuntimeContext + sm_handle + orch/sched/mailbox
     // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
     // Default-constructed: libc-backed backend, no ctx.
     DeviceArena runtime_arena_;
@@ -233,9 +232,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
     // host-orch attach. host_build_graph's orchestrator already ran on the host,
-    // which also relocated every cross-task pointer to its final device address
-    // before H2D — so the SM/arena this thread sees are already fully
-    // device-addressed. This thread attaches the prebuilt arena, points the SM
+    // and every cross-task reference it wrote is an offset from its own block, so
+    // the SM/arena this thread sees need no address fixup. This thread attaches
+    // the prebuilt arena, points the SM
     // handle's ring-header pointers at the device SM WITHOUT resetting the
     // host-populated data, hands the host-computed task count to the scheduler,
     // and releases the other threads. It then falls through and schedules its own
@@ -264,18 +263,26 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
         if (boot_ok) {
             runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
-            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+            rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
 
             void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+            // The image the host shipped is pitched to the submitted task count,
+            // not to the ring capacity, and the device region holds exactly that
+            // image — so its size comes from the same pitch. attach_populated
+            // rejects a pitch outside (0, capacity] and a region too small for it.
+            const uint64_t live_slots =
+                pto2_sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
+            const uint64_t sm_size = runtime->sm_image_bytes;
             // sm_handle and the scheduler state are the device-only zone: their
             // bytes never travel, so they start as whatever the pooled arena last
             // held. Zeroing the handle first is what makes attach_populated's
             // assignment of every field checkable here rather than by inspecting
             // attach_populated.
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->attach_populated(sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes)) {
+            if (!rt->sm_handle->attach_populated(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_size, live_slots, runtime->sm_image_bytes
+                )) {
                 LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
                 rt = nullptr;
                 run_rc = -1;
@@ -291,14 +298,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // All of it precedes runtime_init_ready_, which is what releases
                 // the peer threads into the dispatch loop, so neither a push nor a
                 // completion message sees an uninitialized region.
+                //
+                // Both regions sit in the device-only zone, so their bytes are
+                // whatever the pooled arena last held, and each one's empty state is
+                // whatever its own initializer writes — a ready queue's is a
+                // sequence ramp (slot i holds i), the mailbox's is zeroed cursors
+                // and publication gates. Zeroing the region is a substitute for
+                // neither call.
                 rt->scheduler->seed_queue_slots();
                 rt->aicore_mailbox->init_empty();
             }
         }
 
         if (boot_ok) {
-            memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
-            runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+            runtime_bind_ops(rt);
             runtime->set_slot_states_ptr(nullptr);
 
             sched_ctx_.bind_runtime(rt);
@@ -311,12 +324,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // to keep them alive).
             // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
             // called it in run_host_orchestration; the orchestrator's own
-            // task-allocator pointers are intentionally NOT relocated (only the
-            // SM cross-task pointers and the host-built fanout adjacency —
-            // dep_pool / ready queues / fanout_head — were), so they still hold
-            // host addresses and mark_done()'s active_count() read would
-            // dereference host memory and fault the AICPU. on_orchestration_done
-            // only needs total_tasks and the scalar
+            // task-allocator pointers name host memory the device never reads, so
+            // mark_done()'s active_count() read would dereference it and fault the
+            // AICPU. on_orchestration_done only needs total_tasks and the scalar
             // orchestrator.inline_completed_tasks, both already valid.
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, runtime->host_total_tasks);
             LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
@@ -563,7 +573,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     TRACR_FINALIZE(runtime);
     
     if (runtime_rc != 0) {
-        LOG_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
+        LOG_ERROR("aicpu_execute: simpler runtime failed with rc=%d", runtime_rc);
         return runtime_rc;
     }
 

@@ -16,8 +16,8 @@
 #include <vector>
 
 #include "utils/device_arena.h"
-#include "pto_orchestrator.h"
-#include "pto_shared_memory.h"
+#include "orchestrator.h"
+#include "shared_memory.h"
 
 class OrchestratorFaninTest : public ::testing::Test {
 protected:
@@ -33,10 +33,10 @@ protected:
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(4096 * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(4096 * CHIP_MAX_RING_DEPTH);
 
-        int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        int32_t task_window_sizes[CHIP_MAX_RING_DEPTH];
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             task_window_sizes[r] = static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE);
         }
 
@@ -65,7 +65,7 @@ protected:
     // as exact from its first check and classifies the head without waiting for
     // an acknowledgment.
     void unwire_reclaim_publication() {
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             orch.rings[r].task_allocator.set_reclaim_publication_request(nullptr, nullptr);
             orch.rings[r].fanin_pool.set_reclaim_publication_request(nullptr, nullptr, static_cast<uint8_t>(r));
         }
@@ -86,7 +86,7 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
     ASSERT_TRUE(producer.task_id().is_valid());
 
-    PTO2TaskId deps[] = {producer.task_id(), producer.task_id()};
+    TaskId deps[] = {producer.task_id(), producer.task_id()};
     CoreTaskArgs consumer_args;
     consumer_args.set_dependencies(deps, 2);
     TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
@@ -117,7 +117,7 @@ TEST_F(OrchestratorFaninTest, ExplicitWaitDepProducesWaitOnlyEdge) {
     TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
     ASSERT_TRUE(producer.task_id().is_valid());
 
-    PTO2TaskId deps[] = {producer.task_id()};
+    TaskId deps[] = {producer.task_id()};
     DepFlags kinds[] = {DEP_WAIT};
     CoreTaskArgs consumer_args;
     consumer_args.set_dependencies_with_kinds(deps, kinds, 1);
@@ -140,7 +140,7 @@ TEST_F(OrchestratorFaninTest, DuplicateProducerOrAccumulatesFlags) {
     TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
     ASSERT_TRUE(producer.task_id().is_valid());
 
-    PTO2TaskId deps[] = {producer.task_id(), producer.task_id()};
+    TaskId deps[] = {producer.task_id(), producer.task_id()};
     DepFlags kinds[] = {DEP_WAIT, DEP_WAIT | DEP_RETAIN};
     CoreTaskArgs consumer_args;
     consumer_args.set_dependencies_with_kinds(deps, kinds, 2);
@@ -172,7 +172,7 @@ TEST_F(OrchestratorFaninTest, DuplicateProducerInSpillRegionDedups) {
         ASSERT_TRUE(producers.back().task_id().is_valid());
     }
 
-    std::vector<PTO2TaskId> deps;
+    std::vector<TaskId> deps;
     std::vector<DepFlags> kinds;
     deps.reserve(kProducers + 1);
     kinds.reserve(kProducers + 1);
@@ -194,7 +194,7 @@ TEST_F(OrchestratorFaninTest, DuplicateProducerInSpillRegionDedups) {
     PTO2TaskPayload *payload = consumer_slot.payload;
     EXPECT_EQ(payload->fanin_actual_count, kProducers);  // duplicate folded, not 66
 
-    PTO2TaskId dup = producers.back().task_id();
+    TaskId dup = producers.back().task_id();
     auto &dup_slot = sm_handle->header->rings[dup.ring()].get_slot_state_by_task_id(dup.local());
     EXPECT_EQ(dup_slot.fanout_count, PTO2_FANOUT_SCOPE_BIT + 1);  // one pin, not two
 
@@ -222,7 +222,7 @@ TEST_F(OrchestratorFaninTest, AllCompletedFastPathReleasesWaitOnlyPin) {
     producer_slot.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
     int32_t rc_before = producer_slot.fanout_refcount.load();
 
-    PTO2TaskId deps[] = {producer.task_id()};
+    TaskId deps[] = {producer.task_id()};
     DepFlags kinds[] = {DEP_WAIT};  // ordering-only
     CoreTaskArgs consumer_args;
     consumer_args.set_dependencies_with_kinds(deps, kinds, 1);
@@ -277,7 +277,7 @@ TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapSta
 
     EXPECT_FALSE(blocked.task_id().is_valid());
     EXPECT_TRUE(orch.fatal);
-    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), PTO2_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
     EXPECT_NE(log.find("FATAL: Task Allocator Deadlock - Heap Exhausted! ring=1"), std::string::npos);
     EXPECT_NE(log.find("oldest task owned by an open scope on this ring"), std::string::npos);
     EXPECT_NE(log.find("Heap ring 1:"), std::string::npos);
@@ -290,10 +290,10 @@ TEST_F(OrchestratorFaninTest, StructuralCheckRejectsOpenAncestorWhenNestedScopes
     std::vector<TensorCreateInfo> create_infos;
     create_infos.reserve(2);
 
-    for (int32_t depth = 0; depth < PTO2_MAX_RING_DEPTH; ++depth) {
+    for (int32_t depth = 0; depth < CHIP_MAX_RING_DEPTH; ++depth) {
         orch.begin_scope();
     }
-    ASSERT_EQ(orch.current_ring_id(), PTO2_MAX_RING_DEPTH - 1);
+    ASSERT_EQ(orch.current_ring_id(), CHIP_MAX_RING_DEPTH - 1);
 
     CoreTaskArgs parent_args;
     add_runtime_output_arg(parent_args, create_infos, 1024);
@@ -301,7 +301,7 @@ TEST_F(OrchestratorFaninTest, StructuralCheckRejectsOpenAncestorWhenNestedScopes
     ASSERT_TRUE(parent.task_id().is_valid());
 
     orch.begin_scope();
-    ASSERT_EQ(orch.current_ring_id(), PTO2_MAX_RING_DEPTH - 1);
+    ASSERT_EQ(orch.current_ring_id(), CHIP_MAX_RING_DEPTH - 1);
 
     CoreTaskArgs child_args;
     add_runtime_output_arg(child_args, create_infos, 1);
@@ -312,7 +312,7 @@ TEST_F(OrchestratorFaninTest, StructuralCheckRejectsOpenAncestorWhenNestedScopes
 
     EXPECT_FALSE(child.task_id().is_valid());
     EXPECT_TRUE(orch.fatal);
-    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), PTO2_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
     EXPECT_NE(log.find("oldest task owned by an open scope on this ring"), std::string::npos);
 }
 
@@ -320,11 +320,11 @@ TEST_F(OrchestratorFaninTest, ClosedChildHeadUsesTimeoutWithOpenParentOnSharedRi
     std::vector<TensorCreateInfo> create_infos;
     create_infos.reserve(3);
 
-    for (int32_t depth = 0; depth < PTO2_MAX_RING_DEPTH; ++depth) {
+    for (int32_t depth = 0; depth < CHIP_MAX_RING_DEPTH; ++depth) {
         orch.begin_scope();
     }
     orch.begin_scope();
-    ASSERT_EQ(orch.current_ring_id(), PTO2_MAX_RING_DEPTH - 1);
+    ASSERT_EQ(orch.current_ring_id(), CHIP_MAX_RING_DEPTH - 1);
 
     CoreTaskArgs child_args;
     add_runtime_output_arg(child_args, create_infos, 768);
@@ -332,7 +332,7 @@ TEST_F(OrchestratorFaninTest, ClosedChildHeadUsesTimeoutWithOpenParentOnSharedRi
     ASSERT_TRUE(child.task_id().is_valid());
 
     orch.end_scope();
-    ASSERT_EQ(orch.current_ring_id(), PTO2_MAX_RING_DEPTH - 1);
+    ASSERT_EQ(orch.current_ring_id(), CHIP_MAX_RING_DEPTH - 1);
 
     CoreTaskArgs parent_args;
     add_runtime_output_arg(parent_args, create_infos, 256);
@@ -347,7 +347,7 @@ TEST_F(OrchestratorFaninTest, ClosedChildHeadUsesTimeoutWithOpenParentOnSharedRi
 
     EXPECT_FALSE(blocked.task_id().is_valid());
     EXPECT_TRUE(orch.fatal);
-    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), PTO2_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(sm_handle->header->orch_error_code.load(std::memory_order_acquire), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
     EXPECT_NE(log.find("No reclaim progress for ~500 ms"), std::string::npos);
     EXPECT_EQ(log.find("oldest task owned by an open scope on this ring"), std::string::npos);
 }
@@ -356,31 +356,31 @@ TEST_F(OrchestratorFaninTest, ClosedChildHeadUsesTimeoutWithOpenParentOnSharedRi
 // (sum of the runtime per-ring windows), not the compile-time PTO2_SCOPE_TASKS_CAP.
 // reserve_layout only computes offsets, so no commit()/backing is needed here.
 TEST(OrchestratorLayoutScopeTasksCap, FollowsRuntimeWindowSum) {
-    auto cap_for = [](const int32_t windows[PTO2_MAX_RING_DEPTH]) {
+    auto cap_for = [](const int32_t windows[CHIP_MAX_RING_DEPTH]) {
         DeviceArena arena;
         int32_t cap = PTO2OrchestratorState::reserve_layout(arena, windows).scope_tasks_cap;
         arena.release();
         return cap;
     };
 
-    int32_t windows[PTO2_MAX_RING_DEPTH];
+    int32_t windows[CHIP_MAX_RING_DEPTH];
 
     // Default window: cap == the old compile-time value (no behavior change).
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++)
         windows[r] = PTO2_TASK_WINDOW_SIZE;
-    EXPECT_EQ(cap_for(windows), PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH);
+    EXPECT_EQ(cap_for(windows), PTO2_TASK_WINDOW_SIZE * CHIP_MAX_RING_DEPTH);
     EXPECT_EQ(cap_for(windows), PTO2_SCOPE_TASKS_CAP);
 
     // Shrunk window: cap shrinks to the real budget (no over-allocation).
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++)
         windows[r] = 4;
-    EXPECT_EQ(cap_for(windows), 4 * PTO2_MAX_RING_DEPTH);
+    EXPECT_EQ(cap_for(windows), 4 * CHIP_MAX_RING_DEPTH);
 
     // Enlarged window past the compile default: cap grows to match the rings, so a
     // large scope no longer hits a premature SCOPE_TASKS_OVERFLOW (the bug fixed).
     const int32_t big = PTO2_TASK_WINDOW_SIZE * 2;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++)
         windows[r] = big;
-    EXPECT_EQ(cap_for(windows), big * PTO2_MAX_RING_DEPTH);
+    EXPECT_EQ(cap_for(windows), big * CHIP_MAX_RING_DEPTH);
     EXPECT_GT(cap_for(windows), PTO2_SCOPE_TASKS_CAP);
 }

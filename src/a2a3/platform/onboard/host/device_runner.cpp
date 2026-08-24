@@ -37,7 +37,7 @@
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
 #include "platform_comm/comm.h"
-#include "pto_runtime_c_api.h"
+#include "runtime_c_api.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -148,7 +148,7 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 int DeviceRunner::ensure_acl_ready(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     // aclInit is process-wide; CANN returns ACL_ERROR_REPEAT_INITIALIZE if it
@@ -224,7 +224,7 @@ int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
 ) {
-    if (prepared == nullptr || *prepared != nullptr) return -1;
+    if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->resources_owned = true;
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
@@ -250,9 +250,9 @@ int DeviceRunner::prepare_execution(
             "A soft reset does not clear the poison; finalize() will force-reset "
             "the card so the next Worker on it inits clean."
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
+    if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return PTO_RUNTIME_ERR_INTERNAL;
 
     int rc = ensure_device_initialized();
     if (rc != 0) {
@@ -264,7 +264,7 @@ int DeviceRunner::prepare_execution(
 
     if (block_dim < 1) {
         LOG_ERROR("prepare_execution computed block_dim < 1 from worker_count=%d", runtime.get_worker_count());
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     int num_aicore = block_dim * cores_per_blockdim_;
 
@@ -315,24 +315,24 @@ int DeviceRunner::prepare_execution(
         runtime.set_aicpu_launch_count(0);
         if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
             LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         int resolved_aicpu = resolve_aicpu_thread_num(
             runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
         );
-        if (resolved_aicpu < 0) return -1;
+        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
         if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
             LOG_ERROR(
                 "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
             );
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         runtime.set_aicpu_thread_num(resolved_aicpu);
         launch_aicpu_num = resolved_aicpu;
         const size_t cap = runtime.aicpu_allowed_cpus_capacity();
         if (allowed.size() > cap) {
             LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
         for (size_t i = 0; i < allowed.size(); ++i)
@@ -454,7 +454,7 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
 }
 
 int DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr || !active.prepared->resources_owned) return -1;
+    if (active.prepared == nullptr || !active.prepared->resources_owned) return PTO_RUNTIME_ERR_INTERNAL;
     PreparedExecution &prepared = *active.prepared;
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*retire_aicore=*/true);
@@ -528,7 +528,7 @@ void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexc
 }
 
 int DeviceRunner::create_run_stream(void **out) {
-    if (out == nullptr) return -1;
+    if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     *out = nullptr;
 
     rtStream_t stream = nullptr;
@@ -622,7 +622,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     RunStreamSet streams{static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
     LaunchTransactionResult result = exact_launch_transaction(
         prepared.identity, std::move(permit),
-        [&]() {
+        [&]() -> int {
             // Arming precedes any execution-visible submission, so its failures —
             // including a thread-spawn or allocation throw — are reported as an rc
             // and leave the run safely rollback-able.
@@ -664,7 +664,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                     workers[i].aicore_done = 0;
             } catch (...) {
                 LOG_ERROR("launch_run: arming failed before any stream submission");
-                return -1;
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
 
             // Publishing query/drain ownership is a state change, so it sits past
@@ -683,7 +683,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             }
             return launch_rc;
         },
-        [&]() {
+        [&]() -> int {
             LOG_INFO("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
             int aicpu_launch_n =
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
@@ -702,7 +702,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
 int DeviceRunner::reap_run() {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     int rc = sync_stream_pair(run_streams_.aicpu(), run_streams_.aicore());
     if (rc != 0) {
@@ -869,7 +869,7 @@ private:
 
 int DeviceRunner::force_reset_device() {
     if (device_id_ < 0) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     // aclrtResetDeviceForce is an ACL API; bring ACL up for the whole sequence,
     // released on scope exit so a repeated poison-then-reset cycle in a
@@ -877,7 +877,7 @@ int DeviceRunner::force_reset_device() {
     AclInitGuard acl_guard;
     if (!acl_guard.ok()) {
         LOG_ERROR("force_reset_device: ACL init failed; cannot reset device %d", device_id_);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
         // Reset phase. Bind the device, best-effort drain (the op-timeout
@@ -889,7 +889,7 @@ int DeviceRunner::force_reset_device() {
         DeviceBindGuard bind_guard(device_id_);
         if (!bind_guard.bound()) {
             LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
         aclError rc = aclrtResetDeviceForce(device_id_);
@@ -909,7 +909,7 @@ int DeviceRunner::force_reset_device() {
     DeviceBindGuard probe_bind(device_id_);
     if (!probe_bind.bound()) {
         LOG_ERROR("force_reset_device: post-reset DeviceBindGuard failed for device %d", device_id_);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     aclrtStream probe_stream = nullptr;
     aclError stream_rc = aclrtCreateStream(&probe_stream);
@@ -1163,12 +1163,12 @@ int DeviceRunner::init_chip_swimlane(
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for profiling: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         HalHostRegisterFn fn = get_halHostRegister();
         if (fn == nullptr) {
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
@@ -1201,12 +1201,12 @@ int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, KernelArgsHelp
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for args dump: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         HalHostRegisterFn fn = get_halHostRegister();
         if (fn == nullptr) {
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
@@ -1237,12 +1237,12 @@ int DeviceRunner::init_pmu(
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for PMU: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         HalHostRegisterFn fn = get_halHostRegister();
         if (fn == nullptr) {
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
@@ -1269,12 +1269,12 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for dep_gen: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         HalHostRegisterFn fn = get_halHostRegister();
         if (fn == nullptr) {
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
@@ -1300,12 +1300,12 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
     auto register_cb = +[](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for scope_stats: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         HalHostRegisterFn fn = get_halHostRegister();
         if (fn == nullptr) {
             LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };

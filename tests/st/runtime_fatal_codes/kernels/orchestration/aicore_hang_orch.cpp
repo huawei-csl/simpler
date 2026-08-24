@@ -10,7 +10,7 @@
  */
 
 /**
- * Negative ST orchestration: PTO2_ERROR_SCHEDULER_TIMEOUT (code 100), sub_class=S1.
+ * Negative ST orchestration: SIMPLER_ERROR_SCHEDULER_TIMEOUT (code 100), sub_class=S1.
  *
  * Dispatches a single AIC kernel that spins forever. The task lands on a core and
  * never completes, so when the AICPU no-progress watchdog fires it sees a RUNNING
@@ -23,16 +23,15 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_AIC_HANG 0
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 0,
     };
 }

@@ -32,7 +32,9 @@ typedef struct SimplerHostSpan {
     const char *attributes;
 } SimplerHostSpan;
 
-/* Link-time adapter used by native Host consumers. */
+/* Link-time adapters used by native Host consumers. The enabled query is the
+ * cheap pre-format gate for TIMING-level spans; emission rechecks the level. */
+int unified_log_host_span_enabled(void);
 void unified_log_host_span(const SimplerHostSpan *span);
 
 #ifdef __cplusplus

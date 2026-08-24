@@ -23,8 +23,8 @@
 #include <stdint.h>
 
 #include "aicpu/cache_maintenance.h"
-#include "pto_arg_with_deps.h"      // NOLINT(build/include_subdir)
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "arg_with_deps.h"      // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_SLOW_PRODUCER_AIC 0
 #define FUNC_SYNC_CONSUMER_AIV 1
@@ -32,10 +32,9 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
@@ -69,13 +68,13 @@ static bool wait_for_blockers_started(const ChipTensor &out, int32_t blocker_cou
 
 static bool wait_for_scheduler_loop_fence() {
     CoreTaskArgs first_args;
-    PTO2TaskId first = rt_submit_dummy_task(first_args).task_id();
+    TaskId first = rt_submit_dummy_task(first_args).task_id();
 
     uint32_t fence_shape[1] = {1};
     TensorCreateInfo fence_info(fence_shape, 1, DataType::INT32);
     CoreTaskArgs second_args;
     second_args.add_output(fence_info);
-    PTO2TaskId deps[1] = {first};
+    TaskId deps[1] = {first};
     second_args.set_dependencies(deps, 1);
     TaskOutputTensors outputs = rt_submit_dummy_task(second_args);
 
@@ -88,7 +87,7 @@ static bool wait_for_scheduler_loop_fence() {
     return !rt_is_fatal();
 }
 
-static PTO2TaskId submit_producer(const ChipTensor &out) {
+static TaskId submit_producer(const ChipTensor &out) {
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(0);
@@ -98,7 +97,7 @@ static PTO2TaskId submit_producer(const ChipTensor &out) {
     return rt_submit_aic_task(FUNC_SLOW_PRODUCER_AIC, args).task_id();
 }
 
-static PTO2TaskId submit_aiv_blocker(const ChipTensor &out, int32_t blocker_count) {
+static TaskId submit_aiv_blocker(const ChipTensor &out, int32_t blocker_count) {
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(BLOCKER_STATUS_BASE_CL);
@@ -108,7 +107,7 @@ static PTO2TaskId submit_aiv_blocker(const ChipTensor &out, int32_t blocker_coun
     return rt_submit_aiv_task(FUNC_SPIN_BLOCKER_AIV, args).task_id();
 }
 
-static void submit_consumer(const ChipTensor &out, PTO2TaskId producer, int16_t consumer_blocks) {
+static void submit_consumer(const ChipTensor &out, TaskId producer, int16_t consumer_blocks) {
     CoreTaskArgsWithDeps<1> args;
     args.add_inout(out);
     args.add_scalar(PRODUCER_BLOCKS);
@@ -127,13 +126,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     if (use_pending && (blocker_count <= 0 || blocker_count > BLOCKER_STATUS_CAPACITY || consumer_blocks <= 0 ||
                         consumer_blocks > blocker_count)) {
         rt_report_fatal(
-            PTO2_ERROR_INVALID_ARGS, "invalid pending geometry: blockers=%d consumer=%d", blocker_count, consumer_blocks
+            SIMPLER_ERROR_INVALID_ARGS, "invalid pending geometry: blockers=%d consumer=%d", blocker_count,
+            consumer_blocks
         );
         return;
     }
 
     rt_scope_begin(PTO2ScopeMode::MANUAL);
-    PTO2TaskId producer = use_pending ? submit_aiv_blocker(output, blocker_count) : submit_producer(output);
+    TaskId producer = use_pending ? submit_aiv_blocker(output, blocker_count) : submit_producer(output);
     if (use_pending && (!wait_for_blockers_started(output, blocker_count) || !wait_for_scheduler_loop_fence())) return;
     submit_consumer(output, producer, consumer_blocks);
     if (use_pending && !wait_for_scheduler_loop_fence()) return;

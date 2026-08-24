@@ -20,8 +20,8 @@
  *
  *   ORACLE pass (read-only contract):
  *     Drives `compute_task_fanin` (the same template the device orchestrator
- *     uses in pto_orchestrator.cpp:submit_task) against `tm_oracle`. Its emit
- *     fires with (PTO2TaskId, DepFlags) — the canonical (producer, WAIT/RETAIN)
+ *     uses in orchestrator.cpp:submit_task) against `tm_oracle`. Its emit
+ *     fires with (TaskId, DepFlags) — the canonical (producer, WAIT/RETAIN)
  *     mapping the runtime would have wired, OR-accumulated per producer. This
  *     pass IS the contract, and any future change to `compute_task_fanin`
  *     automatically refreshes the oracle.
@@ -41,7 +41,7 @@
  * `compute_task_fanin`'s producers or edge flags trips this gate immediately and
  * knows to mirror the change in the annot pass.
  *
- * STEP 1 (explicit_deps) is emitted at the call site (per pto_dep_compute.h's
+ * STEP 1 (explicit_deps) is emitted at the call site (per dep_compute.h's
  * "kept at call site" note); both passes run the same explicit-deps loop, so
  * the comparison covers it too.
  *
@@ -71,9 +71,9 @@
 #include "common/dep_gen.h"
 #include "common/unified_log.h"
 #include "data_type.h"
-#include "pto_dep_compute.h"
-#include "pto_task_id.h"
-#include "pto_tensormap.h"
+#include "dep_compute.h"
+#include "task_id.h"
+#include "tensormap.h"
 #include "tensor.h"
 
 namespace {
@@ -419,7 +419,7 @@ bool write_deps_json(
 
 // ---------------------------------------------------------------------------
 // Annot pass — mirrors compute_task_fanin step-by-step against tm_annot.
-// Must stay bit-equivalent to pto_dep_compute.h::compute_task_fanin in terms
+// Must stay bit-equivalent to dep_compute.h::compute_task_fanin in terms
 // of which producer IDs are emitted (the differential check enforces this).
 // ---------------------------------------------------------------------------
 
@@ -439,7 +439,7 @@ void annot_pass(
         const ChipTensor *tensor = &inputs.tensors[i].ref();
 
         // STEP A: creator retention.
-        PTO2TaskId owner = tensor->owner_task_id;
+        TaskId owner = tensor->owner_task_id;
         if (owner.is_valid()) {
             emit_creator(owner, i, *tensor);
         }
@@ -481,17 +481,17 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     // ring's window comfortably covers its observed max local_id (no slot
     // aliasing during INOUT+COVERED remove_from_task). Same sizes feed both
     // maps so they stay in lockstep.
-    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint32_t max_local[PTO2_MAX_RING_DEPTH] = {0};
+    int32_t task_window_sizes[CHIP_MAX_RING_DEPTH];
+    uint32_t max_local[CHIP_MAX_RING_DEPTH] = {0};
     for (size_t i = 0; i < num_records; i++) {
-        PTO2TaskId tid{records[i].task_id};
+        TaskId tid{records[i].task_id};
         uint8_t ring = tid.ring();
         uint32_t local = tid.local();
-        if (ring < PTO2_MAX_RING_DEPTH && local > max_local[ring]) {
+        if (ring < CHIP_MAX_RING_DEPTH && local > max_local[ring]) {
             max_local[ring] = local;
         }
     }
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         int32_t need = static_cast<int32_t>(max_local[r] + 1);
         task_window_sizes[r] = ceil_pow2(need < 16 ? 16 : need);
     }
@@ -556,7 +556,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // overflow's reinterpreted bytes as tensor/dep info.
         if (rec.flags & DEP_GEN_FLAG_OVERFLOW) continue;
 
-        PTO2TaskId task_id{rec.task_id};
+        TaskId task_id{rec.task_id};
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
 
         oracle_preds.clear();
@@ -653,7 +653,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         inputs.tensors = tref_buf;
         inputs.arg_types = atype_buf;
         inputs.explicit_dep_count = dc;
-        inputs.explicit_deps = reinterpret_cast<const PTO2TaskId *>(deps_data);
+        inputs.explicit_deps = reinterpret_cast<const TaskId *>(deps_data);
 
         // Register tasks[] entry (with per-arg slot info) and any unseen
         // tensors[] entries up-front. ChipTensors are registered from the
@@ -721,11 +721,10 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         }
 
         // ============ ORACLE pass — drive compute_task_fanin ============
-        bool ok =
-            compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer, DepFlags kind) -> bool {
-                oracle_preds[producer.raw] |= kind;
-                return true;
-            });
+        bool ok = compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](TaskId producer, DepFlags kind) -> bool {
+            oracle_preds[producer.raw] |= kind;
+            return true;
+        });
         if (!ok) {
             LOG_ERROR("dep_gen replay: compute_task_fanin returned fatal at task_id=%" PRIu64, rec.task_id);
             tm_oracle.destroy();
@@ -737,7 +736,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         annot_pass(
             inputs, tm_annot, in_manual_scope,
             // emit_creator(producer, arg_idx, consumer_tensor)
-            [&](PTO2TaskId producer, int32_t arg_idx, const ChipTensor &consumer) {
+            [&](TaskId producer, int32_t arg_idx, const ChipTensor &consumer) {
                 bool first = annot_preds.find(producer.raw) == annot_preds.end();
                 annot_preds[producer.raw] |= (DEP_WAIT | DEP_RETAIN);
                 if (!first) {
@@ -754,7 +753,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 annot_edges.push_back(e);
             },
             // emit_tensormap(producer, arg_idx, consumer_tensor, entry, status)
-            [&](PTO2TaskId producer, int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry,
+            [&](TaskId producer, int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry,
                 OverlapStatus status) {
                 // Per-(succ, arg_idx, producer_buffer_addr, producer_version)
                 // dedup gives us "the same producer slice fired twice for the

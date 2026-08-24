@@ -71,7 +71,7 @@ follow. Decide per phase based on what each one needs.
 `pre-commit run` (or a `git commit` that triggers the hook) fails with:
 
 ```text
-src/a5/runtime/tensormap_and_ringbuffer/runtime/pto_ring_buffer.h:37:10:
+src/a5/runtime/tensormap_and_ringbuffer/runtime/ring_buffer.h:37:10:
   error: 'algorithm' file not found [clang-diagnostic-error]
    37 | #include <algorithm>
       |          ^~~~~~~~~~~
@@ -201,7 +201,7 @@ clang-tidy runs.
 #    are noarch, so this matters only for ABI flags during simpler's
 #    own link step. (See "Why source-install" below.)
 pip uninstall -y simpler nanobind pybind11
-pip install --no-binary nanobind --no-binary pybind11 nanobind pybind11
+pip install --no-binary nanobind --no-binary pybind11 'nanobind<3' pybind11
 
 # 2. Wipe build/ to drop any cached compile_commands.json or .a files
 #    that were produced with the previous compiler.

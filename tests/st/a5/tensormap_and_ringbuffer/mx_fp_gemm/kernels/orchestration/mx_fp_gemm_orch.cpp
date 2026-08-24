@@ -18,16 +18,15 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_MATMUL_MX 0
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 6,  // A, As, B, Bs, C, mode
     };
 }
@@ -46,7 +45,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         get_dtype_name(ext_bs.dtype), get_dtype_name(ext_c.dtype)
     );
 
-    PTO2_SCOPE() {
+    SIMPLER_SCOPE() {
         CoreTaskArgs args;
         args.add_input(ext_a);
         args.add_input(ext_as);

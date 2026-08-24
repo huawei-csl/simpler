@@ -25,7 +25,7 @@
 
 #include "call_config.h"
 #include "pipeline_slot_pool.h"
-#include "pto_runtime_c_api.h"
+#include "runtime_c_api.h"
 #include "task_args.h"
 #include "types.h"
 
@@ -69,7 +69,7 @@ int prepare_run(
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
     if (g_reject_first_prepare[descriptor->pipeline_slot] && g_prepare_count[descriptor->pipeline_slot] == 1) {
-        return -3;
+        return PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
     }
     return g_prepare_rc[descriptor->pipeline_slot];
 }
@@ -383,6 +383,38 @@ TEST(ChipRunLaneTest, DirectIncompatibleSuccessorRetriesAfterPredecessorFence) {
     worker.finalize();
 }
 
+// SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK (3) negated — the status a device latches for
+// a flow-control deadlock. Spelled out rather than included: the SIMPLER_ERROR_*
+// macros live in each runtime's private runtime_status.h, which this
+// worker-level test does not compile against.
+constexpr int kLatchedFlowControlDeadlock = -3;
+
+// A latched deadlock is terminal. PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE once held
+// this same value, so the lane read the deadlock as "prepare at depth one instead"
+// and retried it — reporting a successful run over a device that had wedged.
+TEST(ChipRunLaneTest, LatchedFlowControlDeadlockIsTerminalRatherThanRetried) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipStorageTaskArgs args{};
+
+    // A live predecessor is what puts the successor's prepare on the overlapping
+    // path, where the incompatible-prepare retry lives.
+    ChipRun first = lane.submit(1, args, CallConfig{});
+    g_prepare_rc[1] = kLatchedFlowControlDeadlock;
+    ChipRun second = lane.submit(1, args, CallConfig{});
+
+    EXPECT_TRUE(second.done());
+    EXPECT_THROW(second.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_EQ(g_prepare_count[1], 1u) << "latched deadlock was retried as an incompatible prepare";
+    EXPECT_FALSE(lane.poisoned());
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    lane.close();
+    worker.finalize();
+}
+
 TEST(ChipRunLaneTest, DirectRuntimeWithoutConcurrentPrepareRetainsDepthOne) {
     ChipWorker worker;
     prime_worker(worker);
@@ -490,13 +522,69 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     g_complete[0] = true;
     g_finalize_rc[0] = -7;
     EXPECT_TRUE(first.done());
-    EXPECT_THROW(first.wait_until(ChipRunLane::Clock::time_point::max()), std::runtime_error);
+    try {
+        (void)first.wait_until(ChipRunLane::Clock::time_point::max());
+        FAIL() << "expected the poisoned-lane error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
     EXPECT_TRUE(lane.poisoned());
 
     ChipStorageTaskArgs args{};
     EXPECT_THROW(
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_finalize_rc[0] = -7;
+
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    try {
+        (void)failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected the poisoned-lane error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, EarlierFailedRunRetainsItsErrorAfterLaterRunPoisonsLane) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+
+    ChipRun earlier = submit(lane, 101, 0);
+    EXPECT_TRUE(earlier.done());
+    EXPECT_FALSE(lane.poisoned());
+
+    ChipRun poisoner = submit(lane, 102, 1);
+    g_complete[1] = true;
+    g_finalize_rc[1] = -7;
+    EXPECT_TRUE(poisoner.done());
+    EXPECT_TRUE(lane.poisoned());
+
+    try {
+        (void)earlier.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected the earlier run's prepare error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("prepare_native_run failed with code -5"), std::string::npos);
+        EXPECT_EQ(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
+        EXPECT_EQ(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
+    }
+
     EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
@@ -515,6 +603,7 @@ TEST(ChipRunLaneTest, PollFailureReportsTheTerminalNativeError) {
         run.wait_until(ChipRunLane::Deadline::max());
         FAIL() << "expected the terminal native error";
     } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
         EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code 507015"), std::string::npos);
     }
     EXPECT_TRUE(lane.poisoned());

@@ -29,11 +29,12 @@
 
 #include "arg_direction.h"
 #include "common/host_api.h"
-#include "pto_runtime_status.h"
-#include "pto_runtime2_types.h"
-#include "pto_shared_memory.h"
+#include "runtime_status.h"
+#include "runtime_types.h"
+#include "shared_memory.h"
 #include "runtime.h"
 #include "task_args.h"
+#include "worker/runtime_c_api.h"
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -245,9 +246,9 @@ ChipStorageTaskArgs make_args(std::vector<uint8_t> &input, std::vector<uint8_t> 
 int bind_runtime(
     Runtime &runtime, const HostApi &api, const ChipStorageTaskArgs &args, const ArgDirection *signature, int sig_count
 ) {
-    uint64_t ring_task_window[PTO2_MAX_RING_DEPTH] = {4, 4, 4, 4};
-    uint64_t ring_heap[PTO2_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
-    uint64_t ring_dep_pool[PTO2_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    uint64_t ring_task_window[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    uint64_t ring_heap[CHIP_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
+    uint64_t ring_dep_pool[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
     return bind_callable_to_runtime_impl(
         &runtime, &api, &args, nullptr, signature, sig_count, ring_task_window, ring_heap, ring_dep_pool
     );
@@ -299,9 +300,9 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionCopiesRuntimeStatus) {
     ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
     auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
     ASSERT_NE(header, nullptr);
-    header->orch_error_code.store(PTO2_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
+    header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), -PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
     EXPECT_EQ(fake_.copy_from_count, 1);
 }
 
@@ -439,7 +440,7 @@ TEST_F(TrbRuntimeTempBufferTest, GrowAllocationFailureFailsBindWithoutLeak) {
     ChipStorageTaskArgs args = make_args(input, output);
     ArgDirection signature[2] = {ArgDirection::IN, ArgDirection::OUT};
 
-    EXPECT_EQ(bind_runtime(runtime, api_, args, signature, 2), -1);
+    EXPECT_EQ(bind_runtime(runtime, api_, args, signature, 2), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(fake_.retained_addr, nullptr);
     EXPECT_EQ(fake_.retained_size, 0u);
     EXPECT_TRUE(fake_.live_mallocs.empty());
@@ -455,7 +456,7 @@ TEST_F(TrbRuntimeTempBufferTest, FailedCopyOnTemporaryPathDoesNotFreeRetainedBuf
     args.add_tensor(make_tensor(input));
     ArgDirection signature[1] = {ArgDirection::IN};
 
-    EXPECT_EQ(bind_runtime(runtime, api_, args, signature, 1), -1);
+    EXPECT_EQ(bind_runtime(runtime, api_, args, signature, 1), PTO_RUNTIME_ERR_INTERNAL);
     // Retained buffer was allocated once for the grow and is NOT freed on the
     // error path (it lives on the slot for the next run); the slice lease is a
     // no-op, so no device_free happens here.
@@ -468,9 +469,9 @@ TEST_F(TrbRuntimeTempBufferTest, FailedCopyOnTemporaryPathDoesNotFreeRetainedBuf
 TEST_F(TrbRuntimeTempBufferTest, PreparedRuntimeEnvRequiresTheActiveArenaKey) {
     fake_.reset();
     HostApi compatibility_api = make_host_api();
-    uint64_t task_window[PTO2_MAX_RING_DEPTH] = {4, 4, 4, 4};
-    uint64_t heap[PTO2_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
-    uint64_t dep_pool[PTO2_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    uint64_t task_window[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
+    uint64_t heap[CHIP_MAX_RING_DEPTH] = {1024, 1024, 1024, 1024};
+    uint64_t dep_pool[CHIP_MAX_RING_DEPTH] = {4, 4, 4, 4};
 
     EXPECT_EQ(concurrent_native_prepare_supported_impl(), 1);
     EXPECT_EQ(prepared_run_config_compatible_impl(&compatibility_api, task_window, heap, dep_pool), 0);

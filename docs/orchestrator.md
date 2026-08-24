@@ -345,7 +345,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
    buys us nothing here. A monotonic `int32_t` gives ~2 billion ids per
    globally quiescent compaction interval.
 2. **`MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
-   (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each slab has its own
+   (Strict-1; matches L2's `CHIP_MAX_RING_DEPTH`). Each slab has its own
    `mmap(MAP_SHARED | MAP_ANONYMOUS)` region, bump cursor, FIFO
    reclamation pointer, and mutex / cv. A task's ring is chosen by
    **scope depth**:
@@ -801,7 +801,7 @@ if (ps_state != TaskState::COMPLETED) live_fanins++;   // wait only if not yet d
 
 ### Tag semantics for write-after-write
 
-`infer_deps` mirrors L2 (`pto_orchestrator.cpp` Step B): only `INPUT`
+`infer_deps` mirrors L2 (`orchestrator.cpp` Step B): only `INPUT`
 and `INOUT` do a tensormap lookup. `OUTPUT` and `OUTPUT_EXISTING`
 are pure inserts — the latter is the way users signal "skip the
 lookup even though I'm writing a pre-existing buffer".

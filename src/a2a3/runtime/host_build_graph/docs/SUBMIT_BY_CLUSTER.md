@@ -28,13 +28,15 @@ The shared graph image separates stable task identity from scheduling state:
 
 - `PTO2TaskDescriptor` contains the task ID, kernel IDs, and packed-buffer
   addresses.
-- `PTO2TaskPayload` contains tensors, scalars, predicates, and position-
-  independent `fanin_local_ids[]`.
-- `PTO2TaskSlotState` contains the active mask, task attributes, logical block
+- `PTO2TaskPayload` contains the argument counts, predicate, and a delta naming
+  each of its tensor, scalar and position-independent fanin-id regions. The
+  arguments live in the pool segments, not in the payload.
+- `ChipTaskSlotState` contains the active mask, task attributes, logical block
   count, subtask counters, completion state, and descriptor/payload bindings.
 
-This image is built on the host, relocated once, and copied to the device. It
-contains no fanout adjacency or dependency-pool pointers.
+This image is built on the host and copied to the device verbatim. It contains
+no fanout adjacency or dependency-pool pointers, and its descriptor/payload
+bindings are deltas from the slot state's own address rather than pointers.
 
 ## Resource Shapes
 
@@ -63,7 +65,7 @@ block_num * popcount(active_mask) <= INT16_MAX
 ```
 
 The product is the number stored in the 16-bit completion counter. Invalid
-values latch `PTO2_ERROR_INVALID_ARGS`; they are not capped at the device's
+values latch `SIMPLER_ERROR_INVALID_ARGS`; they are not capped at the device's
 physical cluster count.
 
 `require_sync_start` adds a separate residency constraint because every block
@@ -75,12 +77,13 @@ must launch as one cohort:
 ## Dependency and Readiness Flow
 
 1. Host orchestration allocates a task slot and builds its payload.
-2. TensorMap and explicit dependencies append producer local IDs to
-   `fanin_local_ids[]`.
+2. TensorMap and explicit dependencies append producer local IDs to the payload's
+   fanin region.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
 4. After H2D, device boot scans every submitted task exactly once.
 5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its first unmet producer's wake list.
+   registers on its latest-submitted unmet producer's wake list, minimising
+   transfers between wake lists and their CAS contention.
 6. Producer completion reclassifies wake-list consumers until they become ready.
 
 Completion flags are monotonic, so a task never needs periodic fanin polling.

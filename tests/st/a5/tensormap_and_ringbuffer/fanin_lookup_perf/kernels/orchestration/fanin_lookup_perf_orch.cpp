@@ -30,7 +30,7 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 static constexpr int32_t MAX_PRODUCERS = 64;
 static constexpr int32_t MAX_CONSUMERS = 64;
@@ -40,10 +40,9 @@ static constexpr uint32_t SLOT_ELEMS = 16;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 5,
     };
 }
@@ -56,14 +55,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     bool use_real_kernels = orch_args.scalar(2) != 0;
     if (producer_count < 1 || producer_count > MAX_PRODUCERS || consumer_count < 1 || consumer_count > MAX_CONSUMERS) {
         rt_report_fatal(
-            PTO2_ERROR_INVALID_ARGS,
+            SIMPLER_ERROR_INVALID_ARGS,
             "producer_count=%d consumer_count=%d exceed supported range producers=[1, %d] consumers=[1, %d]",
             producer_count, consumer_count, MAX_PRODUCERS, MAX_CONSUMERS
         );
         return;
     }
 
-    PTO2TaskId producer_ids[MAX_PRODUCERS];
+    TaskId producer_ids[MAX_PRODUCERS];
     uint32_t slot_shape[1] = {SLOT_ELEMS};
     for (int32_t i = 0; i < producer_count; i++) {
         CoreTaskArgs args;

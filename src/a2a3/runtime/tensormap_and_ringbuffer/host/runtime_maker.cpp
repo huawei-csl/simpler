@@ -41,13 +41,13 @@
 #include <string>
 #include <vector>
 
-#include "../common/pto_runtime_status.h"
-#include "../runtime/pto_runtime2.h"
-#include "../runtime/pto_shared_memory.h"
+#include "../common/runtime_status.h"
+#include "../runtime/runtime_core.h"
+#include "../runtime/shared_memory.h"
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
-#include "../../../../common/worker/pto_runtime_c_api.h"
+#include "../../../../common/worker/runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/strace.h"
@@ -57,6 +57,18 @@
 #include "common/host_api.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+// This file returns both kinds of negative status — a latched device code
+// negated, and PTO_RUNTIME_ERR_* for a host-side failure — so a caller can
+// attribute one to a mechanism only while the two bands stay disjoint. The
+// second conjunct is the structural half and holds for any latched code; the
+// first is a spot check on the highest one this runtime defines, so a new
+// four-digit latched code needs the ceiling raised here as well.
+static_assert(
+    SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED <= PTO_RUNTIME_LATCHED_CODE_MAX &&
+        PTO_RUNTIME_ERR_BASE < -PTO_RUNTIME_LATCHED_CODE_MAX,
+    "host-side C API codes must stay below the negation of every latched device code"
+);
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Orchestration runs on the device, so this run's own content is confined to
@@ -82,9 +94,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
 
-static_assert(
-    RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
-);
+static_assert(RUNTIME_ENV_RING_COUNT == CHIP_MAX_RING_DEPTH, "RuntimeEnv ring count must match the runtime ring depth");
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -96,9 +106,9 @@ static int64_t _now_ms() {
 static bool is_power_of_2_u64(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
 
 template <typename T>
-static std::string format_ring_array(const T (&values)[PTO2_MAX_RING_DEPTH]) {
+static std::string format_ring_array(const T (&values)[CHIP_MAX_RING_DEPTH]) {
     std::string out = "[";
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
         if (r != 0) {
             out += ", ";
         }
@@ -157,7 +167,7 @@ static bool parse_uint_token(
 }
 
 static void apply_env_ring_values(
-    const char *name, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t out[PTO2_MAX_RING_DEPTH]
+    const char *name, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t out[CHIP_MAX_RING_DEPTH]
 ) {
     const char *env = std::getenv(name);
     if (!env) return;
@@ -168,25 +178,25 @@ static void apply_env_ring_values(
         if (!parse_uint_token(name, text, min_val, max_val, require_power_of_2, &value)) {
             return;
         }
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
             out[r] = value;
         }
         return;
     }
 
-    uint64_t parsed[PTO2_MAX_RING_DEPTH]{};
+    uint64_t parsed[CHIP_MAX_RING_DEPTH]{};
     size_t pos = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         size_t comma = text.find(',', pos);
         std::string token = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
         if (!parse_uint_token(name, token, min_val, max_val, require_power_of_2, &parsed[r])) {
             return;
         }
         if (comma == std::string::npos) {
-            if (r != PTO2_MAX_RING_DEPTH - 1) {
+            if (r != CHIP_MAX_RING_DEPTH - 1) {
                 LOG_WARN(
                     "%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env,
-                    PTO2_MAX_RING_DEPTH
+                    CHIP_MAX_RING_DEPTH
                 );
                 return;
             }
@@ -196,10 +206,10 @@ static void apply_env_ring_values(
         }
     }
     if (pos < text.size() || (!text.empty() && text.back() == ',')) {
-        LOG_WARN("%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env, PTO2_MAX_RING_DEPTH);
+        LOG_WARN("%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env, CHIP_MAX_RING_DEPTH);
         return;
     }
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         out[r] = parsed[r];
     }
 }
@@ -220,16 +230,16 @@ static uint64_t read_ring_override(const uint64_t *base, int idx) {
 }
 
 // Each of ring_task_window / ring_heap / ring_dep_pool is a per-ring array of
-// PTO2_MAX_RING_DEPTH entries (0 = unset). Precedence per ring: per-task entry >
+// CHIP_MAX_RING_DEPTH entries (0 = unset). Precedence per ring: per-task entry >
 // PTO2_RING_* env value > compile-time default. A "size all rings the same"
 // request arrives already broadcast to every entry by the caller.
 static bool resolve_ring_config(
     const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH],
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+    uint64_t eff_task_window_sizes[CHIP_MAX_RING_DEPTH], uint64_t eff_heap_sizes[CHIP_MAX_RING_DEPTH],
+    int32_t eff_dep_pool_capacities[CHIP_MAX_RING_DEPTH]
 ) {
-    uint64_t dep_pool_values[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    uint64_t dep_pool_values[CHIP_MAX_RING_DEPTH];
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         eff_task_window_sizes[r] = PTO2_TASK_WINDOW_SIZE;
         eff_heap_sizes[r] = PTO2_HEAP_SIZE;
         dep_pool_values[r] = PTO2_DEP_LIST_POOL_SIZE;
@@ -239,7 +249,7 @@ static bool resolve_ring_config(
     apply_env_ring_values("PTO2_RING_HEAP", 1024, std::numeric_limits<uint64_t>::max(), false, eff_heap_sizes);
     apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         const uint64_t task_window_override = read_ring_override(ring_task_window, r);
         const uint64_t heap_override = read_ring_override(ring_heap, r);
         const uint64_t dep_pool_override = read_ring_override(ring_dep_pool, r);
@@ -405,11 +415,11 @@ private:
 extern "C" int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (api == nullptr || out == nullptr) {
         LOG_ERROR("HostApi or out is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     *out = CallableArtifacts{};
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
@@ -419,12 +429,12 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
             callable, api, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash, &out->aicore_image_hash
         ) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     for (const ChildKernelAddr &c : out->kernel_addrs) {
         if (c.func_id < 0 || c.func_id >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("func_id=%d is out of range [0, %d)", c.func_id, RUNTIME_MAX_FUNC_ID);
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
     }
 
@@ -433,7 +443,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     out->orch_so_data = orch_so_binary;
@@ -448,9 +458,9 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
 // arena description. Resolved once per config from per-task overrides + env +
 // compile-time defaults; depends on nothing that varies per run.
 struct ArenaSizingConfig {
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+    uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH];
+    uint64_t heap_sizes[CHIP_MAX_RING_DEPTH];
+    int32_t dep_pool_capacities[CHIP_MAX_RING_DEPTH];
 };
 
 struct ArenaStaticSizes {
@@ -488,8 +498,8 @@ static void append_cache_key_u64(std::vector<uint8_t> *out, uint64_t value) {
 static PrebuiltRuntimeArenaCacheProbe make_prebuilt_runtime_arena_cache_probe(const ArenaSizingConfig &sizing) {
     PrebuiltRuntimeArenaCacheProbe probe;
     uint64_t hash = 1469598103934665603ULL;
-    probe.serialized_key.reserve(PTO2_MAX_RING_DEPTH * 3 * sizeof(uint64_t));
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    probe.serialized_key.reserve(CHIP_MAX_RING_DEPTH * 3 * sizeof(uint64_t));
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         hash_mix_u64(&hash, sizing.task_window_sizes[r]);
         append_cache_key_u64(&probe.serialized_key, sizing.task_window_sizes[r]);
         hash_mix_u64(&hash, sizing.heap_sizes[r]);
@@ -508,10 +518,10 @@ static bool resolve_arena_sizing(
 extern "C" int prepared_run_config_compatible_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 ) {
-    if (api == nullptr) return -1;
+    if (api == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
 
     ArenaSizingConfig sizing;
-    if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) return -1;
+    if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) return PTO_RUNTIME_ERR_INTERNAL;
 
     PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
     void *gm_heap = nullptr;
@@ -553,7 +563,7 @@ static bool resolve_arena_sizing(
 
 static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStaticSizes *out) {
     out->total_heap = 0;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         if (sizing.heap_sizes[r] > std::numeric_limits<uint64_t>::max() - out->total_heap) {
             LOG_ERROR("Total ring heap size overflows uint64_t");
             return false;
@@ -673,7 +683,7 @@ static bool ensure_static_arenas(
     const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
 ) {
     DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
-    PTO2RuntimeArenaLayout layout =
+    RuntimeArenaLayout layout =
         runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
 
     int64_t t_setup_start = _now_ms();
@@ -728,16 +738,16 @@ static bool ensure_static_arenas(
 // *before* it can dereference the image.
 static bool build_runtime_image(
     const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, const StaticArenaPtrs &ptrs,
-    DeviceArena *host_arena, PTO2RuntimeArenaLayout *out_layout
+    DeviceArena *host_arena, RuntimeArenaLayout *out_layout
 ) {
-    PTO2RuntimeArenaLayout layout =
+    RuntimeArenaLayout layout =
         runtime_reserve_layout(*host_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
     if (host_arena->commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return false;
     }
 
-    PTO2Runtime *rt = runtime_init_data_from_layout(
+    RuntimeContext *rt = runtime_init_data_from_layout(
         *host_arena, layout, PTO2_MODE_EXECUTE, ptrs.gm_sm, sizes.sm_size, ptrs.gm_heap, sizing.heap_sizes
     );
     if (rt == nullptr) {
@@ -779,7 +789,7 @@ static int bind_cached_runtime_image(
 
 static void store_prebuilt_runtime_image(
     const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
-    const PTO2RuntimeArenaLayout &layout, const DeviceArena &host_arena
+    const RuntimeArenaLayout &layout, const DeviceArena &host_arena
 ) {
     api->mark_prebuilt_runtime_arena_cached(
         probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), ptrs.gm_heap, ptrs.gm_sm,
@@ -797,7 +807,7 @@ static void store_prebuilt_runtime_image(
 // prewarm_config_impl entry, so both build the arena identically.
 static bool build_and_cache_prebuilt_arena(
     const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs = nullptr,
-    PTO2RuntimeArenaLayout *out_layout = nullptr
+    RuntimeArenaLayout *out_layout = nullptr
 ) {
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) {
@@ -810,7 +820,7 @@ static bool build_and_cache_prebuilt_arena(
     }
 
     DeviceArena host_arena;  // libc malloc backend; owns the image until upload
-    PTO2RuntimeArenaLayout layout;
+    RuntimeArenaLayout layout;
     if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
         return false;
     }
@@ -858,22 +868,22 @@ extern "C" int bind_callable_to_runtime_impl(
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (api == nullptr) {
         LOG_ERROR("HostApi pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (orch_args == nullptr) {
         LOG_ERROR("orch_args pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     // trb runs orchestration on the device — there is no host-side orch
     // function pointer to invoke. The c_api signature accepts one for
     // symmetry with hbg; assert the trb-side invariant here.
     if (host_orch_func_ptr != nullptr) {
         LOG_ERROR("bind_callable_to_runtime_impl: trb does not accept a host_orch_func_ptr");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int tensor_count = orch_args->tensor_count();
@@ -885,7 +895,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     ArenaSizingConfig sizing;
     if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     // The retained temporary buffer is always used on the trb path — it is an
@@ -895,7 +905,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // bump-slice from it.
     RetainedTempBump bump;
     if (!bump.begin(api, orch_args)) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
@@ -904,7 +914,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     ChipStorageTaskArgs device_args;
     if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &bump, &device_args)) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     apply_orch_sched_env_flags(runtime);
@@ -915,7 +925,7 @@ extern "C" int bind_callable_to_runtime_impl(
         PrebuiltRuntimeArenaCacheProbe cache_probe = make_prebuilt_runtime_arena_cache_probe(sizing);
         int cache_rc = bind_cached_runtime_image(runtime, api, cache_probe, device_args);
         if (cache_rc < 0) {
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         if (cache_rc != 0) {
             // Miss: build + upload the arena image, then wire the runtime
@@ -925,9 +935,9 @@ extern "C" int bind_callable_to_runtime_impl(
             // cache round-trip, so a backend with no-op cache callbacks still
             // binds successfully.
             StaticArenaPtrs ptrs;
-            PTO2RuntimeArenaLayout layout;
+            RuntimeArenaLayout layout;
             if (!build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout)) {
-                return -1;
+                return PTO_RUNTIME_ERR_INTERNAL;
             }
             runtime->set_orch_args(device_args);
             runtime->set_gm_sm_ptr(ptrs.gm_sm);
@@ -960,16 +970,16 @@ extern "C" int prewarm_config_impl(
 ) {
     if (api == nullptr) {
         LOG_ERROR("HostApi pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     ArenaSizingConfig sizing;
     if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     STRACE("chip.prewarm.build");
-    return build_and_cache_prebuilt_arena(api, sizing) ? 0 : -1;
+    return build_and_cache_prebuilt_arena(api, sizing) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
 }
 
 /**
@@ -988,11 +998,11 @@ extern "C" int prewarm_config_impl(
 extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (api == nullptr) {
         LOG_ERROR("HostApi pointer is null");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int rc = 0;
@@ -1020,7 +1030,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.
-        if (sched_error_code == PTO2_ERROR_SCHEDULER_TIMEOUT) {
+        if (sched_error_code == SIMPLER_ERROR_SCHEDULER_TIMEOUT) {
             int32_t detail = host_header.sched_stall_detail.load(std::memory_order_acquire);
             LOG_ERROR(
                 "PTO2 scheduler timeout sub_class=%s (detail=%d) completed=%d/%d running=%d ready=%d waiting=%d "

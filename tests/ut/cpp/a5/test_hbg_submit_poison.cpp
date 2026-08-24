@@ -31,8 +31,8 @@
 #include <vector>
 
 #include "utils/device_arena.h"
-#include "pto_orchestrator.h"
-#include "pto_shared_memory.h"
+#include "orchestrator.h"
+#include "shared_memory.h"
 
 namespace {
 
@@ -49,32 +49,26 @@ protected:
     PTO2SharedMemoryHandle *sm_handle = nullptr;
     PTO2OrchestratorState orch{};
     PTO2SchedulerState sched{};
-    PTO2OrchestratorLayout orch_layout{};
     PTO2SchedulerLayout sched_layout{};
     std::vector<char> gm_heap;
 
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        gm_heap.resize(4096 * PTO2_MAX_RING_DEPTH);
+        gm_heap.resize(4096);
 
-        orch_layout = PTO2OrchestratorState::reserve_layout(runtime_arena, static_cast<int32_t>(PTO2_TASK_WINDOW_SIZE));
         sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
-        ASSERT_TRUE(orch.init_data_from_layout(
-            orch_layout, runtime_arena, sm_handle->sm_base, gm_heap.data(), 4096, PTO2_TASK_WINDOW_SIZE
-        ));
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
         // Same order the AICPU boots in: the slot arrays are not part of the
         // uploaded image, so nothing can push until they carry their ramp.
         sched.seed_queue_slots();
-        orch.wire_arena_pointers(orch_layout, runtime_arena, &sched);
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, PTO2_TASK_WINDOW_SIZE, &sched));
     }
 
     void TearDown() override {
-        orch.destroy();
         sched.destroy();
         runtime_arena.release();
         sm_arena.release();
@@ -88,7 +82,7 @@ protected:
         const size_t n = static_cast<size_t>(ring.task_window_mask) + 1;
         std::memset(ring.task_descriptors, POISON, n * sizeof(PTO2TaskDescriptor));
         std::memset(ring.task_payloads, POISON, n * sizeof(PTO2TaskPayload));
-        std::memset(ring.slot_states, POISON, n * sizeof(PTO2TaskSlotState));
+        std::memset(ring.slot_states, POISON, n * sizeof(ChipTaskSlotState));
         std::memset(ring.completion_flags, POISON, n * sizeof(std::atomic<uint8_t>));
     }
 };
@@ -113,7 +107,7 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     ASSERT_TRUE(root.task_id().is_valid());
 
     // 2. Multi-fanin dummy consumer (duplicate dep deduped to one fanin).
-    PTO2TaskId deps[] = {root.task_id(), root.task_id()};
+    TaskId deps[] = {root.task_id(), root.task_id()};
     CoreTaskArgs consumer_args;
     consumer_args.set_dependencies(deps, 2);
     TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
@@ -143,7 +137,7 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
         const int32_t slot = ring.get_slot_by_task_id(local);
         const PTO2TaskDescriptor &desc = ring.task_descriptors[slot];
         const PTO2TaskPayload &pl = ring.task_payloads[slot];
-        const PTO2TaskSlotState &st = ring.slot_states[slot];
+        const ChipTaskSlotState &st = ring.slot_states[slot];
 
         // Descriptor: the task id is written to this exact local id.
         EXPECT_EQ(desc.task_id.local(), static_cast<uint32_t>(local));
@@ -184,5 +178,5 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     // The consumer's fanin is written: two duplicate deps dedupe to one.
     const PTO2TaskPayload &cons_pl = ring.task_payloads[ring.get_slot_by_task_id(consumer.task_id().local())];
     EXPECT_EQ(cons_pl.fanin_count, 1);
-    EXPECT_EQ(cons_pl.fanin_local_ids[0], static_cast<int32_t>(root.task_id().local()));
+    EXPECT_EQ(cons_pl.fanin_data()[0], static_cast<int32_t>(root.task_id().local()));
 }

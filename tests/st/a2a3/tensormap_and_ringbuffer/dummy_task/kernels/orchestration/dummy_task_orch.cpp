@@ -43,7 +43,7 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_WRITE_CONST 0
 #define FUNC_COPY_FIRST 1
@@ -55,10 +55,9 @@ static constexpr int32_t DENSE_DEP_COUNT = 18;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 4,  // 3 tensors + 1 case scalar
     };
 }
@@ -113,8 +112,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     } else if (case_id == 3) {
         // producer A writes X, producer B writes W
-        PTO2TaskId a_id;
-        PTO2TaskId b_id;
+        TaskId a_id;
+        TaskId b_id;
         {
             CoreTaskArgs args;
             args.add_inout(ext_X);
@@ -126,17 +125,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             b_id = rt_submit_aic_task(FUNC_WRITE_CONST, args).task_id();
         }
         // dummy barrier on A + B (no tensor args, only explicit deps)
-        PTO2TaskId dummy_id;
+        TaskId dummy_id;
         {
             CoreTaskArgs args;
-            PTO2TaskId barrier_deps[] = {a_id, b_id};
+            TaskId barrier_deps[] = {a_id, b_id};
             args.set_dependencies(barrier_deps, 2);
             dummy_id = rt_submit_dummy_task(args).task_id();
         }
         // consumer: explicit dep on dummy, reads X
         {
             CoreTaskArgs args;
-            PTO2TaskId consumer_deps[] = {dummy_id};
+            TaskId consumer_deps[] = {dummy_id};
             args.set_dependencies(consumer_deps, 1);
             args.add_input(ext_X);
             args.add_inout(ext_Y);
@@ -145,16 +144,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     } else if (case_id == 4) {
         // One producer feeds DENSE_DEP_COUNT dummy barriers, then one consumer
         // depends on all of them, exercising both dense-dependency diagnostics.
-        PTO2TaskId a_id;
+        TaskId a_id;
         {
             CoreTaskArgs args;
             args.add_inout(ext_X);
             a_id = rt_submit_aic_task(FUNC_WRITE_CONST, args).task_id();
         }
-        PTO2TaskId dummies[DENSE_DEP_COUNT];
+        TaskId dummies[DENSE_DEP_COUNT];
         for (int32_t i = 0; i < DENSE_DEP_COUNT; i++) {
             CoreTaskArgs args;
-            PTO2TaskId dep[] = {a_id};
+            TaskId dep[] = {a_id};
             args.set_dependencies(dep, 1);
             dummies[i] = rt_submit_dummy_task(args).task_id();
         }
@@ -166,7 +165,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             rt_submit_aic_task(FUNC_COPY_FIRST, args);
         }
     } else {
-        rt_report_fatal(PTO2_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id));
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id)
+        );
     }
 }
 

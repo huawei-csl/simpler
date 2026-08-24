@@ -13,16 +13,42 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <fstream>
 
 #include "common/unified_log.h"
 
 namespace simpler::dfx {
+namespace {
+
+// A pass identity must be unique across every pool in the process, not merely
+// within one. A producer caches its lane against the identity of the pass it
+// claimed it for, and a store is per DeviceRunner: a freshly constructed store can
+// occupy a destroyed one's address with a per-pool counter that has reached the
+// same value, at which point a stale cached lane looks valid for a pass it never
+// claimed and appends at an offset into a buffer this pass has cleared.
+uint32_t next_pass_generation() {
+    static std::atomic<uint32_t> generation{0};
+    return generation.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+}  // namespace
 
 HostPhaseRecordPool *HostPhaseRecordStore::arm(bool collect_records) {
-    pool_ = HostPhaseRecordPool{};
+    // Everything a producer reads about this pass is written before the generation
+    // is published, and the generation is published last with a release. That store
+    // is the pass's only publication point: a producer acquires the generation and
+    // is then guaranteed to see the buffer pointer and count that go with it.
+    // Publishing the generation first would let a producer pair a new generation
+    // with the null pointer below and dereference it.
+    pool_.next_buffer.store(0, std::memory_order_relaxed);
+    pool_.dropped.store(0, std::memory_order_relaxed);
+    pool_.buffers = nullptr;
+    pool_.buffer_count = 0;
     armed_ = false;
     finished_ = false;
+    records_written_ = false;
     submitted_tasks_ = 0;
     // A pass's identity must not survive into the next one: write_records_jsonl
     // asks only whether the store is armed, so a pass written before finish()
@@ -31,6 +57,10 @@ HostPhaseRecordPool *HostPhaseRecordStore::arm(bool collect_records) {
     if (!collect_records) {
         buffers_.clear();
         buffers_.shrink_to_fit();
+        // Still a new pass, and publishing it is what retires the producer lanes a
+        // previous pass handed out — a producer holding one must not append into
+        // storage this call just released.
+        pool_.generation.store(next_pass_generation(), std::memory_order_release);
         return nullptr;
     }
 
@@ -40,20 +70,22 @@ HostPhaseRecordPool *HostPhaseRecordStore::arm(bool collect_records) {
     for (auto &buffer : buffers_) {
         buffer.count = 0;
     }
-
-    // Buffer 0 is active and the rest fill the free queue in index order, so the
-    // reader recovers fill order from the buffer index alone — the free queue
-    // holds exactly PLATFORM_PROF_SLOT_COUNT spares, which is why the pool is
-    // one buffer larger than that.
-    pool_.head.current_buf_ptr = reinterpret_cast<uint64_t>(&buffers_[0]);
-    pool_.head.current_buf_seq = 1;
-    for (size_t i = 1; i < buffers_.size(); ++i) {
-        pool_.free_queue.buffer_ptrs[(i - 1) % PLATFORM_PROF_SLOT_COUNT] = reinterpret_cast<uint64_t>(&buffers_[i]);
-    }
-    pool_.free_queue.head = 0;
-    pool_.free_queue.tail = static_cast<uint32_t>(buffers_.size() - 1);
+    pool_.buffers = buffers_.data();
+    pool_.buffer_count = static_cast<uint32_t>(buffers_.size());
     armed_ = true;
+    // Last, and with a release: see the top of this function.
+    pool_.generation.store(next_pass_generation(), std::memory_order_release);
     return &pool_;
+}
+
+uint64_t HostPhaseRecordStore::stored_records() const {
+    uint64_t total = 0;
+    for (const auto &buffer : buffers_) {
+        total += buffer.count < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER ?
+                     buffer.count :
+                     static_cast<uint32_t>(PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER);
+    }
+    return total;
 }
 
 void HostPhaseRecordStore::finish(uint64_t submitted_tasks, uint64_t invocation_id) {
@@ -61,20 +93,21 @@ void HostPhaseRecordStore::finish(uint64_t submitted_tasks, uint64_t invocation_
     submitted_tasks_ = submitted_tasks;
     invocation_id_ = invocation_id;
     finished_ = true;
-    if (pool_.head.dropped_record_count > 0) {
+    if (dropped_records() > 0) {
         LOG_WARN(
-            "Host phase pool dropped %u of %u records (capacity %zu); the per-event views are truncated while the "
-            "per-kind totals stay exact",
-            static_cast<unsigned>(pool_.head.dropped_record_count),
-            static_cast<unsigned>(pool_.head.total_record_count), capacity()
+            "Host phase pool dropped %llu of %llu records (%d buffers of %d); the per-event views are truncated while "
+            "the per-kind totals stay exact",
+            static_cast<unsigned long long>(dropped_records()), static_cast<unsigned long long>(total_records()),
+            PLATFORM_HOST_PHASE_BUFFERS, PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER
         );
     }
 }
 
-int HostPhaseRecordStore::write_records_jsonl(const std::string &path) const {
-    if (!armed_) return 0;
+int HostPhaseRecordStore::write_records_jsonl(const std::string &path) {
+    if (!armed_ || records_written_) return 0;
     const std::vector<HostPhaseRecord> all = records();
     if (all.empty() && dropped_records() == 0) return 0;
+    records_written_ = true;
 
     // Appended one object per pass: a --rounds run emits a pass per round, and
     // each object carries the identity needed to join it to that round's spans.
@@ -108,7 +141,7 @@ int HostPhaseRecordStore::write_records_jsonl(const std::string &path) const {
 std::vector<HostPhaseRecord> HostPhaseRecordStore::records() const {
     std::vector<HostPhaseRecord> out;
     if (!armed_) return out;
-    out.reserve(pool_.head.total_record_count);
+    out.reserve(static_cast<size_t>(stored_records()));
     for (const auto &buffer : buffers_) {
         const uint32_t count = buffer.count < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER ?
                                    buffer.count :
@@ -117,6 +150,12 @@ std::vector<HostPhaseRecord> HostPhaseRecordStore::records() const {
             out.push_back(buffer.records[i]);
         }
     }
+    // A buffer holds one producer's records, so concatenating the buffers groups
+    // by producer rather than ordering by time. Sorting here is off any measured
+    // path and gives every reader one well-defined order.
+    std::stable_sort(out.begin(), out.end(), [](const HostPhaseRecord &a, const HostPhaseRecord &b) {
+        return a.start_ns < b.start_ns;
+    });
     return out;
 }
 

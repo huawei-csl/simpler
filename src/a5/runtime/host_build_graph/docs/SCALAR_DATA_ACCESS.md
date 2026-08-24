@@ -38,7 +38,7 @@ The execution order is:
 
 1. The host loads and calls the orchestration shared object.
 2. Orchestration builds the entire task graph and returns.
-3. The host relocates and copies the graph image to device memory.
+3. The host copies the graph image to device memory.
 4. AICPU schedulers boot and dispatch the graph.
 
 A producer submitted in step 1 cannot become `COMPLETED` until step 4. Waiting
@@ -50,6 +50,22 @@ Runtime-created output buffers also live in the graph heap and have no host-view
 registration. Even if their address is nonzero, host orchestration must not
 dereference or modify them.
 
+## No Initial-Value Fill on a Runtime Allocation
+
+`TensorCreateInfo` carries no `set_initial_value` here, unlike its
+`tensormap_and_ringbuffer` counterpart. The fill stores to
+`ChipTensor::buffer.addr` — a GM-heap device address — which the AICPU
+orchestrator can write and the host orchestrator this runtime uses cannot. The
+method is absent rather than failing at run time, so an orchestration that asks
+for it does not compile against this runtime instead of faulting on device.
+
+To give a runtime allocation a defined starting content — a fixed-size tile
+whose producer writes only a prefix, so its consumer reads a known value in the
+remainder — have a task write it. Doing it on device also keeps the buffer
+correct under Graph Execution, where a value written once while recording would
+reach none of the replays: each submission materializes its outputs at addresses
+it derives for itself, from a heap block whose prior contents it never reads.
+
 ## Ownership Validation
 
 Before a wait slot is used, the runtime verifies:
@@ -59,7 +75,7 @@ Before a wait slot is used, the runtime verifies:
 - the descriptor's full task ID matches the tensor's owner/producer ID.
 
 The full-ID check prevents a masked ring-slot lookup from aliasing an unused or
-different task. A failure latches `PTO2_ERROR_INVALID_ARGS` and the run returns
+different task. A failure latches `SIMPLER_ERROR_INVALID_ARGS` and the run returns
 status `-5`; reads return zero and writes stop only after that fatal status is
 recorded.
 

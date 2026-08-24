@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -193,11 +194,11 @@ void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
 }
 void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
 void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
-void WorkerEndpoint::control_worker_chip_region_create(const char *, const char *) {
-    throw_unsupported_control("control_worker_chip_region_create");
+void WorkerEndpoint::control_region_allocate(const char *, const char *) {
+    throw_unsupported_control("control_region_allocate");
 }
-void WorkerEndpoint::control_worker_chip_region_release(uint64_t) {
-    throw_unsupported_control("control_worker_chip_region_release");
+void WorkerEndpoint::control_region_release(const char *, const char *) {
+    throw_unsupported_control("control_region_release");
 }
 
 void WorkerEndpoint::submit_progress(Ring *, const WorkerDispatch &) {
@@ -442,7 +443,8 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
 WorkerThread::SubmitDispatchResult
 WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expected_run_id) {
 #if SIMPLER_HOST_STRACE
-    const int64_t trace_start_ns = simpler::host_trace::now_ns();
+    const bool trace_enabled = simpler::host_trace::enabled();
+    const int64_t trace_start_ns = trace_enabled ? simpler::host_trace::now_ns() : 0;
 #endif
     std::unique_lock<std::mutex> admission_lk(admission_mu_);
     if (shutdown_.load(std::memory_order_acquire)) {
@@ -464,9 +466,14 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
     ++next_dispatch_id_;
     inflight_.fetch_add(1, std::memory_order_release);
 #if SIMPLER_HOST_STRACE
-    const RunId trace_run = trace_run_id(ring_, d.task_slot);
-    const uint64_t trace_hash = trace_callable_hash(ring_, d.task_slot);
-    const std::string trace_lease = trace_lease_attrs(ring_, d.task_slot);
+    RunId trace_run = INVALID_RUN_ID;
+    uint64_t trace_hash = 0;
+    std::string trace_lease;
+    if (trace_enabled) {
+        trace_run = trace_run_id(ring_, d.task_slot);
+        trace_hash = trace_callable_hash(ring_, d.task_slot);
+        trace_lease = trace_lease_attrs(ring_, d.task_slot);
+    }
 #endif
     try {
         endpoint_->submit_progress(ring_, d);
@@ -477,12 +484,15 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
     }
     admission_lk.unlock();
 #if SIMPLER_HOST_STRACE
-    const int64_t trace_end_ns = simpler::host_trace::now_ns();
-    const std::string trace_attrs = trace_dispatch_attrs(trace_run, d, endpoint_->caps(), "scheduler") + trace_lease;
-    simpler::host_trace::emit(
-        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Dispatch), trace_run, trace_hash, 0,
-        trace_start_ns, trace_end_ns - trace_start_ns, trace_attrs.c_str()
-    );
+    if (trace_enabled) {
+        const int64_t trace_end_ns = simpler::host_trace::now_ns();
+        const std::string trace_attrs =
+            trace_dispatch_attrs(trace_run, d, endpoint_->caps(), "scheduler") + trace_lease;
+        simpler::host_trace::emit(
+            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Dispatch), trace_run, trace_hash, 0,
+            trace_start_ns, trace_end_ns - trace_start_ns, trace_attrs.c_str()
+        );
+    }
 #endif
     return SubmitDispatchResult::SUBMITTED;
 }
@@ -645,9 +655,15 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
     }
 
 #if SIMPLER_HOST_STRACE
-    const RunId trace_run = trace_run_id(ring_, dispatch.task_slot);
-    const uint64_t trace_hash = trace_callable_hash(ring_, dispatch.task_slot);
-    std::string complete_attrs = trace_dispatch_attrs(trace_run, dispatch, endpoint_->caps(), "worker");
+    const bool trace_enabled = simpler::host_trace::enabled();
+    RunId trace_run = INVALID_RUN_ID;
+    uint64_t trace_hash = 0;
+    std::string complete_attrs;
+    if (trace_enabled) {
+        trace_run = trace_run_id(ring_, dispatch.task_slot);
+        trace_hash = trace_callable_hash(ring_, dispatch.task_slot);
+        complete_attrs = trace_dispatch_attrs(trace_run, dispatch, endpoint_->caps(), "worker");
+    }
 #endif
     WorkerCompletion completion = progress.completion;
     if (accepted_dispatch_ids_.erase(dispatch.dispatch_id) == 0) {
@@ -672,11 +688,14 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
     }
 
 #if SIMPLER_HOST_STRACE
-    complete_attrs += " outcome=" + std::to_string(static_cast<int32_t>(completion.outcome));
-    simpler::host_trace::SpanScope complete_trace(
-        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Complete), trace_run, trace_hash, 0,
-        std::move(complete_attrs)
-    );
+    std::optional<simpler::host_trace::SpanScope> complete_trace;
+    if (trace_enabled) {
+        complete_attrs += " outcome=" + std::to_string(static_cast<int32_t>(completion.outcome));
+        complete_trace.emplace(
+            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Complete), trace_run, trace_hash, 0,
+            std::move(complete_attrs)
+        );
+    }
 #endif
     on_complete_(std::move(completion));
     {
@@ -722,10 +741,14 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     }
 
 #if SIMPLER_HOST_STRACE
-    simpler::host_trace::SpanScope frame_submit_trace(
-        simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::FrameSubmit), state.run_id,
-        trace_callable_hash(ring, dispatch.task_slot), 0, trace_dispatch_attrs(state.run_id, dispatch, caps_, "worker")
-    );
+    std::optional<simpler::host_trace::SpanScope> frame_submit_trace;
+    if (simpler::host_trace::enabled()) {
+        frame_submit_trace.emplace(
+            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::FrameSubmit), state.run_id,
+            trace_callable_hash(ring, dispatch.task_slot), 0,
+            trace_dispatch_attrs(state.run_id, dispatch, caps_, "worker")
+        );
+    }
 #endif
 
     // The lease slot id is a native pipeline slot bounded by the runtime's
@@ -986,16 +1009,19 @@ bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
         FrameRecord &record = frames_[index];
         if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id) continue;
 #if SIMPLER_HOST_STRACE
-        std::ostringstream activate_attrs;
-        activate_attrs << "run_id=" << run_id << " task_slot=" << record.dispatch.task_slot
-                       << " group_index=" << record.dispatch.group_index << " worker_id=" << caps_.worker_id
-                       << " dispatch_id=" << record.dispatch.dispatch_id
-                       << " endpoint_kind=" << endpoint_kind_name(caps_.kind)
-                       << " prepare_only=" << static_cast<int>(record.dispatch.prepare_only) << " role=worker";
-        simpler::host_trace::SpanScope activate_trace(
-            simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Activate), run_id, 0, 0,
-            activate_attrs.str()
-        );
+        std::optional<simpler::host_trace::SpanScope> activate_trace;
+        if (simpler::host_trace::enabled()) {
+            std::ostringstream activate_attrs;
+            activate_attrs << "run_id=" << run_id << " task_slot=" << record.dispatch.task_slot
+                           << " group_index=" << record.dispatch.group_index << " worker_id=" << caps_.worker_id
+                           << " dispatch_id=" << record.dispatch.dispatch_id
+                           << " endpoint_kind=" << endpoint_kind_name(caps_.kind)
+                           << " prepare_only=" << static_cast<int>(record.dispatch.prepare_only) << " role=worker";
+            activate_trace.emplace(
+                simpler::host_trace::host_span_name(simpler::host_trace::HostSpan::Activate), run_id, 0, 0,
+                activate_attrs.str()
+            );
+        }
 #endif
         record.activation_requested = true;
         char *frame = task_frame(index);
@@ -1421,21 +1447,26 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
     run_control_command("control_comm_init");
 }
 
-void LocalMailboxEndpoint::control_worker_chip_region_create(const char *request_shm_name, const char *reply_shm_name) {
+void LocalMailboxEndpoint::control_region_allocate(const char *request_shm_name, const char *reply_shm_name) {
     if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
-        throw std::runtime_error("control_worker_chip_region_create: request and reply shm names must be non-empty");
+        throw std::runtime_error("control_region_allocate: request and reply shm names must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    uint64_t sub_cmd = CTRL_WORKER_CHIP_REGION_CREATE;
+    uint64_t sub_cmd = CTRL_REGION_ALLOCATE;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
-    run_control_command("control_worker_chip_region_create");
+    run_control_command("control_region_allocate");
 }
 
-void LocalMailboxEndpoint::control_worker_chip_region_release(uint64_t region_id) {
+void LocalMailboxEndpoint::control_region_release(const char *request_shm_name, const char *reply_shm_name) {
+    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
+        throw std::runtime_error("control_region_release: request and reply shm names must be non-empty");
+    }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_args(mbox(), CTRL_WORKER_CHIP_REGION_RELEASE, region_id);
-    run_control_command("control_worker_chip_region_release");
+    uint64_t sub_cmd = CTRL_REGION_RELEASE;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
+    run_control_command("control_region_release");
 }
 
 uint64_t WorkerThread::control_malloc(size_t size) {
@@ -1578,14 +1609,14 @@ void WorkerThread::control_comm_init(const char *request_shm_name) {
     endpoint_->control_comm_init(request_shm_name);
 }
 
-void WorkerThread::control_worker_chip_region_create(const char *request_shm_name, const char *reply_shm_name) {
-    if (!endpoint_) throw std::runtime_error("control_worker_chip_region_create: null endpoint");
-    endpoint_->control_worker_chip_region_create(request_shm_name, reply_shm_name);
+void WorkerThread::control_region_allocate(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_region_allocate: null endpoint");
+    endpoint_->control_region_allocate(request_shm_name, reply_shm_name);
 }
 
-void WorkerThread::control_worker_chip_region_release(uint64_t region_id) {
-    if (!endpoint_) throw std::runtime_error("control_worker_chip_region_release: null endpoint");
-    endpoint_->control_worker_chip_region_release(region_id);
+void WorkerThread::control_region_release(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_region_release: null endpoint");
+    endpoint_->control_region_release(request_shm_name, reply_shm_name);
 }
 
 bool WorkerManager::any_busy() const {
@@ -1730,22 +1761,20 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
     wt->control_comm_init(request_shm_name);
 }
 
-void WorkerManager::control_worker_chip_region_create(
-    int worker_id, const char *request_shm_name, const char *reply_shm_name
-) {
+void WorkerManager::control_region_allocate(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
     auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_worker_chip_region_create: invalid worker_id " + std::to_string(worker_id));
+        throw std::runtime_error("control_region_allocate: invalid worker_id " + std::to_string(worker_id));
     }
-    wt->control_worker_chip_region_create(request_shm_name, reply_shm_name);
+    wt->control_region_allocate(request_shm_name, reply_shm_name);
 }
 
-void WorkerManager::control_worker_chip_region_release(int worker_id, uint64_t region_id) {
+void WorkerManager::control_region_release(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
     auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_worker_chip_region_release: invalid worker_id " + std::to_string(worker_id));
+        throw std::runtime_error("control_region_release: invalid worker_id " + std::to_string(worker_id));
     }
-    wt->control_worker_chip_region_release(region_id);
+    wt->control_region_release(request_shm_name, reply_shm_name);
 }
 
 ControlResult WorkerManager::control_digest_only(

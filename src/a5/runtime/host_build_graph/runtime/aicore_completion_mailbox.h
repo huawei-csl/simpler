@@ -15,8 +15,8 @@
 #include <cstdint>
 
 #include "aicore_completion_mailbox_types.h"
-#include "pto_constants.h"
-#include "pto_task_id.h"
+#include "constants.h"
+#include "task_id.h"
 
 // AICPU-only MPSC ring used to convey deferred-completion observations from
 // FIN-handling scheduler threads to the dispatch thread. Producers push under
@@ -50,9 +50,9 @@ struct AICoreCompletionMailboxMessage {
     // value with an acquire load. The release-acquire pair publishes all
     // other fields below as a side effect, so they stay plain.
     std::atomic<uint64_t> seq;
-    PTO2TaskId task_token;
+    TaskId task_token;
     // CONDITION: completion observation addr (counter / backend record).
-    // TASK_NORMAL_DONE: PTO2TaskSlotState pointer carried over to the consumer
+    // TASK_NORMAL_DONE: ChipTaskSlotState pointer carried over to the consumer
     //   so it can finalize the AsyncWaitEntry.slot_state binding.
     uint64_t addr;
     uint64_t backend_cookie;
@@ -77,7 +77,7 @@ static_assert(
 // payload, so try_pop copies out only the fields below (and seq is not even
 // copyable — it is a std::atomic).
 struct AICoreCompletionMsgView {
-    PTO2TaskId task_token{PTO2TaskId::invalid()};
+    TaskId task_token{TaskId::invalid()};
     uint64_t addr{0};
     uint64_t backend_cookie{0};
     uint32_t expected_value{0};
@@ -99,6 +99,30 @@ struct AICoreCompletionMailbox {
     // consumer lock; a stale answer only over/under-triggers a drain attempt.
     bool has_pending() { return tail.load(std::memory_order_acquire) < head.load(std::memory_order_acquire); }
 
+    // Bring the ring to its empty state on arena memory whose prior contents are
+    // unknown. head and tail are the cursors try_pop's bounds check reads, and
+    // each slot's seq is its publication gate: try_pop accepts entries[t] only
+    // when seq == t + 1, and a producer bumps head before it stores seq, so a
+    // residual seq that happens to equal t + 1 would let the consumer read a slot
+    // the producer has not written yet. Zeroing seq closes that window; the rest
+    // of a message is written before its seq and never read ahead of head, so it
+    // needs nothing.
+    //
+    // This is the ring's only initializer, so it is also where the empty state is
+    // defined: a caller that zeroes the region instead happens to land on the same
+    // state, and would silently drop anything non-zero added here.
+    //
+    // Once head and tail persist across binds this collapses to tail := head:
+    // positions never repeat, so a residual seq is always below t + 1 and only
+    // the undrained-messages case is left to discard.
+    void init_empty() {
+        head.store(0, std::memory_order_relaxed);
+        tail.store(0, std::memory_order_relaxed);
+        for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY; i++) {
+            entries[i].seq.store(0, std::memory_order_relaxed);
+        }
+    }
+
     // MPSC push for a CONDITION message. Returns false when the ring is full
     // (head - tail >= CAPACITY); caller should SPIN_WAIT_HINT and retry.
     // Lock-free: CAS the shared head to claim a slot, write the fields, then
@@ -114,34 +138,14 @@ struct AICoreCompletionMailbox {
     //
     // Safe to call concurrently from any number of producers; structurally
     // independent of the AsyncWaitList::busy lock.
-    // Bring the ring to its empty state on arena memory whose prior contents are
-    // unknown. head and tail are the cursors try_pop's bounds check reads, and
-    // each slot's seq is its publication gate: try_pop accepts entries[t] only
-    // when seq == t + 1, and a producer bumps head before it stores seq, so a
-    // residual seq that happens to equal t + 1 would let the consumer read a slot
-    // the producer has not written yet. Zeroing seq closes that window; the rest
-    // of a message is written before its seq and never read ahead of head, so it
-    // needs nothing.
-    //
-    // Once head and tail persist across binds this collapses to tail := head:
-    // positions never repeat, so a residual seq is always below t + 1 and only
-    // the undrained-messages case is left to discard.
-    void init_empty() {
-        head.store(0, std::memory_order_relaxed);
-        tail.store(0, std::memory_order_relaxed);
-        for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY; i++) {
-            entries[i].seq.store(0, std::memory_order_relaxed);
-        }
-    }
-
     bool try_push_condition(
-        PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
+        TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
     ) {
         return try_push_condition(task_token, addr, 0, expected_value, engine, completion_type);
     }
 
     bool try_push_condition(
-        PTO2TaskId task_token, uint64_t addr, uint64_t backend_cookie, uint32_t expected_value, uint32_t engine,
+        TaskId task_token, uint64_t addr, uint64_t backend_cookie, uint32_t expected_value, uint32_t engine,
         int32_t completion_type
     ) {
         while (true) {
@@ -165,10 +169,10 @@ struct AICoreCompletionMailbox {
         }
     }
 
-    // MPSC push for a TASK_NORMAL_DONE sentinel. Carries the PTO2TaskSlotState
+    // MPSC push for a TASK_NORMAL_DONE sentinel. Carries the ChipTaskSlotState
     // pointer in the `addr` field so the consumer can finish binding the
     // AsyncWaitEntry.slot_state without going back to the FIN-handling thread.
-    bool try_push_normal_done(PTO2TaskId task_token, uint64_t slot_state_addr) {
+    bool try_push_normal_done(TaskId task_token, uint64_t slot_state_addr) {
         while (true) {
             uint64_t h = head.load(std::memory_order_relaxed);
             uint64_t t = tail.load(std::memory_order_acquire);

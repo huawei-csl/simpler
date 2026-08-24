@@ -26,16 +26,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 #define FUNC_SPMD_WRITE_AIV 0
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 1,
     };
 }

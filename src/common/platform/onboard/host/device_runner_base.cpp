@@ -47,7 +47,7 @@
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
-#include "pto_runtime_c_api.h"
+#include "runtime_c_api.h"
 #include "task_args.h"
 #include "utils/elf_build_id.h"
 
@@ -315,7 +315,7 @@ int DeviceRunnerBase::setup_static_arena(
 ) {
     if (arena_bank >= arena_banks_.size()) {
         LOG_ERROR("arena bank %u is outside [0, %zu)", arena_bank, arena_banks_.size());
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
     // runtime arena. Split out from a single large allocation because the
@@ -354,7 +354,7 @@ int DeviceRunnerBase::setup_static_arena(
             // is_committed() guard skips the release branch. release() is
             // idempotent on a never-committed arena (zeroes cursor_).
             arena.release();
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         cached_size = requested_size;
         return 0;
@@ -384,7 +384,7 @@ int DeviceRunnerBase::setup_static_arena(
             prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
             prebuilt_runtime_arena_cache_image_.clear();
         }
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (arena_changed && arena_bank == 0) {
         prebuilt_runtime_arena_cache_valid_ = false;
@@ -408,14 +408,14 @@ std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
 int DeviceRunnerBase::attach_current_thread(int device_id) {
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (device_id_ != -1 && device_id_ != device_id) {
         LOG_ERROR(
             "DeviceRunner already initialized on device %d; reset/finalize before switching to device %d", device_id_,
             device_id
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     // CANN device context is per-thread, so every caller must attach explicitly.
@@ -556,7 +556,7 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     // Device must be set first
     if (stream_aicpu_ == nullptr) {
         LOG_ERROR("Device not set before loading binaries");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     if (dispatcher_so_binary_.empty()) {
@@ -564,7 +564,7 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
             "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
             "(RuntimeBinaries.dispatcher_path)"
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
@@ -742,12 +742,12 @@ int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
     // slot to dispatch — the active callable_id.
     if (cid < 0) {
         LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
         LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     runtime.set_active_callable_id(cid);
     return 0;
@@ -757,7 +757,7 @@ int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
         LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     return stamp_orch_so(runtime, cid);
 }
@@ -766,7 +766,7 @@ int DeviceRunnerBase::commit_device_register(int32_t cid) {
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
         LOG_ERROR("commit_device_register: callable_id=%d not registered", cid);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     const auto &state = it->second;
     if (state.host_dlopen_handle != nullptr) {
@@ -784,7 +784,7 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("launch_device_register: callable_id=%d not registered", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (it->second.host_dlopen_handle != nullptr) {
         return 0;
@@ -848,19 +848,19 @@ int DeviceRunnerBase::record_device_orch_callable(
         LOG_ERROR(
             "record_device_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (orch_so_data == nullptr || orch_so_size == 0) {
         LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (chip_buffer_hash == 0 || chip_dev == 0) {
         LOG_ERROR("record_device_orch_callable: missing chip buffer for callable_id=%d", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
@@ -891,19 +891,19 @@ int DeviceRunnerBase::record_host_orch_callable(
         LOG_ERROR(
             "record_host_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
         LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (chip_buffer_hash == 0) {
         LOG_ERROR("record_host_orch_callable: missing chip buffer for callable_id=%d", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     CallableState state;
@@ -945,11 +945,11 @@ int DeviceRunnerBase::provision_dma_workspace(
     const uint32_t supported = dma_workspace_supported_mask();
     if ((required_mask & ~supported) != 0) {
         LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
-        return -1;
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
     if (dma_workspace_handle_ != nullptr) {
         LOG_ERROR("provision_dma_workspace: workspace already provisioned");
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
@@ -1150,7 +1150,7 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     const auto &state = it->second;
 
@@ -1168,7 +1168,7 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
@@ -1500,7 +1500,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     if (aicore_bin_handle_ == nullptr) {
         if (aicore_kernel_binary_.empty()) {
             LOG_ERROR("AICore kernel binary is empty");
-            return -1;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         rtDevBinary_t binary;
         std::memset(&binary, 0, sizeof(binary));
@@ -1548,7 +1548,7 @@ int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
         LOG_ERROR(
             "launch_aicpu_num (%d) must be 0 (auto) or in range [2, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS
         );
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     return 0;
 }
@@ -1629,17 +1629,17 @@ int DeviceRunnerBase::resolve_block_dim() {
 
 int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
     if (validate_launch_aicpu_num(config.aicpu_thread_num) != 0) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     int block_dim = resolve_block_dim();
     if (block_dim < 0) {
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int num_aicore = block_dim * cores_per_blockdim_;
     if (num_aicore > RUNTIME_MAX_WORKER) {
         LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)", block_dim, RUNTIME_MAX_WORKER);
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     runtime.set_worker_count(num_aicore);
@@ -1824,6 +1824,20 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
     }
 }
 
+void DeviceRunnerBase::write_host_phase_records_artifact() {
+    // Per-event view of the prepare path. Every phase it records is produced on
+    // the host during bind, and the store is finished before launch, so this
+    // touches no device state and is callable from any point after bind --
+    // including a path that never launches. Keyed on output_prefix_ because it is
+    // non-empty exactly when this run produces diagnostic artifacts, and on the
+    // store having finished a pass, which is what a host-orchestrating runtime
+    // leaves behind. The store writes a pass at most once, so every path that can
+    // end a run calls this unconditionally.
+    if (!output_prefix_.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    }
+}
+
 void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
@@ -1838,15 +1852,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
         chip_swimlane_collector_.export_swimlane_json();
     }
 
-    // Per-event view of the prepare path. Written here rather than in the reap
-    // tail because a device error reaches this teardown but not that tail, and a
-    // failed run is when the prepare timing is worth having. Keyed on
-    // output_prefix_ because it is non-empty exactly when this run produces
-    // diagnostic artifacts, and on the store having finished a pass, which is what
-    // a host-orchestrating runtime leaves behind.
-    if (!output_prefix_.empty() && host_phase_records_.finished()) {
-        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
-    }
+    write_host_phase_records_artifact();
 
     if (enable_dump_args_) {
         dump_collector_.stop();

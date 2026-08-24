@@ -13,7 +13,7 @@
 
 #include <array>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_ADD 0
 #define FUNC_ADD_SCALAR 1
@@ -32,7 +32,7 @@ void layer(const GraphTaskArgs &args, int variant) {
     CoreTaskArgs add_args;
     add_args.add_input(a, b);
     add_args.add_output(intermediate);
-    const std::array<PTO2TaskId, 1> external_dep{a.owner_task_id};
+    const std::array<TaskId, 1> external_dep{a.owner_task_id};
     add_args.set_dependencies(external_dep.data(), static_cast<uint32_t>(external_dep.size()));
     TaskOutputTensors add_outputs = rt_submit_aiv_task(FUNC_ADD, add_args);
     ChipTensor sum = add_outputs.get_ref(0);
@@ -72,9 +72,9 @@ void submit_layer(const GraphTaskArgs &args, int variant) { rt_submit_graph(&lay
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 5,
     };
 }

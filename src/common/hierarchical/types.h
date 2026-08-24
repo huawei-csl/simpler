@@ -45,7 +45,7 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
-#include "../worker/pto_runtime_c_api.h"
+#include "../worker/runtime_c_api.h"
 
 // =============================================================================
 // TensorKey — compound key for TensorMap dependency tracking
@@ -119,7 +119,7 @@ static constexpr int32_t MAX_SCOPE_DEPTH = 64;
 // Number of independent HeapRing layers inside Ring. Scope depth maps
 // to ring index via `min(depth, MAX_RING_DEPTH - 1)` (L2-style);
 // scopes deeper than MAX_RING_DEPTH share the innermost ring.
-// Matches L2's PTO2_MAX_RING_DEPTH (Strict-1).
+// Matches L2's CHIP_MAX_RING_DEPTH (Strict-1).
 static constexpr int32_t MAX_RING_DEPTH = 4;
 
 static constexpr int32_t INVALID_SLOT = -1;

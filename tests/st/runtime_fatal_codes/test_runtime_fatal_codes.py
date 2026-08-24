@@ -51,7 +51,7 @@ ORCH_DIR = os.path.join(KERNELS, "orchestration")
 #   marker     : substring of the validate_runtime_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
-#   explain    : PTO2_ERROR_* name the "error detail:" annotation line must carry, so
+#   explain    : SIMPLER_ERROR_* name the "error detail:" annotation line must carry, so
 #                the log says what the code *means* and not just what it is. Every reachable
 #                code is checked here; the unreachable ones (10/11/103) are covered by the
 #                cpput over the name table itself.
@@ -86,7 +86,7 @@ CASES = {
         runtime_env={"ring_dep_pool": 4},
         kernel=None,
         marker="orch_error_code=4",
-        explain="DEP_POOL_OVERFLOW",
+        explain="FANIN_CAPACITY_EXCEEDED",
     ),
     "invalid_args": dict(
         orch="invalid_args_orch.cpp",
@@ -179,7 +179,7 @@ CASES = {
     # * SCOPE_TASKS_OVERFLOW (10): scope_tasks_cap is the in-flight slot budget (sum
     #   of the per-ring windows, since #1188), but each ring physically holds only
     #   window-1 tasks (the ring's full/empty distinction), so all rings together
-    #   hold at most sum(window-1) = cap - PTO2_MAX_RING_DEPTH, strictly below the
+    #   hold at most sum(window-1) = cap - CHIP_MAX_RING_DEPTH, strictly below the
     #   cap. scope_tasks therefore tops out below its own cap: the rings fill first
     #   and latch SCOPE_DEADLOCK (1, single scope) or FLOW_CONTROL_DEADLOCK (3,
     #   same-ring nesting). Verified: no (depth, tasks/level, window) combo reaches
@@ -231,7 +231,7 @@ _SIM_CASE_PARAMS = [
 def _assert_annotated(log: str, case: dict) -> None:
     """The failure line must be followed by what the code *means*, not just the number.
 
-    The machine-readable "PTO2 runtime failed: ..." line is deliberately left alone -- it is
+    The machine-readable "simpler runtime failed: ..." line is deliberately left alone -- it is
     what ``marker`` matches and what conftest's device-poison regex reads -- so the meaning is
     carried on its own "error detail:" line, emitted by the LOG_RUNTIME_FAILURE macro
     (src/common/runtime_status/error_log.h).

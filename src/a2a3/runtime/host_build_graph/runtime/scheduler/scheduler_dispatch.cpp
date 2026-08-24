@@ -27,7 +27,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "pto_runtime2.h"
+#include "runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -41,12 +41,12 @@
 #endif
 
 // AICore materializes args[] from src_payload on the gated path using the
-// byte offsets in pto2_dispatch_payload.h (the AICore .o cannot see PTO2TaskPayload).
+// byte offsets in dispatch_payload.h (the AICore .o cannot see PTO2TaskPayload).
 // Pin those constants to the real layout here, where the struct is fully visible.
 static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
 static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
-static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_OFFSET);
-static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_DELTA_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_DELTA_OFFSET);
 static_assert(sizeof(ChipTensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
 
 // =============================================================================
@@ -95,7 +95,7 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
-    PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
+    PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
 ) {
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -124,7 +124,7 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx,
+    PTO2DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx,
     bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
@@ -146,11 +146,18 @@ void SchedulerContext::build_payload(
         // Ready task: fill args here; src_payload = 0 signals AICore to run on pickup.
         dispatch_payload.src_payload = 0;
         int n = 0;
-        for (int32_t i = 0; i < payload.tensor_count; i++) {
-            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+        // Both regions are resolved once: the args[] stores below could alias the
+        // payload as far as the compiler knows, so re-resolving a delta per element
+        // would reload it on every iteration.
+        const ChipTensor *tensors = payload.tensor_data();
+        const int32_t tensor_count = payload.tensor_count;
+        for (int32_t i = 0; i < tensor_count; i++) {
+            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&tensors[i]);
         }
-        for (int32_t i = 0; i < payload.scalar_count; i++) {
-            dispatch_payload.args[n++] = payload.scalars[i];
+        const uint64_t *scalars = payload.scalar_data();
+        const int32_t scalar_count = payload.scalar_count;
+        for (int32_t i = 0; i < scalar_count; i++) {
+            dispatch_payload.args[n++] = scalars[i];
         }
     }
     dispatch_payload.local_context.block_idx = block_idx;
@@ -165,7 +172,7 @@ void SchedulerContext::build_payload(
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
-    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending,
+    int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending,
     int32_t block_idx, bool force_gate
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -245,7 +252,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 }
 
 int SchedulerContext::prepare_block_for_dispatch(
-    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
+    int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
     int32_t block_idx, PublishHandle *out_handles, bool force_gate
 ) {
 #if SIMPLER_DFX
@@ -331,7 +338,7 @@ void SchedulerContext::dispatch_shape(
 
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
-        PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
         int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
         if (got == 0) break;
 
@@ -372,7 +379,7 @@ void SchedulerContext::dispatch_shape(
         bool dispatched_any = false;
         // Logical block ranges published by this pop. AIV can pop two entries per
         // cluster, so this ledger has the same worst-case bound as handles[].
-        PTO2TaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
+        ChipTaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
         int16_t published_counts[CoreTracker::MAX_CLUSTERS * 3];
         int published_n = 0;
 #if SIMPLER_SCHED_PROFILING
@@ -399,7 +406,7 @@ void SchedulerContext::dispatch_shape(
         };
 
         for (int bi = 0; bi < got; bi++) {
-            PTO2TaskSlotState *slot_state = batch[bi];
+            ChipTaskSlotState *slot_state = batch[bi];
             CoreTracker::BitStates selected_mix_clusters(0ULL);
 
             if (is_mix) {
@@ -623,7 +630,7 @@ void SchedulerContext::dispatch_ready_tasks(
 // those release did not take and rings them from its immutable local handles.
 // The seq_cst order guarantees every gated core has exactly one writer.
 int32_t SchedulerContext::stage_consumer_blocks(
-    int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+    int32_t thread_idx, ChipTaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
     CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -723,7 +730,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
     if (!cores.has_value()) return 0;
 
     int32_t total_staged = 0;
-    PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+    ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
     uint64_t task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
     // Batch-pop in one queue op (fewer CAS than one pop per consumer); the pop is
     // bounded by the shape's capacity so the stack buffer always holds it. Then for
@@ -738,7 +745,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
     // the unconsumed tail).
     int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
     for (int bi = 0; bi < got; bi++) {
-        PTO2TaskSlotState *c = batch[bi];
+        ChipTaskSlotState *c = batch[bi];
         if (static_cast<uint64_t>(c->task->task_id.raw) != task_id_snapshots[bi]) continue;
         if (c->payload->early_dispatch_state.load(std::memory_order_acquire) != PTO2_EARLY_DISPATCH_STAGING)
             continue;  // released
@@ -825,7 +832,7 @@ int32_t SchedulerContext::try_early_dispatch(
     // stop-the-world drain. Both paths force-gate every block even if producer release races
     // STAGING -> DISPATCHED. A non-STAGING pop was already released and is dropped.
     uint64_t sync_task_id_snapshot = 0;
-    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
+    if (ChipTaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
         bool current_sync_task =
             static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
@@ -925,14 +932,14 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
         int32_t resolved_this_pass = 0;
         bool resolved_any = false;
         for (int32_t s = 0; s < active_sched_threads_ && !completed_.load(std::memory_order_acquire); s++) {
-            PTO2TaskSlotState *slot;
+            ChipTaskSlotState *slot;
             while ((slot = sp_queues_[s].pop()) != nullptr) {
 #if SIMPLER_SCHED_PROFILING
                 PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot, thread_idx);
 #else
                 PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot);
 #endif
-                if (outcome.error_code != PTO2_ERROR_NONE) {
+                if (outcome.error_code != SIMPLER_ERROR_NONE) {
                     fail_scheduler(runtime, thread_idx, outcome.error_code);
                     break;
                 }
@@ -955,7 +962,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                 thread_idx
 #endif
             );
-            if (poll_result.error_code != PTO2_ERROR_NONE) {
+            if (poll_result.error_code != SIMPLER_ERROR_NONE) {
                 fail_scheduler(runtime, thread_idx, poll_result.error_code);
                 break;
             }
@@ -969,7 +976,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
         // resolution can make further dummies ready in the same pass.
         {
             constexpr int DUMMY_DRAIN_BATCH = 8;
-            PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
+            ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got;
             while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
                 for (int di = 0; di < dummy_got; di++) {
@@ -979,7 +986,7 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
 #else
                     PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
 #endif
-                    if (outcome.error_code != PTO2_ERROR_NONE) {
+                    if (outcome.error_code != SIMPLER_ERROR_NONE) {
                         fail_scheduler(runtime, thread_idx, outcome.error_code);
                         break;
                     }
@@ -1020,9 +1027,9 @@ int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread
                     "Thread %d: P resolution stall (%d/%d resolved)", thread_idx,
                     completed_tasks_.load(std::memory_order_relaxed), total
                 );
-                int32_t expected = PTO2_ERROR_NONE;
+                int32_t expected = SIMPLER_ERROR_NONE;
                 header->sched_error_code.compare_exchange_strong(
-                    expected, PTO2_ERROR_SCHEDULER_TIMEOUT, std::memory_order_acq_rel, std::memory_order_acquire
+                    expected, SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_acq_rel, std::memory_order_acquire
                 );
                 if (!completed_.exchange(true, std::memory_order_acq_rel)) {
                     emergency_shutdown(runtime);
@@ -1303,7 +1310,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Graph control work never consumes an AICore. External dependency
         // readiness and bounded definition materialization progress
-        // independently, then meet at GraphSubmission::activation_gate.
+        // independently, then meet in GraphExecution::state.
         //
         // Keep this ahead of dummy/regular dispatch so a ready Graph can expose
         // its root nodes without waiting for an otherwise unrelated dispatch
@@ -1311,24 +1318,24 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // slice per loop prevents a large definition from monopolizing a
         // scheduler thread.
         if (thread_idx < active_sched_threads_) {
-            PTO2TaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
+            ChipTaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
             if (graph_slot != nullptr) {
                 if (graph_slot->task != nullptr && graph_slot->task_kind == TaskKind::GRAPH) {
                     (void)sched_->activate_graph_task(*graph_slot);
                     made_progress = true;
                 } else {
-                    fail_scheduler(runtime, thread_idx, PTO2_ERROR_INVALID_ARGS);
+                    fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
                     break;
                 }
             }
 
             uint64_t prepare_task_id = 0;
-            PTO2TaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
+            ChipTaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
             if (prepare_slot != nullptr) {
                 const bool valid_slot = prepare_slot->task != nullptr && prepare_slot->task_kind == TaskKind::GRAPH &&
                                         prepare_slot->task->task_id.raw == prepare_task_id;
                 if (!valid_slot) {
-                    fail_scheduler(runtime, thread_idx, PTO2_ERROR_INVALID_ARGS);
+                    fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
                     break;
                 }
 #if SIMPLER_DFX
@@ -1340,11 +1347,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     sched_->prepare_graph_task(*prepare_slot, GRAPH_MATERIALIZE_SLICE_NODES, &nodes_materialized);
                 if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::BUSY) {
                     if (!sched_->push_graph_prepare(prepare_slot, prepare_task_id, thread_idx)) {
-                        fail_scheduler(runtime, thread_idx, PTO2_ERROR_READY_QUEUE_OVERFLOW);
+                        fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
                         break;
                     }
                 } else if (result == GraphMaterializeResult::INVALID) {
-                    fail_scheduler(runtime, thread_idx, PTO2_ERROR_INVALID_ARGS);
+                    fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
                     break;
                 }
                 if (nodes_materialized > 0 || result == GraphMaterializeResult::PREPARED) {

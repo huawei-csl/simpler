@@ -653,7 +653,6 @@ class TestMyKernel(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4},
             "params": {},
         },
     ]
@@ -701,6 +700,14 @@ Key fields:
   where nothing survived (that means the SDK is missing). Used by
   [`qwen3_14b_decode`](../examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/)
   for its CANN attention extern.
+- `CASES[].config` is optional. Ordinary cases should omit `aicpu_thread_num`
+  and use the architecture default; set it only when the test specifically
+  exercises a thread-count or scheduler-topology behavior.
+- The framework owns the `config` namespace. Its keys are
+  `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`;
+  `runtime_env` accepts `ring_task_window`, `ring_heap`, and `ring_dep_pool`.
+  Unknown keys fail when the `@scene_test` class is imported instead of being
+  silently ignored. Case-level extension keys outside `config` remain allowed.
 
 ### Output Validation
 
@@ -752,7 +759,9 @@ Dedicated DFX steps are the exception: they use `--manual include` in normal
 Per-PR and Daily jobs, so marking a case under their target path removes only
 its duplicate main-sweep execution. A caller selecting `--manual only` keeps
 that mode in the DFX steps. The A2/A3 `network1` cases run in the same Daily
-workflow through their existing two-machine job.
+workflow through their existing two-machine job, and the DeepSeek smokes run
+Per-PR in their own parallel job (`st-deepseek-onboard-a2a3`, `--manual only`
+over the two `deepseek_v4_flash_decode` directories).
 
 To move only selected platforms, pass the platform list to the same marker:
 use `@pytest.mark.manual(["a2a3sim", "a5sim"])` (or the equivalent

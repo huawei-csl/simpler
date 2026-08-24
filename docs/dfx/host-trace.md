@@ -18,7 +18,11 @@ children share.
 `src/common/task_interface/profiling_config.h` — separate from the
 `SIMPLER_DFX` gate on the device Orch/Sched markers) and is emitted at
 `LOG_TIMING` (the default threshold) — **no new env var or flag**. In a
-`SIMPLER_HOST_STRACE`-off build the RAII macros compile to nothing.
+`SIMPLER_HOST_STRACE`-off build the RAII macros compile to nothing. In an
+enabled build, Host call sites also read the live process threshold before
+constructing span attributes; `WARN`, `ERROR`, and `NUL` therefore disable the
+instrumentation work as well as the output. Device logging still uses the
+initialization-time policy described in [logging.md](../logging.md).
 
 ## Marker grammar
 
@@ -148,7 +152,7 @@ binding wins**: a `SpanScope` keeps the name pointer it was handed, so a process
 that inits Workers at two levels keeps the first one's word and logs a warning
 rather than relabelling spans that are still open. One process therefore carries
 one vocabulary — which is what makes an L4 run readable, since its own spans say
-`network1.` while each of its L3 children says `host.`.
+`network1.` while each of its L3 children says `node.`.
 
 One process contributes at most two host lanes, because the scheduler runs on
 one thread: the facade thread emits `<level>.graph_build` and `<level>.submit`,
@@ -165,7 +169,8 @@ private logger implementation, then binds it to the
 that state before `fork()`; a chip child re-seeds its inherited copy and passes
 the same pointer to every runtime module it loads. The threshold and one-anchor
 coordination are therefore shared within each process without relying on
-`RTLD_GLOBAL` logger symbols.
+`RTLD_GLOBAL` logger symbols. A private logger is silent before that binding;
+afterward its enabled query follows the shared Host threshold on every span.
 
 ## `ext.` — spans from outside simpler
 
@@ -231,7 +236,9 @@ inside its `chip.run.bind`, matched on `(pid, inv)`. Both sides are the same
 still recovers the stage's own segments from the runtime's timing log lines; where
 both are present the artifact wins, so a segment is not drawn twice. See
 [host_build_graph's profiling levels](../../src/a2a3/runtime/host_build_graph/docs/profiling_levels.md)
-for what that runtime records.
+for what that runtime records, and
+[hbg-bind-phases.md](hbg-bind-phases.md) for what those segments are and
+what produces both the log and the artifact on a real decode network.
 
 **One exception, because a K-deep pipeline is not K threads.** The direct-chip
 lane drives prepare(N+1) and finalize(N) from the *same* OS thread, so a 40-run

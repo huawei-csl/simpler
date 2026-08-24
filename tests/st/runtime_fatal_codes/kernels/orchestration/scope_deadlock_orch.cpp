@@ -10,7 +10,7 @@
  */
 
 /**
- * Negative ST orchestration: PTO2_ERROR_SCOPE_DEADLOCK (code 1).
+ * Negative ST orchestration: SIMPLER_ERROR_SCOPE_DEADLOCK (code 1).
  *
  * Submits far more dummy tasks than the (deliberately tiny) per-ring task window
  * inside a single open scope. The orchestrator's scope-admission check
@@ -27,14 +27,13 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 0,
     };
 }
@@ -49,7 +48,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // tasks-in-scope reaches window-1 the scope-admission check latches
     // SCOPE_DEADLOCK. A handful of tasks is enough — a large batch only piles up
     // post-emergency_shutdown teardown state (which destabilises a5 cleanup).
-    PTO2_SCOPE() {
+    SIMPLER_SCOPE() {
         for (int32_t i = 0; i < 8; i++) {
             CoreTaskArgs args;
             args.add_output(ci);

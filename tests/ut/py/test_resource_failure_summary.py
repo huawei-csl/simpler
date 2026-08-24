@@ -6,7 +6,8 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Tests for Resource phase failure summaries emitted by the root conftest."""
+"""Tests for root-conftest behavior: Resource phase failure summaries and
+device-poison classification."""
 
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ def test_emit_resource_failure_summary_prints_nodeid_and_annotation(capsys):
             output=(
                 "line1\n"
                 "E       RuntimeError: run_prepared failed with code 507018\n"
-                "PTO2 runtime failed: orch_error_code=0 sched_error_code=100 runtime_status=-100\n"
+                "simpler runtime failed: orch_error_code=0 sched_error_code=100 runtime_status=-100\n"
                 "PTO2 scheduler timeout sub_class=S1:running-stalled\n"
             ),
             duration_s=12.34,
@@ -67,7 +68,7 @@ def test_emit_resource_failure_summary_prints_nodeid_and_annotation(capsys):
     assert "hint:" not in out
     assert "line1" not in out
     assert "RuntimeError: run_prepared failed with code 507018" not in out
-    assert "PTO2 runtime failed: orch_error_code=0 sched_error_code=100 runtime_status=-100" not in out
+    assert "simpler runtime failed: orch_error_code=0 sched_error_code=100 runtime_status=-100" not in out
     assert "PTO2 scheduler timeout sub_class=S1:running-stalled" not in out
     assert "standalone pass" not in out
 
@@ -99,3 +100,28 @@ def test_emit_resource_failure_summary_can_emit_compact_recap(capsys):
     assert "rc=2 devices=[7] duration=3.0s" in out
     assert "full output is in the Resource child group above" in out
     assert "hidden tail" not in out
+
+
+def test_device_poison_codes_key_on_the_host_band_not_the_latched_one():
+    """Poison classification reads host-band codes only.
+
+    The a5 DeviceRunner fail-fast ("marked unusable") and a poisoned card whose
+    CANN code an intermediate layer flattened both report the host-side generic
+    code, and both must trigger the worker rebuild. A device-latched code must
+    not: SCOPE_DEADLOCK is an orchestration bug, and treating it as a poisoned
+    context turns one red test into a misleading runtime-wide skip.
+
+    The two bands are defined in src/common/worker/runtime_c_api.h; the set
+    here has to move with them, which is what this test pins.
+    """
+    cf = _load_root_conftest()
+
+    # Host band: PTO_RUNTIME_ERR_INTERNAL, plus the CANN sticky-error codes.
+    assert cf._requires_l2_worker_retirement_msg("prepare_native_run failed with code -1000")
+    assert cf._requires_l2_worker_retirement_msg("simpler_init failed with code 507899")
+
+    # Device-latched band (-1..-999): never poison, whatever the mechanism.
+    assert not cf._requires_l2_worker_retirement_msg("prepare_native_run failed with code -1")  # SCOPE_DEADLOCK
+    assert not cf._requires_l2_worker_retirement_msg("prepare_native_run failed with code -3")  # FLOW_CONTROL_DEADLOCK
+    assert not cf._requires_l2_worker_retirement_msg("prepare_native_run failed with code -100")  # SCHEDULER_TIMEOUT
+    assert not any(-999 <= code <= -1 for code in cf._DEVICE_POISON_CODES)

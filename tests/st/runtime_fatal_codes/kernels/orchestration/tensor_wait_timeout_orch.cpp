@@ -10,7 +10,7 @@
  */
 
 /**
- * Negative ST orchestration: PTO2_ERROR_TENSOR_WAIT_TIMEOUT (code 8).
+ * Negative ST orchestration: SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT (code 8).
  *
  * Submits an AIC kernel that spins forever, then reads its output with
  * get_tensor_data. Because the output has a producer in the TensorMap,
@@ -26,16 +26,15 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_AIC_HANG 0
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 0,
     };
 }

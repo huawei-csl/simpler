@@ -27,7 +27,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 #define N_UNROLL 64
 
@@ -65,10 +65,9 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
@@ -158,7 +157,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             CYCLE_COUNT_LAP(prof_scope_and_loop);
-            PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+            SIMPLER_SCOPE(PTO2ScopeMode::MANUAL) {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
                 uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -176,7 +175,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 const ChipTensor &oi = alloc_outs.get_ref(0);
                 const ChipTensor &li_update = alloc_outs.get_ref(1);
                 const ChipTensor &mi_update = alloc_outs.get_ref(2);
-                PTO2TaskId pre_task_id;
+                TaskId pre_task_id;
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -234,7 +233,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_sf.add_output(pij_buf_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
-                    PTO2TaskId sf_deps[] = {qk_outs.task_id()};
+                    TaskId sf_deps[] = {qk_outs.task_id()};
                     params_sf.set_dependencies(sf_deps, 1);
                     params_sf.add_scalar(scale_value);
                     params_sf.add_scalar(n_blocks);
@@ -255,7 +254,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_input(value_cache);
                     params_pv.add_input(block_table);
                     params_pv.add_output(tile2d_ci);
-                    PTO2TaskId pv_deps[] = {sf_outs.task_id()};
+                    TaskId pv_deps[] = {sf_outs.task_id()};
                     params_pv.set_dependencies(pv_deps, 1);
                     params_pv.add_scalar(n_blocks);
                     params_pv.add_scalar(b_idx * block_num + bn);
@@ -279,7 +278,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_inout(li_update);
                     params_up.add_inout(oi);
                     params_up.add_inout(out_view);
-                    PTO2TaskId up_deps[3];
+                    TaskId up_deps[3];
                     uint32_t up_dep_count = 0;
                     up_deps[up_dep_count++] = pv_outs.task_id();
                     if (!is_first) {

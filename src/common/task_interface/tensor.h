@@ -21,7 +21,7 @@
 
 #include "assert_compat.h"
 #include "data_type.h"
-#include "pto_task_id.h"
+#include "task_id.h"
 
 /**
  * Buffer Handle
@@ -49,7 +49,7 @@ enum class TensorArgType : int32_t {
 };
 
 // `OverlapStatus` / `Segment` (overlap geometry) live in the runtime
-// pto_tensormap.h. `TensorCreateInfo` (submit-time create-info for
+// tensormap.h. `TensorCreateInfo` (submit-time create-info for
 // runtime-allocated outputs) and its materialization helpers live in the
 // runtime tensor_create_info.h. Both are runtime-only and intentionally not
 // part of the wire/host-facing ChipTensor definition.
@@ -95,7 +95,7 @@ enum class TensorArgType : int32_t {
 struct alignas(64) ChipTensor {
     // === Cache line 1 (64B) — hot path ===
     PTOBufferHandle buffer;            // Underlying memory buffer (addr in bytes, size in bytes)
-    PTO2TaskId owner_task_id;          // Creator task; PTO2TaskId::invalid() for external tensors
+    TaskId owner_task_id;              // Creator task; TaskId::invalid() for external tensors
     uint64_t start_offset;             // 1D ELEMENT offset of the view origin into `buffer`
     int32_t version;                   // ChipTensor version for overlap detection
     uint32_t ndims;                    // Number of dimensions used
@@ -190,7 +190,7 @@ struct alignas(64) ChipTensor {
         is_contiguous = true;
         address_space = in_address_space;
         start_offset = 0;
-        owner_task_id = PTO2TaskId::invalid();
+        owner_task_id = TaskId::invalid();
         // Single reverse pass: write shapes, accumulate row-major stride, and
         // track numel — `s` ends as prod(shapes) which is also extent_elem
         // for a contiguous view.
@@ -243,10 +243,10 @@ struct alignas(64) ChipTensor {
     void copy(const ChipTensor &other) { init_from(other); }
 
     // Materialization from a TensorCreateInfo (runtime-allocated outputs) lives
-    // in the runtime tensor_create_info.h as the free functions
-    // init_tensor_from_create_info() / fill_tensor_initial_value(); they operate
-    // on a ChipTensor& through its public members. Kept out of the wire/host-facing
-    // ChipTensor so this header has no dependency on the runtime-only create-info.
+    // in the runtime tensor_create_info.h as init_tensor_from_create_info(), which
+    // operates on a ChipTensor& through its public members. Kept out of the
+    // wire/host-facing ChipTensor so this header has no dependency on the
+    // runtime-only create-info.
 
     // ========================================================================
     // Address / offset computation
@@ -535,7 +535,7 @@ inline ChipTensor make_tensor_strided(
     t.manual_dep = manual_dep;
     t.address_space = address_space;
     t.start_offset = 0;
-    t.owner_task_id = PTO2TaskId::invalid();
+    t.owner_task_id = TaskId::invalid();
     for (uint32_t i = 0; i < ndims; i++) {
         t.shapes[i] = shapes[i];
         t.strides[i] = strides[i];

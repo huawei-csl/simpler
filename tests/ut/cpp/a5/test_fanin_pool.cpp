@@ -10,7 +10,7 @@
  */
 /**
  * Unit tests for PTO2FaninPool and for_each_fanin_storage/slot_state
- * from pto_ring_buffer.h / pto_ring_buffer.cpp
+ * from ring_buffer.h / ring_buffer.cpp
  *
  * Tests:
  * 1. PTO2FaninPool — ring buffer allocation, overflow, tail advance,
@@ -25,8 +25,8 @@
 #include <cstring>
 #include <vector>
 
-#include "pto_ring_buffer.h"
-#include "pto_shared_memory.h"
+#include "ring_buffer.h"
+#include "shared_memory.h"
 
 // =============================================================================
 // FaninPool fixture
@@ -37,12 +37,12 @@ protected:
     static constexpr int32_t POOL_CAP = 32;
 
     std::vector<PTO2FaninSpillEntry> entries;
-    std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
+    std::atomic<int32_t> error_code{SIMPLER_ERROR_NONE};
     PTO2FaninPool pool{};
 
     void SetUp() override {
         entries.assign(POOL_CAP, PTO2FaninSpillEntry{});
-        error_code.store(PTO2_ERROR_NONE);
+        error_code.store(SIMPLER_ERROR_NONE);
         pool.init(entries.data(), POOL_CAP, &error_code);
     }
 };
@@ -83,7 +83,7 @@ TEST_F(FaninPoolTest, OverflowReturnsNullptr) {
     }
     auto *overflow = pool.alloc();
     EXPECT_EQ(overflow, nullptr);
-    EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
+    EXPECT_EQ(error_code.load(), SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED);
 }
 
 TEST_F(FaninPoolTest, EnsureSpaceDeadlockReturnsFalseAndLatchesError) {
@@ -97,7 +97,7 @@ TEST_F(FaninPoolTest, EnsureSpaceDeadlockReturnsFalseAndLatchesError) {
     ring.fc.last_task_alive.store(0, std::memory_order_release);
 
     EXPECT_FALSE(pool.ensure_space(ring, 1));
-    EXPECT_EQ(error_code.load(), PTO2_ERROR_DEP_POOL_OVERFLOW);
+    EXPECT_EQ(error_code.load(), SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED);
 }
 
 TEST_F(FaninPoolTest, AdvanceTailFreesSpace) {
@@ -159,14 +159,14 @@ protected:
     static constexpr int32_t POOL_CAP = 32;
 
     std::vector<PTO2FaninSpillEntry> spill_entries;
-    std::atomic<int32_t> error_code{PTO2_ERROR_NONE};
+    std::atomic<int32_t> error_code{SIMPLER_ERROR_NONE};
     PTO2FaninPool spill_pool{};
 
-    alignas(64) PTO2TaskSlotState slots[64];
+    alignas(64) ChipTaskSlotState slots[64];
 
     void SetUp() override {
         spill_entries.assign(POOL_CAP, PTO2FaninSpillEntry{});
-        error_code.store(PTO2_ERROR_NONE);
+        error_code.store(SIMPLER_ERROR_NONE);
         spill_pool.init(spill_entries.data(), POOL_CAP, &error_code);
         memset(slots, 0, sizeof(slots));
     }
@@ -178,8 +178,8 @@ TEST_F(ForEachFaninTest, InlineOnlyVoid) {
         inline_slots[i].set(&slots[i], DEP_WAIT);
     }
 
-    std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *s, DepFlags) {
+    std::vector<ChipTaskSlotState *> visited;
+    for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](ChipTaskSlotState *s, DepFlags) {
         visited.push_back(s);
     });
 
@@ -196,7 +196,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolEarlyReturn) {
     }
 
     int count = 0;
-    bool result = for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *, DepFlags) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](ChipTaskSlotState *, DepFlags) -> bool {
         count++;
         return count < 3;  // stop after 3rd
     });
@@ -211,7 +211,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
         inline_slots[i].set(&slots[i], DEP_WAIT);
     }
 
-    bool result = for_each_fanin_storage(inline_slots, 3, 0, spill_pool, [](PTO2TaskSlotState *, DepFlags) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 3, 0, spill_pool, [](ChipTaskSlotState *, DepFlags) -> bool {
         return true;
     });
 
@@ -221,7 +221,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
 TEST_F(ForEachFaninTest, ZeroFanin) {
     PTO2FaninSpillEntry inline_slots[PTO2_FANIN_INLINE_CAP] = {};
     int count = 0;
-    for_each_fanin_storage(inline_slots, 0, 0, spill_pool, [&](PTO2TaskSlotState *, DepFlags) {
+    for_each_fanin_storage(inline_slots, 0, 0, spill_pool, [&](ChipTaskSlotState *, DepFlags) {
         count++;
     });
     EXPECT_EQ(count, 0);
@@ -245,8 +245,8 @@ TEST_F(ForEachFaninTest, SpillNoWrap) {
     auto *s1 = spill_pool.alloc();
     s1->set(&slots[17], DEP_WAIT | DEP_RETAIN);
 
-    std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, [&](PTO2TaskSlotState *s, DepFlags) {
+    std::vector<ChipTaskSlotState *> visited;
+    for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, [&](ChipTaskSlotState *s, DepFlags) {
         visited.push_back(s);
     });
 
@@ -281,8 +281,8 @@ TEST_F(ForEachFaninTest, SpillWithWrap) {
         e->set(&slots[16 + i], DEP_WAIT | DEP_RETAIN);
     }
 
-    std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *s, DepFlags) {
+    std::vector<ChipTaskSlotState *> visited;
+    for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](ChipTaskSlotState *s, DepFlags) {
         visited.push_back(s);
     });
 
@@ -315,7 +315,7 @@ TEST_F(ForEachFaninTest, SpillBoolEarlyReturnInSpillRegion) {
 
     int count = 0;
     bool result =
-        for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *, DepFlags) -> bool {
+        for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](ChipTaskSlotState *, DepFlags) -> bool {
             count++;
             return count < 17;  // stop on 17th (first spill entry)
         });
@@ -347,7 +347,7 @@ TEST_F(ForEachFaninTest, DepFlagsRoundTripInlineAndSpill) {
 
     const int32_t total = PTO2_FANIN_INLINE_CAP + 2;  // 64 inline + 2 spill
     std::vector<DepFlags> flags;
-    for_each_fanin_storage(inline_slots, total, spill_start, spill_pool, [&](PTO2TaskSlotState *, DepFlags f) {
+    for_each_fanin_storage(inline_slots, total, spill_start, spill_pool, [&](ChipTaskSlotState *, DepFlags f) {
         flags.push_back(f);
     });
 

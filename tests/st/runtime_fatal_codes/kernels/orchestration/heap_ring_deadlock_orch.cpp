@@ -10,7 +10,7 @@
  */
 
 /**
- * Negative ST orchestration: PTO2_ERROR_HEAP_RING_DEADLOCK (code 2).
+ * Negative ST orchestration: SIMPLER_ERROR_HEAP_RING_DEADLOCK (code 2).
  *
  * Requests an output buffer larger than the (deliberately tiny) per-ring heap.
  * The allocator can never satisfy it, so it latches HEAP_RING_DEADLOCK. The task
@@ -22,14 +22,13 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 0,
     };
 }

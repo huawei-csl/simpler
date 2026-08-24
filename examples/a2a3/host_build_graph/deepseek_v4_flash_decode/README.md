@@ -13,24 +13,53 @@ device can execute what the host built. It is deliberately not a numerics test.
 ## What differs from the TMR case
 
 `kernels/orchestration/decode_fwd_graph.cpp` — the file the test points at — is
-the TMR orchestration with one runtime-specific rewrite, additionally recasting
-the 20-iteration decoder layer loop (40 of the 43 layers) as one
-`rt_submit_graph` per iteration: the
-layer's task set becomes the Graph body (a free function reading its per-layer
-views, scales and indices through `GraphTaskArgs`, positionally), and the host
-records a 744-node Definition once instead of submitting the loop's ~15600
-tasks individually. The runtime is untouched.
+the TMR orchestration recast as a Graph, with **no runtime-specific rewrite left**:
+the whole forward pass is cut into Graph blocks, so a layer's task set becomes a
+Graph body (a free function reading its per-layer views, scales and indices
+through `GraphTaskArgs`, positionally) and the host records it once per identity
+instead of submitting the pass's ~15600 tasks individually. The runtime is
+untouched.
 
-| Edit | Sites | Why |
-| ---- | ----- | --- |
-| `get_tensor_data(recv_count_out, …)` → `HBG_RECV_ROWS_PER_EXPERT` | 10 | HBG builds the whole graph before the device runs anything, so a read of a **task-produced** tensor has no value to return. The constant holds the per-expert tile loops at their real trip count (`ceil(16/16) == 1`, which is what the `h_i8 [512, 2048]` layout budgets per expert). |
+Eight Definitions cover all 43 layers:
 
-The only other `get_tensor_data` read left is `ext_num_tokens_per_owner`: its
-value feeds tile counts and launch block numbers — orchestration control flow
-that must run where the graph is built. The 30 former `hc_attn_scale_*` /
-`hc_ffn_scale_*` reads moved data, not control flow, and are gone from both
-runtimes: each `split_pre_post*` / `comb_sinkhorn*` kernel now takes the scale
-view as an extra tensor input and reads its elements from GM itself.
+- `csa_attn_block` (50 nodes) / `csa_moe_block` (32) and `hca_attn_block` (35) /
+  `hca_moe_block` (31) — the decoder loop's two alternating layer shapes, layers
+  2..41, plus layer 42 replaying `csa_attn_block` and `hca_moe_block`.
+  `csa_moe_block` records two Definitions: its routing kernel is `route_hash_1`
+  at layer 2 and `route_sort` from layer 4 on, and a body is recorded once per
+  key, so the predicate is a Graph config value rather than a host-side `if` the
+  first recorded layer would settle for every replay.
+- `swa_attn_block` (28) — the two peeled sliding-window attentions of layers 0
+  and 1. Their nodes are pairwise alpha-equivalent, so layer 1 replays what layer
+  0 recorded.
+- `hash_moe_l0_block` (31) / `hash_moe_l1_block` (31) — the peeled MoE scopes.
+  These cannot share a Definition: `dispatch_wait` folds the MoE epoch in as a
+  constant (32 at layer 0, 64 at layer 1) where the loop's variants take it as a
+  scalar.
+
+The read that used to force a rewrite was `recv_count_out[expert][0]`, driving
+the ten MoE per-expert tile loops. HBG builds the whole graph before the device
+runs anything, so a read of a **task-produced** tensor has no value to return
+here, and the ten sites stood a constant in. Both runtimes now express that
+control flow as **dispatch predicates** instead: a static per-expert tile
+grid, with each of a tile's six tasks predicated on
+`recv_count_out[expert][0] > t0`. The scheduler evaluates it at the dispatch
+point, on device, where the value is current — so the same source is correct
+under both runtimes and the HBG copy no longer encodes a routing the fixture
+does not have. The one value the loops computed from the count,
+`valid_rows = min(count - t0, 16)`, moves into the `exp_gate_up_act*` kernels
+the same way the scale reads did: the orchestration passes `recv_count_out` as
+an extra tensor input and each kernel derives the row count from GM in
+`kernel_entry`.
+
+The only `get_tensor_data` read left is `ext_num_tokens_per_owner`. It is an
+**external** tensor, which the runtime stages with a host view, and it feeds
+`set_block_num` — a launch parameter a predicate cannot express, because a
+predicate decides whether a task dispatches, not how wide it is. The 30 former
+`hc_attn_scale_*` / `hc_ffn_scale_*` reads moved data, not control flow, and are
+gone from both runtimes: each `split_pre_post*` / `comb_sinkhorn*` kernel now
+takes the scale view as an extra tensor input and reads its elements from GM
+itself.
 
 The six former orchestration-side initializations are now identical under both
 runtimes. Each `sh_gate_up_act_q*` producer clears its own two padded
@@ -38,23 +67,54 @@ runtimes. Each `sh_gate_up_act_q*` producer clears its own two padded
 split-K `hc_head_linear` AtomicAdds. The host therefore never writes a GM-heap
 device address.
 
-Everything else — submit order, dependencies, scope nesting, and the
-orchestration-side `valid_rows = min(n_rows - t0, 16)` — is byte-identical to
-the TMR source inside the Graph body. The graph keeps the size and shape of the
-real one (the 15971 device-side tasks; 1131 host-submitted with the Graph
-collapse) but not the fixture's routing, hence `skip_golden`.
+Everything else — submit order, dependencies, scope nesting — is
+byte-identical to the TMR source inside the Graph body. The graph keeps the
+size and shape of the real one.
 
-## Status: the host records the Definition; device replay is blocked in activation
+`skip_golden` is inherited from the TMR case, which is itself a
+completion/smoke case: no full-network torch reference exists upstream either,
+and component-level goldens live with the standalone kernels in pypto-lib.
 
-With the Graph form the host records the 744-node Definition and boots with
-**1131 tasks on host** (down from 15991 when every task is submitted
-individually) — this is measured, on both ranks. The device-side replay of a
-Definition that large is **not yet exercised**: an unskipped run fails in Graph
-activation (`sched_error_code=5 INVALID_ARGS` from the scheduler's graph
-queues), so the recorded bodies never replay.
+## Status: the host records the Definitions and the device replays them
 
-`skip_golden` therefore establishes host-side construction, not numerical
-correctness.
+With the Graph form the host records the eight Definitions and boots with **129
+submissions from the submitting thread**, two orders of magnitude below
+submitting every task individually — this is measured, on both ranks. The device
+replays all of them and both ranks reach `outcome=0`.
+
+`skip_golden` still means this establishes completion, not numbers.
+
+Getting the replay running took three fixes. Each is a way a Graph can differ
+from the same body submitted task by task, so they are worth keeping written
+down:
+
+1. **The recorder inferred dependencies from the allocation site, not the last
+   writer.** A recorded node's fanin came only from tensor args classified
+   `INTERNAL` — which names whichever node's packed window holds the bytes, i.e.
+   the allocator — plus explicit `set_dependencies`. Every write-then-read
+   through an `alloc_tensors` buffer or a boundary view was therefore unordered,
+   and a Definition replayed a DAG the body does not have when its tasks are
+   submitted individually. Measured on the pre-split single-Definition form of
+   this body: 1348 edges against the 2143 the ordinary path computes for the same
+   tasks, 543 of 561 comparable nodes short. On device that ran
+   `csa_slots_build_valid_qk_plan` before the `topk` that fills its input, so
+   `qk_pv_1` gathered KV pages at addresses the bus rejected. The recorder now
+   runs the same `compute_task_fanin` / `register_task_outputs` the ring path
+   runs, against a tensor map owned by the recording.
+2. **Two bodies read 64-bit comm handles back as `int32_t`.** `csa_moe_block` and
+   `hca_moe_block` bound `recv_*_ctx`, `*_arrived_ctx` and `routed_y_buf_ctx` as
+   `int32_t` while the entry passes `uint64_t`; the peeled `hash_moe_l*_block`
+   bodies already had it right. The MoE all-to-all pushed to a truncated window
+   address, which surfaces as an AIV MTE bus fault rather than a wrong number.
+3. **A host-side branch inside a body was settled at record time** — the
+   `route_hash_1` / `route_sort` choice described above.
+
+The `sched_error_code=5 INVALID_ARGS` this section used to report came from a
+fourth, separate defect: `bind_graph_topology` bounded the Graph *boundary*
+scalar count by `MAX_SCALAR_ARGS`, the per-AICore-task cap (16), rather than the
+`GRAPH_MAX_SCALAR_ARGS` (64) the recorder's boundary is built with. Cutting the
+pass into blocks brought every boundary under 16 and hid it; it is fixed in the
+runtime, so a wider boundary is legal again.
 
 ### Why `hc_head_linear` carries a row-tail bound
 
@@ -93,15 +153,16 @@ This gap is independent of the `hc_head_linear` MTE fault:
 ```bash
 # standalone (2 dies; wrap in task-submit on a shared box)
 python examples/a2a3/host_build_graph/deepseek_v4_flash_decode/\
-test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1> --manual only
+test_deepseek_v4_flash_decode.py -p a2a3 -d <d0>,<d1>
 
 # pytest
 pytest examples/a2a3/host_build_graph/deepseek_v4_flash_decode \
-    --platform a2a3 --device <d0>,<d1> --manual only
+    --platform a2a3 --device <d0>,<d1>
 ```
 
-`manual` because the 368-kernel compile takes minutes; `skip_golden` because the
-routing is stood in, not computed.
+The case is manual: Per-PR CI runs it in the dedicated `st-deepseek-onboard-a2a3`
+job, in parallel with the main sweep rather than at its tail. It remains
+`skip_golden` because no full-network torch reference exists upstream.
 
 To exercise only the host side without launching the device body, set
 `SIMPLER_SKIP_DEVICE_RUN=1`. `simpler_launch_run` then completes the run before
@@ -129,6 +190,6 @@ Kernels, fixture and orchestration come from the TMR case; see its
 network shape, regeneration steps and cost. One orchestration file is specific
 to this case: `kernels/orchestration/decode_fwd_graph.cpp`, the TMR
 orchestration carrying the rewrite in the table above and recast as a Graph —
-the 20-iteration decoder layer loop becomes one `rt_submit_graph` per iteration
-with the layer's task set as the Graph body and its per-layer views, scales and
-indices crossing the boundary positionally.
+the forward pass is cut into the eight Definitions listed above, each layer's
+task set forming a Graph body whose per-layer views, scales and indices cross
+the boundary positionally.

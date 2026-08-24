@@ -21,7 +21,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "pto_runtime2.h"
+#include "runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -84,7 +84,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, [[maybe_unused]] int32_t &completed_this_turn
 #if SIMPLER_DFX
     ,
@@ -110,8 +110,8 @@ void SchedulerContext::complete_slot_task(
     if (slot_state.payload != nullptr) {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         int32_t slab_err = deferred_slab->error_code;
-        if (slab_err != PTO2_ERROR_NONE) {
-            int32_t expected = PTO2_ERROR_NONE;
+        if (slab_err != SIMPLER_ERROR_NONE) {
+            int32_t expected = SIMPLER_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
                 expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
@@ -121,9 +121,9 @@ void SchedulerContext::complete_slot_task(
 
         uint32_t cond_count = deferred_slab->count;
         if (cond_count > MAX_COMPLETIONS_PER_TASK) {
-            int32_t expected = PTO2_ERROR_NONE;
+            int32_t expected = SIMPLER_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
+                expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
             return;
@@ -136,7 +136,7 @@ void SchedulerContext::complete_slot_task(
             // be this thread or a later one).
             slot_state.mark_any_subtask_deferred();
 
-            const PTO2TaskId token = slot_state.task->task_id;
+            const TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
                 while (!mailbox->try_push_condition(
@@ -275,7 +275,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // which point the core becomes pollable again and its FIN is caught.
         // Cheap cacheable load; no MMIO. Pending slot is empty while gated.
         {
-            PTO2TaskSlotState *rs = core.running_slot_state;
+            ChipTaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
                 rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
                 continue;
@@ -393,7 +393,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 // rendezvous. Capture that BEFORE promote nulls the pending fields; after
                 // it lands, bump running_slot_count and ring iff this was the block that
                 // completed the cohort (and the producer already released).
-                PTO2TaskSlotState *promoted = core.pending_slot_state;
+                ChipTaskSlotState *promoted = core.pending_slot_state;
                 bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
                 if (sync_start_promote) {
@@ -444,7 +444,7 @@ void SchedulerContext::check_running_cores_for_completion(
 // Two-phase protocol: CAS 0 -> -1 (sentinel) to claim ownership, store task and
 // reset staging state, then release-store block_num. Other threads acquire-load
 // sync_start_pending; seeing block_num > 0 ensures all relaxed stores are visible.
-bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num) {
+bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num) {
     int32_t expected = 0;
     if (!drain_state_.sync_start_pending.compare_exchange_strong(
             expected, -1, std::memory_order_acquire, std::memory_order_relaxed
@@ -493,7 +493,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_
 // block uses SPLIT placement (each core independently: idle->running, busy->pending) — safe
 // only because gated.
 SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
-    PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated,
+    ChipTaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated,
     [[maybe_unused]] bool record_drain_phases
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -666,7 +666,19 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     }
     bool coordinator = thread_idx == 0;
 
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    ChipTaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    // Null means this thread arrived after the drain it entered for had already
+    // reopened, and no check above rejects it: the reopen below clears pending_task
+    // before sync_start_pending, so a thread entering on a stale non-zero snapshot of
+    // that gate lands here; drain_attempt still names this round and every ack token
+    // is already published, so the reduction and the follower barrier both pass
+    // immediately. It never acked for this round -- the coordinator collected every
+    // ack before clearing -- so there is nothing to stage and nothing to unwind.
+    //
+    // Not the converse case: a thread already past this load cannot see the clear,
+    // because the coordinator waits on drain_stage_done_mask for every thread and a
+    // thread sets its bit only after staging, which is after this load.
+    if (slot_state == nullptr) return;
     // OWNER is acquired before the drain is published and persists through
     // completion, so every staging thread makes the same gate decision even if
     // producer release changes early_dispatch_state during the barrier.

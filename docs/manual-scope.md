@@ -13,7 +13,7 @@ Keep manual scope small and explicit:
 
 The v0 design keeps these rules:
 
-1. `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` opts a scope into manual mode.
+1. `SIMPLER_SCOPE(PTO2ScopeMode::MANUAL)` opts a scope into manual mode.
 2. `MANUAL` nested inside active `MANUAL` is allowed.
 3. `AUTO` nested inside active `MANUAL` is rejected.
 4. Manual deps are attached before submit through `CoreTaskArgs.set_dependencies(...)`.
@@ -26,7 +26,7 @@ The v0 design keeps these rules:
 ### Scope
 
 ```cpp
-PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+SIMPLER_SCOPE(PTO2ScopeMode::MANUAL) {
     ...
 }
 ```
@@ -46,7 +46,7 @@ auto out = rt_submit_task(mixed_kernels, args);
 ```cpp
 CoreTaskArgs args;
 args.add_input(tensor);
-PTO2TaskId deps[] = {prev_task_id};
+TaskId deps[] = {prev_task_id};
 args.set_dependencies(deps, 1);
 ```
 
@@ -71,7 +71,7 @@ Rules:
 
 ```cpp
 auto alloc = alloc_tensors(ci0, ci1, ci2);
-PTO2TaskId alloc_tid = alloc.task_id();
+TaskId alloc_tid = alloc.task_id();
 const Tensor &tmp = alloc.get_ref(0);
 ```
 
@@ -91,16 +91,17 @@ Manual scope v0 is:
 
 ### Scope State
 
-The runtime keeps two manual-scope-specific pieces of state:
+`manual_begin_depth` is the only manual-scope-specific state, and it decides whether
+the current submit is in manual mode. It is explicitly initialized in
+`PTO2OrchestratorState::init()` and reset in `mark_done()` so a reused orchestrator
+starts cleanly on the next run.
 
-- `manual_begin_depth`
-- the current scope task list (`scope_tasks[...]`)
-
-`manual_begin_depth` decides whether the current submit is in manual mode.
-`scope_tasks[...]` remains scope-lifetime bookkeeping for `scope_end()`.
-`manual_begin_depth` is explicitly initialized in `PTO2OrchestratorState::init()` and
-reset in `mark_done()` so a reused orchestrator starts cleanly on
-the next run.
+Whether a scope keeps a task list at all is runtime-specific, and manual mode does
+not change it either way. `tensormap_and_ringbuffer` keeps `scope_tasks[...]` so
+`scope_end()` can release each enclosed task's producer-side reference and let its
+slot be reclaimed. `host_build_graph` keeps no such list and has no scope-end hook:
+its ring is whole-graph-resident, so nothing is reclaimed before the run ends and a
+scope there is depth alone.
 
 The depth model treats `manual_begin_depth` as the depth where the outermost
 active manual scope began:
@@ -131,27 +132,27 @@ For a submitted task:
 ## Example Pattern
 
 ```cpp
-PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+SIMPLER_SCOPE(PTO2ScopeMode::MANUAL) {
     auto alloc = alloc_tensors(tmp_ci);
 
     CoreTaskArgs qk;
     qk.add_input(qi, kj);
     qk.add_output(sij_ci);
-    PTO2TaskId qk_deps[] = {alloc.task_id()};
+    TaskId qk_deps[] = {alloc.task_id()};
     qk.set_dependencies(qk_deps, 1);
     auto qk_out = rt_submit_aic_task(FUNC_QK, qk);
 
     CoreTaskArgs sf;
     sf.add_input(qk_out.get_ref(0));
     sf.add_output(pij_ci, li_ci, mi_ci);
-    PTO2TaskId sf_deps[] = {qk_out.task_id()};
+    TaskId sf_deps[] = {qk_out.task_id()};
     sf.set_dependencies(sf_deps, 1);
     auto sf_out = rt_submit_aiv_task(FUNC_SF, sf);
 
     CoreTaskArgs up;
     up.add_input(sf_out.get_ref(1), sf_out.get_ref(2), pv_out.get_ref(0));
     up.add_inout(mi, li, out_view, tmp);
-    PTO2TaskId up_deps[] = {sf_out.task_id(), pv_out.task_id()};
+    TaskId up_deps[] = {sf_out.task_id(), pv_out.task_id()};
     up.set_dependencies(up_deps, 2);
     auto up_out = rt_submit_aiv_task(FUNC_UP, up);
 }
@@ -163,10 +164,10 @@ When the dep set is conditional, build the array up first and call
 needed on the first iteration:
 
 ```cpp
-PTO2TaskId prev_update = PTO2TaskId::invalid();
+TaskId prev_update = TaskId::invalid();
 for (...) {
     CoreTaskArgs up = ...;
-    PTO2TaskId up_deps[1];
+    TaskId up_deps[1];
     uint32_t up_dep_count = 0;
     if (prev_update.is_valid()) {
         up_deps[up_dep_count++] = prev_update;
