@@ -22,7 +22,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "pto_runtime2.h"
+#include "runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -79,9 +79,9 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -102,8 +102,8 @@ void SchedulerContext::complete_slot_task(
     if (slot_state.payload != nullptr) {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         int32_t slab_err = deferred_slab->error_code;
-        if (slab_err != PTO2_ERROR_NONE) {
-            int32_t expected = PTO2_ERROR_NONE;
+        if (slab_err != SIMPLER_ERROR_NONE) {
+            int32_t expected = SIMPLER_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
                 expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
@@ -113,9 +113,9 @@ void SchedulerContext::complete_slot_task(
 
         uint32_t cond_count = deferred_slab->count;
         if (cond_count > MAX_COMPLETIONS_PER_TASK) {
-            int32_t expected = PTO2_ERROR_NONE;
+            int32_t expected = SIMPLER_ERROR_NONE;
             sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
+                expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
             return;
@@ -124,7 +124,7 @@ void SchedulerContext::complete_slot_task(
         if (cond_count > 0) {
             slot_state.mark_any_subtask_deferred();
 
-            const PTO2TaskId token = slot_state.task->task_id;
+            const TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
                 volatile DeferredCompletionEntry *e = &deferred_slab->entries[i];
                 while (!mailbox->try_push_condition(
@@ -276,7 +276,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
 
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -290,7 +290,7 @@ void SchedulerContext::check_running_cores_for_completion(
 
         // Skip gated early-dispatch cores still waiting for their doorbell.
         {
-            PTO2TaskSlotState *rs = core.running_slot_state;
+            ChipTaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
                 rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
                 continue;
@@ -402,7 +402,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // 2. Update slot data
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
-                PTO2TaskSlotState *promoted = core.pending_slot_state;
+                ChipTaskSlotState *promoted = core.pending_slot_state;
                 bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
                 promote_pending_to_running(core);
                 if (sync_start_promote) {
@@ -453,7 +453,7 @@ void SchedulerContext::check_running_cores_for_completion(
 // Two-phase protocol: CAS 0 -> -1 (sentinel) to claim ownership, store task and
 // reset staging state, then release-store block_num. Other threads acquire-load
 // sync_start_pending; seeing block_num > 0 ensures all relaxed stores are visible.
-bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num) {
+bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num) {
     int32_t expected = 0;
     if (!drain_state_.sync_start_pending.compare_exchange_strong(
             expected, -1, std::memory_order_acquire, std::memory_order_relaxed
@@ -489,7 +489,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_
 // cohort progress, while running_cores seeds the core-count rendezvous (MIX may
 // contribute multiple running cores per logical block).
 SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
-    PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated,
+    ChipTaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated,
     [[maybe_unused]] bool record_drain_phases
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -621,7 +621,7 @@ void SchedulerContext::handle_drain_mode(
     }
     bool coordinator = thread_idx == 0;
 
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    ChipTaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
     bool gated = slot_state->payload != nullptr && PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
 
     if (coordinator) {

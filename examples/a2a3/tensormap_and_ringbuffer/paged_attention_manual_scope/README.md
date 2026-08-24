@@ -15,7 +15,7 @@ diff -r ../paged_attention/kernels ./kernels     # only the orch file differs
 
 ## What changes
 
-`PTO2_SCOPE()` + `PTO2_SCOPE_GUARD()` becomes `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`,
+`SIMPLER_SCOPE()` + `SIMPLER_SCOPE_GUARD()` becomes `SIMPLER_SCOPE(PTO2ScopeMode::MANUAL)`,
 and each submit names its predecessors. See
 [`docs/manual-scope.md`](../../../../docs/manual-scope.md) for the mode itself.
 
@@ -24,7 +24,7 @@ choice:
 
 | API | Shape | Suited to |
 | --- | ----- | --------- |
-| Primitive | `PTO2TaskId deps[] = {...}; params.set_dependencies(deps, n);` | Codegen, and any task whose dependency set is fixed and known at the call site. The caller owns the buffer; the `Arg` stores `(ptr, count)`. |
+| Primitive | `TaskId deps[] = {...}; params.set_dependencies(deps, n);` | Codegen, and any task whose dependency set is fixed and known at the call site. The caller owns the buffer; the `Arg` stores `(ptr, count)`. |
 | Convenience | `CoreTaskArgsWithDeps<> params; params.add_dep(id);` | Hand-written orchestration where the set is assembled conditionally across branches. The wrapper owns a stack-sized buffer and binds it on submit. |
 
 `SF` and `PV` use the primitive form (one predecessor each). `UP` uses the

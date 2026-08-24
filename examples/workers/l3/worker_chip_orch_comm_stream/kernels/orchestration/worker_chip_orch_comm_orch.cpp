@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #include "aicpu/worker_chip_orch_endpoint.h"
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 namespace {
 
@@ -30,7 +30,7 @@ struct ChannelHeader {
 void report_endpoint_error(const WorkerChipOrchEndpoint &endpoint) {
     const WorkerChipEndpointError &err = endpoint.error();
     rt_report_fatal(
-        PTO2_ERROR_EXPLICIT_ORCH_FATAL,
+        SIMPLER_ERROR_EXPLICIT_ORCH_FATAL,
         "L3-L2 endpoint error op=%s kind=%u region=%llu counter_addr=%llu counter_operand=%d observed_counter=%d "
         "msg=%s",
         worker_chip_endpoint_op_to_string(err.op), static_cast<unsigned>(err.kind),
@@ -57,10 +57,9 @@ bool read_payload_or_fail(
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{.expected_arg_count = kExpectedArgCount};
+    return OrchestrationConfig{.expected_arg_count = kExpectedArgCount};
 }
 
 __attribute__((visibility("default"))) void worker_chip_orch_comm_orchestration(const ChipTaskArgs &orch_args) {
@@ -110,7 +109,7 @@ __attribute__((visibility("default"))) void worker_chip_orch_comm_orchestration(
             reinterpret_cast<const ChannelHeader *>(static_cast<uintptr_t>(header_view.gm_addr));
         if (header->seq != seq) {
             rt_report_fatal(
-                PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 channel header seq mismatch expected=%llu got=%llu",
+                SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 channel header seq mismatch expected=%llu got=%llu",
                 static_cast<unsigned long long>(seq), static_cast<unsigned long long>(header->seq)
             );
             return;
@@ -119,7 +118,7 @@ __attribute__((visibility("default"))) void worker_chip_orch_comm_orchestration(
             return;
         }
         if (header->opcode != kChannelData) {
-            rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 channel unknown opcode=%u", header->opcode);
+            rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 channel unknown opcode=%u", header->opcode);
             return;
         }
 

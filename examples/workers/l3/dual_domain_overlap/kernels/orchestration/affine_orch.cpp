@@ -11,14 +11,13 @@
 
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-affine_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig affine_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{.expected_arg_count = 4};
+    return OrchestrationConfig{.expected_arg_count = 4};
 }
 
 __attribute__((visibility("default"))) void affine_orchestration(const ChipTaskArgs &orch_args) {

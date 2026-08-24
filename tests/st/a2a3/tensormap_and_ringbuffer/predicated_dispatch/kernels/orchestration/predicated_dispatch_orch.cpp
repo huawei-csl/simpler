@@ -36,7 +36,7 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_WRITE_CONST 0
 #define FUNC_COPY_FIRST 1
@@ -45,10 +45,9 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 4,  // 3 tensors + 1 case scalar
     };
 }
@@ -60,14 +59,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint64_t case_id = orch_args.scalar(0);
     if (case_id != 1 && case_id != 2) {
-        rt_report_fatal(PTO2_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id));
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "unsupported case_id=%llu", static_cast<unsigned long long>(case_id)
+        );
         return;
     }
     // case 1 => gate 0 (predicate FALSE, skip); case 2 => gate 1 (predicate TRUE, dispatch).
     int64_t gate_value = (case_id == 1) ? 0 : 1;
 
     // gate producer: gate[0] = gate_value
-    PTO2TaskId gate_tid;
+    TaskId gate_tid;
     {
         CoreTaskArgs args;
         args.add_inout(ext_gate);
@@ -88,7 +89,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     {
         CoreTaskArgs args;
         args.add_inout(ext_X);
-        PTO2TaskId deps[] = {gate_tid};
+        TaskId deps[] = {gate_tid};
         args.set_dependencies(deps, 1);
         // predicate: gate[0] > 0  (operand op target), built level by level.
         CoreTaskPredicate pred;

@@ -9,7 +9,7 @@ host register: materialize + dlopen orchestration SO
         ↓
 host run/bind: stage external tensors, execute orchestration to completion
         ↓
-host: relocate the prebuilt graph image and copy it to device memory
+host: copy the prebuilt graph image to device memory
         ↓
 device: attach the image, classify tasks, dispatch with AICPU schedulers
         ↓
@@ -49,9 +49,8 @@ For each run, the host:
 2. reserves one backing arena for runtime/shared-memory subregions;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
-5. finalizes task counts and the graph image;
-6. rewrites per-slot task/payload pointers to device addresses; and
-7. copies the shared-memory image and arena to the device.
+5. finalizes task counts and the graph image; and
+6. copies the shared-memory image and the arena's copied zone to the device.
 
 An orchestration fatal stops this sequence and is propagated through
 `orch_error_code`.
@@ -74,14 +73,18 @@ The shared image uses three per-slot structures:
 | Structure | Purpose |
 | --------- | ------- |
 | `PTO2TaskDescriptor` | Full task ID, kernel IDs, packed-buffer addresses |
-| `PTO2TaskPayload` | Tensors, scalars, predicate, local-ID fanins, dispatch metadata |
-| `PTO2TaskSlotState` | Active mask, attributes, block/subtask counters, completion state, task/payload bindings |
+| `PTO2TaskPayload` | Argument counts, predicate, dispatch metadata, and a delta naming each of its tensor, scalar and fanin regions — the arguments themselves live in the pool segments, so the payload is a fixed three cache lines regardless of the argument caps |
+| `ChipTaskSlotState` | Active mask, attributes, block/subtask counters, completion state, task/payload bindings |
 
 The host/device boundary is POD and position-independent. Fanins are integer
-producer IDs, not pointers. The only per-slot pointers are rebound to their final
-device addresses before H2D.
+producer IDs, not pointers, and a slot state names its payload and descriptor — and
+a payload names its three argument regions — by a delta from the naming field's own
+address, so the image needs no fixup on either side of the copy. A delta is only
+correct for the layout it was taken in, so `compact_live_image` re-takes every one
+of them against the shipped image; the copy to the device moves a field and its
+target together and leaves them all correct.
 
-### 3.1 What Ships: the Arena's Three Zones
+### 3.1 What Ships: the Arena's Two Zones
 
 Three rules decide every byte of the runtime arena:
 
@@ -94,27 +97,38 @@ Three rules decide every byte of the runtime arena:
 3. **Initialize once.** A region whose content does not differ between runs is
    established once, not re-established per bind.
 
-They partition the arena into three contiguous zones, and `runtime_reserve_layout`
+They partition the arena into two contiguous zones, and `runtime_reserve_layout`
 reserves them in this order:
 
-| Zone | Regions | Copied | Written by |
-| ---- | ------- | ------ | ---------- |
-| host-only | orchestrator block: `fanin_seen_epoch` / `scope_tasks` / TensorMap, ~8.5 MB | never | host, during graph construction |
-| copied | `[off_copied_begin, off_copied_end)`: the runtime header | whole zone, one copy | host |
-| device-only | `sm_handle`, `PTO2SchedulerState` and its thirteen queue slot arrays, the completion mailbox | never | AICPU at boot |
+| Zone | Regions | Copied | Allocated on device | Written by |
+| ---- | ------- | ------ | ------------------- | ---------- |
+| device-only | `sm_handle`, the completion mailbox, `PTO2SchedulerState` and its thirteen queue slot arrays | never | yes | AICPU at boot |
+| copied | `[off_copied_begin, off_copied_end)`: the runtime header | whole zone, one copy | yes | host |
 
-Putting the copied zone **between** the two zones that are never copied is what
-makes `bind` a single contiguous `copy_to_device`. Both bounds are layout fields,
-so no consumer infers a boundary from which region happens to be reserved first —
+The copied zone comes last, so `bind` is a single contiguous `copy_to_device`
+starting at `off_copied_begin` — and the device's shared-memory tail begins
+exactly where that zone ends. Both bounds are layout fields, so no consumer infers
+a boundary from which region happens to be reserved first —
 `bind_callable_to_runtime_impl` asserts only that they are ordered and in range.
+
+**Why the orchestrator is not in the arena at all.** hbg has no device-side
+orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
+table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
+therefore a plain host object that owns those arrays — `PTO2OrchestratorState::init`
+allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
+before the copied zone is uploaded, so no host address crosses the boundary. A
+`static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
+putting an owning member back inside it. The one orchestrator value the device-side
+scheduler reads, the count of tasks completed inline during orchestration, is a
+scalar `rt_orchestration_done` publishes into the runtime header.
 
 **Why the scheduler state is device-written.** `PTO2SchedulerState` holds no
 per-run content: `sm_header` and the ring pointer derive from a pooled SM base,
-queue capacities are compile-time constants, and hbg never advances
-`last_task_alive`. Its one host-side entry point, `on_scope_end`, is an empty stub
-here. So the host would only be writing an initialization pattern — 203,392 bytes
+queue capacities are compile-time constants, hbg never advances
+`last_task_alive`, and it has no host-side entry point at all. So the host would
+only be writing an initialization pattern — 203,392 bytes
 of it, dominated by `AsyncWaitList::entries` — for the device to receive and never
-read. `PTO2Runtime` therefore holds a *pointer* to it, wired from
+read. `RuntimeContext` therefore holds a *pointer* to it, wired from
 `off_scheduler` on each side, and the AICPU calls `init_data_from_layout` at boot.
 
 **Why the queue slots are device-written.** `push` claims `slots[pos & mask]` only
@@ -233,8 +247,8 @@ AIC/MIX tasks use the available cluster count.
 TensorMap maps tensor regions to producer task IDs. For every task:
 
 1. INPUT/INOUT regions look up overlapping producers.
-2. Explicit and discovered producers are deduplicated into
-   `fanin_local_ids[]`.
+2. Explicit and discovered producers are deduplicated into the payload's fanin
+   region.
 3. OUTPUT/INOUT regions register the new task as producer.
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
@@ -247,7 +261,10 @@ Submit does not push tasks into ready queues. After the graph arrives on device,
 boot classification scans every submitted task exactly once:
 
 - a task whose fanins are all complete is routed to its shape queue;
-- otherwise it registers on the first unmet producer's intrusive wake list; and
+- otherwise it registers on its latest-submitted unmet producer's intrusive
+  wake list -- the producer likeliest to complete last, which minimises how
+  often a waiter is transferred between wake lists and the CAS contention
+  those transfers cause; and
 - producer completion reclassifies every detached waiter.
 
 Completion flags are monotonic, so this consumer-pull scheme cannot miss a

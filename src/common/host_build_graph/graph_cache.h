@@ -16,13 +16,19 @@
 
 #include <type_traits>
 
-#include "pto_task_id.h"
-#include "pto_types.h"
+#include "task_id.h"
+#include "types.h"
 
 struct GraphScopeResult {
     bool execute_block{true};
     bool recording{false};
-    PTO2TaskId task_id{PTO2TaskId::invalid()};
+    TaskId task_id{TaskId::invalid()};
+    // The recording this call opened, non-null exactly when `recording` is set.
+    // The recording thread hands it back to graph_prepare so binding needs no
+    // lookup: several Definitions record at once, and finding one by key would
+    // mean traversing the in-flight map under its mutex on a path whose whole
+    // purpose is to not contend with the submitting thread.
+    void *recording_handle{nullptr};
 };
 
 using GraphSubmitResult = GraphScopeResult;

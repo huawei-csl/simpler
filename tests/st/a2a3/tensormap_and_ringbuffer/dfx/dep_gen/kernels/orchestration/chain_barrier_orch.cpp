@@ -31,7 +31,7 @@
 
 #include <cstdint>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_WRITE_CONST 0
 #define FUNC_COPY_FIRST 1
@@ -42,10 +42,9 @@ static constexpr int32_t MAX_PRODUCERS = 500;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 3,  // X, Y, scalar(N)
     };
 }
@@ -57,11 +56,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t n_raw = orch_args.scalar(0);
     int32_t n = static_cast<int32_t>(n_raw);
     if (n < 1 || n > MAX_PRODUCERS) {
-        rt_report_fatal(PTO2_ERROR_INVALID_ARGS, "chain_barrier_orch: invalid n=%d", n);
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "chain_barrier_orch: invalid n=%d", n);
         return;
     }
 
-    PTO2TaskId producer_ids[MAX_PRODUCERS];
+    TaskId producer_ids[MAX_PRODUCERS];
 
     // N producers each INOUT X. tensormap auto-deps them in a chain, so X[0]
     // stays at SENTINEL through all of them — the host only checks the final
@@ -74,7 +73,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     // Dummy barrier with explicit deps on ALL N producers. dc=n > 64 forces
     // the dep_gen writer to emit base + overflow chain.
-    PTO2TaskId barrier_id;
+    TaskId barrier_id;
     {
         CoreTaskArgs args;
         args.set_dependencies(producer_ids, n);
@@ -84,7 +83,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // Consumer: explicit dep on barrier only, reads X, writes Y.
     {
         CoreTaskArgs args;
-        PTO2TaskId consumer_deps[] = {barrier_id};
+        TaskId consumer_deps[] = {barrier_id};
         args.set_dependencies(consumer_deps, 1);
         args.add_input(ext_X);
         args.add_inout(ext_Y);

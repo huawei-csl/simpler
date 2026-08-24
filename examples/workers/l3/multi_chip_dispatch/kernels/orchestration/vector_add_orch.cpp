@@ -20,14 +20,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
+__attribute__((visibility("default"))) OrchestrationConfig
 vector_add_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 3,  // a, b, out
     };
 }

@@ -11,14 +11,14 @@
 
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
+__attribute__((visibility("default"))) OrchestrationConfig
 domain_allreduce_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{.expected_arg_count = 5};
+    return OrchestrationConfig{.expected_arg_count = 5};
 }
 
 __attribute__((visibility("default"))) void domain_allreduce_orchestration(const ChipTaskArgs &orch_args) {

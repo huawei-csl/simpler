@@ -10,7 +10,7 @@
  */
 
 /**
- * Negative ST orchestration: PTO2_ERROR_EXPLICIT_ORCH_FATAL (code 9).
+ * Negative ST orchestration: SIMPLER_ERROR_EXPLICIT_ORCH_FATAL (code 9).
  *
  * The orchestration author's own escape hatch: rt_report_fatal() latches a
  * user-chosen code (9 here) directly, no runtime resource needs to be exhausted.
@@ -21,14 +21,13 @@
 
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 0,
     };
 }
@@ -40,7 +39,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     TensorCreateInfo ci(shape, 1, DataType::FLOAT32);
     (void)alloc_tensors(ci);
 
-    rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "st injected fatal");
+    rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "st injected fatal");
 
     // Exercise API short-circuit after fatal: these must become no-ops, not fall
     // through into runtime-side asserts or extra reporting.

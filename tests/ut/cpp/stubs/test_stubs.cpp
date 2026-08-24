@@ -34,6 +34,8 @@
 
 extern "C" {
 
+int unified_log_host_span_enabled() { return 0; }
+
 void unified_log_host_span(const struct SimplerHostSpan *) {}
 
 void unified_log_error(const char *func, const char *fmt, ...) {
@@ -108,7 +110,7 @@ void flush_range_impl(const void * /* addr */, size_t /* size */) {}
 // platform_regs.h stub (get_reg_ptr)
 // =============================================================================
 
-// PTO2SchedulerState::ring_one_doorbell (pto_scheduler.h, speculative
+// PTO2SchedulerState::ring_one_doorbell (scheduler.h, speculative
 // early-dispatch) is an inline that resolves a register id to its MMIO pointer
 // via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
 // host UT runner; hand back writable static storage (8 bytes — the doorbell is a

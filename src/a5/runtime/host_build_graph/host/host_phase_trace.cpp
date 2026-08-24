@@ -39,34 +39,66 @@
 namespace {
 
 // Bind segments carry a few attributes each beyond their duration (byte counts,
-// tensor counts). They are formatted when the segment ends and printed at flush,
-// so a segment's values need not outlive it and the log write stays off the
-// measured path.
-constexpr size_t kBindAttrsCapacity = 96;
+// tensor counts, this thread's fault and context-switch deltas). They are formatted
+// when the segment ends and printed at flush, so a segment's values need not outlive
+// it and the log write stays off the measured path.
+//
+// Sized to the widest buffer any caller formats into (`char attrs[224]` in
+// runtime_maker.cpp), not to what a run happens to produce: the copy in below
+// truncates silently, and the widest segment already formats 86 bytes, so a workload
+// with one wider counter would drop a trailing attribute with nothing to say it had.
+constexpr size_t kBindAttrsCapacity = 224;
 
-// record_node and graph_submit are updated concurrently by different cores.
-// Keep phase counters on distinct cache lines so lock-free accounting does not
-// turn that intended overlap into cache-line ownership ping-pong.
-struct alignas(64) KindCounter {
-    std::atomic<uint64_t> total_ns{0};
-    std::atomic<uint64_t> count{0};
-    std::atomic<uint64_t> payload_sum{0};
-    std::atomic<uint64_t> first_start_ns{0};
+// One producer's counters and in-flight claim, on its own cache lines.
+//
+// The producers of a bind are independent -- each records its own Definition and
+// counts only its own operations -- so nothing here is shared, and the per-record
+// path performs no atomic read-modify-write at all. Sharing them cost the emitting
+// thread about 0.8 us per record at eight producers, purely in cache-line
+// ownership: every producer of a Graph workload records the same kind
+// (`record_node`), so a per-kind counter is a single line eight threads fight
+// over, and the `alignas(64)` that separates one kind from another does nothing
+// about that.
+//
+// Plain integers, not atomics, and that is only sound because a lane has exactly
+// one writer for the whole bind -- never a shared fallback -- and the reader sums
+// the lanes after the bind is closed and its producers drained. A producer that
+// cannot get a lane of its own does not record.
+struct KindCounter {
+    uint64_t total_ns{0};
+    uint64_t count{0};
+    uint64_t payload_sum{0};
+    uint64_t first_start_ns{0};
 };
-static_assert(sizeof(KindCounter) == 64);
+
+struct alignas(64) ProducerLane {
+    // Records accepted by `active` but not yet finished with the counters and the
+    // pool. begin/end clear `active` and then drain the sum of these to zero, so a
+    // record can never be reported by a bind it does not belong to.
+    std::atomic<int32_t> in_flight{0};
+    std::array<KindCounter, kHostPhaseKindCount> counters{};
+};
+
+// One lane per thread that can record: the submitting thread plus one per
+// concurrently-recorded Definition, so the ceiling is GRAPH_MAX_DEFINITIONS + 1 =
+// 17. Matches the pool's buffer count, which is sized the same way, so a producer
+// that got a buffer also has a lane and neither denial is reachable in a sized
+// run.
+constexpr size_t kProducerLanes = PLATFORM_HOST_PHASE_BUFFERS;
 
 struct TraceState {
     std::atomic<HostPhaseRecordPool *> pool{nullptr};
     const HostApi *api;
     std::atomic<bool> active{false};
-    // Records accepted by `active` but not yet finished with the counters and the
-    // pool. begin/end clear `active` and then drain this to zero, so a record can
-    // never be reported by a pass it does not belong to.
-    std::atomic<int32_t> in_flight{0};
+    std::atomic<uint32_t> generation{0};
+    std::atomic<uint32_t> next_lane{0};
+    // Records dropped because every lane was taken. Unreachable while the lane
+    // count covers the producer ceiling; counted rather than assumed so a workload
+    // that outgrows it says so instead of silently under-reporting.
+    std::atomic<uint64_t> lane_denied{0};
     std::mutex lifecycle_mutex;
-    std::mutex pool_mutex;
     std::atomic<uint64_t> submitted_tasks{0};
-    std::array<KindCounter, kHostPhaseKindCount> counters;
+    std::array<ProducerLane, kProducerLanes> lanes;
     std::array<std::array<char, kBindAttrsCapacity>, kHostPhaseKindCount> bind_attrs;
 };
 
@@ -75,20 +107,40 @@ TraceState &state() {
     return s;
 }
 
+// This thread's lane for the current bind, or nullptr when every lane is taken.
+//
+// `generation` is what makes a cached lane safe to reuse: it is process-unique per
+// bind, so a lane claimed under one bind is never mistaken for a claim under
+// another. Returns the generation it claimed under, because the caller must
+// re-check it once admitted -- see host_phase_record.
+ProducerLane *producer_lane(TraceState &s, uint32_t &claimed_generation) {
+    static thread_local ProducerLane *lane = nullptr;
+    static thread_local uint32_t lane_generation = 0;
+    const uint32_t generation = s.generation.load(std::memory_order_acquire);
+    if (lane == nullptr || lane_generation != generation) {
+        const uint32_t index = s.next_lane.fetch_add(1, std::memory_order_relaxed);
+        lane = index < kProducerLanes ? &s.lanes[index] : nullptr;
+        lane_generation = generation;
+    }
+    claimed_generation = generation;
+    return lane;
+}
+
 // Publish-then-check against the trace lifecycle's clear-then-drain. Claiming a
 // slot before reading `active` is what makes the pair race-free: a record that
-// got in before the pass closed is waited for, and one that arrives after sees
-// `active` false and withdraws.
+// got in before the bind closed is waited for, and one that arrives after sees
+// `active` false and withdraws. The claim is on this producer's own line, so it
+// costs nothing to the others.
 class RecordAdmission {
 public:
-    explicit RecordAdmission(TraceState &s) :
-        s_(s) {
-        s_.in_flight.fetch_add(1, std::memory_order_acq_rel);
-        admitted_ = s_.active.load(std::memory_order_acquire);
-        if (!admitted_) s_.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    RecordAdmission(TraceState &s, ProducerLane &lane) :
+        lane_(lane) {
+        lane_.in_flight.fetch_add(1, std::memory_order_acq_rel);
+        admitted_ = s.active.load(std::memory_order_acquire);
+        if (!admitted_) lane_.in_flight.fetch_sub(1, std::memory_order_acq_rel);
     }
     ~RecordAdmission() {
-        if (admitted_) s_.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        if (admitted_) lane_.in_flight.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     RecordAdmission(const RecordAdmission &) = delete;
@@ -97,18 +149,43 @@ public:
     explicit operator bool() const { return admitted_; }
 
 private:
-    TraceState &s_;
+    ProducerLane &lane_;
     bool admitted_{false};
 };
 
 // Called with `active` already false, so no new record can be admitted. Only the
-// recording worker can still be inside one, and commit joins it before a pass
+// recording worker can still be inside one, and commit joins it before a bind
 // ends, so in practice this returns without spinning.
 void drain_in_flight_records(TraceState &s) {
-    while (s.in_flight.load(std::memory_order_acquire) != 0) {}
+    for (ProducerLane &lane : s.lanes) {
+        while (lane.in_flight.load(std::memory_order_acquire) != 0) {}
+    }
 }
 
 bool is_bind_kind(uint32_t kind) { return kind < static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask); }
+
+// The orchestrator core spells its own kinds as plain integers, because it is also
+// compiled for the AICPU where this header is absent (see HostOrchPhase in
+// orchestrator_core/orchestrator.cpp). Nothing there can check them against
+// the enum, so the check lives here: inserting or removing a bind kind shifts
+// every orchestrator kind, and a silent shift would file each record under its
+// neighbour's name.
+static_assert(
+    static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask) == 12,
+    "HostOrchPhase in the orchestrator core hardcodes 12..22; update both together"
+);
+static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGraphCommit) == 19, "same");
+// The orchestration .so spells these three as plain integers too — it cannot include
+// this header either (see RtOrchPhase in orchestration_api.h).
+static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGeneratedArgs) == 22, "same");
+
+// Opt-in spelling shared by this runtime's switches, matching the runtime's
+// other default-off switch, SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE, so that
+// `=false` / `=off` / `=no` read as off rather than as a non-zero string.
+bool env_opt_in(const char *name) {
+    const char *env = std::getenv(name);
+    return env != nullptr && (env[0] == '1' || env[0] == 't' || env[0] == 'T');
+}
 
 uint32_t current_thread_id() {
     // A thread's identity is fixed for its lifetime, so resolve it once. This
@@ -124,43 +201,59 @@ uint32_t current_thread_id() {
     return id;
 }
 
-void record_counter(TraceState &s, uint64_t start_ns, uint64_t end_ns, uint32_t kind, uint64_t payload) {
-    KindCounter &counter = s.counters[kind];
-    uint64_t unset = 0;
-    (void)counter.first_start_ns.compare_exchange_strong(unset, start_ns, std::memory_order_relaxed);
-    counter.total_ns.fetch_add(end_ns - start_ns, std::memory_order_relaxed);
-    counter.count.fetch_add(1, std::memory_order_relaxed);
-    counter.payload_sum.fetch_add(payload, std::memory_order_relaxed);
+void record_counter(ProducerLane &lane, uint64_t start_ns, uint64_t end_ns, uint32_t kind, uint64_t payload) {
+    KindCounter &counter = lane.counters[kind];
+    if (counter.first_start_ns == 0) counter.first_start_ns = start_ns;
+    counter.total_ns += end_ns - start_ns;
+    counter.count++;
+    counter.payload_sum += payload;
 }
 
 void append_record(TraceState &s, uint64_t start_ns, uint64_t end_ns, uint32_t kind, uint64_t payload, uint32_t index) {
-    if (s.pool.load(std::memory_order_acquire) == nullptr) return;
-    std::lock_guard<std::mutex> lock(s.pool_mutex);
-    HostPhaseRecordPool *pool = s.pool.load(std::memory_order_relaxed);
+    // No lock: the pool claims a slot per record with one atomic increment, so
+    // concurrent recording threads do not serialize here. `pool` is republished
+    // only by begin/end, which bracket every record via the admission drain.
+    HostPhaseRecordPool *pool = s.pool.load(std::memory_order_acquire);
     if (pool == nullptr) return;
     host_phase_pool_append(
         pool, static_cast<HostPhaseKind>(kind), start_ns, end_ns, payload, index, current_thread_id()
     );
 }
 
-void reset_counter(KindCounter &counter) {
-    counter.total_ns.store(0, std::memory_order_relaxed);
-    counter.count.store(0, std::memory_order_relaxed);
-    counter.payload_sum.store(0, std::memory_order_relaxed);
-    counter.first_start_ns.store(0, std::memory_order_relaxed);
+// A bind's totals for one kind, summed across the producers that recorded it.
+// Valid only after the lanes are drained.
+KindCounter merged_counter(const TraceState &s, uint32_t kind) {
+    KindCounter merged{};
+    for (const ProducerLane &lane : s.lanes) {
+        const KindCounter &counter = lane.counters[kind];
+        merged.total_ns += counter.total_ns;
+        merged.count += counter.count;
+        merged.payload_sum += counter.payload_sum;
+        if (counter.first_start_ns != 0 &&
+            (merged.first_start_ns == 0 || counter.first_start_ns < merged.first_start_ns)) {
+            merged.first_start_ns = counter.first_start_ns;
+        }
+    }
+    return merged;
+}
+
+void reset_lanes(TraceState &s) {
+    for (ProducerLane &lane : s.lanes) {
+        lane.counters = {};
+    }
 }
 
 }  // namespace
 
-bool host_phase_timing_enabled() {
+bool host_phase_breakdown_enabled() {
     // Read once: the value cannot change within a process, and the orchestrator
-    // asks per submit-level operation. Opt-in spelling matches the runtime's
-    // other default-off switch, SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE, so that
-    // `=false` / `=off` / `=no` read as off rather than as a non-zero string.
-    static const bool enabled = [] {
-        const char *env = std::getenv("SIMPLER_HBG_BIND_BREAKDOWN_ENABLE");
-        return env != nullptr && (env[0] == '1' || env[0] == 't' || env[0] == 'T');
-    }();
+    // asks per submit-level operation.
+    static const bool enabled = env_opt_in("SIMPLER_HBG_BIND_BREAKDOWN_ENABLE");
+    return enabled;
+}
+
+bool host_phase_records_enabled() {
+    static const bool enabled = env_opt_in("SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE");
     return enabled;
 }
 
@@ -182,11 +275,24 @@ host_phase_record(uint64_t start_ns, uint64_t end_ns, uint32_t kind, uint64_t pa
     // ORCH_PHASE_END calls this on every submit-level operation, so the load
     // above stays the whole cost when tracing is off. Admission then re-checks
     // under the in-flight claim, which is what actually closes the boundary.
-    RecordAdmission admission(s);
+    uint32_t claimed_generation = 0;
+    ProducerLane *lane = producer_lane(s, claimed_generation);
+    if (lane == nullptr) {
+        s.lane_denied.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    RecordAdmission admission(s, *lane);
     if (!admission) {
         return;
     }
-    record_counter(s, start_ns, end_ns, kind, payload);
+    // A bind can have closed and a new one opened between claiming the lane and
+    // being admitted here, and the new bind resets the lane hand-out -- so a lane
+    // claimed for the old bind may already belong to another producer, and writing
+    // its plain-integer counters would be a race. A stale claim withdraws instead.
+    if (s.generation.load(std::memory_order_acquire) != claimed_generation) {
+        return;
+    }
+    record_counter(*lane, start_ns, end_ns, kind, payload);
     append_record(s, start_ns, end_ns, kind, payload, index);
 }
 
@@ -195,15 +301,24 @@ void host_phase_record_bind(uint32_t kind, uint64_t start_ns, const char *attrs,
     if (!s.active.load(std::memory_order_acquire) || !is_bind_kind(kind)) {
         return;
     }
-    RecordAdmission admission(s);
+    uint32_t claimed_generation = 0;
+    ProducerLane *lane = producer_lane(s, claimed_generation);
+    if (lane == nullptr) {
+        s.lane_denied.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    RecordAdmission admission(s, *lane);
     if (!admission) {
+        return;
+    }
+    if (s.generation.load(std::memory_order_acquire) != claimed_generation) {
         return;
     }
     const uint64_t end_ns = static_cast<uint64_t>(simpler::log::monotonic_now_ns());
     if (attrs != nullptr) {
         snprintf(s.bind_attrs[kind].data(), kBindAttrsCapacity, "%s", attrs);
     }
-    record_counter(s, start_ns, end_ns, kind, payload);
+    record_counter(*lane, start_ns, end_ns, kind, payload);
     append_record(s, start_ns, end_ns, kind, payload, 0);
 }
 
@@ -214,18 +329,26 @@ void host_phase_trace_begin(const void *host_api) {
     drain_in_flight_records(s);
     s.api = static_cast<const HostApi *>(host_api);
     HostPhaseRecordPool *pool =
-        s.api != nullptr ? static_cast<HostPhaseRecordPool *>(s.api->host_phase_pool_arm(host_phase_timing_enabled())) :
-                           nullptr;
+        s.api != nullptr ?
+            static_cast<HostPhaseRecordPool *>(s.api->host_phase_pool_arm(host_phase_records_enabled())) :
+            nullptr;
     s.pool.store(pool, std::memory_order_release);
     // Timestamps are taken whenever either sink wants them. Gating the clock on
-    // the environment variable alone would leave a level-4 run recording zeros.
+    // one switch alone would leave the other sink recording zeros.
     s.submitted_tasks.store(0, std::memory_order_relaxed);
-    for (KindCounter &counter : s.counters)
-        reset_counter(counter);
+    s.lane_denied.store(0, std::memory_order_relaxed);
+    reset_lanes(s);
     for (auto &attrs : s.bind_attrs) {
         attrs[0] = '\0';
     }
-    s.active.store(s.pool != nullptr || host_phase_timing_enabled(), std::memory_order_release);
+    // Retires the producers' cached lanes, so a thread that recorded in the last
+    // bind claims afresh rather than keeping a lane whose counters were just
+    // cleared under it. Published before `active`, so no record can see the new
+    // bind with a stale lane. The counter is process-wide monotonic rather than
+    // per-bind-reset, so no two binds ever share an identity.
+    s.next_lane.store(0, std::memory_order_relaxed);
+    s.generation.fetch_add(1, std::memory_order_release);
+    s.active.store(s.pool != nullptr || host_phase_breakdown_enabled(), std::memory_order_release);
 }
 
 void host_phase_trace_note_submitted(uint64_t submitted_tasks) {
@@ -240,16 +363,21 @@ void host_phase_trace_end() {
     }
     s.active.store(false, std::memory_order_release);
     // Every record already past the `active` check finishes its counter and pool
-    // work before the totals below are read and the pool is handed back.
+    // work before the totals below are read and the pool is handed back, so no
+    // lock is needed here either: the drain, not a mutex, is what makes the pool
+    // quiescent.
     drain_in_flight_records(s);
-    std::lock_guard<std::mutex> pool_lock(s.pool_mutex);
     // Read the pool's own tally before handing it back, and drop the pointer
-    // after: the pool belongs to the runner from finish() onward, and the pass is
+    // after: the pool belongs to the runner from finish() onward, and the bind is
     // over either way, so nothing here may outlive it. Clearing `active` also
     // makes a second end() without an intervening begin() a no-op rather than a
     // stale read plus a duplicate report.
     HostPhaseRecordPool *pool = s.pool.load(std::memory_order_relaxed);
-    const uint64_t dropped = pool != nullptr ? pool->head.dropped_record_count : 0;
+    // Both ways a record can be lost: no buffer left in the pool, or no lane left
+    // to count it in. The second is unreachable while the lane count covers the
+    // producer ceiling, and is summed in rather than assumed away.
+    const uint64_t dropped = (pool != nullptr ? pool->dropped.load(std::memory_order_relaxed) : 0) +
+                             s.lane_denied.load(std::memory_order_relaxed);
     if (s.api != nullptr) {
         uint64_t inv = 0;
 #if SIMPLER_HOST_STRACE
@@ -260,27 +388,27 @@ void host_phase_trace_end() {
         s.api->host_phase_pool_finish(s.submitted_tasks.load(std::memory_order_relaxed), inv);
     }
     s.pool.store(nullptr, std::memory_order_release);
-    if (!host_phase_timing_enabled()) {
+    if (!host_phase_breakdown_enabled()) {
         // Records were collected for a per-event reader alone, which has its own
         // report; this breakdown was not asked for.
         return;
     }
 
     for (uint32_t kind = 0; kind < kHostPhaseKindCount; ++kind) {
-        const KindCounter &counter = s.counters[kind];
-        const uint64_t count = counter.count.load(std::memory_order_relaxed);
+        const KindCounter counter = merged_counter(s, kind);
+        const uint64_t count = counter.count;
         if (count == 0) {
             continue;
         }
-        const uint64_t total_ns = counter.total_ns.load(std::memory_order_relaxed);
-        const uint64_t payload_sum = counter.payload_sum.load(std::memory_order_relaxed);
-        const uint64_t first_start_ns = counter.first_start_ns.load(std::memory_order_relaxed);
+        const uint64_t total_ns = counter.total_ns;
+        const uint64_t payload_sum = counter.payload_sum;
+        const uint64_t first_start_ns = counter.first_start_ns;
         const char *name = host_phase_kind_name(static_cast<HostPhaseKind>(kind));
         if (is_bind_kind(kind)) {
-            // One occurrence per pass, so the summed time is the segment's own
+            // One occurrence per bind, so the summed time is the segment's own
             // duration and the twelve of them partition the bind stage. The line
             // carries its own start because every line is written at the end of
-            // the pass, off the path being measured — the write time says nothing
+            // the bind, off the path being measured — the write time says nothing
             // about when the segment ran.
             LOG_TIMING(
                 "bind phase=%s start_ns=%llu dur_ns=%llu %s", name, static_cast<unsigned long long>(first_start_ns),

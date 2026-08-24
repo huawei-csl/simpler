@@ -175,7 +175,7 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
 struct ChipSwimlaneAicoreTaskRecord {
     uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
     uint64_t end_time;                 // Post-kernel timestamp
-    uint64_t task_token_raw;           // PTO2TaskId::raw — identity (NOT join key)
+    uint64_t task_token_raw;           // TaskId::raw — identity (NOT join key)
     uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
     uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
 } __attribute__((aligned(32)));
@@ -546,7 +546,7 @@ enum class ChipSwimlaneSchedPhaseKind : uint32_t {
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
- *  Must match PTO2ResourceShape's first three values (see pto_submit_types.h).
+ *  Must match PTO2ResourceShape's first three values (see submit_types.h).
  *  Hardcoded here rather than included to keep this header runtime-independent. */
 constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
 
@@ -662,6 +662,12 @@ enum class HostPhaseKind : uint32_t {
     OrchRecordNode,
     OrchGraphSubmit,
     OrchBuildDefinition,
+    OrchGraphBegin,
+    OrchRecordingWait,
+    OrchGraphCommit,
+    OrchSubmitAdmit,
+    OrchRecordHandoff,
+    OrchGeneratedArgs,
     Count
 };
 
@@ -669,7 +675,7 @@ constexpr uint32_t kHostPhaseKindCount = static_cast<uint32_t>(HostPhaseKind::Co
 
 /**
  * Whether this kind ends with a task submitted to the runtime, i.e. whether its
- * record's `payload` is a task id and whether it counts towards the pass's
+ * record's `payload` is a task id and whether it counts towards the bind's
  * total_tasks. The three that do are what a per-submit consumer sees; the rest
  * are sub-operations of a submit, or bind work with no task at all.
  */
@@ -727,6 +733,18 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "graph_submit";
     case HostPhaseKind::OrchBuildDefinition:
         return "build_definition";
+    case HostPhaseKind::OrchGraphBegin:
+        return "graph_begin";
+    case HostPhaseKind::OrchRecordingWait:
+        return "recording_wait";
+    case HostPhaseKind::OrchGraphCommit:
+        return "graph_commit";
+    case HostPhaseKind::OrchSubmitAdmit:
+        return "submit_admit";
+    case HostPhaseKind::OrchRecordHandoff:
+        return "record_handoff";
+    case HostPhaseKind::OrchGeneratedArgs:
+        return "generated_args";
     case HostPhaseKind::Count:
         break;
     }
@@ -748,15 +766,16 @@ using ChipSwimlaneAicpuOrchPhaseBuffer =
 using ChipSwimlaneAicpuSchedPhasePool = ChipSwimlaneAicpuTaskPool;
 using ChipSwimlaneAicpuOrchPhasePool = ChipSwimlaneAicpuTaskPool;
 
-// The host phase pool is the same head + free_queue plumbing over host DDR
-// instead of device shared memory: producers are serialized by the host trace
-// sink while rotating through a fixed set of fixed-size buffers, and a reader
-// walks them in rotation order. Its buffers are
-// smaller and fewer than a device thread's because its producer emits hundreds
-// of records per pass rather than tens of thousands (see
+// The host phase pool holds the same fixed-size record buffers over host DDR
+// instead of device shared memory, but not the head + free_queue plumbing: those
+// exist so a single device producer can hand filled buffers to a host reader
+// mid-run, and the host pool has many concurrent producers and one reader that
+// only ever looks after the bind is closed. It is defined in
+// host/host_phase_records.h, which owns that host-only shape; the buffers are
+// smaller and fewer than a device thread's because a producer emits hundreds of
+// records per bind rather than tens of thousands (see
 // PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER).
 using HostPhaseRecordBuffer = TypedBuffer<HostPhaseRecord, PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER>;
-using HostPhaseRecordPool = ChipSwimlaneAicpuTaskPool;
 
 // =============================================================================
 // Helper Functions - Memory Layout

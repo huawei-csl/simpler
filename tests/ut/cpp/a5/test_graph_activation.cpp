@@ -26,8 +26,8 @@
 #include <vector>
 
 #include "utils/device_arena.h"
-#include "pto_orchestrator.h"
-#include "pto_shared_memory.h"
+#include "orchestrator.h"
+#include "shared_memory.h"
 
 class GraphActivationTest : public ::testing::Test {
 protected:
@@ -66,7 +66,7 @@ protected:
         node.slot.task_kind = TaskKind::KERNEL;
         node.slot.total_required_subtasks = 1;
         node.slot.logical_block_num = 1;
-        node.slot.payload = &node.payload;
+        node.slot.payload.set(&node.payload);
     }
 };
 
@@ -88,7 +88,7 @@ TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegiste
 
     sched.register_graph_wake(exec, &nodes[0].slot, &nodes[1].slot);
 
-    PTO2TaskSlotState *out[2];
+    ChipTaskSlotState *out[2];
     ASSERT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, PTO2ResourceShape::AIC, out, 2), 1)
         << "consumer must route to ready, not hang on the SENTINEL wake list";
     EXPECT_EQ(out[0], &nodes[1].slot);
@@ -114,7 +114,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     sched.graph_incremental_publish(exec, 0, 4);
     EXPECT_EQ(exec.published_nodes.load(), 4);
 
-    PTO2TaskSlotState *out[4];
+    ChipTaskSlotState *out[4];
     ASSERT_EQ(sched.get_ready_tasks_batch(sched.ready_queues, PTO2ResourceShape::AIC, out, 4), 1)
         << "only the consumer whose producers are all COMPLETED routes at publish time";
     EXPECT_EQ(out[0], &nodes[2].slot);
@@ -128,7 +128,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
 
 // Incremental activation dispatches a node before the graph reaches ACTIVE, so
 // complete_task must accept a node completion while the graph is MATERIALIZING or
-// PREPARED, and reject it only for SUBMITTED (not yet localized) or COMPLETED
+// PREPARED, and reject it only for SUBMITTED (not yet bound) or COMPLETED
 // (already retired).
 TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
     GraphDefinition definition{};
@@ -138,7 +138,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         node[0].slot.task_kind = TaskKind::GRAPH_NODE;
         node[0].slot.graph_node_index = 0;
         node[0].slot.total_required_subtasks = 1;
-        node[0].slot.payload = &node[0].payload;
+        node[0].slot.payload.set(&node[0].payload);
 
         GraphExecution exec{};
         exec.definition = &definition;
@@ -146,7 +146,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         exec.node_count = 1;
         exec.remaining_nodes.store(1);
         exec.outer_slot = nullptr;
-        exec.state.store(state);
+        graph_execution_set_state(exec, state);
         node[0].slot.graph_context = &exec;
 #if SIMPLER_SCHED_PROFILING
         return sched.complete_task(node[0].slot, 0).error_code;
@@ -155,9 +155,9 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
 #endif
     };
 
-    EXPECT_EQ(complete_in_state(GraphExecutionState::MATERIALIZING), PTO2_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::PREPARED), PTO2_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::ACTIVE), PTO2_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::SUBMITTED), PTO2_ERROR_INVALID_ARGS);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::COMPLETED), PTO2_ERROR_INVALID_ARGS);
+    EXPECT_EQ(complete_in_state(GraphExecutionState::MATERIALIZING), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete_in_state(GraphExecutionState::PREPARED), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete_in_state(GraphExecutionState::ACTIVE), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete_in_state(GraphExecutionState::SUBMITTED), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(complete_in_state(GraphExecutionState::COMPLETED), SIMPLER_ERROR_INVALID_ARGS);
 }

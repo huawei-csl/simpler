@@ -15,9 +15,10 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <cstddef>
 #include <type_traits>
 
-#include "pto_runtime2_types.h"
+#include "runtime_types.h"
 #include "tensor.h"
 
 inline constexpr uint32_t GRAPH_MAX_NODES = 1024;
@@ -51,9 +52,9 @@ struct GraphTensor {
     uint8_t reserved[3];
 };
 
-// Everything from GraphTensorSourceRef through GraphSubmission is copied
-// across the host-device boundary. Keep it pointer-free, fixed-width and
-// position-independent: every reference is an offset from its owning header.
+// Definition records are copied across the host-device boundary. Keep them
+// pointer-free, fixed-width and position-independent: every reference is an
+// offset from its owning header.
 struct GraphTensorSourceRef {
     uint8_t source;
     uint8_t reserved;
@@ -159,12 +160,9 @@ struct GraphDefinition {
     uint32_t tensor_arg_count;
     uint32_t scalar_arg_count;
     uint32_t predicate_count;
-    // Bytes an execution of this Definition needs for its GraphExecution header,
-    // node storage and patch arrays. Derived from task_count / tensor_arg_count /
-    // scalar_arg_count, so host and device read one value instead of each
-    // computing it. The outer GRAPH task's heap allocation covers
-    // required_heap + this, and the execution lives at
-    // packed_buffer_base + required_heap.
+    // Bytes the GraphExecution header, node array and node argument pools need in
+    // the outer GRAPH task's heap tail. Invocation boundaries live in the outer
+    // task payload's compact argument-pool regions instead.
     uint32_t execution_storage_bytes;
     uint32_t off_fanout_offsets;
     uint32_t off_fanout_indices;
@@ -181,27 +179,103 @@ struct GraphDefinition {
     uint32_t off_predicates;
 };
 
-// One submission of a Graph. The static Definition is a shared device object
-// this references by address; the execution storage is not referenced at all —
-// it sits at outer_slot.task->packed_buffer_base + definition->required_heap,
-// so both sides derive it from the Definition rather than carrying it on the
-// wire.
-struct GraphSubmission {
-    uint64_t graph_key;
-    uint64_t local_execution;
-    // Device GM address of the shared Definition object this replay references
-    // (an integer-typed absolute address per the wire rules) plus the content
-    // hash the host computed for it.
-    uint64_t definition_addr;
-    uint64_t definition_hash;
-    uint32_t activation_gate;
-    uint32_t total_bytes;
-    uint32_t tensors_offset;
-    uint32_t tensor_count;
-    uint32_t scalars_offset;
-    uint32_t scalar_count;
-};
+inline uint64_t graph_definition_hash_rotl(uint64_t value, uint32_t shift) {
+    return (value << shift) | (value >> (64U - shift));
+}
 
+inline uint64_t graph_definition_hash_round(uint64_t accumulator, uint64_t input) {
+    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
+    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
+    accumulator += input * PRIME2;
+    accumulator = graph_definition_hash_rotl(accumulator, 31);
+    return accumulator * PRIME1;
+}
+
+inline uint64_t graph_definition_hash_word(const uint8_t *bytes, size_t offset) {
+    constexpr size_t CONTENT_HASH_OFFSET = offsetof(GraphDefinition, content_hash);
+    static_assert(CONTENT_HASH_OFFSET % sizeof(uint64_t) == 0);
+    if (offset == CONTENT_HASH_OFFSET) return 0;
+    uint64_t word = 0;
+    __builtin_memcpy(&word, bytes + offset, sizeof(word));
+    return word;
+}
+
+// The Definition hash follows XXH64's four-lane structure so large images do
+// not serialize one multiply per word, and is bit-identical to XXH64 with this
+// seed for any image whose content_hash field is already zero.
+//
+// `data` must be the base of a GraphDefinition image: the word at
+// offsetof(GraphDefinition, content_hash) is read as zero, which is what lets
+// the device verify in place instead of copying the image to clear that field.
+// Hashing any other buffer, or a subrange that does not start at the image base,
+// silently substitutes zero for eight bytes of it.
+//
+// Definitions are rebuilt and rehashed by the same runtime version, so this is
+// an integrity checksum rather than a persisted wire-format identifier.
+inline uint64_t graph_definition_content_hash(const void *data, size_t size) {
+    constexpr uint64_t SEED = 1469598103934665603ULL;
+    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
+    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
+    constexpr uint64_t PRIME3 = 1609587929392839161ULL;
+    constexpr uint64_t PRIME4 = 9650029242287828579ULL;
+    constexpr uint64_t PRIME5 = 2870177450012600261ULL;
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    size_t offset = 0;
+    uint64_t hash = 0;
+
+    if (size >= 32) {
+        uint64_t lane1 = SEED + PRIME1 + PRIME2;
+        uint64_t lane2 = SEED + PRIME2;
+        uint64_t lane3 = SEED;
+        uint64_t lane4 = SEED - PRIME1;
+        const size_t stripes_end = size - 32;
+        do {
+            lane1 = graph_definition_hash_round(lane1, graph_definition_hash_word(bytes, offset));
+            lane2 = graph_definition_hash_round(lane2, graph_definition_hash_word(bytes, offset + 8));
+            lane3 = graph_definition_hash_round(lane3, graph_definition_hash_word(bytes, offset + 16));
+            lane4 = graph_definition_hash_round(lane4, graph_definition_hash_word(bytes, offset + 24));
+            offset += 32;
+        } while (offset <= stripes_end);
+        hash = graph_definition_hash_rotl(lane1, 1) + graph_definition_hash_rotl(lane2, 7) +
+               graph_definition_hash_rotl(lane3, 12) + graph_definition_hash_rotl(lane4, 18);
+        hash ^= graph_definition_hash_round(0, lane1);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane2);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane3);
+        hash = hash * PRIME1 + PRIME4;
+        hash ^= graph_definition_hash_round(0, lane4);
+        hash = hash * PRIME1 + PRIME4;
+    } else {
+        hash = SEED + PRIME5;
+    }
+
+    hash += size;
+    while (offset + sizeof(uint64_t) <= size) {
+        const uint64_t mixed = graph_definition_hash_round(0, graph_definition_hash_word(bytes, offset));
+        hash ^= mixed;
+        hash = graph_definition_hash_rotl(hash, 27) * PRIME1 + PRIME4;
+        offset += sizeof(uint64_t);
+    }
+    if (offset + sizeof(uint32_t) <= size) {
+        uint32_t word = 0;
+        __builtin_memcpy(&word, bytes + offset, sizeof(word));
+        hash ^= static_cast<uint64_t>(word) * PRIME1;
+        hash = graph_definition_hash_rotl(hash, 23) * PRIME2 + PRIME3;
+        offset += sizeof(uint32_t);
+    }
+    while (offset < size) {
+        hash ^= static_cast<uint64_t>(bytes[offset]) * PRIME5;
+        hash = graph_definition_hash_rotl(hash, 11) * PRIME1;
+        ++offset;
+    }
+    hash ^= hash >> 33;
+    hash *= PRIME2;
+    hash ^= hash >> 29;
+    hash *= PRIME3;
+    hash ^= hash >> 32;
+    return hash;
+}
 static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
 static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
 static_assert(std::is_trivially_copyable_v<GraphTensor>);
@@ -216,8 +290,21 @@ static_assert(std::is_trivially_copyable_v<GraphBoundarySignature>);
 static_assert(std::is_standard_layout_v<GraphBoundarySignature>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);
 static_assert(std::is_standard_layout_v<GraphDefinition>);
-static_assert(std::is_trivially_copyable_v<GraphSubmission>);
-static_assert(std::is_standard_layout_v<GraphSubmission>);
+
+// Section starts are offsets from the image base, so a section is correctly
+// aligned only if the buffer holding the image is. The builder writes each
+// section through a typed pointer into a std::vector<std::byte>, whose data() is
+// aligned for any type with fundamental alignment and no further — so a section
+// type that asked for more would make every one of those stores undefined, with
+// no diagnostic.
+static_assert(
+    alignof(GraphNodeDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
+        alignof(GraphTensorSourceRef) <= alignof(std::max_align_t) &&
+        alignof(GraphScalarSourceRef) <= alignof(std::max_align_t) &&
+        alignof(GraphBoundarySignature) <= alignof(std::max_align_t) &&
+        alignof(GraphPredicate) <= alignof(std::max_align_t),
+    "a Definition section type must not be over-aligned: its storage is a byte vector"
+);
 
 inline GraphTensor graph_tensor_pack(const ChipTensor &tensor) {
     GraphTensor packed{};
@@ -241,7 +328,7 @@ inline GraphTensor graph_tensor_pack(const ChipTensor &tensor) {
 
 inline void graph_tensor_unpack(const GraphTensor &packed, ChipTensor *tensor) {
     tensor->buffer = PTOBufferHandle{packed.buffer_addr, packed.buffer_size};
-    tensor->owner_task_id = PTO2TaskId{packed.owner_task_id};
+    tensor->owner_task_id = TaskId{packed.owner_task_id};
     tensor->start_offset = packed.start_offset;
     tensor->extent_elem_cache = packed.extent_elem;
     tensor->version = packed.version;
@@ -297,37 +384,6 @@ inline const T *graph_definition_ptr(const GraphDefinition &definition, uint32_t
     return graph_definition_array<T>(definition, offset, 1);
 }
 
-inline GraphSubmission *graph_submission_from_slot(PTO2TaskSlotState &slot) {
-    return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphSubmission *>(slot.graph_context) : nullptr;
-}
-
-inline bool graph_submission_wire_size_valid(const GraphSubmission &submission, size_t available_bytes) {
-    return available_bytes >= sizeof(GraphSubmission) && submission.total_bytes == available_bytes;
-}
-
-inline const GraphTensor *graph_submission_tensors(const GraphSubmission &submission) {
-    if (submission.tensors_offset == 0 || submission.tensors_offset % alignof(GraphTensor) != 0 ||
-        submission.tensors_offset > submission.total_bytes ||
-        submission.tensor_count > (submission.total_bytes - submission.tensors_offset) / sizeof(GraphTensor)) {
-        return nullptr;
-    }
-    return reinterpret_cast<const GraphTensor *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.tensors_offset
-    );
-}
-
-inline const uint64_t *graph_submission_scalars(const GraphSubmission &submission) {
-    if (submission.scalar_count == 0) return nullptr;
-    if (submission.scalars_offset == 0 || submission.scalars_offset % alignof(uint64_t) != 0 ||
-        submission.scalars_offset > submission.total_bytes ||
-        submission.scalar_count > (submission.total_bytes - submission.scalars_offset) / sizeof(uint64_t)) {
-        return nullptr;
-    }
-    return reinterpret_cast<const uint64_t *>(
-        reinterpret_cast<const uint8_t *>(&submission) + submission.scalars_offset
-    );
-}
-
 enum class GraphExecutionState : uint8_t {
     SUBMITTED = 0,
     MATERIALIZING = 1,
@@ -345,14 +401,22 @@ enum class GraphMaterializeResult : uint8_t {
 
 struct alignas(64) GraphNodeStorage {
     PTO2TaskDescriptor task;
+    ChipTaskSlotState slot;
+    // The payload carries its argument regions as deltas into pools past the node
+    // array, so its size is the same for every node and the slot names it by a delta
+    // from the slot's own address. Field order here therefore constrains nothing, and
+    // node_at strides the storage by this type.
     PTO2TaskPayload payload;
-    PTO2TaskSlotState slot;
 };
 
-inline constexpr uint64_t GRAPH_EXECUTION_INITIALIZING = 1;
+inline constexpr uint8_t GRAPH_EXECUTION_STATE_MASK = 0x7;
+inline constexpr uint8_t GRAPH_EXECUTION_EXTERNAL_READY = 0x8;
 
 struct GraphExecution {
-    std::atomic<GraphExecutionState> state{GraphExecutionState::SUBMITTED};
+    // The low bits hold GraphExecutionState. EXTERNAL_READY shares this byte so
+    // dependency readiness can arrive before materialization without a separate
+    // per-submission gate object.
+    std::atomic<uint8_t> state{static_cast<uint8_t>(GraphExecutionState::SUBMITTED)};
     std::atomic<uint8_t> materialize_busy{0};
     std::atomic<int32_t> remaining_nodes{0};
     std::atomic<int32_t> retired_nodes{0};
@@ -367,9 +431,14 @@ struct GraphExecution {
     int32_t materialized_nodes{0};
     int32_t constructed_nodes{0};
     uint32_t consumed_tensor_args{0};
-    PTO2TaskSlotState *outer_slot{nullptr};
+    ChipTaskSlotState *outer_slot{nullptr};
     GraphNodeStorage *nodes{nullptr};
     GraphNodeStorage *node_storage{nullptr};
+    // This execution's node argument pools, in the storage tail past node_storage.
+    // Every node payload's tensor and scalar deltas point here; its pool position is
+    // the Definition's tensor_offset / scalar_offset.
+    ChipTensor *node_tensor_pool{nullptr};
+    uint64_t *node_scalar_pool{nullptr};
     const GraphDefinition *definition{nullptr};
     const uint32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
@@ -377,36 +446,137 @@ struct GraphExecution {
     uint32_t boundary_tensor_count{0};
     const uint64_t *boundary_scalars{nullptr};
     uint32_t boundary_scalar_count{0};
+
+    GraphNodeStorage &node_at(int32_t index) const { return node_storage[index]; }
 };
 
 static_assert(std::is_trivially_destructible_v<GraphNodeStorage>);
+// The tensor pool starts right after the node array, and the scalar pool starts
+// after a whole number of ChipTensors.
+static_assert(
+    alignof(GraphNodeStorage) % alignof(ChipTensor) == 0,
+    "a node entry must be at least ChipTensor-aligned: the tensor pool follows the node array"
+);
+static_assert(sizeof(ChipTensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned");
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
+// The whole storage is aligned for its widest member, so one base check covers the
+// header as well as the node array that follows it.
+static_assert(
+    alignof(GraphNodeStorage) % alignof(GraphExecution) == 0,
+    "the node array's alignment must subsume the execution header's"
+);
+static_assert(sizeof(GraphTensor) <= sizeof(ChipTensor));
 
-// The execution occupies [GraphExecution][GraphNodeStorage x node_count] at the
-// tail of the outer GRAPH task's heap allocation.
-inline bool graph_execution_storage_layout(int32_t node_count, size_t *nodes_offset, size_t *storage_bytes) {
-    if (nodes_offset == nullptr || storage_bytes == nullptr || node_count <= 0 ||
-        node_count > static_cast<int32_t>(GRAPH_MAX_NODES)) {
+inline constexpr size_t graph_boundary_tensor_pool_slots(uint32_t tensor_count) {
+    const size_t bytes = static_cast<size_t>(tensor_count) * sizeof(GraphTensor);
+    return (bytes + sizeof(ChipTensor) - 1) / sizeof(ChipTensor);
+}
+
+// The outer GRAPH task's heap tail occupies
+// [GraphExecution][GraphNodeStorage x node_count][ChipTensor x tensor_arg_count]
+// [uint64_t x scalar_arg_count].
+//
+// The last two regions are the node payloads' argument pools, indexed by the
+// Definition's own tensor_offset / scalar_offset — which is why the Definition's
+// arg-table counts size them rather than a per-node sum: node i's arguments occupy
+// [offset, offset + count) in both the table and the pool. There is no fanin region:
+// node dependencies live in the Definition's fanin CSR, so a node's fanin_count stays
+// 0 and its fanin delta unbound.
+struct GraphExecutionStorageLayout {
+    size_t nodes_offset;
+    size_t tensors_offset;
+    size_t scalars_offset;
+    size_t total_bytes;
+};
+
+inline bool graph_execution_storage_layout(
+    int32_t node_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, GraphExecutionStorageLayout *out
+) {
+    if (out == nullptr || node_count <= 0 || node_count > static_cast<int32_t>(GRAPH_MAX_NODES)) {
         return false;
     }
     constexpr size_t ALIGNMENT = alignof(GraphNodeStorage);
-    *nodes_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    *storage_bytes = *nodes_offset + static_cast<size_t>(node_count) * sizeof(GraphNodeStorage);
+    out->nodes_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    out->tensors_offset = out->nodes_offset + static_cast<size_t>(node_count) * sizeof(GraphNodeStorage);
+    out->scalars_offset = out->tensors_offset + static_cast<size_t>(tensor_arg_count) * sizeof(ChipTensor);
+    out->total_bytes = out->scalars_offset + static_cast<size_t>(scalar_arg_count) * sizeof(uint64_t);
     return true;
 }
 
-inline bool graph_execution_storage_bytes(int32_t node_count, size_t *storage_bytes) {
-    size_t nodes_offset = 0;
-    return graph_execution_storage_layout(node_count, &nodes_offset, storage_bytes);
+inline bool graph_execution_storage_bytes(
+    int32_t node_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, size_t *storage_bytes
+) {
+    GraphExecutionStorageLayout layout{};
+    if (storage_bytes == nullptr ||
+        !graph_execution_storage_layout(node_count, tensor_arg_count, scalar_arg_count, &layout)) {
+        return false;
+    }
+    *storage_bytes = layout.total_bytes;
+    return true;
 }
 
-GraphExecution *graph_execution_localize(PTO2TaskSlotState &outer_slot);
+GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot);
 GraphMaterializeResult graph_execution_materialize_slice(
-    PTO2TaskSlotState &outer_slot, GraphExecution &execution, int32_t max_nodes, int32_t *nodes_materialized = nullptr
+    ChipTaskSlotState &outer_slot, GraphExecution &execution, int32_t max_nodes, int32_t *nodes_materialized = nullptr
 );
 
-inline GraphExecution *graph_execution_from_slot(PTO2TaskSlotState &slot) {
+inline GraphExecution *graph_execution_from_slot(ChipTaskSlotState &slot) {
     return slot.task_kind == TaskKind::GRAPH_NODE ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
+}
+
+// An outer GRAPH slot's graph_context holds the shared Definition's device address
+// until graph_execution_localize replaces it with the execution, so this cast is only
+// valid after that call. What makes it safe is the boot sequence, not this slot: every
+// AICPU thread localizes a disjoint slice of the task window in classify_partition and
+// all of them barrier before runtime_init_ready_ is published, so no dispatch — and
+// therefore no caller of this function — observes an unlocalized GRAPH slot. A slot
+// whose localization failed carries nullptr.
+inline GraphExecution *graph_execution_from_outer_slot(ChipTaskSlotState &slot) {
+    return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
+}
+
+inline GraphExecutionState
+graph_execution_state(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
+    return static_cast<GraphExecutionState>(execution.state.load(order) & GRAPH_EXECUTION_STATE_MASK);
+}
+
+inline bool
+graph_execution_external_ready(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
+    return (execution.state.load(order) & GRAPH_EXECUTION_EXTERNAL_READY) != 0;
+}
+
+inline void graph_execution_set_state(
+    GraphExecution &execution, GraphExecutionState next, std::memory_order order = std::memory_order_release
+) {
+    uint8_t observed = execution.state.load(std::memory_order_relaxed);
+    // Masked, so a state added past GRAPH_EXECUTION_STATE_MASK cannot reach the
+    // readiness bit sharing this byte.
+    const uint8_t next_state = static_cast<uint8_t>(static_cast<uint8_t>(next) & GRAPH_EXECUTION_STATE_MASK);
+    while (!execution.state.compare_exchange_weak(
+        observed, static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | next_state), order,
+        std::memory_order_relaxed
+    )) {}
+}
+
+inline bool graph_execution_transition(
+    GraphExecution &execution, GraphExecutionState expected_state, GraphExecutionState next_state
+) {
+    uint8_t observed = execution.state.load(std::memory_order_acquire);
+    const uint8_t desired_state = static_cast<uint8_t>(static_cast<uint8_t>(next_state) & GRAPH_EXECUTION_STATE_MASK);
+    while ((observed & GRAPH_EXECUTION_STATE_MASK) == static_cast<uint8_t>(expected_state)) {
+        const uint8_t desired = static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | desired_state);
+        if (execution.state.compare_exchange_weak(
+                observed, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
+    return (execution.state.fetch_or(GRAPH_EXECUTION_EXTERNAL_READY, std::memory_order_acq_rel) &
+            GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
 inline bool graph_execution_complete_node(GraphExecution &execution) {
@@ -414,25 +584,9 @@ inline bool graph_execution_complete_node(GraphExecution &execution) {
 }
 
 inline void graph_execution_mark_completed(GraphExecution &execution) {
-    execution.state.store(GraphExecutionState::COMPLETED, std::memory_order_release);
+    graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
 }
 
 inline void graph_execution_retire_node(GraphExecution &execution) {
     execution.retired_nodes.fetch_add(1, std::memory_order_release);
-}
-
-inline bool graph_submission_signal(GraphSubmission &submission, uint32_t bit) {
-    constexpr uint32_t BOTH = 0x3;
-    uint32_t observed = __atomic_fetch_or(&submission.activation_gate, bit, __ATOMIC_ACQ_REL);
-    return observed != BOTH && (observed | bit) == BOTH;
-}
-
-inline GraphExecution *graph_submission_local_execution(GraphSubmission &submission) {
-    uint64_t raw = __atomic_load_n(&submission.local_execution, __ATOMIC_ACQUIRE);
-    if (raw <= GRAPH_EXECUTION_INITIALIZING) return nullptr;
-    return reinterpret_cast<GraphExecution *>(static_cast<uintptr_t>(raw));
-}
-
-inline bool graph_submission_execution_initializing(const GraphSubmission &submission) {
-    return __atomic_load_n(&submission.local_execution, __ATOMIC_ACQUIRE) == GRAPH_EXECUTION_INITIALIZING;
 }

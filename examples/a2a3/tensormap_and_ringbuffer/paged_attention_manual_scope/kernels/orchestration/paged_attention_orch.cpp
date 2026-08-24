@@ -13,7 +13,7 @@
  *
  * Matches the small-case paged_attention orchestration shape while replacing
  * the automatic same-scope dependency wiring with explicit task-to-task deps
- * inside PTO2_SCOPE(PTO2ScopeMode::MANUAL).
+ * inside SIMPLER_SCOPE(PTO2ScopeMode::MANUAL).
  */
 
 #include <algorithm>
@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "pto_orchestration_api.h"
+#include "orchestration_api.h"
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -62,10 +62,9 @@ inline uint64_t get_sys_cnt_aicpu() {
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
+__attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return PTO2OrchestrationConfig{
+    return OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
@@ -150,7 +149,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+            SIMPLER_SCOPE(PTO2ScopeMode::MANUAL) {
                 CYCLE_COUNT_LAP(prof_scope);
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
@@ -166,8 +165,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 const ChipTensor &oi = alloc_outs.get_ref(0);
                 const ChipTensor &li_update = alloc_outs.get_ref(1);
                 const ChipTensor &mi_update = alloc_outs.get_ref(2);
-                PTO2TaskId alloc_task = alloc_outs.task_id();
-                PTO2TaskId prev_update_task = PTO2TaskId::invalid();
+                TaskId alloc_task = alloc_outs.task_id();
+                TaskId prev_update_task = TaskId::invalid();
                 PROF_INC(prof_submit_count, 1);
                 CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -208,7 +207,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
-                    PTO2TaskId sf_deps[] = {qk_outs.task_id()};
+                    TaskId sf_deps[] = {qk_outs.task_id()};
                     params_sf.set_dependencies(sf_deps, 1);
                     params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
@@ -223,7 +222,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
-                    PTO2TaskId pv_deps[] = {sf_outs.task_id()};
+                    TaskId pv_deps[] = {sf_outs.task_id()};
                     params_pv.set_dependencies(pv_deps, 1);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);

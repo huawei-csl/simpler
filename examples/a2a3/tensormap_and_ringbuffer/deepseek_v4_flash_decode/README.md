@@ -36,8 +36,9 @@ CI terms: the harvested distributed program compiles, both ranks' graphs
 dispatch, the cross-die window protocol (TPUT/TNOTIFY arrivals, LM-head
 all-gather) drains, and the run terminates cleanly.
 
-It is marked `manual`: compiling 368 incore kernels plus the 7.8k-line chip
-orchestration takes several minutes, so it does not run in the default sweep.
+The case is manual: Per-PR CI runs it in the dedicated `st-deepseek-onboard-a2a3`
+job instead of the main sweep; compiling its 368 incore kernels plus the 7.8k-line
+chip orchestration takes several minutes.
 
 The six buffer initializations formerly expressed as orchestration-side
 `set_initial_value(0)` calls now run on device. Each of the five
@@ -52,39 +53,56 @@ The 30 orchestration-side `get_tensor_data` reads of `hc_attn_scale_*` /
 values went straight into task scalars for the `split_pre_post*` /
 `comb_sinkhorn*` kernels. Each of those kernels now takes the scale view as an
 extra tensor input and reads scale0/scale1 (`split_pre_post*`) or scale2
-(`comb_sinkhorn*`) from GM itself. The remaining reads — `recv_count_out` and
-`ext_num_tokens_per_owner` — feed loop trip counts and launch block numbers,
-i.e. orchestration control flow, and stay on the orchestrator.
+(`comb_sinkhorn*`) from GM itself.
 
-## Status: blocked on the #1644 pto-isa pin bump
+The ten `recv_count_out` reads that drove the MoE per-expert tile loops are gone
+too. `recv_count_out[expert][0]` is written on the device by `dispatch_meta`, so
+reading it in orchestration stalls the orchestrator on a producer wait. The count
+now steers the loops from the device side, split by role:
 
-The case PASSES on every runtime from the wire-ABI cutover (#1729, the earliest
-commit whose scene-test plumbing can host it) through #1771 — all of which pin
-pto-isa `83d01313`, the commit these kernels were generated against. From
-`7a1b9b11` ("CI: bump pinned pto-isa for PTOAS v0.55", pto-isa -> `0cefc9a5`)
-onward, including current main, both ranks stall mid-network: two kernels spin
-forever on comm-window arrival counters, the AICPU orchestrator times out
-reading `recv_count_out` (`TENSOR_WAIT_TIMEOUT`, "producer not completed"), and
-the scheduler exits `S1:running-stalled`. The stall layer moves with fixture
-content (a timing-dependent miss, not a fixed logic error), and the identical
-program + content passes under pypto's own runner against pto-isa `83d01313`
-even with every weight streamed as a host tensor. Bisect evidence: PASS at
-PR #1771 and FAIL at PR #1644 on otherwise identical simpler code. Candidate
-pto-isa changes in `83d01313..0cefc9a5` touch exactly the GM-polling path
-these kernels spin on
-(`6ffe3221` "Qualify dcci cache line arguments", `2d9d4288` "normalize cache
-line constants").
+- **Trip count → dispatch predicate.** The tile grid is static — the
+  `h_i8 [512, 2048]` layout budgets 16 rows per expert and a tile is 16 rows, so
+  one tile per expert — and each of a tile's six tasks carries a **dispatch
+  predicate** on that element (`recv_count_out[expert][0] > t0`). The scheduler
+  evaluates it at the dispatch point, where the task is already ready and the
+  count is therefore current: an expert whose count does not reach the tile's
+  first row has the tile's tasks retired inline, never dispatched to a core.
+  The predicate declares no dependency of its own, and needs none here — every
+  task in the tile consumes a `dispatch_gather` output, and `dispatch_gather`
+  depends on `dispatch_meta`.
+- **`valid_rows` → kernel-side read.** The one value the loops computed from the
+  count, `valid_rows = min(count - t0, 16)`, is a task arg of `exp_gate_up_act*`.
+  The orchestration passes `recv_count_out` as an extra tensor input instead
+  (taking the former first-scalar slot, as the scale views did), and each of the
+  five kernels derives the row count from GM in `kernel_entry`, after a
+  single-line `dcci` on the element.
+
+`ext_num_tokens_per_owner` is the one read left. It is an **external** tensor, so
+it has a value before the network runs, and it feeds `set_block_num` — a launch
+parameter a predicate cannot express, because a predicate decides whether a task
+dispatches, not how wide it is.
+
+## Status: full-device completion on the current pin
+
+The original bring-up recorded a timing-dependent mid-network stall after the
+pto-isa pin bump in #1644. That status is historical: the current case completes
+on the repository pin `cd4a3d3f7a1a27fcfe536f617e9bca3008929664`. The device
+verification in #1939 passed both the TMR and HBG variants on two A2A3 dies. The
+Per-PR run for #1949 then exercised both full device bodies in the ordinary
+scene-test sweep: TMR passed in 299.25 seconds and HBG in 303.09 seconds.
+Since the split into `st-deepseek-onboard-a2a3`, that Per-PR coverage runs in a
+dedicated job parallel to the main sweep.
 
 ## Running
 
 ```bash
 # standalone (2 dies; wrap in task-submit on a shared box)
 python examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode/test_deepseek_v4_flash_decode.py \
-    -p a2a3 -d <d0>,<d1> --manual only
+    -p a2a3 -d <d0>,<d1>
 
 # pytest
 pytest examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode \
-    --platform a2a3 --device <d0>,<d1> --manual only
+    --platform a2a3 --device <d0>,<d1>
 ```
 
 The fixture materializes on the order of 100 GiB of host tensors (weights for
