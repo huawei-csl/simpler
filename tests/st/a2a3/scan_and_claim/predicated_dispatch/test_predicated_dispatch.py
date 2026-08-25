@@ -28,6 +28,8 @@ never stalls on it. Chain:
          Y = 999.0. Proves the dispatch path is taken when the predicate holds.
 """
 
+import os
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -37,6 +39,10 @@ SENTINEL = 42.0
 POISON = 999.0  # what the clobber writes if the predicate lets it dispatch
 INIT_VAL = -1.0
 
+
+# M4 sweeps the AICPU thread count without editing this file:
+#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestPredicatedDispatch(SceneTestCase):
@@ -91,13 +97,13 @@ class TestPredicatedDispatch(SceneTestCase):
         {
             "name": "PredicateFalseSkips",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
             "params": {"case": 1},
         },
         {
             "name": "PredicateTrueDispatches",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
             "params": {"case": 2},
         },
     ]

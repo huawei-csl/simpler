@@ -24,12 +24,18 @@ instead of one link per pass. Case 4 (18-way dummy fanout then fanin) covers
 the dense-dependency variant.
 """
 
+import os
+
 from copy import deepcopy
 from pathlib import Path
 
 from simpler_setup import scene_test
 from tests.st.a2a3.tensormap_and_ringbuffer.dummy_task.test_dummy_task import TestDummyTask as _TmrBase
 
+
+# M4 sweeps the AICPU thread count without editing this file:
+#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestDummyTaskScanAndClaim(_TmrBase):
@@ -47,7 +53,7 @@ class TestDummyTaskScanAndClaim(_TmrBase):
         {
             **deepcopy(case),
             "platforms": ["a2a3"],
-            "config": {**deepcopy(case.get("config", {})), "aicpu_thread_num": 1},
+            "config": {**deepcopy(case.get("config", {})), "aicpu_thread_num": _SAC_THREADS},
         }
         for case in _TmrBase.CASES
     ]

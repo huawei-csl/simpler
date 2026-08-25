@@ -214,13 +214,16 @@ private:
 
     // scan_and_claim: complete_slot_task retires tasks inline but has no Runtime*
     // to hand fail_scheduler, so a completion error is latched here and raised by
-    // the dispatch loop on its next turn.
-    int32_t inline_complete_error_{SIMPLER_ERROR_NONE};
+    // the dispatch loop on its next turn. Atomic because every thread can write
+    // it; first error wins and the rest are redundant.
+    std::atomic<int32_t> inline_complete_error_{SIMPLER_ERROR_NONE};
 
-    // Dependency-only tasks retired inside the scan this pass. Consumed by the
-    // dispatch loop as forward progress, so a pass that only cleared a chain of
-    // dummies does not count toward the hang budget.
-    int32_t inline_retired_this_pass_{0};
+    // Dependency-only tasks retired inside the scan this pass, PER THREAD. Each
+    // thread reads and clears only its own slot, so no atomics are needed — but a
+    // single shared counter would be a data race the moment N > 1. Consumed by
+    // the dispatch loop as forward progress, so a pass that only cleared a chain
+    // of dummies does not count toward the hang budget.
+    int32_t inline_retired_this_pass_[MAX_AICPU_THREADS]{};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};

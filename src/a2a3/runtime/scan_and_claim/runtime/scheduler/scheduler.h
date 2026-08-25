@@ -682,6 +682,10 @@ struct PTO2SchedulerState {
             // sees its dependency met. hbg needed a bounded drain loop
             // (DUMMY_DRAIN_BATCH) to get the same effect.
             if (shape == PTO2ResourceShape::DUMMY || predicate_failed) {
+                // Claim before retiring: with N > 1, two threads can find the
+                // same dep-only task ready in the same instant. The flag CAS
+                // makes exactly one of them the retirer; the loser skips.
+                if (!ring.try_claim_completion_flag(i)) continue;
 #if SIMPLER_SCHED_PROFILING
                 TaskCompletionOutcome outcome = complete_task(s, thread_idx);
 #else

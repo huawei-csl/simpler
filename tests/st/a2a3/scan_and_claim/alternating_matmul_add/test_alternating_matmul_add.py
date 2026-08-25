@@ -13,6 +13,8 @@ Tests interleaved AIC matmul and AIV add execution with scalar parameters and
 batched task submission.
 """
 
+import os
+
 import ctypes
 
 import torch
@@ -22,6 +24,10 @@ from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, sce
 
 TMR_CASE = "../../tensormap_and_ringbuffer/alternating_matmul_add"
 
+
+# M4 sweeps the AICPU thread count without editing this file:
+#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestAlternatingMatmulAddScanAndClaim(SceneTestCase):
@@ -56,20 +62,20 @@ class TestAlternatingMatmulAddScanAndClaim(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
             "params": {"batch": 1, "M": 1, "N": 1, "matmul_batch": 1, "add_batch": 1},
         },
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
             "params": {"batch": 500, "M": 4, "N": 4, "matmul_batch": 4, "add_batch": 4},
             "manual": True,
         },
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
             "params": {"batch": 512, "M": 2, "N": 5, "matmul_batch": 4, "add_batch": 5},
             "manual": True,
         },

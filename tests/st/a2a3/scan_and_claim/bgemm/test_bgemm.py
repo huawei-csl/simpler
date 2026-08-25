@@ -13,6 +13,8 @@ Computation: C = C_init + A @ B (4x4x4 grid, 64x64 tiles).
 Tests AIC (Cube) + AIV (Vector) cooperation with tile-first memory layout.
 """
 
+import os
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -27,6 +29,10 @@ GRID_N = 4
 BATCH = 1
 C_BASE = 0.25
 
+
+# M4 sweeps the AICPU thread count without editing this file:
+#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestBgemmScanAndClaim(SceneTestCase):
@@ -62,7 +68,7 @@ class TestBgemmScanAndClaim(SceneTestCase):
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
             "params": {},
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
         },
     ]
 

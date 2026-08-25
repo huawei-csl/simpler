@@ -201,7 +201,10 @@ void SchedulerContext::complete_slot_task(
         if (outcome.error_code != SIMPLER_ERROR_NONE) {
             // complete_slot_task has no Runtime* to hand fail_scheduler, so latch
             // the code and let the dispatch loop raise it on the next turn.
-            inline_complete_error_ = outcome.error_code;
+            int32_t no_err = SIMPLER_ERROR_NONE;
+            inline_complete_error_.compare_exchange_strong(
+                no_err, outcome.error_code, std::memory_order_acq_rel, std::memory_order_relaxed
+            );
         } else {
             completed_this_turn += outcome.stream_tasks_completed;
         }

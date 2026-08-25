@@ -111,6 +111,27 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         completion_flags[local_id & task_window_mask].store(1, order);
     }
 
+    // scan_and_claim: atomically claim the right to retire a task, by being the
+    // thread that flips its completion flag 0 -> 1. Exactly one caller wins.
+    //
+    // This exists for **dependency-only** tasks (DUMMY / predicate-false), which
+    // are retired inline by whichever thread's scan first finds them ready. A
+    // task that needs cores is claimed by claim_block_range's CAS instead, but a
+    // dep-only task occupies no core and so has no block to claim — without this,
+    // two threads scanning concurrently both retire it and the run's completed
+    // count double-counts.
+    //
+    // Publishing the flag *before* the rest of the retire is safe here precisely
+    // because these tasks produce no data: there is nothing for a consumer to
+    // read early. Losers simply observe the flag set and skip the task as
+    // already-retired, using the same test the scan already performs.
+    bool try_claim_completion_flag(int32_t local_id) const {
+        uint8_t expected = 0;
+        return completion_flags[local_id & task_window_mask].compare_exchange_strong(
+            expected, 1, std::memory_order_acq_rel, std::memory_order_relaxed
+        );
+    }
+
     // set completion flag first before updating the watermark (logic requirement)
     void update_completed_watermark() {
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);

@@ -13,11 +13,17 @@ Computation: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)
 Diamond topology: t0(AIV) -> t1(AIC), t2(AIC) -> t3(AIV).
 """
 
+import os
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
+
+# M4 sweeps the AICPU thread count without editing this file:
+#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestMatmulScanAndClaim(SceneTestCase):
@@ -60,7 +66,7 @@ class TestMatmulScanAndClaim(SceneTestCase):
             "platforms": ["a2a3sim", "a2a3"],
             "manual": True,
             "params": {},
-            "config": {"aicpu_thread_num": 1},
+            "config": {"aicpu_thread_num": _SAC_THREADS},
         },
     ]
 

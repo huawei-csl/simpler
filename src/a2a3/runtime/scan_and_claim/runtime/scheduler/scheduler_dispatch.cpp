@@ -123,7 +123,7 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
     if (retired_inline > 0) {
         completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
-        inline_retired_this_pass_ += retired_inline;
+        inline_retired_this_pass_[thread_idx] += retired_inline;
     }
     return count;
 #else
@@ -131,7 +131,7 @@ int SchedulerContext::pop_ready_tasks_batch(
 #endif
     if (retired_inline > 0) {
         completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
-        inline_retired_this_pass_ += retired_inline;
+        inline_retired_this_pass_[thread_idx] += retired_inline;
     }
     return count;
 }
@@ -1043,8 +1043,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             );
             // scan_and_claim: inline retirement happens inside complete_slot_task,
             // which cannot reach fail_scheduler; surface any latched error here.
-            if (inline_complete_error_ != SIMPLER_ERROR_NONE) {
-                fail_scheduler(runtime, thread_idx, inline_complete_error_);
+            const int32_t inline_err = inline_complete_error_.load(std::memory_order_acquire);
+            if (inline_err != SIMPLER_ERROR_NONE) {
+                fail_scheduler(runtime, thread_idx, inline_err);
                 break;
             }
         }
@@ -1230,7 +1231,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
-        inline_retired_this_pass_ = 0;
+        inline_retired_this_pass_[thread_idx] = 0;
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
@@ -1274,11 +1275,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
         [[maybe_unused]] int32_t staged_count =
             try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
-        if (inline_retired_this_pass_ > 0) {
+        if (inline_retired_this_pass_[thread_idx] > 0) {
             // Clearing a chain of dependency-only tasks is real forward progress
             // even when no core moved, so it must reset the hang budget.
             made_progress = true;
-            inline_retired_this_pass_ = 0;
+            inline_retired_this_pass_[thread_idx] = 0;
         }
 #if SIMPLER_DFX
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
