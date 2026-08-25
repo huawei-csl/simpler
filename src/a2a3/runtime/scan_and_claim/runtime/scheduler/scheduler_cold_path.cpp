@@ -709,20 +709,18 @@ bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
     //
-    // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
-    // partition across the remaining (aicpu_thread_num_ - 1) scheduler threads
-    // only, so P never owns a cluster and never polls a COND register. P is
-    // mandatory — like tmr's scheduler + orchestrator split, host_build_graph
-    // needs at least two AICPU threads (one S + one P); one thread cannot own
-    // cores and resolve on a dedicated thread at once.
-    if (aicpu_thread_num_ < 2) {
-        LOG_ERROR(
-            "host_build_graph requires aicpu_thread_num >= 2 (1 scheduler + 1 resolution); got %d", aicpu_thread_num_
-        );
+    // scan_and_claim: N symmetric threads, every one of them core-owning. There
+    // is no dedicated resolution thread, because there is nothing to resolve on
+    // a separate thread: readiness is derived by scanning completion flags, so
+    // the thread that retires a task publishes one flag and is done. That makes
+    // aicpu_thread_num == 1 a legal, and for bring-up the *preferred*,
+    // configuration — the hbg gate demanding >= 2 (1 scheduler + 1 resolution)
+    // is therefore gone.
+    if (aicpu_thread_num_ < 1) {
+        LOG_ERROR("scan_and_claim requires aicpu_thread_num >= 1; got %d", aicpu_thread_num_);
         return false;
     }
-    p_thread_idx_ = aicpu_thread_num_ - 1;
-    active_sched_threads_ = aicpu_thread_num_ - 1;
+    active_sched_threads_ = aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
 
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
@@ -1053,29 +1051,6 @@ void SchedulerContext::on_orchestration_done(
 ) {
     total_tasks_ = total_tasks;
 
-    // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
-    // releases runtime_init_ready_ — no scheduler thread can push until then.
-    // Completed-but-unresolved tasks in flight are bounded by BOTH the total task
-    // count and the ring's task window (a task must occupy a ring slot to run and
-    // complete), so size to the tighter of the two, rounded up to a power of two
-    // and floored at 256. The window already caps this, so there is no artificial
-    // ceiling and a producer never has to spin on a full queue.
-    uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
-    if (sched_->ring_sched_state.ring != nullptr) {
-        uint64_t window = static_cast<uint64_t>(sched_->ring_sched_state.ring->task_window_mask) + 1;
-        if (window < sp_bound) {
-            sp_bound = window;
-        }
-    }
-    uint64_t sp_cap = 256;
-    while (sp_cap < sp_bound) {
-        sp_cap <<= 1;
-    }
-    for (int32_t t = 0; t < active_sched_threads_; t++) {
-        sp_queues_[t].destroy();  // free a prior run's buffer before re-alloc
-        sp_queues_[t].init(sp_cap);
-    }
-
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->inline_completed_tasks);
     if (inline_completed > 0) {
@@ -1096,12 +1071,6 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-    // The polling initial classify (seed the ready queues + wake lists for the
-    // whole graph) runs AFTER this, partitioned across all AICPU threads in
-    // classify_partition() — see AicpuExecutor::run. It is kept out of this
-    // leader-only setup so the O(total_tasks) scan is not serial on one thread
-    // while the others idle-wait for runtime_init_ready_.
-
 #if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
     // scheduler threads' final core distribution.
@@ -1114,38 +1083,4 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 #endif
-}
-
-// Polling initial classify (device boot), partitioned across all AICPU threads.
-// Each thread classifies its contiguous slice of the submitted-task range
-// exactly once. Graph tasks additionally enter the bounded preparation queue;
-// their external fanin follows the same ready/wake classification as any other
-// outer task.
-void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
-    if (completed_.load(std::memory_order_acquire) || sched_->ring_sched_state.ring == nullptr) {
-        return;
-    }
-    PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
-    const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
-    // Disjoint contiguous slices covering [0, submitted): thread t owns
-    // [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
-    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
-    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
-    for (int32_t id = lo; id < hi; id++) {
-        if (ring.is_completion_flag_set(id)) {
-            continue;  // completed on the host (hidden alloc); nothing to dispatch
-        }
-        ChipTaskSlotState &slot = ring.get_slot_state_by_task_id(id);
-        if (slot.task_kind == TaskKind::GRAPH) {
-            if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.task->task_id.raw, thread_idx)) return;
-        }
-        int32_t state = sched_->classify_fanin_state(&slot);
-        if (state < 0) {
-            sched_->push_ready_routed(&slot);
-        } else {
-            int32_t prod_local = slot.payload->fanin_data()[state];
-            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &slot);
-        }
-    }
 }

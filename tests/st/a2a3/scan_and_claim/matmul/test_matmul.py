@@ -7,10 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Vector example — scan_and_claim runtime with host-side DAG building.
+"""Matmul diamond — scan_and_claim runtime with AIC+AIV mixed execution.
 
-Computation: f = (a + b + 1) * (a + b + 2), where a=2.0, b=3.0, so f=42.0.
-Tests scan_and_claim runtime with intermediate tensors allocated from HeapRing.
+Computation: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)
+Diamond topology: t0(AIV) -> t1(AIC), t2(AIC) -> t3(AIV).
 """
 
 import torch
@@ -20,34 +20,34 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
 @scene_test(level=2, runtime="scan_and_claim")
-class TestVectorExampleScanAndClaim(SceneTestCase):
-    """Vector example: f = (a + b + 1) * (a + b + 2) via host-side DAG."""
+class TestMatmulScanAndClaim(SceneTestCase):
+    """Matmul diamond: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)."""
 
-    RTOL = 1e-5
-    ATOL = 1e-5
+    RTOL = 1e-2
+    ATOL = 1e-2
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/example_orch.cpp",
+            "source": "kernels/orchestration/matmul_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.OUT],
+            "signature": [D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
             {
                 "func_id": 0,
-                "source": "kernels/aiv/kernel_add.cpp",
-                "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-            },
-            {
-                "func_id": 1,
-                "source": "kernels/aiv/kernel_add_scalar.cpp",
+                "source": "kernels/aiv/kernel_log_sqrt.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT],
             },
             {
+                "func_id": 1,
+                "source": "kernels/aic/kernel_matmul.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
                 "func_id": 2,
-                "source": "kernels/aiv/kernel_mul.cpp",
+                "source": "kernels/aiv/kernel_add_exp.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
             },
@@ -58,28 +58,44 @@ class TestVectorExampleScanAndClaim(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": True,
             "params": {},
             "config": {"aicpu_thread_num": 1},
         },
     ]
 
     def generate_args(self, params):
-        SIZE = 128 * 128
-        a = torch.full((SIZE,), 2.0, dtype=torch.float32)
-        b = torch.full((SIZE,), 3.0, dtype=torch.float32)
+        ROWS = 128
+        COLS = 128
+        SIZE = ROWS * COLS
+
+        input_value = torch.exp(torch.tensor(4.0)).item()
+        weight_value = 1.0 / (2 * COLS)
+
+        a = torch.full((SIZE,), input_value, dtype=torch.float16)
+        w1 = torch.full((SIZE,), weight_value, dtype=torch.float16)
+        w2 = torch.full((SIZE,), weight_value, dtype=torch.float16)
         f = torch.zeros(SIZE, dtype=torch.float32)
 
         return TaskArgsBuilder(
             TensorArg("a", a),
-            TensorArg("b", b),
+            TensorArg("w1", w1),
+            TensorArg("w2", w2),
             TensorArg("f", f),
         )
 
     def compute_golden(self, args, params):
-        a = args.a
-        b = args.b
-        args.f[:] = (a + b + 1) * (a + b + 2)
+        ROWS = 128
+        COLS = 128
+
+        a = args.a.reshape(ROWS, COLS).to(torch.float32)
+        w1 = args.w1.reshape(ROWS, COLS).to(torch.float32)
+        w2 = args.w2.reshape(ROWS, COLS).to(torch.float32)
+
+        b = torch.sqrt(torch.log(a))
+        c = torch.matmul(b, w1)
+        d = torch.matmul(b, w2)
+        args.f[:] = torch.exp(c + d).flatten().to(torch.float32)
 
 
 if __name__ == "__main__":

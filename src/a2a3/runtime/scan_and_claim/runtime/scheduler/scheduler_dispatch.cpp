@@ -91,20 +91,28 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
     return false;
 }
 
+// scan_and_claim: task discovery. Same signature and same contract as hbg's
+// queue pop — "give me up to max_count dispatchable tasks of this shape" — so
+// dispatch_shape and everything below it is untouched. `queues` is now unused:
+// readiness is derived from the ring's completion flags instead of read out of a
+// queue somebody pushed into.
 int SchedulerContext::pop_ready_tasks_batch(
     PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
 ) {
+    (void)queues;
+    // Inline retirements (dummy / predicate-false) are completions that no core
+    // will ever report, so they are accounted here, at the one place every scan
+    // funnels through.
+    int32_t retired_inline = 0;
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #if SIMPLER_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
-    int count = sched_->get_ready_tasks_batch(
-        queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
-    );
+    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
     chip_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
 #endif
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -113,10 +121,18 @@ int SchedulerContext::pop_ready_tasks_batch(
             chip_swimlane.pop_miss++;
         }
     }
+    if (retired_inline > 0) {
+        completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
+        inline_retired_this_pass_ += retired_inline;
+    }
+    return count;
 #else
-    (void)thread_idx;
-    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
 #endif
+    if (retired_inline > 0) {
+        completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
+        inline_retired_this_pass_ += retired_inline;
+    }
     return count;
 }
 
@@ -404,7 +420,8 @@ void SchedulerContext::dispatch_shape(
                 auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
                 selected_mix_clusters = tracker.get_mix_cluster_offset_states(cmask, wanted) & cores;
                 if (!selected_mix_clusters.has_value()) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    // scan_and_claim: no re-push. The task is unretired with
+                    // unclaimed blocks, so the next scan finds it again.
                     continue;
                 }
             }
@@ -415,18 +432,14 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
-                    continue;
+                    continue;  // scan_and_claim: rediscovered by the next scan
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
-                    if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
-                    }
-                    for (int rem = bi + 1; rem < got; rem++) {
-                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
-                    }
+                    (void)enter_drain_mode(slot_state, slot_state->logical_block_num);
+                    // scan_and_claim: neither this slot nor the untouched tail of
+                    // the batch needs re-pushing — the scan re-derives both.
                     entered_drain = true;
                     break;
                 }
@@ -434,10 +447,12 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 flush_publish();
-                // These came off this queue and no other owner holds them, so a
-                // drop would lose them: retry until the space they vacated is
-                // free again.
-                while (!disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi)) {}
+                // scan_and_claim: the unbounded retry-push that used to live here
+                // was only needed because a dropped queue entry was lost forever.
+                // Nothing pops these queues any more, so retrying would spin
+                // until the queue filled and then never exit. The batch tail is
+                // simply abandoned; every one of its tasks is still unretired
+                // with unclaimed blocks and is found again by the next scan.
                 break;
             }
 
@@ -459,9 +474,10 @@ void SchedulerContext::dispatch_shape(
             published_counts[published_n] = static_cast<int16_t>(claim);
             published_n++;
 
-            if (start + claim < slot_state->logical_block_num) {
-                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
-            }
+            // scan_and_claim: a partially-claimed SPMD task keeps
+            // next_block_idx < logical_block_num, which is exactly the scan's
+            // "still claimable" test, so peers pick up the remaining blocks
+            // without any re-push.
 
             for (int32_t b = 0; b < claim; b++) {
                 auto core_offset = is_mix ? selected_mix_clusters.pop_first() : cores.pop_first();
@@ -567,25 +583,14 @@ void SchedulerContext::dispatch_ready_tasks(
     // signals a stop by setting entered_drain when it enters a sync_start drain.
     bool entered_drain = false;
 
-    // Tier 0: ready sync_start cohorts take cores before any regular ready task
-    // (sync_start > MIX > C/V within the normal source). Same order and machinery,
-    // fed from ready_sync_queues; an oversized cohort arms the stop-the-world drain
-    // (entered_drain), which also short-circuits the regular tier below.
-    run_staging_order(
-        thread_idx, pmu_active,
-        [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            dispatch_shape(
-                thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
-            );
-            return entered_drain;
-        },
-        [&] {
-            return has_residual_sync_mix();
-        }
-    );
-    if (entered_drain) return;
-
-    // Tier 1: regular ready work.
+    // scan_and_claim v1: no sync_start tier. hbg ran a Tier 0 over
+    // ready_sync_queues before regular work; discovery is now a single scan, so a
+    // second tier would just re-examine the same task ids. Tasks that require a
+    // sync_start cohort are skipped by the scan and therefore never dispatch —
+    // deliberate for v1 (see the plan's "deliberate v1 simplifications"), and the
+    // reason spmd_sync_start_stress is not in the M2 gate.
+    //
+    // Single tier: regular ready work.
     run_staging_order(
         thread_idx, pmu_active,
         [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
@@ -879,184 +884,6 @@ int32_t SchedulerContext::try_early_dispatch(
 }
 
 // =============================================================================
-// Dedicated resolution (P) thread — 3S+1P
-// =============================================================================
-
-// P owns no AICore cores. It drains the per-S CompletedTaskQueues and runs
-// on_task_complete for every finished task: publish completion_flags, drain the
-// wake list (route/re-register waiters into the ready queues), advance the
-// watermark. As the sole producer of the ready queues its enqueues never
-// contend. P owns completed_tasks_ and the terminal completed_ flip, so the S
-// threads keep dispatching until P has resolved the whole graph (watermark fully
-// advanced) — the host's wait_for_consumers never observes a stranded prefix.
-int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread_idx) {
-    always_assert(sched_ != nullptr);
-    PTO2SharedMemoryHeader *header = sched_->sm_header;
-    if (!header) {
-        LOG_ERROR("PTO2 resolution: header is null");
-        return -1;
-    }
-    LOG_INFO("Thread %d: resolution (P) thread starting, serving %d schedulers", thread_idx, active_sched_threads_);
-
-#if SIMPLER_DFX
-    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
-    chip_swimlane.reset();
-    chip_swimlane.chip_swimlane_enabled = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-#endif
-
-    uint64_t last_progress_ts = get_sys_cnt_aicpu();
-    uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
-    const int32_t scheduler_timeout_ms_override = get_scheduler_timeout_ms();
-    if (scheduler_timeout_ms_override > 0) {
-        scheduler_timeout_cycles =
-            static_cast<uint64_t>(scheduler_timeout_ms_override) * PLATFORM_PROF_SYS_CNT_FREQ / 1000;
-    }
-
-    while (true) {
-        if (completed_.load(std::memory_order_acquire)) break;
-
-        int32_t published_task_count = 0;
-        if (handle_orchestrator_exit(thread_idx, header, runtime, published_task_count) == LoopAction::BREAK_LOOP)
-            break;
-
-        int32_t resolved_this_pass = 0;
-        bool resolved_any = false;
-        for (int32_t s = 0; s < active_sched_threads_ && !completed_.load(std::memory_order_acquire); s++) {
-            ChipTaskSlotState *slot;
-            while ((slot = sp_queues_[s].pop()) != nullptr) {
-#if SIMPLER_SCHED_PROFILING
-                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot, thread_idx);
-#else
-                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot);
-#endif
-                if (outcome.error_code != SIMPLER_ERROR_NONE) {
-                    fail_scheduler(runtime, thread_idx, outcome.error_code);
-                    break;
-                }
-                resolved_this_pass += outcome.stream_tasks_completed;
-                resolved_any = true;
-            }
-        }
-        if (completed_.load(std::memory_order_acquire)) break;
-
-        // Async deferred completions, moved off the scheduler threads. Every
-        // condition that fires resolves via on_task_complete inside
-        // poll_and_complete, so async ready tasks also enter the ready queues
-        // through P alone.
-        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
-            (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
-            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_
-#if SIMPLER_SCHED_PROFILING
-                ,
-                thread_idx
-#endif
-            );
-            if (poll_result.error_code != SIMPLER_ERROR_NONE) {
-                fail_scheduler(runtime, thread_idx, poll_result.error_code);
-                break;
-            }
-            resolved_this_pass += poll_result.completed;
-            resolved_any = resolved_any || poll_result.resolved > 0;
-        }
-
-        // Dependency-only tasks (empty active_mask, or a predicate that failed)
-        // route to dummy_ready_queue during resolution; P produces and drains it,
-        // so the queue is single-threaded end to end. Loop until empty — a dummy's
-        // resolution can make further dummies ready in the same pass.
-        {
-            constexpr int DUMMY_DRAIN_BATCH = 8;
-            ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
-            int dummy_got;
-            while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
-                for (int di = 0; di < dummy_got; di++) {
-#if SIMPLER_SCHED_PROFILING
-                    PTO2SchedulerState::TaskCompletionOutcome outcome =
-                        sched_->complete_task(*dummy_batch[di], thread_idx);
-#else
-                    PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
-#endif
-                    if (outcome.error_code != SIMPLER_ERROR_NONE) {
-                        fail_scheduler(runtime, thread_idx, outcome.error_code);
-                        break;
-                    }
-                    resolved_this_pass += outcome.stream_tasks_completed;
-                    resolved_any = true;
-                }
-                if (completed_.load(std::memory_order_acquire)) break;
-            }
-        }
-        if (completed_.load(std::memory_order_acquire)) break;
-
-        if (resolved_any) {
-            if (resolved_this_pass > 0) {
-                completed_tasks_.fetch_add(resolved_this_pass, std::memory_order_relaxed);
-#if SIMPLER_SCHED_PROFILING
-                // P owns the completion accounting, so it owns the profiling mirror too
-                // (the S threads' completed_this_turn no longer feeds it in P mode).
-                sched_->tasks_completed.fetch_add(resolved_this_pass, std::memory_order_relaxed);
-#endif
-            }
-            last_progress_ts = get_sys_cnt_aicpu();
-            continue;  // fast re-drain while work keeps arriving
-        }
-
-        // Idle: nothing to resolve this pass. A task legitimately in flight — some
-        // thread still owns a RUNNING core — means P is merely waiting for that
-        // task to finish, not stalled: refresh the budget and keep spinning
-        // (mirrors resolve_and_dispatch's sibling-owns-running guard, so a task
-        // that runs longer than the timeout does not false-latch here). Only latch
-        // a hang when work is outstanding AND no thread anywhere owns a running
-        // task — a genuine forward-progress stall / pre-dispatch deadlock.
-        uint64_t now = get_sys_cnt_aicpu();
-        if (now - last_progress_ts > scheduler_timeout_cycles) {
-            const int32_t total = total_tasks_;
-            bool outstanding = total > 0 && completed_tasks_.load(std::memory_order_relaxed) < total;
-            if (outstanding && no_thread_owns_running_task()) {
-                LOG_ERROR(
-                    "Thread %d: P resolution stall (%d/%d resolved)", thread_idx,
-                    completed_tasks_.load(std::memory_order_relaxed), total
-                );
-                int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
-                    expected, SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_acq_rel, std::memory_order_acquire
-                );
-                if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-                    emergency_shutdown(runtime);
-                }
-                break;
-            }
-            last_progress_ts = now;  // a task is still running (or none outstanding): not a stall
-        }
-        SPIN_WAIT_HINT();
-    }
-
-#if SIMPLER_DFX
-    // P owns no cores, so the AICore-keyed flushes below iterate an empty core
-    // list; the sched-phase-buffer flush is the one that matters — it drains any
-    // per-thread records P wrote (e.g. under SCHED_PROFILING) so they are not lost.
-    if (chip_swimlane.chip_swimlane_enabled) {
-        chip_swimlane_aicpu_flush(
-            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
-        );
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
-            chip_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
-        }
-    }
-    if (is_dump_args_enabled()) {
-        dump_args_flush(thread_idx);
-    }
-    if (is_pmu_enabled()) {
-        pmu_aicpu_flush_buffers(
-            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
-        );
-    }
-#endif
-
-    return completed_tasks_.load(std::memory_order_relaxed);
-}
-
-// =============================================================================
 // Main scheduler dispatch loop
 // =============================================================================
 
@@ -1214,6 +1041,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress
             );
+            // scan_and_claim: inline retirement happens inside complete_slot_task,
+            // which cannot reach fail_scheduler; surface any latched error here.
+            if (inline_complete_error_ != SIMPLER_ERROR_NONE) {
+                fail_scheduler(runtime, thread_idx, inline_complete_error_);
+                break;
+            }
         }
         if (completed_this_turn > 0) {
 #if SIMPLER_SCHED_PROFILING
@@ -1233,11 +1066,42 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        // Async deferred-completion polling and dependency-only (dummy /
-        // predicate-failed) retirement both run on P, which owns every
-        // completion→ready transition — the scheduler threads' loop stays purely
-        // core-local (poll own COND, dispatch own cores) and never touches the
-        // shared mailbox or dummy queue.
+        // Async deferred-completion polling. In hbg this lived on the resolution
+        // thread P; with P gone it has to live here or it does not happen at all.
+        // That is not a theoretical concern: a task with a subtask that
+        // registered a deferred CONDITION routes its completion through the
+        // AICore mailbox instead of completing inline (see
+        // complete_slot_task's defer_completion_to_consumer), so without this
+        // poll such a task never completes and the run dies of a
+        // forward-progress timeout with no other symptom.
+        //
+        // Dependency-only (dummy / predicate-false) retirement is NOT here — it
+        // happens inside the scan, at the point readiness is established.
+        //
+        // N > 1 caveat: this makes every thread a mailbox consumer. Confirm
+        // poll_and_complete's concurrency contract before raising N above 1 —
+        // hbg only ever called it from the single P thread.
+        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
+            (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
+            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
+                rt_->aicore_mailbox, sched_
+#if SIMPLER_SCHED_PROFILING
+                ,
+                thread_idx
+#endif
+            );
+            if (poll_result.error_code != SIMPLER_ERROR_NONE) {
+                fail_scheduler(runtime, thread_idx, poll_result.error_code);
+                break;
+            }
+            if (poll_result.completed > 0) {
+                completed_tasks_.fetch_add(poll_result.completed, std::memory_order_relaxed);
+                cur_thread_completed += poll_result.completed;
+            }
+            if (poll_result.resolved > 0 || poll_result.completed > 0) {
+                made_progress = true;
+            }
+        }
 
 #if SIMPLER_DFX
         if (!try_completed) {
@@ -1366,6 +1230,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
+        inline_retired_this_pass_ = 0;
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
@@ -1409,6 +1274,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
         [[maybe_unused]] int32_t staged_count =
             try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        if (inline_retired_this_pass_ > 0) {
+            // Clearing a chain of dependency-only tasks is real forward progress
+            // even when no core moved, so it must reset the hang budget.
+            made_progress = true;
+            inline_retired_this_pass_ = 0;
+        }
 #if SIMPLER_DFX
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.

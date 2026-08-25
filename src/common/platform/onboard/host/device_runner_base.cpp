@@ -1534,9 +1534,18 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
 // =============================================================================
 
 int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
-    if (launch_aicpu_num == 1 || launch_aicpu_num < 0 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
+    // The floor used to be 2, rejecting launch_aicpu_num == 1 outright. That was
+    // never a platform constraint — it encoded the two resident runtimes' own
+    // minimums (tensormap: >=1 orchestrator + >=1 scheduler; host_build_graph:
+    // >=1 scheduler + 1 resolution thread). scan_and_claim has N symmetric
+    // core-owning threads and no dedicated resolver, so N == 1 is a valid and
+    // useful configuration for it.
+    //
+    // The minimum is therefore enforced per runtime, where it is actually known:
+    // see each runtime's assign_cores_to_threads.
+    if (launch_aicpu_num < 0 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
-            "launch_aicpu_num (%d) must be 0 (auto) or in range [2, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS
+            "launch_aicpu_num (%d) must be 0 (auto) or in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }

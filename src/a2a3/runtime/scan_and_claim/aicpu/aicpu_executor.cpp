@@ -331,16 +331,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         classify_ready_.store(true, std::memory_order_release);
     }
 
-    // Parallel initial classify. Every AICPU thread waits for the leader's
-    // orchestration setup, seeds its disjoint slice of the whole graph's ready
-    // set + wake lists, then barriers. Only once all slices are done does the
-    // leader publish runtime_init_ready_, so no thread dispatches against a
-    // half-seeded graph.
+    // scan_and_claim: there is no initial classify pass. hbg had to seed the
+    // whole graph's ready set + wake lists here — an O(total_tasks) scan
+    // partitioned across every thread with a barrier on each side, so that no
+    // thread could dispatch against a half-seeded graph. Deriving readiness on
+    // the fly deletes the phase outright: the first scan of the first thread
+    // reads the same completion flags any later scan would.
+    //
+    // The barrier itself is kept. It no longer guards seeding, but it still
+    // orders every thread behind the leader's orchestration setup (SM attached,
+    // task count latched), which the dispatch path does depend on.
     while (!classify_ready_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
-    }
-    if (!sched_ctx_.is_completed() && rt != nullptr) {
-        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
     }
     classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (thread_idx == aicpu_thread_num_ - 1) {
@@ -360,11 +362,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
-            // 3S+1P: the last thread is the core-less resolution (P) thread; the
-            // rest are core-owning schedulers (S).
-            int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
-                                    sched_ctx_.run_resolution_thread(runtime, thread_idx) :
-                                    sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            // scan_and_claim: N symmetric core-owning threads, all running the
+            // same loop. No resolution thread, so no branch on thread_idx.
+            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;

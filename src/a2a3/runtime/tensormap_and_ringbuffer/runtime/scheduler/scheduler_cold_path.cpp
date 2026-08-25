@@ -989,6 +989,21 @@ void SchedulerContext::post_handshake_profiling_init() {
 bool SchedulerContext::assign_cores_to_threads() {
     // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
+    //
+    // tensormap_and_ringbuffer needs at least two AICPU threads: thread N-1 runs
+    // the on-device orchestrator, leaving N-1 core-owning schedulers, so N == 1
+    // means one orchestrator and zero schedulers — nothing would ever dispatch.
+    // This used to be caught only by DeviceRunnerBase::validate_launch_aicpu_num,
+    // whose floor of 2 was relaxed to 1 for runtimes that can legitimately run
+    // single-threaded. State the requirement here, where it is actually known,
+    // so the misconfiguration fails loudly instead of hanging.
+    if (aicpu_thread_num_ < 2) {
+        LOG_ERROR(
+            "tensormap_and_ringbuffer requires aicpu_thread_num >= 2 (1 orchestrator + >=1 scheduler); got %d",
+            aicpu_thread_num_
+        );
+        return false;
+    }
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     int32_t cluster_count = aic_count_;
 

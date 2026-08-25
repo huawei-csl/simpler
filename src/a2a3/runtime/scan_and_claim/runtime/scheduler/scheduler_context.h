@@ -137,16 +137,6 @@ public:
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
-    // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
-    // per-S CompletedTaskQueues and runs on_task_complete for each finished task
-    // (completion_flags publish + wake-list drain + watermark advance), making P
-    // the sole producer of the ready queues. Owns completed_tasks_ / termination.
-    int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
-
-    // Index of the dedicated resolution (P) thread — the last AICPU thread.
-    // host_build_graph always reserves it (aicpu_thread_num >= 2 is required).
-    int32_t p_thread_idx() const { return p_thread_idx_; }
-
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
@@ -160,13 +150,6 @@ public:
     // Callers must invoke rt_orchestration_done(rt) before this — that
     // step belongs to the orchestrator lifecycle, not the scheduler.
     void on_orchestration_done(Runtime *runtime, RuntimeContext *rt, int32_t thread_idx, int32_t total_tasks);
-
-    // Seed the ready queues + wake lists for the whole graph at boot. Called by
-    // every AICPU thread on a disjoint slice of the submitted-task range, after
-    // on_orchestration_done and before runtime_init_ready_ (the caller barriers
-    // all threads between the two). Concurrency-safe: push_ready_routed and
-    // register_wake are the same lock-free primitives used during the run.
-    void classify_partition(int32_t thread_idx, int32_t nthreads);
 
     // Bind the RuntimeContext scheduler pointer.
     void bind_runtime(RuntimeContext *rt);
@@ -229,14 +212,15 @@ private:
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
-    // --- 3S+1P dedicated resolution thread ---
-    // The AICPU threads split into (aicpu_thread_num_ - 1) core-owning schedulers
-    // (S) plus one core-less resolution thread (P) at index p_thread_idx_ =
-    // aicpu_thread_num_ - 1. host_build_graph requires aicpu_thread_num_ >= 2 (one
-    // S + one P). Each S thread hands its finished tasks to P through
-    // sp_queues_[its_thread_idx].
-    int32_t p_thread_idx_{-1};
-    CompletedTaskQueue sp_queues_[MAX_AICPU_THREADS];
+    // scan_and_claim: complete_slot_task retires tasks inline but has no Runtime*
+    // to hand fail_scheduler, so a completion error is latched here and raised by
+    // the dispatch loop on its next turn.
+    int32_t inline_complete_error_{SIMPLER_ERROR_NONE};
+
+    // Dependency-only tasks retired inside the scan this pass. Consumed by the
+    // dispatch loop as forward progress, so a pass that only cleared a chain of
+    // dummies does not count toward the hang budget.
+    int32_t inline_retired_this_pass_{0};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};

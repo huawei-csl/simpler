@@ -186,12 +186,25 @@ void SchedulerContext::complete_slot_task(
             );
         }
 #endif
-        // 3S+1P: hand the finished task to the dedicated resolution (P) thread.
-        // P publishes completion_flags, drains the wake list, and advances the
-        // watermark — and owns completed_tasks_, so this scheduler thread neither
-        // resolves nor bumps completed_this_turn. (The Resolve swimlane bar is
-        // emitted by P, not here.)
-        sp_queues_[thread_idx].push(&slot_state);
+        // scan_and_claim: the thread that dispatched the task retires it, here,
+        // inline. There is no hand-off hop: complete_task publishes the
+        // completion flag and advances the watermark (the cursor), which is all
+        // "resolution" now consists of. completed_this_turn is bumped again
+        // (hbg's 3S+1P had stopped using it, hence the [[maybe_unused]] on the
+        // parameter) so the caller's progress accounting and hang detection see
+        // the completion on the thread that observed it.
+#if SIMPLER_SCHED_PROFILING
+        PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state, thread_idx);
+#else
+        PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state);
+#endif
+        if (outcome.error_code != SIMPLER_ERROR_NONE) {
+            // complete_slot_task has no Runtime* to hand fail_scheduler, so latch
+            // the code and let the dispatch loop raise it on the next turn.
+            inline_complete_error_ = outcome.error_code;
+        } else {
+            completed_this_turn += outcome.stream_tasks_completed;
+        }
 #if SIMPLER_DFX
         chip_swimlane.phase_complete_count++;
 #endif

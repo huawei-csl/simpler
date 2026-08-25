@@ -594,29 +594,121 @@ struct PTO2SchedulerState {
         return -1;
     }
 
-    // Register `consumer` on `producer`'s wake list. If the producer already
-    // completed (head == SENTINEL), re-classify against ALL fanins: route to
-    // ready only when every fanin is met, else re-target the next unmet producer
-    // and retry. Monotonic completion_flags guarantee termination.
-    void register_wake(ChipTaskSlotState *producer, ChipTaskSlotState *consumer) {
+    // =========================================================================
+    // scan_and_claim: task discovery by scanning, not by being pushed to.
+    // =========================================================================
+    //
+    // Find up to `max_count` dispatchable tasks of `want_shape`, scanning task
+    // ids upward from the cursor. Replaces hbg's ready-queue pop.
+    //
+    // The cursor is `completed_watermark`: the highest id whose whole prefix
+    // [0, watermark] has retired. It is initialised to -1, so the first scan
+    // starts at 0. It only ever advances across a *contiguous* run of retired
+    // tasks and stops dead at the first non-retired one — it is a floor, never a
+    // hint, and it never passes a live task. The scan itself walks freely above
+    // that floor; only the floor is contiguity-bound.
+    //
+    // Why scanning upward from the cursor terminates and cannot starve: task ids
+    // are assigned in submission order, which is topological, so every producer
+    // of task i has an id < i. Every id below the cursor has retired by
+    // definition. Therefore the task *at* the cursor always has its dependencies
+    // met — it may be already claimed, or need a core shape this thread has none
+    // free of, but it is never unready.
+    //
+    // v1 scans the whole remaining window rather than a bounded prefix. A bounded
+    // scan is the design's intent and its best property (cost per pass
+    // independent of graph size), but a fixed cap turns the head-of-line case —
+    // a long straggler pinning the cursor while the next CAP entries all depend
+    // on it — from "slow" into "the forward-progress watchdog latches a hang that
+    // isn't one". Correctness first; the cap arrives with its growth rule.
+    //
+    // No `state[]` array and no CAS claim here, because the tree already has
+    // both: `completion_flags` is the RETIRED bit, and `next_block_idx` reaching
+    // `logical_block_num` is the BUSY bit — advanced only through
+    // claim_block_range's compare_exchange, which IS the atomic claim. A
+    // partially-claimed SPMD task stays claimable, which is what lets peers take
+    // its remaining blocks.
+    // `out_retired` returns how many dependency-only tasks this call retired
+    // inline. The caller MUST add it to the run's completed-task count: those
+    // tasks are finished and will never be reported by any core-completion path,
+    // so dropping the number leaves the total permanently short and the
+    // "all tasks done" test can never fire — the run then dies of a
+    // forward-progress timeout with a correctly-executed graph behind it.
+    int scan_ready_tasks_batch(
+        PTO2ResourceShape want_shape, ChipTaskSlotState **out, int max_count, [[maybe_unused]] int thread_idx,
+        int32_t &out_retired
+    ) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
-        while (true) {
-            ChipTaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
-            while (expected != WAKE_LIST_SENTINEL) {
-                consumer->next_in_wake_list = expected;
-                if (producer->wake_list_head.compare_exchange_weak(
-                        expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed
-                    )) {
-                    return;
+        const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
+        int32_t i = ring.completed_watermark.load(std::memory_order_acquire) + 1;
+        if (i < 0) i = 0;
+
+        int found = 0;
+        for (; i < submitted && found < max_count; i++) {
+            // RETIRED. Acquire, so observing the flag also observes the outputs.
+            if (ring.is_completion_flag_set(i)) continue;
+
+            ChipTaskSlotState &s = ring.get_slot_state_by_task_id(i);
+            if (s.task == nullptr || s.payload == nullptr) continue;  // slot not populated
+
+            // v1 gap, skipped rather than mis-dispatched: recorded Graphs need the
+            // activate / materialize path this scan does not implement.
+            //
+            // TaskKind::DUMMY is NOT skipped. It is a first-class kind (KERNEL=0,
+            // DUMMY=1, GRAPH=2, GRAPH_NODE=3), and hbg does not special-case it
+            // either — push_ready_routed branches only on GRAPH, letting a DUMMY
+            // task fall through and be classified by its (empty) active_mask. A
+            // `task_kind != KERNEL` filter here silently strands every dummy in
+            // the graph and the run dies of a forward-progress timeout.
+            if (s.task_kind == TaskKind::GRAPH || s.task_kind == TaskKind::GRAPH_NODE) continue;
+
+            // Dependencies, re-derived from the flags on every visit. There is no
+            // READY memo in v1: a repeat fanin check is a handful of byte loads,
+            // and skipping the memo removes a whole state and its transitions
+            // from the first version that has to be debugged.
+            if (classify_fanin_state(&s) >= 0) continue;
+
+            const PTO2ResourceShape shape = s.active_mask.to_shape();
+            const bool predicate_failed =
+                s.task_attrs.has_predicate() && !s.payload->predicate.pass();
+
+            // A dependency-only task — no active subtask slots, or a predicate
+            // that evaluated false — occupies no core, so waiting for one to
+            // finish would wait forever. Retire it inline, right here.
+            //
+            // Doing it during the scan also makes chains resolve transitively
+            // within a single pass: retiring id k sets its flag before the loop
+            // reaches k+1, so a consumer of k later in this same scan already
+            // sees its dependency met. hbg needed a bounded drain loop
+            // (DUMMY_DRAIN_BATCH) to get the same effect.
+            if (shape == PTO2ResourceShape::DUMMY || predicate_failed) {
+#if SIMPLER_SCHED_PROFILING
+                TaskCompletionOutcome outcome = complete_task(s, thread_idx);
+#else
+                TaskCompletionOutcome outcome = complete_task(s);
+#endif
+                if (outcome.error_code == SIMPLER_ERROR_NONE) {
+                    out_retired += outcome.stream_tasks_completed;
                 }
+                continue;
             }
-            int32_t state = classify_fanin_state(consumer);
-            if (state < 0) {
-                push_ready_routed(consumer);
-                return;
-            }
-            producer = &ring.get_slot_state_by_task_id(consumer->payload->fanin_data()[state]);
+
+            // From here on the task needs cores, so the resource guards apply.
+            // They are deliberately AFTER the dependency-only retirement above: a
+            // task that occupies no core must never be gated on core state, and
+            // in particular must never be judged BUSY by a block counter it does
+            // not use.
+            if (s.task_attrs.requires_sync_start()) continue;  // v1: no cohort drain
+
+            // BUSY: every logical block already claimed by some thread. Advanced
+            // only via claim_block_range's compare_exchange, so this doubles as
+            // the atomic claim; a partially-claimed SPMD task stays claimable.
+            if (s.next_block_idx.load(std::memory_order_acquire) >= s.logical_block_num) continue;
+
+            if (shape != want_shape) continue;
+            out[found++] = &s;
         }
+        return found;
     }
 
     // Producer completion under polling: publish the host-visible task_state
@@ -632,22 +724,16 @@ struct PTO2SchedulerState {
         slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
         ring.set_completion_flag(task_id);
 
-        ChipTaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
-        while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
-            ChipTaskSlotState *next = waiter->next_in_wake_list;
-            if (waiter->payload->fanin_count == 1) {
-                push_ready_routed(waiter);  // single-fanin waiter was waiting only on us
-                waiter = next;
-                continue;
-            }
-            int state = classify_fanin_state(waiter);
-            if (state < 0) {
-                push_ready_routed(waiter);
-            } else {
-                register_wake(&ring.get_slot_state_by_task_id(waiter->payload->fanin_data()[state]), waiter);
-            }
-            waiter = next;
-        }
+        // scan_and_claim: no wake-list drain, and no push of newly-ready
+        // consumers. Publishing the completion_flags byte IS the notification —
+        // every scheduler thread re-derives readiness from those flags on its
+        // next scan, so a consumer that became ready here is found by whoever
+        // scans past it next. This is the whole point of the design: there is no
+        // wakeup to lose, so there is no protocol to get wrong.
+        //
+        // set_completion_flag is a release store and the payload writes precede
+        // it, so a consumer that observes the flag (acquire, via
+        // is_completion_flag_set) also observes this task's outputs.
 
         // completed_watermark = highest id such that every task in [0, watermark]
         // has its completion_flags byte set. The host wait_for_consumers gates on
@@ -878,19 +964,6 @@ struct PTO2SchedulerState {
     // consumer-pull publish_flags design. sync_start cohorts still launch via
     // ready_sync_queues (unaffected).
     void propagate_dispatch_fanin(ChipTaskSlotState & /*p*/) {}
-
-    int get_ready_tasks_batch(PTO2ReadyQueue *queues, PTO2ResourceShape shape, ChipTaskSlotState **out, int max_count) {
-        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
-    }
-
-#if SIMPLER_SCHED_PROFILING
-    int get_ready_tasks_batch(
-        PTO2ReadyQueue *queues, PTO2ResourceShape shape, ChipTaskSlotState **out, int max_count, uint64_t &atomic_count,
-        uint64_t &wait_cycle
-    ) {
-        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count, atomic_count, wait_cycle);
-    }
-#endif
 
     // Orch owns dependency discovery and saves the immutable fanin wire.
     // Scheduler polling only chooses which already-wired producer a consumer

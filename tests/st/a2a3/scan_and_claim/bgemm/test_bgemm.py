@@ -62,6 +62,7 @@ class TestBgemmScanAndClaim(SceneTestCase):
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
             "params": {},
+            "config": {"aicpu_thread_num": 1},
         },
     ]
 
