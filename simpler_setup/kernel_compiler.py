@@ -296,6 +296,10 @@ class KernelCompiler:
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
         if runtime_name == "host_build_graph":
             return self.host_gxx
+        if runtime_name == "scan_and_claim":
+            # Host-orchestrated like host_build_graph: the orchestration .so is
+            # dlopen'd on the host, so it is built with the host toolchain.
+            return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
             if self.platform.endswith("sim"):
                 return self.host_gxx
