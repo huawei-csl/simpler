@@ -40,7 +40,11 @@ from simpler_setup.log_config import configure_logging
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RUNTIME = "tensormap_and_ringbuffer"
+# Overridable so the same fatal-code suite can validate any runtime that
+# implements the async completion contract, not just tensormap_and_ringbuffer.
+# Read at import time because @pytest.mark.runtime(RUNTIME) below is evaluated
+# during collection. Default unchanged.
+RUNTIME = os.environ.get("SIMPLER_FATAL_CODES_RUNTIME", "tensormap_and_ringbuffer")
 KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
 
@@ -288,7 +292,9 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
     handle = worker.register(chip_callable)
     worker.init()
     config = CallConfig()
-    config.aicpu_thread_num = 2
+    # Overridable: scan_and_claim can legitimately run single-threaded, and the
+    # async-completion contract under test is thread-count independent.
+    config.aicpu_thread_num = int(os.environ.get("SIMPLER_FATAL_CODES_THREADS", "2"))
     for key, value in case["runtime_env"].items():
         setattr(config.runtime_env, key, value)
     return worker, handle, config
