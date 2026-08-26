@@ -17,6 +17,7 @@
  *   tensor(0) input   INPUT           (plain device mem, staged in by bootstrap)
  *   tensor(1) output  OUTPUT_EXISTING (plain device mem, flushed by bootstrap)
  *   tensor(2) scratch INOUT           (HCCL window slot; cross-rank read/write)
+ *   tensor(3) timing  OUTPUT          (host-backed; Phase-2 barrier timestamps)
  *   scalar(0) nranks
  *   scalar(1) CommContext device pointer
  *
@@ -35,7 +36,7 @@ __attribute__((visibility("default"))) OrchestrationConfig
 allreduce_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 5,  // 3 tensors + 2 scalars
+        .expected_arg_count = 6,  // 4 tensors + 2 scalars
     };
 }
 
@@ -43,11 +44,14 @@ __attribute__((visibility("default"))) void allreduce_orchestration(const ChipTa
     const ChipTensor &input = orch_args.tensor(0).ref();
     const ChipTensor &output = orch_args.tensor(1).ref();
     const ChipTensor &scratch = orch_args.tensor(2).ref();
+    const ChipTensor &timing = orch_args.tensor(3).ref();
 
     CoreTaskArgs params;
     params.add_input(input);
     params.add_output(output);
     params.add_inout(scratch);
+    // Phase-2 barrier timestamps, written by the kernel and read back on the host.
+    params.add_output(timing);
     params.add_scalar(orch_args.scalar(0));  // nranks
     params.add_scalar(orch_args.scalar(1));  // CommContext
     rt_submit_aiv_task(0, params);

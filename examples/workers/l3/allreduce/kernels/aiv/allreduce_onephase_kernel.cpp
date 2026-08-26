@@ -35,6 +35,7 @@
 #include "pto/comm/comm_types.hpp"
 #include "pto/comm/pto_comm_inst.hpp"
 #include "platform_comm/comm_context.h"
+#include "aicore/aicore.h"  // get_sys_cnt_aicore()
 #include "tensor.h"
 
 #ifndef __gm__
@@ -59,13 +60,20 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ ChipTensor *output_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ ChipTensor *scratch_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
-    int nranks = static_cast<int>(args[3]);
-    __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
+    __gm__ ChipTensor *timing_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[3]);
+    int nranks = static_cast<int>(args[4]);
+    __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[5]);
 
     __gm__ float *input = reinterpret_cast<__gm__ float *>(input_tensor->buffer.addr) + input_tensor->start_offset;
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
     __gm__ float *scratch =
         reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
+    // Phase-2 barrier timing, read back by the host: slot 0 = barrier entry,
+    // slot 1 = all TNOTIFYs issued, slot 2+peer = that peer's TWAIT satisfied.
+    // Raw get_sys_cnt_aicore() ticks; the host converts to a comm lane.
+    __gm__ int64_t *timing =
+        reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
+
     // Signal area sits at the tail of the scratch buffer: nranks int32 slots.
     // Peer r writes into my_rank's signal[r] when its stage-in is done.
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + ALLREDUCE_COUNT);
@@ -113,16 +121,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // stage-in is visible, then waits until every peer has notified us.
     // After this point the scratch data on all ranks is readable.
     // ------------------------------------------------------------------
+    timing[0] = static_cast<int64_t>(get_sys_cnt_aicore());
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
+    timing[1] = static_cast<int64_t>(get_sys_cnt_aicore());
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         pto::comm::Signal sig(signal_base + peer);
         pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
+        timing[2 + peer] = static_cast<int64_t>(get_sys_cnt_aicore());
     }
     pipe_barrier(PIPE_ALL);
 

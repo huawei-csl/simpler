@@ -48,6 +48,7 @@ from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _F32 = DataType.FLOAT32
+_I64 = DataType.INT64
 
 _KERNEL_AIV = os.path.join(HERE, "kernels", "aiv", "allreduce_onephase_kernel.cpp")
 _KERNEL_ORCH = os.path.join(HERE, "kernels", "orchestration", "allreduce_onephase_orch.cpp")
@@ -55,6 +56,9 @@ _KERNEL_ORCH = os.path.join(HERE, "kernels", "orchestration", "allreduce_onephas
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
+# Phase-2 barrier timing slots written by the kernel: [0]=barrier entry,
+# [1]=all TNOTIFYs issued, [2+peer]=that peer's TWAIT satisfied.
+TIMING_SLOTS = 2 + K_MAX_SUPPORTED_RANKS
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -76,7 +80,11 @@ def build_chip_callable(platform: str) -> ChipCallable:
     pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
-    kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
+    kernel_include_dirs = list(include_dirs) + [
+        str(kc.project_root / "src" / "common"),
+        # aicore/aicore.h -> inner_kernel.h (get_sys_cnt_aicore) lives per backend.
+        str(kc.platform_dir / ("sim" if platform.endswith("sim") else "onboard") / "aicore"),
+    ]
     kernel_bytes = kc.compile_incore(
         source_path=_KERNEL_AIV,
         core_type="aiv",
@@ -91,16 +99,46 @@ def build_chip_callable(platform: str) -> ChipCallable:
         source_path=_KERNEL_ORCH,
     )
     core_callable = CoreCallable.build(
-        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
+        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT, ArgDirection.OUT],
         binary=kernel_bytes,
     )
     return ChipCallable.build(
-        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
+        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT, ArgDirection.OUT],
         func_name="allreduce_orchestration",
         config_name="allreduce_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
+
+
+# PLATFORM_PROF_SYS_CNT_FREQ (a2a3): the AICore system counter ticks at 50 MHz,
+# so one tick is 20 ns.
+SYS_CNT_FREQ_HZ = 50_000_000
+
+
+def report_barrier_timing(host_timings, nranks: int) -> None:
+    """Print the Phase-2 barrier cost per rank from the kernel's timestamps.
+
+    Slot layout written by allreduce_onephase_kernel.cpp:
+      [0]        barrier entry
+      [1]        all TNOTIFYs issued
+      [2 + peer] that peer's TWAIT satisfied
+    """
+
+    def to_us(ticks: int) -> float:
+        return ticks * 1e6 / SYS_CNT_FREQ_HZ
+
+    print("[allreduce] Phase-2 barrier cost (AICore get_sys_cnt_aicore ticks @ 50 MHz):")
+    for r in range(nranks):
+        t = host_timings[r].tolist()
+        peer_done = [(p, t[2 + p]) for p in range(nranks) if p != r and t[2 + p] != 0]
+        if t[0] == 0 or not peer_done:
+            print(f"  rank {r}: no barrier timing recorded")
+            continue
+        notify_us = to_us(t[1] - t[0])
+        total_us = to_us(max(d for _, d in peer_done) - t[0])
+        detail = "  ".join(f"peer{p}={to_us(d - t[1]):.1f}us" for p, d in peer_done)
+        print(f"  rank {r}: notify={notify_us:7.1f}us  barrier_total={total_us:7.1f}us  |  {detail}")
 
 
 def expected_output(nranks: int) -> list[float]:
@@ -126,6 +164,7 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
         for rank in range(nranks)
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    host_timings = [torch.zeros(TIMING_SLOTS, dtype=torch.int64).share_memory_() for _ in range(nranks)]
 
     print("[allreduce] compiling onephase kernel...")
     chip_callable = build_chip_callable(platform)
@@ -163,6 +202,10 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
                         TensorArgType.OUTPUT_EXISTING,
                     )
                     chip_args.add_tensor(domain.buffers["scratch"].tensor((float_elems,), _F32), TensorArgType.INOUT)
+                    chip_args.add_tensor(
+                        worker.make_tensor_arg(host_timings[i], shapes=(TIMING_SLOTS,), dtype=_I64),
+                        TensorArgType.OUTPUT_EXISTING,
+                    )
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(domain.device_ctx)
                     args_list.append(chip_args)
@@ -170,6 +213,8 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
 
         print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
+
+        report_barrier_timing(host_timings, nranks)
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True
