@@ -1255,6 +1255,11 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     remote_l3::TaskPayloadWire payload;
     payload.callable_digest = slot.callable.digest;
     payload.config = slot.config;
+    // config.flow_id is the base of this group's consecutive TraCR flow-id
+    // block; this member owns base + group_index (0 stays 0 = no flow).
+    if (payload.config.flow_id != 0) {
+        payload.config.flow_id += group_index;
+    }
 
     const TaskArgs &a = slot.args(group_index);
     const RemoteTaskArgsSidecar &sidecar = slot.remote_sidecar_for(group_index);

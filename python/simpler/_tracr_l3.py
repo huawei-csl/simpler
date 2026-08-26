@@ -146,6 +146,19 @@ def next_flow_id() -> int:
     return _flow_counter
 
 
+def next_flow_id_block(count: int) -> int:
+    """Reserve ``count`` consecutive flow ids and return the first, or 0 when
+    inactive. A group submit shares one CallConfig across its members, so the
+    base id travels on the wire and each member's dispatch adds its group_index
+    to recover its own id (see worker_manager.cpp / remote_endpoint.cpp)."""
+    global _flow_counter
+    if not active() or count <= 0:
+        return 0
+    base = _flow_counter + 1
+    _flow_counter += count
+    return base
+
+
 def flow_start(flow_id: int) -> None:
     """Open a causal-flow arrow whose tail attaches to the event currently set on
     the orchestrator channel — call right after the ``mark_set`` that opens it.

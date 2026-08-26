@@ -788,7 +788,15 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     std::memcpy(frame + MAILBOX_OFF_PREPARATION_DISPOSITION, &no_disposition, sizeof(no_disposition));
     uint64_t reserved_callable = 0;
     std::memcpy(frame + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(reserved_callable));
-    std::memcpy(frame + MAILBOX_OFF_CONFIG, &state.config, sizeof(CallConfig));
+    // A group shares one CallConfig, so config.flow_id is the base of a block
+    // of group_size consecutive TraCR flow ids; this member owns base +
+    // group_index. 0 stays 0 (no flow), and a single task has group_index 0, so
+    // its id is unchanged.
+    CallConfig member_config = state.config;
+    if (member_config.flow_id != 0) {
+        member_config.flow_id += dispatch.group_index;
+    }
+    std::memcpy(frame + MAILBOX_OFF_CONFIG, &member_config, sizeof(CallConfig));
     std::memcpy(frame + MAILBOX_OFF_PIPELINE_LEASE, &state.pipeline_lease, sizeof(PipelineSlotLease));
     std::memcpy(
         frame + MAILBOX_OFF_TASK_CALLABLE_HASH, state.callable.digest.data(),

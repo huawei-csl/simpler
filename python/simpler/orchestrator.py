@@ -468,6 +468,17 @@ class Orchestrator:
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         _tracr.mark_set("SubmitNextLevelGroup", len(args_list))
+        # One group submit fans out to N device runs, and a flow id must be
+        # unique per arrow, so reserve N consecutive ids and open one arrow per
+        # member. Only the base travels in cfg (the group shares a single
+        # CallConfig); each member's dispatch adds its group_index to recover
+        # its own id. next_flow_id_block() is 0 when the host TraCR lane is
+        # inactive, so cfg.flow_id stays at its default and no flow is drawn.
+        fid_base = _tracr.next_flow_id_block(len(args_list))
+        if fid_base:
+            cfg.flow_id = fid_base
+            for member in range(len(args_list)):
+                _tracr.flow_start(fid_base + member)
         try:
             with prov_guard:
                 for child_ptrs, target_worker_id in member_checks:

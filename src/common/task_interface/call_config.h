@@ -19,10 +19,19 @@
  * (`chip_swimlane_records.json` / `args_dump/` / `pmu.csv` / `deps.json` /
  * `scope_stats/scope_stats.jsonl`).
  *
- * `flow_id` is the per-run TraCR causal-flow id: the host stamps it before a
- * NEXT_LEVEL submit and the AICPU orchestrator emits a matching FLOW_END, so a
- * merged trace draws an arrow from the host scheduling event to the device work
- * it triggered. 0 means "no flow" (TraCR host lane inactive).
+ * `flow_id` is the TraCR causal-flow id: the host stamps it before a NEXT_LEVEL
+ * submit and the AICPU orchestrator emits a matching FLOW_END, so a merged trace
+ * draws an arrow from the host scheduling event to the device work it triggered.
+ * 0 means "no flow" (TraCR host lane inactive).
+ *
+ * For a *group* submit the members share one CallConfig, so this field carries
+ * the **base** of a block of `group_size` consecutive ids: member `i` owns
+ * `flow_id + i`, and the dispatch adds `group_index` on the way out
+ * (worker_manager.cpp for local mailbox, remote_endpoint.cpp for remote L3).
+ * A single submit has group_index 0, so its id is the base itself. Flow ids
+ * must be unique per arrow -- tracr_process pairs starts to ends by index
+ * within one id, so reusing one id for N members would draw one arrow and drop
+ * the rest.
  *
  * There is no block_dim knob: a run always takes the whole device. Onboard that
  * is every cluster the AICore stream reports (aclrtGetStreamResLimit, capped by
