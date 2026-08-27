@@ -72,7 +72,11 @@
 // Task management
 // Actual window size is passed at runtime to runtime_create_from_sm().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
+#ifdef INDEP_ORCH
+#define PTO2_TASK_WINDOW_SIZE 65536  // Default per-ring task window size (power of 2)
+#else
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default task window size (power of 2)
+#endif
 
 // host_build_graph has one ring, and carries no per-ring dimension anywhere:
 // host-orch builds the whole graph on the host, it fits that ring, and the

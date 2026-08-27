@@ -38,6 +38,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
       - name: Set up C++ compiler
         uses: ./.github/actions/setup-gcc-15
         with:

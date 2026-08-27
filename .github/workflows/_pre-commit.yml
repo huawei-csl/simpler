@@ -44,6 +44,7 @@ jobs:
       - name: Checkout target
         uses: actions/checkout@v5
         with:
+          submodules: recursive
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0

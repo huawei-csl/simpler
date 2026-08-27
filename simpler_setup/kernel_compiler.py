@@ -193,7 +193,18 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
-        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
+        tracr_dir1 = str(self.project_root / "tools")
+        tracr_dir2 = str(self.project_root / "tools" / "tracr" / "include")
+        tracr_dir3 = str(self.project_root / "tools" / "tracr" / "extern")
+        return [
+            runtime_dir,
+            runtime_common_dir,
+            common_dir,
+            src_common_dir,
+            tracr_dir1,
+            tracr_dir2,
+            tracr_dir3,
+        ] + self.get_platform_include_dirs()
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -660,6 +671,15 @@ class KernelCompiler:
             *self._orchestration_compile_flags(toolchain),
             *self._orchestration_link_flags(toolchain),
         ]
+
+        if os.getenv("BUILD_TRACR", "OFF") == "ON":
+            cmd.extend(
+                [
+                    "-DENABLE_TRACR",
+                    "-DTRACR_DISABLE_FLUSH",
+                    "-DUSE_HW_COUNTER",
+                ]
+            )
 
         if extra_sources:
             for src in extra_sources:

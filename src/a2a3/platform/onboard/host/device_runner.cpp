@@ -31,6 +31,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <tracr_simpler_api.hpp>
+
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
 #include "platform_comm/comm.h"
@@ -406,6 +409,17 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
+    // Allocate the device TraCR buffers here: aicpu_thread_num is now resolved
+    // (it sizes the per-thread allocation) and the Runtime struct is not yet
+    // uploaded, so tracrData_/tracrDataSizes_ reach the AICPU.
+#ifdef ENABLE_TRACR
+    rc = DevAllocTraCR(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
+        return rc;
+    }
+#endif
+
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args);
     if (rc != 0) return rc;
 
@@ -449,6 +463,15 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         return rc;
     }
 
+#ifdef ENABLE_TRACR
+    // reap_run synced the streams, so the AICPU has finished writing traces into
+    // the device TraCR buffer; it stays resident until cleanup_execution frees it.
+    rc = StoreTracrData(this, *prepared.runtime);
+    if (rc != 0) {
+        LOG_ERROR("StoreTracrData failed: %d", rc);
+        return -1;
+    }
+#endif
     // A proven-complete stream is reusable until a code publication marks it
     // stale. Publish retirement so cleanup does not replace it with an
     // unproven state after the device result has already been established.
