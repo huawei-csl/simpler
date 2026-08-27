@@ -218,6 +218,35 @@ private:
     // it; first error wins and the rest are redundant.
     std::atomic<int32_t> inline_complete_error_{SIMPLER_ERROR_NONE};
 
+    // Rolling scan resume position, per thread AND per resource shape.
+    //
+    // Why this exists: an UNBOUNDED scan from the cursor is O(remaining) per
+    // call, and pop_ready_tasks_batch is called once per (shape x phase) per
+    // loop iteration. Since the cursor advances gradually, total scan work is
+    // O(n^2) in task count -- measured at PA Case2 (32,832 tasks) as 913 ms of
+    // device wall, ~60x hbg, exactly matching the quadratic prediction.
+    //
+    // Why not a plain cap from the cursor: that reintroduces the head-of-line
+    // cliff. If a straggler pins the cursor and the next CAP entries all depend
+    // on it, every pass rescans the same dead window, independent ready work
+    // beyond the cap is never seen, and the forward-progress watchdog latches a
+    // hang that is not one.
+    //
+    // The resume position fixes both: each pass examines at most SCAN_CAP
+    // entries and then REMEMBERS where it stopped, so the next pass continues
+    // rather than restarting. Work per pass is bounded; coverage of the window is
+    // still complete, just spread across passes. Clamped up to the cursor floor
+    // (never re-examine a retired prefix) and wrapped at most once per call
+    // (so a pass with nothing to find terminates instead of spinning).
+    //
+    // Per SHAPE as well as per thread: with one position per thread, a scan for
+    // AIC would advance past MIX candidates and delay finding them until the
+    // next wrap. 4 x 3 ints, so the separation is free.
+    //
+    // Device-side only: SchedulerContext is not part of the H2D image, so this
+    // costs no shared-memory layout change.
+    int32_t scan_resume_[MAX_AICPU_THREADS][PTO2_NUM_RESOURCE_SHAPES]{};
+
     // Dependency-only tasks retired inside the scan this pass, PER THREAD. Each
     // thread reads and clears only its own slot, so no atomics are needed — but a
     // single shared counter would be a data race the moment N > 1. Consumed by

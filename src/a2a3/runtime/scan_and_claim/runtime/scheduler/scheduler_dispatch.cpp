@@ -109,10 +109,14 @@ int SchedulerContext::pop_ready_tasks_batch(
 #if SIMPLER_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
-    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
+    int count = sched_->scan_ready_tasks_batch(
+        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
+    );
     chip_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
+    int count = sched_->scan_ready_tasks_batch(
+        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
+    );
 #endif
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -127,7 +131,9 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
     return count;
 #else
-    int count = sched_->scan_ready_tasks_batch(shape, out, max_count, thread_idx, retired_inline);
+    int count = sched_->scan_ready_tasks_batch(
+        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
+    );
 #endif
     if (retired_inline > 0) {
         completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);

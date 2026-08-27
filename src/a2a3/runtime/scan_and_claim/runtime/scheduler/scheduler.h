@@ -634,17 +634,36 @@ struct PTO2SchedulerState {
     // so dropping the number leaves the total permanently short and the
     // "all tasks done" test can never fire — the run then dies of a
     // forward-progress timeout with a correctly-executed graph behind it.
+    // Entries examined per call. Bounds the cost of one pass; `resume` carries
+    // the position forward so bounding it costs coverage-per-pass, not coverage.
+    static constexpr int SCAN_CAP = 128;
+
     int scan_ready_tasks_batch(
         PTO2ResourceShape want_shape, ChipTaskSlotState **out, int max_count, [[maybe_unused]] int thread_idx,
-        int32_t &out_retired
+        int32_t &out_retired, int32_t &resume
     ) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
         const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
-        int32_t i = ring.completed_watermark.load(std::memory_order_acquire) + 1;
-        if (i < 0) i = 0;
+        if (submitted <= 0) return 0;
+
+        // The cursor is the floor: everything at or below it has retired, so
+        // resuming below it can only waste loads.
+        int32_t floor = ring.completed_watermark.load(std::memory_order_acquire) + 1;
+        if (floor < 0) floor = 0;
+        if (floor >= submitted) return 0;
+        if (resume < floor || resume >= submitted) resume = floor;
 
         int found = 0;
-        for (; i < submitted && found < max_count; i++) {
+        int examined = 0;
+        bool wrapped = false;
+        int32_t i = resume;
+        for (; found < max_count && examined < SCAN_CAP; i++, examined++) {
+            if (i >= submitted) {
+                if (wrapped) break;  // one wrap per call: nothing to find right now
+                wrapped = true;
+                i = floor;
+                if (i >= submitted) break;
+            }
             // RETIRED. Acquire, so observing the flag also observes the outputs.
             if (ring.is_completion_flag_set(i)) continue;
 
@@ -702,7 +721,23 @@ struct PTO2SchedulerState {
             // task that occupies no core must never be gated on core state, and
             // in particular must never be judged BUSY by a block counter it does
             // not use.
-            if (s.task_attrs.requires_sync_start()) continue;  // v1: no cohort drain
+            // sync_start cohorts ARE dispatchable. hbg gave them a priority tier
+            // (Tier 0 over ready_sync_queues, ahead of regular work) which M2
+            // deleted along with the queues -- but that tier was a *policy*, not
+            // the mechanism. The mechanism survives intact and is queue-free:
+            // dispatch_shape's sync_start branch either places the whole cohort
+            // outright, or calls enter_drain_mode, which parks the task in
+            // drain_state_.pending_task and raises sync_start_pending; every
+            // thread then converges in handle_drain_mode and stages the cohort
+            // from drain_state_. No ready_sync_queue is consulted anywhere on
+            // that path, so surfacing these tasks from the scan is sufficient.
+            //
+            // Consequence to watch: without the priority tier a sync_start task
+            // competes with ordinary work for cores rather than pre-empting it.
+            // enter_drain_mode stops the world to gather cores, so this should
+            // cost latency rather than correctness -- but it is the reason to
+            // keep an eye on wide cohorts (qwen3's per-layer paged-attention MIX
+            // is block_num = attention_core_num).
 
             // BUSY: every logical block already claimed by some thread. Advanced
             // only via claim_block_range's compare_exchange, so this doubles as
@@ -712,6 +747,9 @@ struct PTO2SchedulerState {
             if (shape != want_shape) continue;
             out[found++] = &s;
         }
+        // Remember where to carry on. Wrapping i back into range keeps the stored
+        // value meaningful for the next call.
+        resume = (i >= submitted) ? floor : i;
         return found;
     }
 
