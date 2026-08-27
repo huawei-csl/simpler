@@ -76,11 +76,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Phase-2 barrier trace: TraCR Payloads the host serializes as a .bts lane.
     __gm__ int64_t *tracr_buf =
         reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
-    // Block 0 owns the shared buffer; any other block records nothing.
-    // get_block_num(args) is 1 today (block_dim>1 is not implemented), so this
-    // is future-proofing, not a live filter.
+    // Block 0 owns the shared buffer; any other block records nothing. This is
+    // the zero-argument hardware intrinsic the platform kernel entry uses, not
+    // the runtime's logical get_block_idx(args) -- that one lives in
+    // runtime/common/intrinsic.h, which a kernel does not include.
+    // block_dim>1 is not implemented today, so this is future-proofing rather
+    // than a live filter.
     const int tracr_cap =
-        (get_block_idx(args) == 0)
+        (get_block_idx() == 0)
             ? tracr_aicore_capacity(static_cast<int>(timing_tensor->buffer.size / sizeof(int64_t)))
             : kTracrDisabled;
     tracr_aicore_reset(tracr_buf, tracr_cap);
