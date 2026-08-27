@@ -76,8 +76,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Phase-2 barrier trace: TraCR Payloads the host serializes as a .bts lane.
     __gm__ int64_t *tracr_buf =
         reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
-    const int tracr_cap = tracr_aicore_capacity(static_cast<int>(timing_tensor->buffer.size / sizeof(int64_t)));
-    tracr_aicore_reset(tracr_buf);
+    // Block 0 owns the shared buffer; any other block records nothing.
+    // get_block_num(args) is 1 today (block_dim>1 is not implemented), so this
+    // is future-proofing, not a live filter.
+    const int tracr_cap =
+        (get_block_idx(args) == 0)
+            ? tracr_aicore_capacity(static_cast<int>(timing_tensor->buffer.size / sizeof(int64_t)))
+            : kTracrDisabled;
+    tracr_aicore_reset(tracr_buf, tracr_cap);
 
     // Signal area sits at the tail of the scratch buffer: nranks int32 slots.
     // Peer r writes into my_rank's signal[r] when its stage-in is done.

@@ -71,13 +71,33 @@ constexpr int64_t kTracrNsPerTick = 20;
 constexpr int kTracrHeaderWords = 2;
 constexpr int kTracrWordsPerPayload = 2;
 
+// Capacity value that silently disables recording, without counting a drop.
+//
+// One buffer has one writer. When several workers run the same kernel source
+// against a shared buffer -- SPMD blocks, or a vector kernel split across a
+// block's two AIV sub-cores -- each of them would read-modify-write the same
+// count word with no atomic, losing records and corrupting the count. The
+// designated writer passes a real capacity and every other worker passes this,
+// so the guard costs one comparison and no buffer traffic.
+//
+// Marker filtering is not a loss for communication: an SPMD collective must
+// already confine its notify/wait to one block, or the peer's counter is
+// incremented once per block and the barrier releases early. For an SPMD
+// *compute* kernel the per-block variation is the signal, and that wants a
+// per-core buffer instead -- see D2 in the project docs.
+constexpr int kTracrDisabled = -1;
+
 /** Payload capacity of a buffer of `words` int64 words. */
 __aicore__ __attribute__((always_inline)) inline int tracr_aicore_capacity(int words) {
     return (words - kTracrHeaderWords) / kTracrWordsPerPayload;
 }
 
-/** Open a buffer for writing. Required before the first emit. */
-__aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ int64_t *buf) {
+/** Open a buffer for writing. Required before the first emit. No-op for a
+ *  worker that is not the designated writer. */
+__aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ int64_t *buf, int capacity) {
+    if (capacity < 0) {
+        return;
+    }
     buf[0] = 0;
     buf[1] = 0;
 }
@@ -90,6 +110,9 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ 
 __aicore__ __attribute__((always_inline)) inline void tracr_aicore_emit(
     __gm__ int64_t *buf, int capacity, uint32_t channel, uint32_t event, uint32_t extra, uint64_t ticks
 ) {
+    if (capacity < 0) {
+        return;
+    }
     int64_t n = buf[0];
     if (n >= static_cast<int64_t>(capacity)) {
         buf[1] = buf[1] + 1;
