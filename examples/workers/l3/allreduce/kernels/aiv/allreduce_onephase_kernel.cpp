@@ -97,10 +97,15 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
     __gm__ float *scratch =
         reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
-    // Phase-2 barrier trace: a flat array of 16-byte TraCR Payloads, two int64
-    // words each, read back by the host and written out as a .bts lane. Entries
-    // are appended in issue order, so timestamps are non-decreasing -- which is
-    // the order tracr_process requires of every .bts it loads.
+    // Phase-2 barrier trace, read back by the host and written out as a .bts
+    // lane. Layout: one payload-sized header holding the record count, then a
+    // flat array of 16-byte TraCR Payloads, two int64 words each. Entries are
+    // appended in issue order, so timestamps are non-decreasing -- the order
+    // tracr_process requires of every .bts it loads.
+    //
+    // The count is explicit because this buffer is OUTPUT_EXISTING: nothing
+    // stages the host's zeros to the device, so untouched words hold whatever
+    // GM held before and cannot be used as a terminator.
     __gm__ int64_t *tracr_buf =
         reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
 
@@ -151,7 +156,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // stage-in is visible, then waits until every peer has notified us.
     // After this point the scratch data on all ranks is readable.
     // ------------------------------------------------------------------
-    int tracr_n = 0;
+    int tracr_n = 1;
     // Span 1 (Phase2): issuing this rank's notifies to every peer.
     tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventPhase2, static_cast<uint32_t>(my_rank),
                get_sys_cnt_aicore());
@@ -174,6 +179,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventReset, kTracrExtraNone,
                    get_sys_cnt_aicore());
     }
+    tracr_buf[0] = static_cast<int64_t>(tracr_n - 1);
+    tracr_buf[1] = 0;
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------

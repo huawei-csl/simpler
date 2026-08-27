@@ -60,7 +60,7 @@ DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 # The kernel writes TraCR Payloads (16 B = two int64 words) into this buffer:
 # one notify span plus one wait span per peer, each a SET/RESET pair.
-TRACR_PAYLOAD_CAP = 2 + 2 * K_MAX_SUPPORTED_RANKS
+TRACR_PAYLOAD_CAP = 1 + 2 + 2 * K_MAX_SUPPORTED_RANKS  # header + notify span + per-peer spans
 TRACR_SLOTS = 2 * TRACR_PAYLOAD_CAP
 
 
@@ -126,17 +126,18 @@ TRACR_PAYLOAD_FMT = struct.Struct("<HHIQ")
 
 
 def decode_payloads(words: list[int]) -> list[tuple[int, int, int, int]]:
-    """Decode the kernel's int64 word pairs into (channel, event, extra, ts_ns).
+    """Decode the kernel's buffer into (channel, event, extra, ts_ns) records.
 
-    Entries are appended in issue order and a zero timestamp marks the end of
-    what the kernel actually wrote.
+    Word 0 is the record count. It is authoritative: the buffer is
+    OUTPUT_EXISTING, so words past the count hold stale device memory rather
+    than zeros and must not be read.
     """
+    count = words[0] & 0xFFFFFFFFFFFFFFFF if words else 0
+    count = min(count, len(words) // 2 - 1)
     out = []
-    for i in range(0, len(words) - 1, 2):
-        w0 = words[i] & 0xFFFFFFFFFFFFFFFF
-        ts = words[i + 1] & 0xFFFFFFFFFFFFFFFF
-        if ts == 0:
-            break
+    for i in range(1, count + 1):
+        w0 = words[i * 2] & 0xFFFFFFFFFFFFFFFF
+        ts = words[i * 2 + 1] & 0xFFFFFFFFFFFFFFFF
         out.append((w0 & 0xFFFF, (w0 >> 16) & 0xFFFF, (w0 >> 32) & 0xFFFFFFFF, ts))
     return out
 
