@@ -118,7 +118,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
 # re-checks them against the metadata the runtime actually emitted, so a change
 # to the channel layout or the MarkerType X-macro fails the run instead of
 # silently relabelling the lane.
-TRACR_CHAN_AIVECTOR0 = 28
+TRACR_CHANNEL_NAME = "AIVector_0"
 TRACR_EVENT_PHASE2 = 7
 TRACR_EVENT_BARRIER = 17
 TRACR_EVENT_RESET = 0xFFFF
@@ -141,20 +141,27 @@ def decode_payloads(words: list[int]) -> list[tuple[int, int, int, int]]:
     return out
 
 
-def verify_tracr_ids(meta: dict) -> None:
-    """Fail loudly if the kernel's hard-coded channel/event ids have drifted."""
+def resolve_tracr_channel(meta: dict) -> int:
+    """Index of the lane the AICore payloads belong on.
+
+    channel_names is sized by the run's core count, so this is resolved by name
+    per run rather than assumed.
+    """
     names = meta["channel_names"]
+    if TRACR_CHANNEL_NAME not in names:
+        raise RuntimeError(f"TraCR channel {TRACR_CHANNEL_NAME!r} absent from this proc's channel_names")
+    return names.index(TRACR_CHANNEL_NAME)
+
+
+def verify_tracr_events(meta: dict) -> None:
+    """Fail loudly if the kernel's hard-coded event ids have drifted."""
     marker_types = [meta["markerTypes"][k] for k in sorted(meta["markerTypes"])]
-    checks = [
-        (names[TRACR_CHAN_AIVECTOR0] if TRACR_CHAN_AIVECTOR0 < len(names) else None, "AIVector_0", "channel"),
-        (marker_types[TRACR_EVENT_PHASE2] if TRACR_EVENT_PHASE2 < len(marker_types) else None, "Phase2", "event"),
-        (marker_types[TRACR_EVENT_BARRIER] if TRACR_EVENT_BARRIER < len(marker_types) else None, "Barrier", "event"),
-    ]
-    for got, want, kind in checks:
+    for event_id, want in ((TRACR_EVENT_PHASE2, "Phase2"), (TRACR_EVENT_BARRIER, "Barrier")):
+        got = marker_types[event_id] if event_id < len(marker_types) else None
         if got != want:
             raise RuntimeError(
-                f"TraCR {kind} id drift: kernel expects {want!r} at that index, metadata has {got!r}. "
-                f"Update the kTracr* constants in allreduce_onephase_kernel.cpp."
+                f"TraCR event id drift: kernel writes {event_id} for {want!r}, metadata has {got!r}. "
+                f"Update the kTracrEvent* constants in allreduce_onephase_kernel.cpp."
             )
 
 
@@ -176,12 +183,14 @@ def write_aicore_bts(host_tracr, device_ids: list[int]) -> int:
         if not payloads:
             continue
         with open(meta_path) as fh:
-            verify_tracr_ids(json.load(fh))
+            meta = json.load(fh)
+        verify_tracr_events(meta)
+        channel = resolve_tracr_channel(meta)
         used = [n for n in os.listdir(proc_dir) if n.startswith("thread.") and n[7:].isdigit()]
         thread_dir = os.path.join(proc_dir, f"thread.{max((int(n[7:]) for n in used), default=0) + 1}")
         os.makedirs(thread_dir, exist_ok=True)
         with open(os.path.join(thread_dir, "traces.bts"), "wb") as fh:
-            fh.write(b"".join(TRACR_PAYLOAD_FMT.pack(*p) for p in payloads))
+            fh.write(b"".join(TRACR_PAYLOAD_FMT.pack(channel, ev, ex, ts) for _c, ev, ex, ts in payloads))
         written += 1
     return written
 

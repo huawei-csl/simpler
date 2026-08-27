@@ -61,12 +61,14 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 // definition and no TraCR header -- tracr_process reads a .bts as a flat array
 // of these and never asks who produced them.
 //
-// The three constants below mirror host-side tables and are the one place this
-// slice is coupled to them: kTracrChanAIVector0 is the index of "AIVector_0" in
-// the proc's channel_names, and the event ids are MarkerType enum values from
-// tools/tracr_simpler_markers.hpp. main.py re-checks all three against the
-// emitted metadata.json and fails the run if they drift.
-constexpr int kTracrChanAIVector0 = 28;
+// channel_names is sized by the run's actual core count, so the index of
+// "AIVector_0" is not knowable at kernel compile time: the kernel writes a
+// placeholder and main.py stamps the real index after resolving the name
+// against the emitted metadata.json -- the same way HostCopyTraces2BTS stamps
+// its own channel. The event ids below are MarkerType enum values from
+// tools/tracr_simpler_markers.hpp, which is fixed at build time; main.py
+// re-checks those against the metadata and fails the run if they drift.
+constexpr uint32_t kTracrChanPlaceholder = 0;
 constexpr uint32_t kTracrEventPhase2 = 7;
 constexpr uint32_t kTracrEventBarrier = 17;
 constexpr uint32_t kTracrEventReset = 0xFFFFu;
@@ -151,7 +153,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     int tracr_n = 0;
     // Span 1 (Phase2): issuing this rank's notifies to every peer.
-    tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventPhase2, static_cast<uint32_t>(my_rank),
+    tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventPhase2, static_cast<uint32_t>(my_rank),
                get_sys_cnt_aicore());
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
@@ -159,17 +161,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
-    tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventReset, kTracrExtraNone,
+    tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventReset, kTracrExtraNone,
                get_sys_cnt_aicore());
     // One span per peer (Barrier, extraId = peer rank): waiting on that peer's
     // notify. Flat, never nested, so each SET is closed before the next opens.
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
-        tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventBarrier, static_cast<uint32_t>(peer),
+        tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventBarrier, static_cast<uint32_t>(peer),
                    get_sys_cnt_aicore());
         pto::comm::Signal sig(signal_base + peer);
         pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
-        tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventReset, kTracrExtraNone,
+        tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventReset, kTracrExtraNone,
                    get_sys_cnt_aicore());
     }
     pipe_barrier(PIPE_ALL);
