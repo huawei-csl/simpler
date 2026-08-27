@@ -133,7 +133,7 @@ def decode_payloads(words: list[int]) -> list[tuple[int, int, int, int]]:
     than zeros and must not be read.
     """
     count = words[0] & 0xFFFFFFFFFFFFFFFF if words else 0
-    count = min(count, len(words) // 2 - 1)
+    count = min(count, len(words) // 2 - 1)  # word 1 is the drop count
     out = []
     for i in range(1, count + 1):
         w0 = words[i * 2] & 0xFFFFFFFFFFFFFFFF
@@ -214,7 +214,9 @@ def report_barrier_timing(host_tracr, nranks: int) -> None:
                 open_span = (event, extra, ts)
         notify = "  ".join(f"notify={d:.1f}us" for e, _x, d in spans if e == TRACR_EVENT_PHASE2)
         waits = "  ".join(f"peer{x}={d:.1f}us" for e, x, d in spans if e == TRACR_EVENT_BARRIER)
-        print(f"  rank {rank}: {len(payloads)} payloads / {len(spans)} spans  |  {notify}  {waits}")
+        dropped = host_tracr[rank].tolist()[1] & 0xFFFFFFFFFFFFFFFF
+        drop_note = f"  [{dropped} DROPPED - buffer too small]" if dropped else ""
+        print(f"  rank {rank}: {len(payloads)} payloads / {len(spans)} spans  |  {notify}  {waits}{drop_note}")
 
 
 def expected_output(nranks: int) -> list[float]:

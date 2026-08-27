@@ -36,6 +36,7 @@
 #include "pto/comm/pto_comm_inst.hpp"
 #include "platform_comm/comm_context.h"
 #include "aicore/aicore.h"  // get_sys_cnt_aicore()
+#include "aicore/tracr_aicore_emit.h"
 #include "tensor.h"
 
 #ifndef __gm__
@@ -56,36 +57,11 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
 
-// TraCR Payload is 16 B little-endian: channelId:u16, eventId:u16, extraId:u32,
-// timestamp:u64. Written as two int64 words so the kernel needs no struct
-// definition and no TraCR header -- tracr_process reads a .bts as a flat array
-// of these and never asks who produced them.
-//
-// channel_names is sized by the run's actual core count, so the index of
-// "AIVector_0" is not knowable at kernel compile time: the kernel writes a
-// placeholder and main.py stamps the real index after resolving the name
-// against the emitted metadata.json -- the same way HostCopyTraces2BTS stamps
-// its own channel. The event ids below are MarkerType enum values from
-// tools/tracr_simpler_markers.hpp, which is fixed at build time; main.py
-// re-checks those against the metadata and fails the run if they drift.
-constexpr uint32_t kTracrChanPlaceholder = 0;
-constexpr uint32_t kTracrEventPhase2 = 7;
-constexpr uint32_t kTracrEventBarrier = 17;
-constexpr uint32_t kTracrEventReset = 0xFFFFu;
-constexpr uint32_t kTracrExtraNone = 0xFFFFFFFFu;
-// get_sys_cnt_aicore() counts at PLATFORM_PROF_SYS_CNT_FREQ (50 MHz); TraCR
-// timestamps are nanoseconds.
-constexpr int64_t kTracrNsPerTick = 20;
-
-__aicore__ __attribute__((always_inline)) inline void tracr_emit(
-    __gm__ int64_t *buf, int index, uint32_t channel, uint32_t event, uint32_t extra, uint64_t ticks
-) {
-    uint64_t word0 = (channel & 0xFFFFull) | ((event & 0xFFFFull) << 16) | (static_cast<uint64_t>(extra) << 32);
-    buf[index * 2] = static_cast<int64_t>(word0);
-    buf[index * 2 + 1] = static_cast<int64_t>(ticks * static_cast<uint64_t>(kTracrNsPerTick));
-}
-
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+    constexpr uint32_t kEventPhase2 = 7;
+    constexpr uint32_t kEventBarrier = 17;
+    constexpr uint32_t kChanPlaceholder = 0;
+
     __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ ChipTensor *output_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ ChipTensor *scratch_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
@@ -97,17 +73,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
     __gm__ float *scratch =
         reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
-    // Phase-2 barrier trace, read back by the host and written out as a .bts
-    // lane. Layout: one payload-sized header holding the record count, then a
-    // flat array of 16-byte TraCR Payloads, two int64 words each. Entries are
-    // appended in issue order, so timestamps are non-decreasing -- the order
-    // tracr_process requires of every .bts it loads.
-    //
-    // The count is explicit because this buffer is OUTPUT_EXISTING: nothing
-    // stages the host's zeros to the device, so untouched words hold whatever
-    // GM held before and cannot be used as a terminator.
+    // Phase-2 barrier trace: TraCR Payloads the host serializes as a .bts lane.
     __gm__ int64_t *tracr_buf =
         reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
+    const int tracr_cap = tracr_aicore_capacity(static_cast<int>(timing_tensor->buffer.size / sizeof(int64_t)));
+    tracr_aicore_reset(tracr_buf);
 
     // Signal area sits at the tail of the scratch buffer: nranks int32 slots.
     // Peer r writes into my_rank's signal[r] when its stage-in is done.
@@ -156,31 +126,23 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // stage-in is visible, then waits until every peer has notified us.
     // After this point the scratch data on all ranks is readable.
     // ------------------------------------------------------------------
-    int tracr_n = 1;
-    // Span 1 (Phase2): issuing this rank's notifies to every peer.
-    tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventPhase2, static_cast<uint32_t>(my_rank),
-               get_sys_cnt_aicore());
+    tracr_aicore_mark_set(tracr_buf, tracr_cap, kChanPlaceholder, kEventPhase2, static_cast<uint32_t>(my_rank));
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
-    tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventReset, kTracrExtraNone,
-               get_sys_cnt_aicore());
-    // One span per peer (Barrier, extraId = peer rank): waiting on that peer's
-    // notify. Flat, never nested, so each SET is closed before the next opens.
+    tracr_aicore_mark_reset(tracr_buf, tracr_cap, kChanPlaceholder);
+    // One span per peer, extraId = that peer's rank. Flat, never nested: each
+    // SET is closed before the next opens.
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
-        tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventBarrier, static_cast<uint32_t>(peer),
-                   get_sys_cnt_aicore());
+        tracr_aicore_mark_set(tracr_buf, tracr_cap, kChanPlaceholder, kEventBarrier, static_cast<uint32_t>(peer));
         pto::comm::Signal sig(signal_base + peer);
         pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
-        tracr_emit(tracr_buf, tracr_n++, kTracrChanPlaceholder, kTracrEventReset, kTracrExtraNone,
-                   get_sys_cnt_aicore());
+        tracr_aicore_mark_reset(tracr_buf, tracr_cap, kChanPlaceholder);
     }
-    tracr_buf[0] = static_cast<int64_t>(tracr_n - 1);
-    tracr_buf[1] = 0;
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
