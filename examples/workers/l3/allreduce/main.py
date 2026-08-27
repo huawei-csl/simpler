@@ -24,7 +24,9 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import struct
 import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -56,9 +58,10 @@ _KERNEL_ORCH = os.path.join(HERE, "kernels", "orchestration", "allreduce_onephas
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
-# Phase-2 barrier timing slots written by the kernel: [0]=barrier entry,
-# [1]=all TNOTIFYs issued, [2+peer]=that peer's TWAIT satisfied.
-TIMING_SLOTS = 2 + K_MAX_SUPPORTED_RANKS
+# The kernel writes TraCR Payloads (16 B = two int64 words) into this buffer:
+# one notify span plus one wait span per peer, each a SET/RESET pair.
+TRACR_PAYLOAD_CAP = 2 + 2 * K_MAX_SUPPORTED_RANKS
+TRACR_SLOTS = 2 * TRACR_PAYLOAD_CAP
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -111,34 +114,97 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-# PLATFORM_PROF_SYS_CNT_FREQ (a2a3): the AICore system counter ticks at 50 MHz,
-# so one tick is 20 ns.
-SYS_CNT_FREQ_HZ = 50_000_000
+# Must match the constants in allreduce_onephase_kernel.cpp. verify_tracr_ids()
+# re-checks them against the metadata the runtime actually emitted, so a change
+# to the channel layout or the MarkerType X-macro fails the run instead of
+# silently relabelling the lane.
+TRACR_CHAN_AIVECTOR0 = 28
+TRACR_EVENT_PHASE2 = 7
+TRACR_EVENT_BARRIER = 17
+TRACR_EVENT_RESET = 0xFFFF
+TRACR_PAYLOAD_FMT = struct.Struct("<HHIQ")
 
 
-def report_barrier_timing(host_timings, nranks: int) -> None:
-    """Print the Phase-2 barrier cost per rank from the kernel's timestamps.
+def decode_payloads(words: list[int]) -> list[tuple[int, int, int, int]]:
+    """Decode the kernel's int64 word pairs into (channel, event, extra, ts_ns).
 
-    Slot layout written by allreduce_onephase_kernel.cpp:
-      [0]        barrier entry
-      [1]        all TNOTIFYs issued
-      [2 + peer] that peer's TWAIT satisfied
+    Entries are appended in issue order and a zero timestamp marks the end of
+    what the kernel actually wrote.
     """
+    out = []
+    for i in range(0, len(words) - 1, 2):
+        w0 = words[i] & 0xFFFFFFFFFFFFFFFF
+        ts = words[i + 1] & 0xFFFFFFFFFFFFFFFF
+        if ts == 0:
+            break
+        out.append((w0 & 0xFFFF, (w0 >> 16) & 0xFFFF, (w0 >> 32) & 0xFFFFFFFF, ts))
+    return out
 
-    def to_us(ticks: int) -> float:
-        return ticks * 1e6 / SYS_CNT_FREQ_HZ
 
-    print("[allreduce] Phase-2 barrier cost (AICore get_sys_cnt_aicore ticks @ 50 MHz):")
-    for r in range(nranks):
-        t = host_timings[r].tolist()
-        peer_done = [(p, t[2 + p]) for p in range(nranks) if p != r and t[2 + p] != 0]
-        if t[0] == 0 or not peer_done:
-            print(f"  rank {r}: no barrier timing recorded")
+def verify_tracr_ids(meta: dict) -> None:
+    """Fail loudly if the kernel's hard-coded channel/event ids have drifted."""
+    names = meta["channel_names"]
+    marker_types = [meta["markerTypes"][k] for k in sorted(meta["markerTypes"])]
+    checks = [
+        (names[TRACR_CHAN_AIVECTOR0] if TRACR_CHAN_AIVECTOR0 < len(names) else None, "AIVector_0", "channel"),
+        (marker_types[TRACR_EVENT_PHASE2] if TRACR_EVENT_PHASE2 < len(marker_types) else None, "Phase2", "event"),
+        (marker_types[TRACR_EVENT_BARRIER] if TRACR_EVENT_BARRIER < len(marker_types) else None, "Barrier", "event"),
+    ]
+    for got, want, kind in checks:
+        if got != want:
+            raise RuntimeError(
+                f"TraCR {kind} id drift: kernel expects {want!r} at that index, metadata has {got!r}. "
+                f"Update the kTracr* constants in allreduce_onephase_kernel.cpp."
+            )
+
+
+def write_aicore_bts(host_tracr, device_ids: list[int]) -> int:
+    """Serialize each rank's AICore payloads as a .bts lane in its device proc.
+
+    The device proc dirs are written by the runtime during run(); this appends a
+    thread folder beside them, exactly as HostCopyTraces2BTS does for the host
+    copy lanes. Returns the number of lanes written.
+    """
+    base = os.path.join(os.path.expanduser("~/ascend"), f"tracr_{os.environ.get('PYPTO_RUN_SAMPLE_ID', '0')}")
+    written = 0
+    for rank, device_id in enumerate(device_ids):
+        proc_dir = os.path.join(base, f"proc.{1000 + device_id}")
+        meta_path = os.path.join(proc_dir, "metadata.json")
+        if not os.path.isfile(meta_path):
             continue
-        notify_us = to_us(t[1] - t[0])
-        total_us = to_us(max(d for _, d in peer_done) - t[0])
-        detail = "  ".join(f"peer{p}={to_us(d - t[1]):.1f}us" for p, d in peer_done)
-        print(f"  rank {r}: notify={notify_us:7.1f}us  barrier_total={total_us:7.1f}us  |  {detail}")
+        payloads = decode_payloads(host_tracr[rank].tolist())
+        if not payloads:
+            continue
+        with open(meta_path) as fh:
+            verify_tracr_ids(json.load(fh))
+        used = [n for n in os.listdir(proc_dir) if n.startswith("thread.") and n[7:].isdigit()]
+        thread_dir = os.path.join(proc_dir, f"thread.{max((int(n[7:]) for n in used), default=0) + 1}")
+        os.makedirs(thread_dir, exist_ok=True)
+        with open(os.path.join(thread_dir, "traces.bts"), "wb") as fh:
+            fh.write(b"".join(TRACR_PAYLOAD_FMT.pack(*p) for p in payloads))
+        written += 1
+    return written
+
+
+def report_barrier_timing(host_tracr, nranks: int) -> None:
+    """Print the Phase-2 barrier cost per rank, decoded from the AICore payloads."""
+    print("[allreduce] Phase-2 barrier, decoded from AICore TraCR payloads:")
+    for rank in range(nranks):
+        payloads = decode_payloads(host_tracr[rank].tolist())
+        if not payloads:
+            print(f"  rank {rank}: no payloads recorded")
+            continue
+        spans, open_span = [], None
+        for _chan, event, extra, ts in payloads:
+            if event == TRACR_EVENT_RESET:
+                if open_span is not None:
+                    spans.append((open_span[0], open_span[1], (ts - open_span[2]) / 1000.0))
+                    open_span = None
+            else:
+                open_span = (event, extra, ts)
+        notify = "  ".join(f"notify={d:.1f}us" for e, _x, d in spans if e == TRACR_EVENT_PHASE2)
+        waits = "  ".join(f"peer{x}={d:.1f}us" for e, x, d in spans if e == TRACR_EVENT_BARRIER)
+        print(f"  rank {rank}: {len(payloads)} payloads / {len(spans)} spans  |  {notify}  {waits}")
 
 
 def expected_output(nranks: int) -> list[float]:
@@ -164,7 +230,7 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
         for rank in range(nranks)
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-    host_timings = [torch.zeros(TIMING_SLOTS, dtype=torch.int64).share_memory_() for _ in range(nranks)]
+    host_tracr = [torch.zeros(TRACR_SLOTS, dtype=torch.int64).share_memory_() for _ in range(nranks)]
 
     print("[allreduce] compiling onephase kernel...")
     chip_callable = build_chip_callable(platform)
@@ -203,7 +269,7 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
                     )
                     chip_args.add_tensor(domain.buffers["scratch"].tensor((float_elems,), _F32), TensorArgType.INOUT)
                     chip_args.add_tensor(
-                        worker.make_tensor_arg(host_timings[i], shapes=(TIMING_SLOTS,), dtype=_I64),
+                        worker.make_tensor_arg(host_tracr[i], shapes=(TRACR_SLOTS,), dtype=_I64),
                         TensorArgType.OUTPUT_EXISTING,
                     )
                     chip_args.add_scalar(domain.domain_size)
@@ -214,7 +280,10 @@ def run(device_ids: list[int], platform: str = "a2a3") -> int:
         print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        report_barrier_timing(host_timings, nranks)
+        report_barrier_timing(host_tracr, nranks)
+        lanes = write_aicore_bts(host_tracr, device_ids)
+        if lanes:
+            print(f"[allreduce] wrote {lanes} AICore TraCR lane(s) into the device procs")
 
         expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True

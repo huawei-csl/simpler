@@ -56,6 +56,33 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
 
+// TraCR Payload is 16 B little-endian: channelId:u16, eventId:u16, extraId:u32,
+// timestamp:u64. Written as two int64 words so the kernel needs no struct
+// definition and no TraCR header -- tracr_process reads a .bts as a flat array
+// of these and never asks who produced them.
+//
+// The three constants below mirror host-side tables and are the one place this
+// slice is coupled to them: kTracrChanAIVector0 is the index of "AIVector_0" in
+// the proc's channel_names, and the event ids are MarkerType enum values from
+// tools/tracr_simpler_markers.hpp. main.py re-checks all three against the
+// emitted metadata.json and fails the run if they drift.
+constexpr int kTracrChanAIVector0 = 28;
+constexpr uint32_t kTracrEventPhase2 = 7;
+constexpr uint32_t kTracrEventBarrier = 17;
+constexpr uint32_t kTracrEventReset = 0xFFFFu;
+constexpr uint32_t kTracrExtraNone = 0xFFFFFFFFu;
+// get_sys_cnt_aicore() counts at PLATFORM_PROF_SYS_CNT_FREQ (50 MHz); TraCR
+// timestamps are nanoseconds.
+constexpr int64_t kTracrNsPerTick = 20;
+
+__aicore__ __attribute__((always_inline)) inline void tracr_emit(
+    __gm__ int64_t *buf, int index, uint32_t channel, uint32_t event, uint32_t extra, uint64_t ticks
+) {
+    uint64_t word0 = (channel & 0xFFFFull) | ((event & 0xFFFFull) << 16) | (static_cast<uint64_t>(extra) << 32);
+    buf[index * 2] = static_cast<int64_t>(word0);
+    buf[index * 2 + 1] = static_cast<int64_t>(ticks * static_cast<uint64_t>(kTracrNsPerTick));
+}
+
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ ChipTensor *output_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
@@ -68,10 +95,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *output = reinterpret_cast<__gm__ float *>(output_tensor->buffer.addr) + output_tensor->start_offset;
     __gm__ float *scratch =
         reinterpret_cast<__gm__ float *>(scratch_tensor->buffer.addr) + scratch_tensor->start_offset;
-    // Phase-2 barrier timing, read back by the host: slot 0 = barrier entry,
-    // slot 1 = all TNOTIFYs issued, slot 2+peer = that peer's TWAIT satisfied.
-    // Raw get_sys_cnt_aicore() ticks; the host converts to a comm lane.
-    __gm__ int64_t *timing =
+    // Phase-2 barrier trace: a flat array of 16-byte TraCR Payloads, two int64
+    // words each, read back by the host and written out as a .bts lane. Entries
+    // are appended in issue order, so timestamps are non-decreasing -- which is
+    // the order tracr_process requires of every .bts it loads.
+    __gm__ int64_t *tracr_buf =
         reinterpret_cast<__gm__ int64_t *>(timing_tensor->buffer.addr) + timing_tensor->start_offset;
 
     // Signal area sits at the tail of the scratch buffer: nranks int32 slots.
@@ -121,19 +149,28 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // stage-in is visible, then waits until every peer has notified us.
     // After this point the scratch data on all ranks is readable.
     // ------------------------------------------------------------------
-    timing[0] = static_cast<int64_t>(get_sys_cnt_aicore());
+    int tracr_n = 0;
+    // Span 1 (Phase2): issuing this rank's notifies to every peer.
+    tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventPhase2, static_cast<uint32_t>(my_rank),
+               get_sys_cnt_aicore());
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
-    timing[1] = static_cast<int64_t>(get_sys_cnt_aicore());
+    tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventReset, kTracrExtraNone,
+               get_sys_cnt_aicore());
+    // One span per peer (Barrier, extraId = peer rank): waiting on that peer's
+    // notify. Flat, never nested, so each SET is closed before the next opens.
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
+        tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventBarrier, static_cast<uint32_t>(peer),
+                   get_sys_cnt_aicore());
         pto::comm::Signal sig(signal_base + peer);
         pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
-        timing[2 + peer] = static_cast<int64_t>(get_sys_cnt_aicore());
+        tracr_emit(tracr_buf, tracr_n++, kTracrChanAIVector0, kTracrEventReset, kTracrExtraNone,
+                   get_sys_cnt_aicore());
     }
     pipe_barrier(PIPE_ALL);
 
