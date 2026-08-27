@@ -13,6 +13,9 @@
 #include <cinttypes>
 #include <cstdio>
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -979,6 +982,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    // Close only the core lanes this run actually used. channel_names is sized to
+    // worker_count (== cores_total_num_ here), so a reset on a higher lane emits a
+    // trace event on a channelId the metadata never names.
+    for (int32_t i = 0; i < cores_total_num_; i++) {
+        INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + i);
+    }
+
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};
