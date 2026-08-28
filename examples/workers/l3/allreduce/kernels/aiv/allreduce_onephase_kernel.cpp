@@ -62,6 +62,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     constexpr uint32_t kEventPhase2 = 7;
     constexpr uint32_t kEventBarrier = 17;
     constexpr uint32_t kChanPlaceholder = 0;
+    // This barrier runs once per kernel invocation and sends exactly one notify
+    // per peer, so a constant sequence keeps every (src,dst) id unique. A
+    // multi-round barrier must vary this with the round index -- a repeated id
+    // mispairs silently rather than warning.
+    constexpr uint32_t kBarrierSeq = 0;
 
     __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
     __gm__ ChipTensor *output_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
@@ -142,6 +147,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
         pto::comm::Signal sig(remote_signal);
         pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+        // Arrow tail: this notify releases `peer`. The receiver closes the same
+        // id with mirrored arguments.
+        tracr_aicore_flow_start(
+            tracr_buf, tracr_cap, kChanPlaceholder,
+            tracr_aicore_flow_id(static_cast<uint32_t>(my_rank), static_cast<uint32_t>(peer), kBarrierSeq)
+        );
     }
     tracr_aicore_mark_reset(tracr_buf, tracr_cap, kChanPlaceholder);
     // One span per peer, extraId = that peer's rank. Flat, never nested: each
@@ -151,6 +162,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         tracr_aicore_mark_set(tracr_buf, tracr_cap, kChanPlaceholder, kEventBarrier, static_cast<uint32_t>(peer));
         pto::comm::Signal sig(signal_base + peer);
         pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
+        // Arrow head: `peer`'s notify is what released this wait. Mirrors the
+        // sender's argument order, so both sides name the same id.
+        tracr_aicore_flow_end(
+            tracr_buf, tracr_cap, kChanPlaceholder,
+            tracr_aicore_flow_id(static_cast<uint32_t>(peer), static_cast<uint32_t>(my_rank), kBarrierSeq)
+        );
         tracr_aicore_mark_reset(tracr_buf, tracr_cap, kChanPlaceholder);
     }
     pipe_barrier(PIPE_ALL);

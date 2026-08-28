@@ -62,6 +62,11 @@
 
 // TraCR's EVENTID_RESET: closes the span currently open on the channel.
 constexpr uint32_t kTracrEventReset = 0xFFFFu;
+// TraCR's EVENTID_FLOW_START / EVENTID_FLOW_END: the two endpoints of a causal
+// arrow. Each attaches to whatever span is open on its channel at that instant,
+// and carries the flow id in extraId rather than an event type.
+constexpr uint32_t kTracrEventFlowStart = 0xFFFEu;
+constexpr uint32_t kTracrEventFlowEnd = 0xFFFDu;
 // TraCR's "no extra information" sentinel (UINT32_MAX).
 constexpr uint32_t kTracrExtraNone = 0xFFFFFFFFu;
 // get_sys_cnt_aicore() counts at PLATFORM_PROF_SYS_CNT_FREQ (50 MHz); TraCR
@@ -137,4 +142,39 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_mark_reset(
     __gm__ int64_t *buf, int capacity, uint32_t channel
 ) {
     tracr_aicore_emit(buf, capacity, channel, kTracrEventReset, kTracrExtraNone, get_sys_cnt_aicore());
+}
+
+/**
+ * Flow id for one message, packed so both endpoints derive it independently:
+ * the sender calls (me, peer, seq) and the receiver (peer, me, seq) -- same
+ * function, mirrored arguments, no handshake.
+ *
+ * A flow id must be unique per message and shared by both endpoints.
+ * tracr_process pairs starts to ends *by index within one id*, so a reused id
+ * does not warn: it mispairs silently, and one dropped record shifts every
+ * later arrow on that id. `seq` is what keeps ids unique across rounds, and it
+ * must be a value both sides already know -- a round or invocation index
+ * qualifies, anything data-dependent does not.
+ *
+ * Ranks are global, not device ids: device ids are node-local, so two nodes
+ * would collide. 8 bits each leaves 16 bits of sequence per ordered pair.
+ */
+__aicore__ __attribute__((always_inline)) inline uint32_t tracr_aicore_flow_id(
+    uint32_t src_rank, uint32_t dst_rank, uint32_t seq
+) {
+    return ((src_rank & 0xFFu) << 24) | ((dst_rank & 0xFFu) << 16) | (seq & 0xFFFFu);
+}
+
+/** Tail of a causal arrow, on the sending side. */
+__aicore__ __attribute__((always_inline)) inline void tracr_aicore_flow_start(
+    __gm__ int64_t *buf, int capacity, uint32_t channel, uint32_t flow_id
+) {
+    tracr_aicore_emit(buf, capacity, channel, kTracrEventFlowStart, flow_id, get_sys_cnt_aicore());
+}
+
+/** Head of a causal arrow, on the receiving side. */
+__aicore__ __attribute__((always_inline)) inline void tracr_aicore_flow_end(
+    __gm__ int64_t *buf, int capacity, uint32_t channel, uint32_t flow_id
+) {
+    tracr_aicore_emit(buf, capacity, channel, kTracrEventFlowEnd, flow_id, get_sys_cnt_aicore());
 }

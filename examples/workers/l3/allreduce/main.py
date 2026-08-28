@@ -60,7 +60,8 @@ DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 # The kernel writes TraCR Payloads (16 B = two int64 words) into this buffer:
 # one notify span plus one wait span per peer, each a SET/RESET pair.
-TRACR_PAYLOAD_CAP = 1 + 2 + 2 * K_MAX_SUPPORTED_RANKS  # header + notify span + per-peer spans
+TRACR_PAYLOAD_CAP = 1 + 2 + 4 * K_MAX_SUPPORTED_RANKS  # header + notify span
+#   + per peer: one flow start (notify loop) and SET/RESET/flow end (wait loop)
 TRACR_SLOTS = 2 * TRACR_PAYLOAD_CAP
 
 
@@ -122,6 +123,8 @@ TRACR_CHANNEL_NAME = "AIVector_0"
 TRACR_EVENT_PHASE2 = 7
 TRACR_EVENT_BARRIER = 17
 TRACR_EVENT_RESET = 0xFFFF
+TRACR_EVENT_FLOW_START = 0xFFFE
+TRACR_EVENT_FLOW_END = 0xFFFD
 TRACR_PAYLOAD_FMT = struct.Struct("<HHIQ")
 
 
@@ -206,6 +209,8 @@ def report_barrier_timing(host_tracr, nranks: int) -> None:
             continue
         spans, open_span = [], None
         for _chan, event, extra, ts in payloads:
+            if event in (TRACR_EVENT_FLOW_START, TRACR_EVENT_FLOW_END):
+                continue  # arrow endpoints attach to the open span; they do not open one
             if event == TRACR_EVENT_RESET:
                 if open_span is not None:
                     spans.append((open_span[0], open_span[1], (ts - open_span[2]) / 1000.0))
@@ -216,7 +221,11 @@ def report_barrier_timing(host_tracr, nranks: int) -> None:
         waits = "  ".join(f"peer{x}={d:.1f}us" for e, x, d in spans if e == TRACR_EVENT_BARRIER)
         dropped = host_tracr[rank].tolist()[1] & 0xFFFFFFFFFFFFFFFF
         drop_note = f"  [{dropped} DROPPED - buffer too small]" if dropped else ""
-        print(f"  rank {rank}: {len(payloads)} payloads / {len(spans)} spans  |  {notify}  {waits}{drop_note}")
+        flows = sum(1 for _c, e, _x, _t in payloads if e in (TRACR_EVENT_FLOW_START, TRACR_EVENT_FLOW_END))
+        print(
+            f"  rank {rank}: {len(payloads)} payloads / {len(spans)} spans / {flows} flow endpoints"
+            f"  |  {notify}  {waits}{drop_note}"
+        )
 
 
 def expected_output(nranks: int) -> list[float]:
