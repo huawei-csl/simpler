@@ -9,9 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Entry-lifetime tests for the host_build_graph copy of PTO2TensorMap.
+ * Entry-lifetime tests for the host_build_graph copy of ChipTensorMap.
  *
- * This is a distinct type from the tensormap_and_ringbuffer PTO2TensorMap
+ * This is a distinct type from the tensormap_and_ringbuffer ChipTensorMap
  * covered by a2a3/test_tensormap.cpp: single-ring, no entry epochs, and — the
  * subject of this file — no completion-watermark retirement. A registered
  * output stays visible until dependency computation explicitly removes it as
@@ -24,50 +24,55 @@
 #include <algorithm>
 #include <vector>
 
-#include "tensormap.h"
+#include "host_build_graph/tensormap.h"
+#include "host_build_graph/task_id_encoding.h"
 
 namespace {
 
 struct TestLookupResult {
     struct Entry {
-        PTO2TensorMapEntry *entry;
+        ChipTensorMapEntry *entry;
         OverlapStatus overlap_status;
     };
     std::vector<Entry> entries;
     int count = 0;
 };
 
-void run_lookup(PTO2TensorMap &tmap, const ChipTensor &tensor, TestLookupResult &out) {
-    tmap.lookup(tensor, [&](PTO2TensorMapEntry &e, OverlapStatus s) -> bool {
+void run_lookup(ChipTensorMap &tmap, const simpler::hbg::Tensor &tensor, TestLookupResult &out) {
+    tmap.lookup(tensor, [&](ChipTensorMapEntry &e, OverlapStatus s) -> bool {
         out.entries.push_back({&e, s});
         out.count++;
         return true;
     });
 }
 
-ChipTensor make_test_tensor(uint64_t addr, uint32_t shape0) {
+simpler::hbg::Tensor make_test_tensor(uint64_t addr, uint32_t shape0) {
     uint32_t shapes[MAX_TENSOR_DIMS] = {shape0};
-    return make_tensor_external(reinterpret_cast<void *>(addr), shapes, 1, DataType::FLOAT32, false, 0);
+    return simpler::hbg::make_tensor_external(reinterpret_cast<void *>(addr), shapes, 1, DataType::FLOAT32, false, 0);
 }
 
 class HbgTensorMapTest : public ::testing::Test {
 protected:
     static constexpr int32_t NUM_BUCKETS = 16;
     static constexpr int32_t POOL_SIZE = 64;
-    static constexpr int32_t WINDOW_SIZE = 32;
+    // Task chains this map is dimensioned for. A local id is its own chain index
+    // here, so it is also the exclusive upper bound on a producer id these tests
+    // may insert under.
+    static constexpr int32_t MAX_TASKS = 64;
+    static constexpr int32_t LAST_TASK = MAX_TASKS - 1;
 
-    PTO2TensorMap tmap{};
+    ChipTensorMap tmap{};
 
-    void SetUp() override { ASSERT_TRUE(tmap.init(NUM_BUCKETS, POOL_SIZE, WINDOW_SIZE)); }
+    void SetUp() override { ASSERT_TRUE(tmap.init(NUM_BUCKETS, POOL_SIZE, MAX_TASKS)); }
 };
 
 // Completion progress alone cannot make an older producer disappear. Direct
 // inserts remain visible until dependency computation explicitly removes one.
 TEST_F(HbgTensorMapTest, EveryProducerOfARegionStaysVisible) {
-    ChipTensor t = make_test_tensor(0x1000, 256);
-    tmap.insert(t, TaskId::make(0, 0));
-    tmap.insert(t, TaskId::make(0, 1));
-    tmap.insert(t, TaskId::make(0, 2));
+    simpler::hbg::Tensor t = make_test_tensor(0x1000, 256);
+    tmap.insert(t, simpler::hbg::make_global_task(0));
+    tmap.insert(t, simpler::hbg::make_global_task(1));
+    tmap.insert(t, simpler::hbg::make_global_task(2));
     EXPECT_EQ(tmap.valid_count(), 3);
 
     TestLookupResult result;
@@ -77,18 +82,18 @@ TEST_F(HbgTensorMapTest, EveryProducerOfARegionStaysVisible) {
     for (const auto &e : result.entries) {
         producers.push_back(e.entry->producer_task_id);
     }
-    EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make(0, 0)), producers.end());
-    EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make(0, 1)), producers.end());
-    EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make(0, 2)), producers.end());
+    EXPECT_NE(std::find(producers.begin(), producers.end(), simpler::hbg::make_global_task(0)), producers.end());
+    EXPECT_NE(std::find(producers.begin(), producers.end(), simpler::hbg::make_global_task(1)), producers.end());
+    EXPECT_NE(std::find(producers.begin(), producers.end(), simpler::hbg::make_global_task(2)), producers.end());
 }
 
-// Two tasks whose local ids alias to the same task slot both keep their entries;
-// slot reuse is not retirement.
-TEST_F(HbgTensorMapTest, SlotAliasingTasksBothKeepTheirEntries) {
-    ChipTensor t = make_test_tensor(0x1000, 256);
-    // Task 0 and task 0 + WINDOW_SIZE share slot 0 (local_id & (WINDOW_SIZE-1)).
-    tmap.insert(t, TaskId::make(0, 0));
-    tmap.insert(t, TaskId::make(0, WINDOW_SIZE));
+// A local id is its own task chain index -- nothing masks with the chain count -- so
+// two distinct producers never share a chain, and the highest id the map is
+// dimensioned for reaches its own chain rather than folding onto a lower one.
+TEST_F(HbgTensorMapTest, DistinctLocalIdsGetDistinctTaskChains) {
+    simpler::hbg::Tensor t = make_test_tensor(0x1000, 256);
+    tmap.insert(t, simpler::hbg::make_global_task(0));
+    tmap.insert(t, simpler::hbg::make_global_task(LAST_TASK));
 
     EXPECT_EQ(tmap.valid_count(), 2);
     TestLookupResult result;
@@ -98,8 +103,25 @@ TEST_F(HbgTensorMapTest, SlotAliasingTasksBothKeepTheirEntries) {
     for (const auto &e : result.entries) {
         producers.push_back(e.entry->producer_task_id);
     }
-    EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make(0, 0)), producers.end());
-    EXPECT_NE(std::find(producers.begin(), producers.end(), TaskId::make(0, WINDOW_SIZE)), producers.end());
+    EXPECT_NE(std::find(producers.begin(), producers.end(), simpler::hbg::make_global_task(0)), producers.end());
+    EXPECT_NE(
+        std::find(producers.begin(), producers.end(), simpler::hbg::make_global_task(LAST_TASK)), producers.end()
+    );
+
+    // Each producer's chain head is its own entry, and LAST_TASK reaches the last
+    // reserved chain rather than folding onto a lower one. Read the heads directly:
+    // an entry count cannot tell one chain per producer from one shared chain.
+    ASSERT_NE(tmap.task_entry_heads[0], nullptr);
+    ASSERT_NE(tmap.task_entry_heads[LAST_TASK], nullptr);
+    EXPECT_EQ(tmap.task_entry_heads[0]->producer_task_id, simpler::hbg::make_global_task(0));
+    EXPECT_EQ(tmap.task_entry_heads[LAST_TASK]->producer_task_id, simpler::hbg::make_global_task(LAST_TASK));
+
+    // Unlinking a chain's only entry empties that chain and leaves the other intact.
+    tmap.remove_entry(*tmap.task_entry_heads[LAST_TASK]);
+    EXPECT_EQ(tmap.valid_count(), 1);
+    EXPECT_EQ(tmap.task_entry_heads[LAST_TASK], nullptr);
+    ASSERT_NE(tmap.task_entry_heads[0], nullptr);
+    EXPECT_EQ(tmap.task_entry_heads[0]->producer_task_id, simpler::hbg::make_global_task(0));
 }
 
 // Without an explicit semantic removal, direct inserts consume one pool entry
@@ -111,7 +133,7 @@ TEST_F(HbgTensorMapTest, PoolOccupancyOnlyGrows) {
     EXPECT_EQ(tmap.free_entries(), POOL_SIZE);
 
     for (int32_t i = 0; i < 8; i++) {
-        tmap.insert(make_test_tensor(0x1000 + 0x100 * i, 64), TaskId::make(0, i));
+        tmap.insert(make_test_tensor(0x1000 + 0x100 * i, 64), simpler::hbg::make_global_task(i));
         EXPECT_EQ(tmap.current_used(), i + 1);
         EXPECT_EQ(tmap.free_entries(), POOL_SIZE - (i + 1));
     }
@@ -122,11 +144,11 @@ TEST_F(HbgTensorMapTest, PoolOccupancyOnlyGrows) {
 // whole pool free, and the next body's inserts starting from entry 0. A leftover bucket
 // chain here would give the next Definition a producer the body never had.
 TEST_F(HbgTensorMapTest, ResetLeavesTheMapAsFreshlyInitialized) {
-    ChipTensor t = make_test_tensor(0x1000, 256);
+    simpler::hbg::Tensor t = make_test_tensor(0x1000, 256);
     for (int32_t i = 0; i < 8; i++) {
-        tmap.insert(make_test_tensor(0x1000 + 0x100 * i, 64), TaskId::make(0, i));
+        tmap.insert(make_test_tensor(0x1000 + 0x100 * i, 64), simpler::hbg::make_global_task(i));
     }
-    tmap.insert(t, TaskId::make(0, 9));
+    tmap.insert(t, simpler::hbg::make_global_task(9));
     ASSERT_EQ(tmap.current_used(), 9);
 
     tmap.reset();
@@ -141,30 +163,30 @@ TEST_F(HbgTensorMapTest, ResetLeavesTheMapAsFreshlyInitialized) {
 
     // And it is usable, not merely empty: the second body's producer is the only one a
     // lookup can reach.
-    tmap.insert(t, TaskId::make(0, 3));
+    tmap.insert(t, simpler::hbg::make_global_task(3));
     EXPECT_EQ(tmap.current_used(), 1);
     TestLookupResult second_body;
     run_lookup(tmap, t, second_body);
     ASSERT_EQ(second_body.count, 1);
-    EXPECT_EQ(second_body.entries[0].entry->producer_task_id, TaskId::make(0, 3));
+    EXPECT_EQ(second_body.entries[0].entry->producer_task_id, simpler::hbg::make_global_task(3));
 }
 
 // Reset is reachable any number of times, including on a map that was never inserted
-// into, and does not depend on the task window having been narrowed or widened -- it
-// keeps the sizes init() reserved.
+// into, and does not depend on how many task chains it reserved -- it keeps the sizes
+// init() reserved.
 TEST_F(HbgTensorMapTest, ResetIsIdempotentAndKeepsReservedSizes) {
     tmap.reset();
     tmap.reset();
     EXPECT_EQ(tmap.pool_capacity(), POOL_SIZE);
     EXPECT_EQ(tmap.free_entries(), POOL_SIZE);
 
-    // A task id that aliases slot 0 still lands in a working chain after two resets.
-    ChipTensor t = make_test_tensor(0x2000, 128);
-    tmap.insert(t, TaskId::make(0, WINDOW_SIZE));
+    // The last reserved chain is still a working chain after two resets.
+    simpler::hbg::Tensor t = make_test_tensor(0x2000, 128);
+    tmap.insert(t, simpler::hbg::make_global_task(LAST_TASK));
     TestLookupResult result;
     run_lookup(tmap, t, result);
     ASSERT_EQ(result.count, 1);
-    EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make(0, WINDOW_SIZE));
+    EXPECT_EQ(result.entries[0].entry->producer_task_id, simpler::hbg::make_global_task(LAST_TASK));
 }
 
 // Filling the pool drives free_entries() to zero. No device-completion watermark
@@ -172,7 +194,7 @@ TEST_F(HbgTensorMapTest, ResetIsIdempotentAndKeepsReservedSizes) {
 // waiting for asynchronous reclaim that HBG does not have.
 TEST_F(HbgTensorMapTest, ExhaustedPoolStaysExhausted) {
     for (int32_t i = 0; i < POOL_SIZE; i++) {
-        tmap.insert(make_test_tensor(0x10000 + 0x100 * i, 64), TaskId::make(0, i % WINDOW_SIZE));
+        tmap.insert(make_test_tensor(0x10000 + 0x100 * i, 64), simpler::hbg::make_global_task(i % MAX_TASKS));
     }
     EXPECT_EQ(tmap.current_used(), POOL_SIZE);
     EXPECT_EQ(tmap.free_entries(), 0);

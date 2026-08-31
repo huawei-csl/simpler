@@ -217,7 +217,7 @@ void chip_swimlane_aicpu_record_sched_phase(
  * @param thread_idx     Scheduler thread that completed the task
  * @param complete_time  Timestamp sampled immediately before completion propagation
  * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full PTO2 task identity
+ * @param task_id        Full task identity
  */
 void chip_swimlane_aicpu_record_dummy_task(
     int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
@@ -229,7 +229,7 @@ void chip_swimlane_aicpu_record_dummy_task(
  * @param thread_idx     Scheduler thread that completed the task
  * @param complete_time  Timestamp sampled immediately before completion propagation
  * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full PTO2 task identity
+ * @param task_id        Full task identity
  */
 void chip_swimlane_aicpu_record_predicated_skip(
     int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
@@ -238,7 +238,7 @@ void chip_swimlane_aicpu_record_predicated_skip(
 /** Record one bounded Scheduler-side Graph materialization slice. */
 void chip_swimlane_aicpu_record_graph_prepare(
     int thread_idx, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
-    uint32_t nodes_materialized
+    uint32_t tasks_materialized
 );
 
 /**
@@ -260,7 +260,7 @@ void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
  *
  * @param start_time  Submit start timestamp
  * @param end_time    Submit end timestamp
- * @param task_id     Task identifier. For tensormap_and_ringbuffer, full PTO2
+ * @param task_id     Task identifier. For tensormap_and_ringbuffer, full
  *                    encoding: (ring_id << 32) | local_id, enabling
  *                    cross-view correlation between orchestrator and
  *                    scheduler swimlanes.

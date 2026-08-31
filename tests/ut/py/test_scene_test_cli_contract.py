@@ -21,13 +21,14 @@ from simpler_setup import parallel_scheduler
 from simpler_setup.scene_test import (
     SceneTestCase,
     _dispatch_test_phases_standalone,
-    _effective_diagnostic_options,
+    effective_diagnostic_options,
     run_class_cases,
+    standalone_pytest_options,
 )
 
 
 def test_multi_rounds_disable_every_diagnostic() -> None:
-    options = _effective_diagnostic_options(
+    options = effective_diagnostic_options(
         2,
         chip_swimlane=4,
         dump_args=3,
@@ -42,7 +43,7 @@ def test_multi_rounds_disable_every_diagnostic() -> None:
 
 def test_swimlane_overhead_requires_chip_swimlane() -> None:
     with pytest.raises(ValueError, match="requires --enable-chip-swimlane"):
-        _effective_diagnostic_options(
+        effective_diagnostic_options(
             1,
             chip_swimlane=0,
             dump_args=0,
@@ -69,6 +70,39 @@ def test_dep_gen_extension_hook_uses_the_shared_multi_round_gate() -> None:
     assert not SceneTestCase._effective_enable_dep_gen(request)
 
 
+def test_thin_pytest_wrapper_forwards_the_shared_cli_contract() -> None:
+    options = {
+        "--rounds": 7,
+        "--skip-golden": True,
+        "--enable-chip-swimlane": 3,
+        "--dump-args": 2,
+        "--enable-pmu": 4,
+        "--enable-dep-gen": True,
+        "--enable-scope-stats": True,
+        "--enable-swimlane-overhead": True,
+    }
+    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name, default=None: options.get(name, default)))
+
+    assert standalone_pytest_options(request) == {
+        "rounds": 7,
+        "skip_golden": True,
+        "enable_chip_swimlane": 3,
+        "dump_args": 2,
+        "enable_pmu": 4,
+        "enable_dep_gen": True,
+        "enable_scope_stats": True,
+        "enable_swimlane_overhead": True,
+    }
+
+
+@pytest.mark.parametrize(("rounds", "expected"), [(1, 3), (2, 0)])
+def test_chip_swimlane_extension_hook_uses_the_shared_multi_round_gate(rounds, expected) -> None:
+    options = {"--rounds": rounds, "--enable-chip-swimlane": 3}
+    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name, default=None: options.get(name, default)))
+
+    assert SceneTestCase._effective_enable_chip_swimlane(request) == expected
+
+
 def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> None:
     scene_test_module = importlib.import_module("simpler_setup.scene_test")
     output_prefix = scene_test_module.Path("diagnostic-output")
@@ -78,7 +112,7 @@ def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> 
         def _run_and_validate(self, *_args, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(scene_test_module, "_build_output_prefix", lambda _case_label: output_prefix)
+    monkeypatch.setattr(scene_test_module, "build_output_prefix", lambda _case_label: output_prefix)
 
     run_class_cases(
         object(),
@@ -106,8 +140,10 @@ def test_run_class_cases_reports_the_failing_case_name() -> None:
 
     case = {"name": "large_bf16", "params": {"batch": 64, "dtype": "bfloat16"}}
 
+    # The scene's own exception type reaches the caller: a negative scene test
+    # asserts on it, so a fixed-type wrapper would make such a test unable to pass.
     with pytest.raises(
-        RuntimeError,
+        ValueError,
         match=r"SceneTest case failed: FailingScene::large_bf16: device run failed$",
     ) as failure:
         run_class_cases(
@@ -125,8 +161,36 @@ def test_run_class_cases_reports_the_failing_case_name() -> None:
             enable_scope_stats=False,
         )
 
-    assert isinstance(failure.value.__cause__, ValueError)
-    assert str(failure.value.__cause__) == "device run failed"
+    # Annotated in place, so there is no wrapper to unwrap and the traceback still
+    # points at the scene that raised.
+    assert failure.value.__cause__ is None
+    assert failure.value.args[0] == "SceneTest case failed: FailingScene::large_bf16: device run failed"
+
+
+def test_run_class_cases_names_the_case_without_args() -> None:
+    """An exception carrying no message still gets the case name, not `'…: '`."""
+
+    class FailingScene:
+        def _run_and_validate(self, *_args, **_kwargs):
+            raise ValueError
+
+    with pytest.raises(ValueError) as failure:
+        run_class_cases(
+            object(),
+            FailingScene(),
+            [{"name": "empty_args"}],
+            callable_obj=object(),
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_chip_swimlane=0,
+            enable_dump_args=0,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    assert str(failure.value) == "SceneTest case failed: FailingScene::empty_args"
 
 
 def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:

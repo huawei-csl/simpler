@@ -36,6 +36,11 @@ from pathlib import Path
 from typing import Any
 
 from simpler_setup.tools.clock_correlation import build_clock_alignment
+from simpler_setup.tools.scheduler_phase_records import (
+    canonical_sched_phase,
+    nested_resolve_record_ids,
+    scheduler_thread_role,
+)
 
 
 def _func_id_to_letter(func_id):
@@ -86,10 +91,10 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
     return label
 
 
-def normalize_pto2_task_id_int(v):
-    """Unsigned 64-bit PTO2 task id (matches host JSON / device ``task_id.raw``).
+def normalize_task_id_int(v):
+    """Unsigned 64-bit task id (matches host JSON / device ``task_id.raw``).
 
-    Normalizes signed values to unsigned for ``(ring_id << 32) | local_id``.
+    Normalizes signed values to unsigned so the high field decodes correctly.
     Returns None if ``v`` is not convertible to int.
     """
     try:
@@ -102,16 +107,20 @@ def normalize_pto2_task_id_int(v):
 
 
 def format_task_display(task_id):
-    """Format PTO2 task_id for human-readable labels.
+    """Format a task_id for human-readable labels.
 
-    Layout: 64-bit raw = (ring_id << 32) | local_id (same as runtime TaskId).
+    The high 32 bits are a ring index under ``tensormap_and_ringbuffer`` (any ring in
+    ``0..CHIP_MAX_RING_DEPTH-1``) and an id space under ``host_build_graph``
+    (0 = GLOBAL, 1 = IN_GRAPH). The short form below therefore covers tmr ring 0 and
+    every hbg GLOBAL task; a tmr task on ring 2 is equally ordinary and gets the long
+    form.
 
     Returns:
-        ``r{ring}t{local}`` when ring != 0 (e.g. r2t100), else ``t{local}`` for single-ring (ring 0).
+        ``r{high}t{local}`` when the high field != 0 (e.g. r2t100), else ``t{local}``.
 
     For invalid or non-numeric values, returns str(task_id).
     """
-    tid = normalize_pto2_task_id_int(task_id)
+    tid = normalize_task_id_int(task_id)
     if tid is None:
         return str(task_id)
     ring = (tid >> 32) & 0xFF
@@ -121,13 +130,14 @@ def format_task_display(task_id):
     return f"r{ring}t{local}"
 
 
-def _decode_graph_node_task_id(task_id):
-    """Decode Scheduler-owned ring-1 Graph-node ids.
+def _decode_in_graph_task_id(task_id):
+    """Decode Scheduler-owned in-graph task ids.
 
-    Graph nodes use ``local=(outer_local << 10) | node_index`` while the
-    stream-visible outer Graph task remains on ring 0.
+    ``host_build_graph`` puts a materialized in-graph task in id space 1 (IN_GRAPH) with
+    ``local=(graph_local_id << 10) | task_index``; the stream-visible outer Graph task
+    stays in space 0 (GLOBAL). See src/common/host_build_graph/task_id_encoding.h.
     """
-    tid = normalize_pto2_task_id_int(task_id)
+    tid = normalize_task_id_int(task_id)
     if tid is None or ((tid >> 32) & 0xFFFFFFFF) != 1:
         return None
     local = tid & 0xFFFFFFFF
@@ -135,14 +145,14 @@ def _decode_graph_node_task_id(task_id):
 
 
 def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR0912
-    """Join Graph-node rows to their outer GraphPrepare records."""
+    """Join in-graph task rows to their outer GraphPrepare records."""
     prepare_by_outer = defaultdict(list)
     dummy_rows = []
     for thread_idx, records in enumerate(scheduler_phases or []):
         for record in records:
             phase = record.get("phase")
             if phase == "graph_prepare":
-                outer_task_id = normalize_pto2_task_id_int(record.get("task_id"))
+                outer_task_id = normalize_task_id_int(record.get("task_id"))
                 if outer_task_id is not None and (outer_task_id >> 32) == 0:
                     prepare_by_outer[outer_task_id].append(record)
             elif phase == "dummy_task":
@@ -150,17 +160,17 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
 
     rows_by_outer = defaultdict(list)
     for task in tasks:
-        decoded = _decode_graph_node_task_id(task.get("task_id"))
+        decoded = _decode_in_graph_task_id(task.get("task_id"))
         if decoded is not None:
-            outer_task_id, node_index = decoded
-            rows_by_outer[outer_task_id].append((task, node_index))
+            outer_task_id, task_index = decoded
+            rows_by_outer[outer_task_id].append((task, task_index))
 
     dummy_by_outer = defaultdict(list)
     for record, thread_idx in dummy_rows:
-        decoded = _decode_graph_node_task_id(record.get("task_id"))
+        decoded = _decode_in_graph_task_id(record.get("task_id"))
         if decoded is not None:
-            outer_task_id, node_index = decoded
-            dummy_by_outer[outer_task_id].append((record, node_index, thread_idx))
+            outer_task_id, task_index = decoded
+            dummy_by_outer[outer_task_id].append((record, task_index, thread_idx))
 
     instances = []
     for outer_task_id, prepare_records in prepare_by_outer.items():
@@ -168,8 +178,8 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
         aicpu_rows = dummy_by_outer.get(outer_task_id, [])
         if not rows and not aicpu_rows:
             continue
-        node_indices = {node_index for _, node_index in rows}
-        node_indices.update(node_index for _, node_index, _ in aicpu_rows)
+        task_indices = {task_index for _, task_index in rows}
+        task_indices.update(task_index for _, task_index, _ in aicpu_rows)
         starts = [
             task.get("dispatch_time_us", _task_slice_start_us(task))
             if task.get("dispatch_time_us", -1) >= 0
@@ -188,7 +198,7 @@ def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR091
                 "outer_task_id": outer_task_id,
                 "rows": rows,
                 "aicpu_rows": aicpu_rows,
-                "visible_node_indices": sorted(node_indices),
+                "visible_task_indices": sorted(task_indices),
                 "execution_start_us": min(starts),
                 "execution_end_us": max(ends),
                 "prepare_start_us": prepare_start_us,
@@ -348,7 +358,7 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     host_composite_end_us = (max(host_timestamps) - host_origin_ns) / 1000.0 if host_timestamps else 0.0
 
     # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
-    # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
+    # same task_token_raw to the same core (SPMD over-subscription, MIX
     # cluster spread) each get their own reg_task_id, so this key is unique
     # per dispatch even when task_token_raw collides.
     #
@@ -666,8 +676,8 @@ def load_deps_json(deps_path):
     for edge in edges:
         if not isinstance(edge, dict):
             continue
-        pred = normalize_pto2_task_id_int(edge.get("pred"))
-        succ = normalize_pto2_task_id_int(edge.get("succ"))
+        pred = normalize_task_id_int(edge.get("pred"))
+        succ = normalize_task_id_int(edge.get("succ"))
         if pred is None or succ is None:
             continue
         key = (pred, succ)
@@ -711,7 +721,7 @@ def load_deps_kernel_map(deps_path):
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        tid = normalize_pto2_task_id_int(task.get("task_id"))
+        tid = normalize_task_id_int(task.get("task_id"))
         kids = task.get("kernel_ids")
         if tid is None or not isinstance(kids, list) or len(kids) != 3:
             continue
@@ -742,7 +752,7 @@ def load_deps_block_map(deps_path):
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        tid = normalize_pto2_task_id_int(task.get("task_id"))
+        tid = normalize_task_id_int(task.get("task_id"))
         if tid is None:
             continue
         try:
@@ -1438,23 +1448,23 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             )
         for instance in graph_instances:
             outer_display = format_task_display(instance["outer_task_id"])
-            node_indices = instance["visible_node_indices"]
+            task_indices = instance["visible_task_indices"]
             events.append(
                 {
                     "args": {
                         "outer_task_id": instance["outer_task_id"],
-                        "visible_node_count": len(node_indices),
-                        "visible_node_index_min": min(node_indices),
-                        "visible_node_index_max": max(node_indices),
+                        "visible_in_graph_task_count": len(task_indices),
+                        "visible_in_graph_task_index_min": min(task_indices),
+                        "visible_in_graph_task_index_max": max(task_indices),
                         "prepare_slice_count": instance["prepare_slice_count"],
                         "prepare_duration_us": instance["prepare_duration_us"],
                         "execution_start_us": instance["execution_start_us"],
                         "execution_duration_us": instance["execution_end_us"] - instance["execution_start_us"],
-                        "synthetic_id_layout": "ring1:(outer_task_id << 10) | node_index",
+                        "synthetic_id_layout": "ring1:(outer_task_id << 10) | in_graph_task_index",
                     },
                     "cat": "graph_execution",
                     "cname": "rail_animation",
-                    "name": f"GraphExecution({outer_display}, {len(node_indices)} visible nodes)",
+                    "name": f"GraphExecution({outer_display}, {len(task_indices)} visible in-graph tasks)",
                     "ph": "X",
                     "pid": 5,
                     "tid": 5000 + instance["lane_idx"],
@@ -1724,7 +1734,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "dispatch": "terrible",  # red
             "async_poll": "yellow",  # async-wait completion polling (split from complete)
             "release": "olive",  # deferred-release drain (on_task_release work)
-            "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
+            "dummy": "grey",  # dummy_drain pass (TMR Resolve nests inside; HBG P bar is standalone)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
             # sync_start stop-the-world drain: outer bar time-contains the two
             # inner staging passes, so Perfetto nests them by depth on the track.
@@ -1732,7 +1742,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "drain_prepare": "cq_build_attempt_runnable",  # inner: cluster scan + build_payload
             "drain_publish": "cq_build_attempt_passed",  # inner: MMIO write_reg per subtask (the cohort launch)
             "graph_prepare": "rail_animation",  # bounded Scheduler-side Definition expansion
-            # Inner phase — nests inside Complete or Dummy via time containment
+            # Inner in TMR; standalone on HBG's dedicated P thread.
             "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
             # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
             "dummy_task": "grey",
@@ -1792,9 +1802,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # as a 0.02 us sliver so Perfetto does not collapse it to a hairline.
         AICPU_WORKER_MARKER_MIN_DUR_US = 0.02  # noqa: N806
 
+        assigned_thread_indices = {
+            assigned for assigned in (core_to_thread or []) if isinstance(assigned, int) and assigned >= 0
+        }
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
             resolve_tid = sched_lane_tid(thread_idx, 1)
+            nested_resolve_ids = nested_resolve_record_ids(thread_records)
+            is_resolution_thread = (
+                scheduler_thread_role(thread_records, assigned_thread_indices, thread_idx, nested_resolve_ids)
+                == "resolution"
+            )
 
             # Thread name metadata
             events.append(
@@ -1807,7 +1825,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "tid": tid,
                 }
             )
-            if any(record.get("phase") == "resolve" for record in thread_records):
+            if nested_resolve_ids:
                 events.append(
                     {
                         "args": {"name": f"Sched_{thread_idx}"},
@@ -1829,12 +1847,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # virtual worker, so we route them to Worker View (pid=4) AICPU_N
             # (where N = the AICPU id of the sched thread that drained them).
             for record in thread_records:
-                phase = record.get("phase", "unknown")
+                raw_phase = record.get("phase", "unknown")
+                phase = canonical_sched_phase(raw_phase)
                 if phase in ("dummy_task", "predicated_skip"):
                     start_us = record["start_time_us"]
                     end_us = record["end_time_us"]
                     dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
-                    task_id = normalize_pto2_task_id_int(record.get("task_id"))
+                    task_id = normalize_task_id_int(record.get("task_id"))
                     task_label = format_task_display(task_id) if task_id is not None else "unknown"
                     if phase == "dummy_task":
                         event_name = f"dummy({task_label})"
@@ -1944,7 +1963,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         tasks_processed = matched_finish_rows
                         phase_args["tasks_processed"] = tasks_processed
                 display_name = f"{phase}({tasks_processed})"
-                event_tid = resolve_tid if phase == "resolve" else tid
+                event_tid = resolve_tid if raw_phase == "resolve" and id(record) in nested_resolve_ids else tid
                 events.append(
                     {
                         "args": phase_args,
@@ -1964,10 +1983,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # start, so emitting both is redundant. Two samples at the
                 # SAME ts (e.g. final-drain emit where start_time==end_time)
                 # also breaks Perfetto's rate calc (divide-by-zero → NULL).
-                # Only complete/dispatch carry real queue depths; release/
-                # resolve/early_dispatch zero-fill them, so skip their counter
-                # samples to avoid spurious 0 dips.
-                if phase not in ("complete", "dispatch"):
+                # Complete/Dispatch and every HBG P-thread phase carry live
+                # shared-queue snapshots. Other runtime phases zero-fill them.
+                phase_has_live_depths = phase in ("complete", "dispatch") or (
+                    is_resolution_thread and phase in ("resolve", "async_poll", "dummy")
+                )
+                if not phase_has_live_depths:
                     continue
                 if not depths_valid:
                     continue
@@ -2094,7 +2115,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 for rec in thread_records:
                     phase = rec.get("phase")
                     if phase in ("dummy_task", "predicated_skip"):
-                        task_id = normalize_pto2_task_id_int(rec.get("task_id"))
+                        task_id = normalize_task_id_int(rec.get("task_id"))
                         if task_id is not None:
                             if phase == "dummy_task":
                                 dummy_task_ids.add(task_id)
@@ -2703,7 +2724,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 task_id = record.get("task_id", -1)
                 if task_id < 0:
                     continue
-                tid_k = normalize_pto2_task_id_int(task_id)
+                tid_k = normalize_task_id_int(task_id)
                 if tid_k is None:
                     continue
                 # First-seen orch_submit wins; legacy orch_fanin / orch_params
@@ -2721,7 +2742,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
         if has_aicpu_data and orch_anchor_by_task:
             for task in tasks:
-                tid = normalize_pto2_task_id_int(task.get("task_id"))
+                tid = normalize_task_id_int(task.get("task_id"))
                 if tid is None:
                     continue
 

@@ -59,7 +59,7 @@ Each sub-level macro requires `SIMPLER_DFX=1`:
 **What's compiled:**
 
 - Debug/diagnostic logs (always present)
-- Progress tracking (`PTO2 progress: completed=...`)
+- Progress tracking (`progress: completed=...`)
 - Stall detection and dump (triggered after the `SCHEDULER_TIMEOUT_MS` wall-clock no-progress budget)
 - Deadlock/livelock detection (`diagnose_stuck_state`, called on stall)
 
@@ -74,8 +74,8 @@ Each sub-level macro requires `SIMPLER_DFX=1`:
 - No `sched_start/sched_end/sched_cost` timestamps
 - No `orch_start/orch_end/orch_cost` timestamps
 - No `Scheduler summary: total_time=...`
-- No `PTO2 total submitted tasks` log
-- `PTO2 progress: completed=... total=...` may appear (thread 0 only, at task completion milestones)
+- No `total submitted tasks` log
+- `progress: completed=... total=...` may appear (thread 0 only, at task completion milestones)
 
 ---
 
@@ -83,7 +83,7 @@ Each sub-level macro requires `SIMPLER_DFX=1`:
 
 host_build_graph boots **scheduler-only** — the orchestrator runs on the host,
 so the device log carries no `orch_start`/`orch_end`/`orch_cost` lines and no
-`PTO2 total submitted tasks` line (see the note at the top of this file). Every
+`total submitted tasks` line (see the note at the top of this file). Every
 AICPU thread schedules its own core slice, so `N_sched == aicpu_thread_num`.
 
 **What's compiled:**
@@ -246,7 +246,7 @@ so records and spans read against each other with no alignment step.
 | Group | Kinds |
 | ----- | ----- |
 | Bind segments (partition the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `sm_h2d`, `arena_h2d`, `host_view_close` |
-| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_node`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
+| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_in_graph_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
 
 Three of the orchestrator kinds end with a task submitted — `submit_task`,
 `alloc_tensors`, `graph_submit` — so their count is the bind's `total_tasks`
@@ -258,6 +258,29 @@ why a per-kind total is a **cost share, not an interval**: a per-event mean is
 The last three come from the generated orchestration `.so` rather than the runtime,
 through the ops table's `record_orch_phase`, so they carry submit group 0 rather
 than the submission they belong to.
+
+### A phase is an interval; a quantity is an attribute
+
+The two shapes of information on this path are not interchangeable, and choosing
+the wrong one produces a number that reads as data and is not:
+
+- **A record is an interval** — one operation, start to end. Its `detail` says
+  *which* operation (a task id, a Graph key, the submission index) or *how much*
+  it covered (`build_definition`'s in-graph task count, `recording_wait`'s in-flight
+  count). That is the whole contract.
+- **A quantity about a segment is an attribute** — `bytes=`, `heap_used=`,
+  `spilled=`, `minflt=`, `nvcsw=`. It goes in the segment's attribute string,
+  which is what the `bind phase=` line prints.
+
+So: **a new interval to name earns a new kind; a new quantity about an interval
+that already exists is an attribute on it.** Adding a kind to carry a statistic
+puts a measurement into the timeline where a reader expects a duration, and the
+breakdown will then sum it.
+
+Which is exactly why `detail` is summed only where it counts something
+(`host_phase_kind_detail_is_quantity`). Nine of the eleven orchestrator kinds
+carry an identity, and a sum over identities — task ids added together — was
+printed as `detail_sum` for as long as the column was unconditional.
 
 ### The three switches
 
@@ -303,7 +326,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   They come from per-kind counters, not from the record pool. The counters use
   lock-free atomic additions across the main and recording-worker lanes, with
   every phase isolated on its own cache line so concurrent `graph_submit` and
-  `record_node` updates do not false-share. The per-event pool is armed when the
+  `record_in_graph_task` updates do not false-share. The per-event pool is armed when the
   artifact is wanted (`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE` *and* an output
   prefix) or whenever the chip swimlane is at `ORCH_PHASES`; a steady-state run
   satisfies neither, so it pays no pool append and no artifact lock at all. A
@@ -321,7 +344,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   This is the channel to read for a distribution or a per-event timeline; the
   summed lines cannot express either. Every record carries its producer Linux
   tid. `strace_timing.py --swimlane --host-phase-records <path>` draws each record
-  inside the matching `chip.run.bind`; `record_node` and `build_definition`
+  inside the matching `chip.run.bind`; `record_in_graph_task` and `build_definition`
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 
@@ -393,8 +416,8 @@ header just like on onboard.
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
 
-At level 1 the AICore record carries the full PTO2 `task_token_raw`
-(`(ring_id << 32) | local_id`), read straight from
+At level 1 the AICore record carries the full `task_token_raw`
+(a `TaskId::raw`; see `src/common/host_build_graph/task_id_encoding.h`), read straight from
 `LocalContext.async_ctx.task_token.raw` inside the AICore helper —
 already in cache from the dispatch payload, so no extra GM load.
 Identity fields the AICPU side used to write at level 1 (`func_id`,

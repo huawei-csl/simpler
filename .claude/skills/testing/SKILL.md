@@ -113,14 +113,21 @@ command -v npu-smi &>/dev/null
 | Found | `<arch>sim` (simulation) **and** `<arch>` (hardware) |
 | Not found | Simulation only (default `a2a3sim`) |
 
-**When `npu-smi` is found**, detect the platform by parsing chip name from `npu-smi info` output:
+**When `npu-smi` is found**, detect the platform by parsing chip name from `npu-smi info` output. If that call fails, retry it as `task-submit --run "npu-smi info"` — some shared hosts restrict DCMI to root — and judge by exit status, not by whether output appeared (see [running-onboard.md](../../rules/running-onboard.md#why)):
 
 | Chip name contains | Platform |
 | ------------------ | -------- |
 | `910B` or `910C` | `a2a3` (sim: `a2a3sim`) |
 | `950` | `a5` (sim: `a5sim`) |
 
-Use the detected platform for all subsequent `--platform` flags. If the chip name is unrecognized, warn and default to `a2a3`.
+Use the detected platform for all subsequent `--platform` flags.
+
+Two different failures hide behind an empty chip name, and only one of them is safe to guess past:
+
+- **Both the bare call and the `task-submit` retry exited non-zero** — the silicon was never identified. `command -v npu-smi` above only proves the binary exists, so this is the state on a DCMI-restricted host with no `task-submit`. Report the error and test **simulation only**; do not guess a hardware platform.
+- **The query succeeded but the chip name matches no row** — genuinely unrecognized silicon. Warn and default to `a2a3`.
+
+Guessing `a2a3` in the first case runs hardware tests against silicon nobody has identified, which is the `--platform` mismatch that [onboard-arch-precheck](../onboard-arch-precheck/SKILL.md) exists to refuse.
 
 ### Step 2 — Test Scope
 
@@ -150,7 +157,7 @@ Parallelism is handled by the `#591` scheduler (`simpler_setup/parallel_schedule
 When testing on `a2a3`, detect idle devices:
 
 ```bash
-npu-smi info
+npu-smi info || task-submit --run "npu-smi info"
 ```
 
 Pick devices whose **HBM-Usage is 0** and find the **longest consecutive sub-range** (at most 4). Pass as `--device <start>-<end>` (or `--device <id>` if only one idle device). If no idle device is found, skip hardware testing and warn.
@@ -182,7 +189,7 @@ git diff --name-only
    - Examples: `examples/{arch}/<runtime>/<name>/`
    - Device-only scene tests: `tests/st/{arch}/<runtime>/<name>/`
 2. Add `test_<name>.py` with a `@scene_test`-decorated class (see [docs/testing.md](../../docs/testing.md) for the full template: `CALLABLE`, `CASES`, `generate_args`, `compute_golden`). End with `if __name__ == "__main__": SceneTestCase.run_module(__name__)` so the file runs standalone.
-3. Omit `CASES[*]["config"]["aicpu_thread_num"]` unless the test specifically exercises a thread-count or scheduler-topology behavior. The default automatically selects the correct count for each architecture; do not copy or pin that default. When an override is necessary, add a nearby comment explaining the test dependency. The framework rejects unknown `config` keys at import time; the accepted keys are `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`, with `ring_task_window`, `ring_heap`, and `ring_dep_pool` under `runtime_env`.
+3. Omit `CASES[*]["config"]["aicpu_thread_num"]` unless the test specifically exercises a thread-count or scheduler-topology behavior. The default automatically selects the correct count for each architecture; do not copy or pin that default. When an override is necessary, add a nearby comment explaining the test dependency. The framework rejects unknown `config` keys at import time; the accepted keys are `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`, with `ring_task_window`, `ring_heap`, and `ring_dep_pool` under `runtime_env`. Do not set `ring_heap` on a `host_build_graph` case — that runtime commits its graph heap to the size orchestration measured and warns that the knob reached nothing.
 4. Add kernel source files under `kernels/aic/`, `kernels/aiv/`, and/or `kernels/orchestration/` — referenced by `CALLABLE["orchestration"]["source"]` / `CALLABLE["incores"][*]["source"]` as paths relative to the test file.
 5. Pytest auto-discovers any `test_*.py` under `examples/` and `tests/st/`; no registration needed.
 

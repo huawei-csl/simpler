@@ -24,6 +24,68 @@ constructing span attributes; `WARN`, `ERROR`, and `NUL` therefore disable the
 instrumentation work as well as the output. Device logging still uses the
 initialization-time policy described in [logging.md](../logging.md).
 
+## Where the records go
+
+The host logger writes to stderr until it is given a directory, and then it
+writes to `<directory>/host.<pid>.log` instead. The directory is
+`CallConfig.output_prefix` — the one every other diagnostic artifact already goes
+under — so a run that has one gets its host log beside its other artifacts, and a
+run that does not keeps its records on the console. There is no separate switch to
+configure, and the runtime never derives the path itself.
+
+**The destination belongs to the logger, not to a record.** Everything that logger
+writes follows it: `LOG_*` records, `[STRACE]` spans, `[CLOCK_ANCHOR]`, the
+`bind phase=` summaries, and the spans Python emits through
+`unified_log_host_span`. Nothing declares an intent and no record kind is treated
+specially, so there is no state in which part of a run's log is in one place and
+part in another. The first non-empty directory in a process wins, and a record
+falls back to stderr rather than being lost whenever the file cannot take it: a
+path that does not fit, a failed open, a failed write, or a failed flush.
+
+**Python's own log records are part of this stream too.** Seeding the native
+threshold installs a handler on the `simpler` logger that forwards each record
+through `unified_log_*`, so a Python `logger.warning(...)` carries the same
+envelope and the same clock as a C++ record and lands in the same place. It also
+still reaches the root logger, because propagation is left alone — that is what
+keeps a console readable and `caplog` working, and it makes the console a view of
+the log rather than a second half of it. Records logged before a worker is
+initialized have no handler to forward through yet and stay on the root logger.
+See [logging.md](../logging.md).
+
+Each process's file is fully buffered. It is flushed when a depth-zero invocation
+record completes, which is the point at which the records so far describe a whole
+invocation, and whenever a `WARN` or `ERROR` record is written, which is rare and
+worth having on disk if the process dies. That flush runs on the thread that
+emitted the record, so this reduces the observer effect by roughly the ratio of
+records to flushes rather than removing it: expect a residual tail at each flush
+boundary, not a clean floor. A system tracer would hand the bytes to a consumer
+instead, and would bound its buffer and count what it drops; this does neither,
+deliberately.
+
+Every DSO that compiles the logger holds its own buffered stream on that one
+file, so the buffering above is per module rather than per process: a `WARN` from
+one module does not put another module's pending records on disk. Unloading a
+module closes its stream, so a `dlclose` — which the sim device runner performs
+on the AICPU SO at every teardown — leaves no records behind in the mapping it
+drops. A stream inherited across `fork` belongs to the parent and is left alone,
+so a child never flushes the parent's copied buffer a second time.
+
+## Reading a run back
+
+Every record carries its own `pid`, so the tools take several inputs and
+concatenate them, and a directory expands to the `host.*.log` files inside it:
+
+```bash
+python -m simpler_setup.tools.strace_timing <output_prefix> --swimlane swimlane.json
+```
+
+A process writes its `[CLOCK_ANCHOR]` ahead of its first record and into the same
+stream, so each file is self-contained for wall-clock recovery. If an input is
+truncated or a process's file is missing, the pids in it stay monotonic-only and
+`clockAnchors` is absent from the output rather than wrong — the tool warns when a
+pid emitted spans and no anchor was found for it, which is the signal that this
+happened.
+
 ## Marker grammar
 
 Every host log record starts with a `CLOCK_MONOTONIC` nanosecond timestamp:
@@ -142,10 +204,28 @@ which every one of those levels runs on:
 | `<level>.activate` | prepared-frame activation |
 | `<level>.complete` | terminal child progress handling |
 | `<level>.post_fence_retirement` | run erase + quiescent compaction, after the completion fence |
+| `<level>.scheduler_loop` | one scheduler-loop iteration that drained a completion or dispatched a task |
 
 Their attributes carry the available `run_id`, `task_slot`, `group_index`,
 `worker_id`, `dispatch_id`, endpoint kind, and the dispatch's pipeline lease
 (`slot_id` / `generation`).
+
+`<level>.scheduler_loop` is the exception to that list and to the tree below: a
+loop iteration serves whichever runs were ready, so it belongs to no run and
+carries no key at all. Its own attributes are the counts:
+
+| Attribute | Meaning |
+| --------- | ------- |
+| `drained` `dispatched` | completions handled and tasks handed to a worker in this iteration |
+| `drain_ns` | how much of the span was phase 1, so the two phases are separable from one record |
+| `spins` | iterations since the previous span that did neither |
+
+**An iteration that neither drained nor dispatched emits nothing.** The loop
+skips its condition-variable wait entirely whenever any worker is busy, so its
+iteration count is bounded by CPU speed rather than by work — one span per
+iteration would be unbounded, and the ratio that matters is recoverable without
+them: the gap between two spans on the scheduler lane is the wait, and `spins`
+reports how many empty iterations the gap contained.
 
 The word is resolved once per process, from its Worker's level, and the **first
 binding wins**: a `SpanScope` keeps the name pointer it was handed, so a process
@@ -156,7 +236,7 @@ one vocabulary — which is what makes an L4 run readable, since its own spans s
 
 One process contributes at most two host lanes, because the scheduler runs on
 one thread: the facade thread emits `<level>.graph_build` and `<level>.submit`,
-and the scheduler thread emits the other four. `role=worker` on
+and the scheduler thread emits the other five. `role=worker` on
 `<level>.frame_submit`, `<level>.activate` and `<level>.complete` names the
 worker a dispatch targets, not the thread that ran it.
 

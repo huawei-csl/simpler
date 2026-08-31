@@ -60,6 +60,7 @@
 
 #include "common/core_type.h"
 #include "common/dfx_backpressure_device.h"
+#include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 
 // =============================================================================
@@ -137,11 +138,11 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
  *
  * Two identity fields with different roles:
  *
- * - `task_token_raw` — the PTO2 task identity `(ring_id << 32) | local_id`.
- *   Per-task unique. AICore reads it from
+ * - `task_token_raw` — the task identity, a `TaskId::raw` in whatever layout
+ *   the minting runtime uses. Per-task unique. AICore reads it from
  *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
  *   payload's cache line). The host pulls it from here as the canonical
- *   task id + ring decoder at ALL levels — the AICPU record carries no
+ *   task id at ALL levels — the AICPU record carries no
  *   identity after the slim-down (only dispatch/finish timestamps and the
  *   reg_task_id join key), so AICore is the single source of truth for
  *   task identity. NOT a join key on its own: SPMD `block_num > num_cores`,
@@ -487,12 +488,19 @@ static_assert(sizeof(ChipSwimlaneDataHeader) % 64 == 0, "ChipSwimlaneDataHeader 
  * a single discriminator byte:
  *
  *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
- *     Complete, Dispatch, Release, Dummy, EarlyDispatch.
+ *     Complete, Dispatch, Release, Dummy, EarlyDispatch, AsyncPoll, Drain,
+ *     GraphPrepare.
  *     Every iter is a sequence of zero-or-more outer bars + optional gap.
  *
  *   INNER (no anchor advance; Perfetto auto-nests by time containment):
- *     Resolve. Only parents are Complete and Dummy — those are the two
- *     FIN-observation sites that call on_task_complete.
+ *     Resolve in the tensormap_and_ringbuffer runtime, plus DrainPrepare and
+ *     DrainPublish. Resolve is contained by Complete or Dummy there.
+ *
+ *   HBG RESOLUTION-THREAD OUTER:
+ *     ResolveStandalone, AsyncPoll, and Dummy. The host_build_graph runtime
+ *     hands FIN'd slots from S threads to a dedicated P thread, so these are
+ *     standalone, mutually exclusive P-thread bars rather than nested
+ *     S-thread work.
  *
  *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
  *     DummyTask and PredicatedSkip. One zero-width marker per dependency-only
@@ -515,13 +523,12 @@ enum class ChipSwimlaneSchedPhaseKind : uint32_t {
     EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
                         // of a flagged producer's consumer's gated blocks.
                         // tasks_processed = blocks staged this pass.
-    // Inner (parent: Complete | Dummy)
-    Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
-                  // push newly-ready successors, ring doorbells for
-                  // early-dispatch hits. tasks_processed = # consumers visited.
+    // Inner in tensormap_and_ringbuffer (parent: Complete | Dummy).
+    Resolve = 6,  // Complete ready work after FIN observation. tasks_processed
+                  // is consumers visited.
     // Separate-lane (Worker View pid=4 AICPU_N)
     DummyTask = 7,      // Per-dummy identity marker (zero-width). phase_data.dummy_task
-                        // carries the local/ring components of the full PTO2 identity.
+                        // carries the local/ring components of the full task identity.
     Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
                         // (ack barrier + availability + parallel stage + finalize).
                         // One bar per dispatch-loop iteration that enters the drain,
@@ -541,12 +548,16 @@ enum class ChipSwimlaneSchedPhaseKind : uint32_t {
                           // phase_data.dummy_task identity payload as DummyTask.
     // Outer (sched lane): one bounded Graph Definition materialization slice.
     // phase_data.graph_task identifies the ring-0 outer Graph task and
-    // tasks_processed is the number of nodes patched in this slice.
+    // tasks_processed is the number of in-graph tasks patched in this slice.
     GraphPrepare = 13,
+    // Outer on host_build_graph's dedicated P thread. Kept distinct from the
+    // nested TMR Resolve so post-processing never infers the role from rounded
+    // timestamps. tasks_processed is completed SPSC slots.
+    ResolveStandalone = 14,
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
- *  Must match PTO2ResourceShape's first three values (see submit_types.h).
+ *  Must match ResourceShape's first three values (see submit_types.h).
  *  Hardcoded here rather than included to keep this header runtime-independent. */
 constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
 
@@ -607,7 +618,7 @@ static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicp
 struct ChipSwimlaneAicpuOrchPhaseRecord {
     uint64_t start_time;  // Submit start timestamp
     uint64_t end_time;    // Submit end timestamp
-    uint64_t task_id;     // Full PTO2 encoding (ring_id << 32) | local_id
+    uint64_t task_id;     // TaskId::raw, in the minting runtime's layout
     uint32_t submit_idx;  // Monotonic submit counter
     uint32_t _pad;        // 32B alignment padding
 };
@@ -624,7 +635,7 @@ static_assert(sizeof(ChipSwimlaneAicpuOrchPhaseRecord) == 32, "ChipSwimlaneAicpu
  *
  * `payload` is kind-discriminated: a task id for the kinds that submit a task
  * (see host_phase_kind_submits_task), otherwise a per-kind detail count such as
- * a byte or node count. Readers must consult `kind` before interpreting it.
+ * a byte or in-graph task count. Readers must consult `kind` before interpreting it.
  */
 struct HostPhaseRecord {
     uint64_t start_ns;
@@ -638,40 +649,11 @@ struct HostPhaseRecord {
 static_assert(sizeof(HostPhaseRecord) == 40, "HostPhaseRecord layout drift");
 
 /**
- * What one HostPhaseRecord measured.
- *
- * The bind kinds partition the bind stage: their durations sum to the
- * `chip.run.bind` span. The orchestrator kinds are nested inside BindHostOrch
- * and do not partition it — some are sub-operations of others.
+ * What one HostPhaseRecord measured — the kinds themselves live in
+ * common/host_phase_kind.h, so the AICPU build and the orchestration .so can name
+ * them without taking this header's dependencies. The predicates below are
+ * host-only and stay here.
  */
-enum class HostPhaseKind : uint32_t {
-    BindArgs = 0,
-    BindArenaBuild,
-    BindStaticArena,
-    BindGmHeap,
-    BindSharedMem,
-    BindRuntimeInit,
-    BindHostOrch,
-    BindGraphUpload,
-    BindRelocate,
-    BindSmH2d,
-    BindArenaH2d,
-    BindHostViewClose,
-    OrchSubmitTask,
-    OrchAllocTensors,
-    OrchRecordNode,
-    OrchGraphSubmit,
-    OrchBuildDefinition,
-    OrchGraphBegin,
-    OrchRecordingWait,
-    OrchGraphCommit,
-    OrchSubmitAdmit,
-    OrchRecordHandoff,
-    OrchGeneratedArgs,
-    Count
-};
-
-constexpr uint32_t kHostPhaseKindCount = static_cast<uint32_t>(HostPhaseKind::Count);
 
 /**
  * Whether this kind ends with a task submitted to the runtime, i.e. whether its
@@ -695,6 +677,19 @@ inline bool host_phase_kind_submits_task(HostPhaseKind kind) {
 inline bool host_phase_kind_is_device_upload(HostPhaseKind kind) {
     return kind == HostPhaseKind::BindGraphUpload || kind == HostPhaseKind::BindSmH2d ||
            kind == HostPhaseKind::BindArenaH2d;
+}
+
+/**
+ * Whether a kind's `detail` is a quantity, i.e. whether summing it across a bind
+ * means anything.
+ *
+ * Most kinds put in `detail` the identity of what their interval measured — a
+ * task id, a Graph key, the submission index — and a sum over identities is a
+ * number no reader can act on. Only the kinds that carry a count get the summed
+ * column in the breakdown; the rest print their count and total alone.
+ */
+inline bool host_phase_kind_detail_is_quantity(HostPhaseKind kind) {
+    return kind == HostPhaseKind::OrchBuildDefinition || kind == HostPhaseKind::OrchRecordingWait;
 }
 
 inline const char *host_phase_kind_name(HostPhaseKind kind) {
@@ -727,8 +722,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:
         return "alloc_tensors";
-    case HostPhaseKind::OrchRecordNode:
-        return "record_node";
+    case HostPhaseKind::OrchRecordInGraphTask:
+        return "record_in_graph_task";
     case HostPhaseKind::OrchGraphSubmit:
         return "graph_submit";
     case HostPhaseKind::OrchBuildDefinition:

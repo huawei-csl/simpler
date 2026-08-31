@@ -277,7 +277,7 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     std::string task_window_max;
     std::string heap_max;
     std::string dep_pool_max;
-    for (int r = 0; r < PTO2_SCOPE_STATS_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->task_window_cap[r]);
         task_window_max += buf;
@@ -288,9 +288,9 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     }
     std::fprintf(
         fp,
-        // version 6: heap_start/heap_end are monotonic cumulative bytes (was
-        // wrapping ring offsets in v5) — see docs/dfx/scope-stats.md.
-        "{\"version\": 6, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
+        // heap_start/heap_end are monotonic cumulative bytes, not wrapping ring
+        // offsets — see docs/dfx/scope-stats.md.
+        "{\"fatal\": %s, \"dropped\": %u, \"total\": %u, "
         "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
         hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
         task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap

@@ -63,10 +63,19 @@ runtime-specific ones) unambiguous about ownership.
 
 ### 4. Everything carries the `SIMPLER_` project prefix
 
-`PTO2_` is the device runtime's internal namespace (89 identifiers:
-`CHIP_MAX_RING_DEPTH`, `SIMPLER_ERROR_*`, `RuntimeContext`, …). Configuration
-surface exposed to users / CI / external consumers is unified under
-`SIMPLER_`, regardless of which internal namespace implements it.
+The device runtime's internal names carry no project prefix at all — they are
+plain domain names (`RuntimeContext`, `SchedulerState`, `TaskDescriptor`), taking
+a `Chip` / `CHIP_` prefix in two cases: where the host orchestrator owns the bare
+name (`ChipTensorMap`, `ChipReadyQueue`, `CHIP_MAX_SCOPE_DEPTH`), and for
+object-like macros, which capture their identifier textually in every including
+translation unit (`CHIP_HEAP_SIZE`, `CHIP_ALIGN_UP`). Configuration surface exposed
+to users / CI / external consumers is unified under `SIMPLER_`, and status codes
+under `SIMPLER_ERROR_*`.
+
+There is no `PTO2_` configuration surface left. `PTO2_RING_TASK_WINDOW` /
+`PTO2_RING_HEAP` / `PTO2_RING_DEP_POOL` were the last of it; ring sizing is per
+task now, on `CallConfig.runtime_env`, and the runtime warns if one of those names
+is still exported so a stale export cannot quietly become the compile-time default.
 
 ## Compile-time gates vs runtime emission
 
@@ -97,6 +106,16 @@ and emission, so disabled markers do not leave marker-only transfers behind.
 | `SIMPLER_SCHED_PROFILING` | 0 | scheduler hot-path counters (requires `SIMPLER_DFX`) |
 | `SIMPLER_TENSORMAP_PROFILING` | 0 | tensor-map hash-table counters (requires `SIMPLER_ORCH_PROFILING`) |
 | `SIMPLER_HOST_STRACE` | 1 | `[STRACE]` macros (`strace.h`) and onboard capture used only by device-domain markers; independent of `SIMPLER_DFX` |
+
+Set them per build with `build_runtimes.py --profiling-{dfx,orch,sched,tensormap}`,
+on any platform. The four are one configuration: every target of a platform is
+compiled with the same values, because `SIMPLER_DFX` adds fields to a struct the
+host and the AICPU both compile. A build overwrites that platform's ordinary
+runtime artifacts under `build/lib/`, and the counters cost what they report — the
+orchestrator sub-steps measured about 7% of the bind thread's own time on dsv4 —
+so rebuild before quoting a timing from a tree that has profiled.
+`.github/workflows/_profiling-flags-smoke.yml` guards the flag combinations on the
+simulator platforms.
 
 ### Env vars
 

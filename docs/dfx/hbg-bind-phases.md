@@ -25,18 +25,19 @@ line per segment per bind at `LOG_TIMING`:
 
 | Segment | What it covers |
 | ------- | -------------- |
-| `args` | staging the caller's host tensors and mapping them for host access |
+| `args` | staging readable caller tensors H2D and exposing their existing host buffers to orchestration; pure outputs skip both |
 | `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init` | arena layout, GM heap and shared-memory bring-up |
-| `host_orch` | **all** orchestration: every task submitted, every Graph node recorded, the Definition built |
-| `graph_upload` | uploading the Definition objects and binding every Graph task to the one with its key |
-| `arena_h2d` | the one H2D of the bind: the arena's copied zone and the shared-memory image |
-| `host_view_close` | unmapping the host views taken in `args` |
+| `host_orch` | **all** orchestration: every task submitted, every in-graph task recorded, the Definition built |
+| `graph_upload` | one H2D of the block holding every Definition object, and binding each Graph task to the one with its key. The recorders built the objects in that block's host staging during `host_orch`, so this segment writes their headers and copies in only what did not fit |
+| `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
+| `host_view_close` | closing per-run tensor-access regions and any optional device mappings; the current bind path installs none (`count=0 bytes=0`) |
 
 The **control plane** is `host_orch + graph_upload + relocate + sm_h2d +
 arena_h2d`: everything between "the caller's data is in place" and "the device
-can start". It is what the < 1 ms target applies to. `args` and
-`host_view_close` are excluded — they scale with the caller's tensor bytes, not
-with the graph.
+can start". It is what the < 1 ms target applies to. `args` is excluded because
+it scales with the caller's tensor bytes, not with the graph. `host_view_close`
+stays excluded so current reports remain comparable with older logs, although
+the current bind path has no device mappings to close.
 
 **Two of those five are retired kinds a current run does not emit.** `relocate`
 and `sm_h2d` date from when the shared-memory image was relocated and copied on
@@ -47,9 +48,8 @@ as absent from every bind. The table above is what a current run emits: ten
 segments, three of them control plane.
 
 **The control plane is a sum of costs, not an interval.** `arena_h2d` runs
-*after* `host_view_close`, hundreds of milliseconds later, so the segments do not
-form one contiguous window. Sum the ones the bind has; do not subtract two
-timestamps.
+*after* `host_view_close`, so the segments do not form one contiguous window.
+Sum the ones the bind has; do not subtract two timestamps.
 
 ## Prerequisites
 
@@ -69,16 +69,17 @@ device lock for the whole job (see
 | Property | qwen3-14b decode | DeepSeek-V4 FLASH decode |
 | -------- | ---------------- | ------------------------ |
 | Path | `examples/a2a3/host_build_graph/qwen3_14b_decode/` | `examples/a2a3/host_build_graph/deepseek_v4_flash_decode/` |
+| Entry point | standalone `main.py`, which owns its L2 `Worker` | standalone `main.py`, which owns its L3 `Worker` |
 | Devices | 1 | 2 (EP2/TP2) |
-| Level | 2 | 3 |
 | Host tasks | 47 | 1131 |
-| Graph replays | 40, of a 277-node Definition | 20, of a 743-node Definition |
+| Graph replays | 40, of a 277-task Definition | 20, of a 743-task Definition |
 | Graph boundary | 26 tensors | 118 tensors, 31 scalars |
 | First-run compile | seconds | **minutes** (369 kernel sources + an 11.6k-line orchestration) |
-| Marked | `manual` | `skip_golden` |
+| Parameters | device memory; valid fixture streamed once before all rounds | child memory, and `--skip-golden` leaves it uninitialized |
+| Marked | `manual` | `manual`, and it has no golden |
 
-The level decides how a case's output is captured, which is what the recipe below
-has to work around.
+The entry point decides how a case's output is captured, which is what the recipe
+below has to work around.
 
 ## Recipe A — stable numbers, many rounds
 
@@ -100,21 +101,53 @@ Four switches and one flag make the measurement, and each is load-bearing:
 | Switch | Why |
 | ------ | --- |
 | `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1` | emits the `bind phase=` lines at all |
-| `SIMPLER_LOG_LEVEL=TIMING` | the level they are emitted at |
-| `TORCH_DEVICE_BACKEND_AUTOLOAD=0` | otherwise `torch_npu` grabs a device on import, which a host-only measurement does not want — and nothing in the log records whether it was set |
+| `--log-level timing` | pins the level the report is read at, and is the only way it reaches the `[stamp]` line; TIMING is already the default, so this records a condition rather than enabling one |
+| `TORCH_DEVICE_BACKEND_AUTOLOAD=0` | keeps CPU golden imports from loading `torch_npu`; the `torch_backend_autoload` timing record confirms the effective setting and observed module state |
 | `SIMPLER_SKIP_DEVICE_RUN=1` | returns at `simpler_launch_run`, so the host path is measured without a working device run |
-| `--skip-golden` | with the device skipped the outputs a golden check compares are never produced, so a checking case such as qwen otherwise fails at validation with the whole measurement already complete in the log |
+| `--skip-golden` | with the device skipped the outputs a golden check compares are never produced. Qwen still streams its valid fixture once before the measured rounds; on dsv4 the flag also skips the 42.6 GiB-per-rank fixture upload |
+
+**`--log-level` overrides a level that is already TIMING; it does not turn the
+records on.** There is one control point and it is the Python logger named
+`simpler`: [`python/simpler/_log.py`](../../python/simpler/_log.py) sets it to
+TIMING at import when nothing else has, and `Worker` snapshots that logger's
+effective level once — feeding it to the host log and to every forked chip
+child, which is why the same level governs the host and device sides.
+`configure_logging()` in
+[`simpler_setup/log_config.py`](../../simpler_setup/log_config.py) is the only
+way a CLI moves that snapshot; there is no environment variable.
+
+The recipe passes `--log-level timing` anyway, because **the level is the one
+measurement condition with no record of its own in the log.** Autoload state has
+`torch_backend_autoload`; the level has nothing, so a run that omits the flag
+leaves it implicit in whichever default that commit compiled in. Two arms of a
+cross-commit A/B could then run at different levels with neither `[stamp]`
+showing it — the same silent-mismatch failure the autoload record exists to
+prevent. Passing it puts the level in the stamp, where a `diff` of the two first
+lines catches a mismatch.
+
+SceneTest and the standalone Qwen driver emit one `torch_backend_autoload`
+record per interpreter after torch-dependent argument preparation and before
+the first dispatch. `effective` reports the environment's dispatch-time intent
+using torch's current private autoload predicate; `torch_npu_loaded` reports the
+observed module state and is the authoritative field if the environment changed
+after torch was imported. `raw` is the JSON-encoded environment value (`null`
+when unset); values longer than 64 characters carry their first 64 characters
+and `raw_truncated=true`, keeping the record single-line and bounded.
+
+**The dsv4 driver is neither of those two, so a dsv4 log carries no such
+record** — `hbg_bind_phases` prints "backend-autoload state must be established
+before comparing this log" on every dsv4 measurement. The check below that this
+is the one condition already known to have produced a wrong number therefore has
+no in-log witness on that case; the `[stamp]` line is all a dsv4 A/B has, so both
+arms must be read off it by hand.
 
 **`SIMPLER_SKIP_DEVICE_RUN` is presence-based.** `SIMPLER_SKIP_DEVICE_RUN=0` still
 skips; `unset` it. It is a temporary handle from the dsv4 bring-up and is deleted
 once that case's device execution works.
 
-**A multi-device case must be invoked as its own L3 child command**
-(`--runtime host_build_graph --level 3`). A case whose `device_count > 1` is
-otherwise dispatched by the module runner as one subprocess per class, and
-`run_jobs` captures that subprocess's stdout and prints it only on failure — so a
-passing run yields a log with **no** `bind phase=` lines at all. qwen is
-`level=2` and needs no child command.
+Both cases now run through standalone `main.py` drivers. Qwen owns its L2
+`Worker` in the invoked process, while dsv4 owns its L3 `Worker`; neither needs
+module-runner `--runtime` / `--level` forwarding to expose `bind phase=` lines.
 
 A 2-rank case emits one bind per rank per round, so six rounds is twelve binds.
 Pass `--rounds` to the parser so it infers the rank count and drops one cold bind
@@ -142,13 +175,22 @@ two-bind log that is 18 lines where 20 exist, with nothing to say a segment went
 missing.
 
 Each line carries `start_ns` (a `CLOCK_MONOTONIC` timestamp) plus the segment's
-own attributes — `tasks=` and `heap_used=` on `host_orch`, `defs=`, `bytes=` and
-`submissions=` on `graph_upload`, and `arena_h2d`'s itemized upload. Group the
+own attributes — `tasks=` and `heap_used=` on `host_orch`, `defs=`, `bytes=`,
+`submissions=` and `spilled=` on `graph_upload`, and `arena_h2d`'s itemized upload.
+Group the
 lines into binds — `arena_h2d` is the last segment of a bind, so it closes one —
 then sum the control-plane segments **within each bind** and take the minimum of
 those sums. Never sum
 minima taken across binds; that total belongs to no bind and can point the wrong
 way (see below).
+
+**`spilled=` should be 0 on every bind but the first.** It counts the Definition
+objects the recorders could not build inside the retained staging, which
+`graph_upload` then has to copy in. The first bind of a process has nothing
+retained and so spills all of them; a later bind that still spills means the run's
+Definitions outgrew the high-water mark the previous one left, and the copies are
+back. It is not spelled `copied=` on purpose: on `arena_h2d` that name means a
+zone, not a count.
 
 **A segment's `bytes=` is what that segment itself copied, so no copy is counted
 twice.** `graph_upload` counts the Definition objects it uploads, which are all it
@@ -162,6 +204,47 @@ is a copy count of the other.)
 
 The first bind of each rank is warm-up and belongs in neither statistic; drop it
 explicitly rather than letting a minimum quietly exclude it.
+
+### Was the segment running or waiting?
+
+Every line also carries the kernel counters, which say what a duration cannot. Each
+covers the same span the duration does.
+
+| Field | Source | What it says |
+| ----- | ------ | ------------ |
+| `cpu_ns` | the bind thread's `CLOCK_THREAD_CPUTIME_ID` | how much of the segment that thread spent **running**, so `dur_ns - cpu_ns` is what it spent **off CPU** — blocked *and* runnable-but-preempted, which the two `*csw` counters separate |
+| `rec_cpu_ns` | every recording worker's CPU clock, summed | how many threads' worth of work ran **alongside** — a ratio to `dur_ns`, never something to subtract from it |
+| `minflt` / `tminflt` | `getrusage` `RUSAGE_SELF` / `RUSAGE_THREAD` | minor faults for the whole process, and the bind thread's share of them; the difference is the recorders' |
+| `nvcsw` / `nivcsw` | `getrusage` `RUSAGE_SELF` | voluntary and involuntary context switches **for the whole process**, so the recorders' switches are in here too. A high `nivcsw` says the box was loaded, not that this code was; neither counter isolates the bind thread — `tminflt` is the only thread-scoped field |
+
+**`rec_cpu_ns` and `tminflt` are Linux-only, and read zero elsewhere.** Sampling
+another thread's CPU clock needs `pthread_getcpuclockid` and a per-thread fault count
+needs `getrusage(RUSAGE_THREAD)`; Darwin provides neither. That costs nothing where it
+matters — a bind is profiled on the silicon it binds to — but on a `*sim` platform
+built for macOS a `reccpu` of 0 means "not measurable here", not "nothing ran
+alongside". `cpu_ns` uses `CLOCK_THREAD_CPUTIME_ID` for the calling thread and works
+everywhere.
+
+```bash
+python -m simpler_setup.tools.phase_time_split <log>          # cold and warm, per segment
+python -m simpler_setup.tools.phase_time_split <log> --phase host_orch
+```
+
+**CPU time comes from per-thread clocks and never from rusage.** `ru_utime` and
+`ru_stime` are accounted per scheduler tick — 10 ms at `CLK_TCK=100` — so on a segment
+of a millisecond they quantise to either zero or a whole tick, and the values look
+plausible one at a time while being noise. A per-thread clock reads the scheduler's
+running total in nanoseconds; measured against a busy and a sleeping thread over a
+1.29 ms window it resolved both to under 10 µs. The three counters stay on rusage
+because they are event counts, which do not quantise.
+
+**On-CPU sends you somewhere different from off-CPU.** A segment that is mostly
+on-CPU is running, so split it further by the fault count and by the syscalls inside
+its window. A segment that is mostly off-CPU is waiting, and `nvcsw` versus `nivcsw`
+says whether it blocked or merely lost the CPU. Reading a fault count without this
+split is what let a page-fault tail be chased three times on a segment whose faults
+were on threads with spare parallelism — see
+[`docs/investigations/2026-08-host-orch-phase-tail-is-page-faults.md`](../investigations/2026-08-host-orch-phase-tail-is-page-faults.md).
 
 Device wall clock for the same rounds comes from the `[STRACE]` markers, on a run
 that did not skip the device:
@@ -179,10 +262,14 @@ its failure modes have already produced wrong answers on this box.
 **Both arms must be the same ruler, and the log is the only witness you get.** A
 baseline missing `TORCH_DEVICE_BACKEND_AUTOLOAD=0` produced a wrong number once:
 it alone paid for `torch_npu` grabbing a device on import, and the difference was
-attributed to the branch. Nothing in this repo reads that variable — it is
-`torch_npu`'s own — so no log line records whether it was set. The recipe
-therefore echoes the command it is about to run, verbatim, as the log's first
-line, and `hbg_bind_phases` prints that line above the table:
+attributed to the branch. Compare the `torch_backend_autoload` timing record in
+both logs; the measurement recipe produces
+`setting=0 raw="0" raw_truncated=false effective=disabled torch_imported=true torch_npu_loaded=false`.
+`hbg_bind_phases` prints every distinct record above its table and warns when the
+log does not carry one.
+
+The recipe also echoes the command it is about to run, verbatim, as the log's
+first line, and `hbg_bind_phases` prints that line above the table:
 
 ```bash
 diff <(head -1 base.log) <(head -1 measure.log)   # must differ only in the commit
@@ -251,12 +338,27 @@ execution does not complete still yield its prepare timing — and it is why a
 swimlane for a case that hangs on device is cheaper to take with the variable set
 than to take by waiting out the stall.
 
+**The flag that satisfies condition 2 also moves the log.** A non-empty
+`CallConfig.output_prefix` redirects every host-log record — `bind phase=` lines
+and `[STRACE]` spans alike — from stderr into `outputs/<case>_<ts>/host.<pid>.log`,
+one file per process ([`python/simpler/worker.py`](../../python/simpler/worker.py)
+sets the directory on the L3 submit path and in the forked chip child;
+[`src/common/log/host_log.cpp`](../../src/common/log/host_log.cpp) opens the file).
+So Recipe A's `grep -c 'bind phase=' "$LOG"` reports **0** for a Recipe B run that
+worked perfectly, and the finisher must read the prefix's own logs. Measured on a
+2-rank dsv4 run: `$LOG` alone yields `No [STRACE] markers found` and drops every
+phase record, while `$LOG` plus the prefix's logs attaches all 4186 of them.
+
 The skill's timeline mode is this recipe; it finishes with
 
 ```bash
-python -m simpler_setup.tools.strace_timing <log> \
-    --host-phase-records outputs/<case>_<ts>/host_phase_records.jsonl \
-    --swimlane host_swimlane.json
+D=outputs/<case>_<ts>
+# The clock anchors are split: the invoking process wrote its own to $LOG, each
+# chip child wrote its own under $D. Concatenating keeps every pid alignable.
+cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
+python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
+    --host-phase-records "$D/host_phase_records.jsonl" \
+    --swimlane "$D/host_swimlane.json"
 ```
 
 Load the JSON in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`. Each
@@ -292,7 +394,8 @@ signal than any duration on a shared box.
 
 | Trap | Symptom | What to do |
 | ---- | ------- | ---------- |
-| dsv4 run through the module runner's L3 phase | log has zero `bind phase=` lines, test passes | run the L3 child command directly (Recipe A) |
+| Any diagnostic flag on (so, every Recipe B run) | `$LOG` has zero `bind phase=` lines and no `[STRACE]` markers, run passes | the non-empty `output_prefix` moved the host log to `outputs/<case>_<ts>/host.<pid>.log`; grep and parse those too |
+| A `SceneTestCase` with `device_count > 1` run through the module runner | log has zero `bind phase=` lines, test passes | give the child command `--runtime <rt> --level 3`; a standalone `main.py` case needs nothing |
 | `SIMPLER_SKIP_DEVICE_RUN=0` | run still skips the device, "PASSED" means nothing ran | `unset` the variable |
 | `--rounds 6` with `--enable-scope-stats` | no `outputs/<case>_<ts>/` artifacts, plus a `disabled: --rounds > 1` warning | one round for artifacts, many rounds for numbers |
 | Only `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` set for Recipe B | `bind phase=` lines present, no `host_phase_records.jsonl` | the records are a separate switch: also export `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` |
@@ -301,6 +404,8 @@ signal than any duration on a shared box.
 | Summing per-segment minima by hand | a total no bind achieved; can invert the sign | read the tool's `total` row — the minimum of the per-bind sums |
 | `--rounds 1` for numbers | the tool refuses: every bind is a rank's warm-up | six rounds; `--keep-first` only to look at the cold bind deliberately |
 | Single bind, or comparing across differently-loaded moments | swings of 3.5× | six rounds, compare minima, keep an untouched segment as a control |
+| Reading a **warm** bind as a **steady-state** one | the first few warm binds carry several hundred more `minflt` than the last ones, and a per-bind average built from them is a warm-up figure wearing a steady-state label | the parser drops the cold bind per rank, not the decay after it: on dsv4 `host_orch`'s `minflt` runs 989, 983 (cold), then 114, 173, 54, 3, 13, 13, 11, 8. Take **twelve** rounds and read the last binds, or check the count column is flat before quoting a duration |
+| Dividing a total by the bind count | a per-bind figure no bind ever had, inflated by the cold and decaying ones | bucket by bind first and look at the sequence; only quote a mean over binds whose counts already agree |
 | `base` then `measure`, sequentially | a load drift reads as the branch's effect | interleave the arms and require the sign to agree per repetition |
 | Stale build | mass collection errors, or a `launch_aicpu_num (0)` failure | `pip install --no-build-isolation -e .` after every `HEAD` move |
 
@@ -308,11 +413,17 @@ signal than any duration on a shared box.
 
 Both columns are one measurement session on `main` at **`777d4171`**, host
 `host_build_graph`, on one a2a3 die for qwen and two for dsv4, four rounds each with
-the warm-up bind dropped — 3 steady-state binds for qwen and 6 for dsv4, since a
+the warm-up bind dropped — 3 warm binds for qwen and 6 for dsv4, since a
 2-rank case emits one bind per rank per round and the parser drops one cold bind per
 rank. Durations are the full **range** across those
 binds; `heap_used`, every `bytes=` and every count are exact and repeat
 byte-identically.
+
+**Warm, not steady-state.** Dropping one cold bind per rank does not reach the steady
+state: the decay behind it takes about six binds on dsv4, so a four-round session spends
+most of its warm binds inside it. Both columns therefore sit somewhere in the warm-up,
+which is another reason to treat them as orientation rather than as a baseline — see the
+trap table above.
 
 **For orientation, not thresholds, and pinned to a commit for a reason.** The
 machine's other tenants move every duration here, so the range is the point: a
@@ -331,7 +442,7 @@ meant to outlive it.
 | `heap_used` | 127,673,344 | 2,038,508,544 |
 | device wall | 39.3 ms | does not complete yet (`sched_error_code=5 INVALID_ARGS`) |
 | `args` (excluded) | 1.37 s / 40.9 GB, 19 of 20 staged | 1.48 s / 45.8 GB, 77 of 92 staged |
-| `host_view_close` (excluded) | 0.25 s / 40.9 GB | 0.28 s / 45.8 GB |
+| `host_view_close` (excluded, legacy mapping path) | 0.25 s / 40.9 GB | 0.28 s / 45.8 GB |
 
 † The three upload rows are the markers as they read at that commit, before the
 upload was restructured: `graph_upload`'s `bytes=` then also counted the Graph
@@ -341,13 +452,37 @@ objects in `graph_upload`, carries no submission block at all, and ships both
 remaining regions in `arena_h2d` — so the same case reports different figures for
 the same work.
 
+**dsv4's `args` and `host_view_close` rows no longer describe that case at this
+scale.** Both are per-byte costs over what a bind stages, and dsv4's parameters
+now live in child memory: allocated once before the first round, and passed
+through without malloc, H2D or a host view. What still crosses is
+`num_tokens_per_owner`, the one caller tensor the host orchestrator has to read —
+so a bind stages **1 of its 92 tensors, 8 bytes**. On `dcf7559e8`, 12 binds
+(`--rounds 6`, both ranks) measure `args` at 0.036–0.075 ms and
+`host_view_close` at 0.0012–0.0030 ms with `count=0 bytes=0`, against 1.48 s and
+0.28 s over 45.8 GB above. The same run peaks at 1.31 GiB of host RSS across the
+whole process tree under `--skip-golden`, and at 23.4 GiB when the fixture is
+streamed in, where the row above cost ~45.5 GB per rank. qwen still stages its
+fixture.
+
+The rows also describe the legacy mapping behavior at the pinned commit. A
+current bind uses the caller's existing host buffers as its
+orchestration views, so it performs no `halHostRegister` calls and reports
+`host_view_close count=0 bytes=0`. On Qwen3-14B this makes the close marker
+20.12–24.73 us instead of the 0.25 s shown above. The old `args` figure included
+20 registrations in addition to staging 19 tensors H2D; current `args` retains
+the H2D work but removes that registration side.
+
 Three of these deserve reading together. `host_orch` is the whole story on dsv4 —
-839 `submit_task`, 743 `record_node` and 272 `alloc_tensors` per bind against qwen's
+839 `submit_task`, 743 `record_in_graph_task` and 272 `alloc_tensors` per bind against qwen's
 5, 277 and 2 — and its 2.3 ms of scatter is why a claim about it needs a
-sub-counter rather than a stopwatch. `args` plus `host_view_close` are two orders of
-magnitude above everything else while being excluded from the control plane: they
-are per-byte costs over the ~41–46 GB of weights each case stages, so they belong
-to getting the weights resident, not to dispatching a graph. And dsv4's device wall
-is absent because the case does not complete on device on this commit — it is a
-`skip_golden` completion case whose host path is what these numbers describe, which
-is also why `SIMPLER_SKIP_DEVICE_RUN` appears in its recipe.
+sub-counter rather than a stopwatch. At the pinned commit, `args` plus
+`host_view_close` are two orders of magnitude above everything else while being
+excluded from the control plane: they are staging and legacy mapping costs over
+the ~41–46 GB of weights, not graph dispatch. Current qwen runs retain the
+staging cost in `args` but close no mappings; moving dsv4's parameters to child
+memory left its bind staging one 8-byte tensor, whose caller-buffer view also
+needs no mapping. And dsv4's device wall is absent because the case did not
+complete on device at the pinned commit — it is a completion case with no golden
+whose host path is what these numbers describe, which is also why
+`SIMPLER_SKIP_DEVICE_RUN` appears in its recipe.

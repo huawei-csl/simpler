@@ -20,16 +20,24 @@ The follow-up Graph execution layout now removes the per-occurrence
 compact payload pools, while `GraphExecution` and node storage are initialized
 in the outer Graph task's heap tail on device. The outer slot's existing
 `graph_context` points first to the shared Definition and then to the localized
-execution. The measurements below describe the earlier shared-Definition step
-and remain its historical baseline.
+execution. The upload itself has since been packed further: the objects share one
+retained device block and one retained host staging block per pipeline slot, so a
+bind issues a single `rtMemcpy` for all of them
+(`HostApi::acquire_graph_definition_block`), and the recorders build their images
+directly into that staging at offsets they claim from it, so in steady state the
+upload copies no image at all — it writes the headers and ships the block. A run
+whose Definitions outgrow the retained capacity still builds them in buffers of its
+own and has them copied in, which `graph_upload`'s `spilled=` counts. The
+measurements below describe the earlier shared-Definition step and remain its
+historical baseline.
 
 ## Change
 
 `254f924e` (measured by `4d434174`/`b8095e39`, enabled by `f868ac52`):
 
 - each distinct Definition uploads **once** as a
-  `[GraphDefinitionHeader][Definition image]` object retained by
-  `acquire_graph_definition_buffer`, keyed by content identity;
+  `[GraphDefinitionHeader][Definition image]` object retained by the runner's
+  per-key Graph Definition buffer cache, keyed by content identity;
 - `GraphSubmission` carries `definition_addr` + `definition_hash` instead of
   the inline image; a submission is now 2,568 bytes;
 - device localize validates the shared object through a one-time verify gate
@@ -128,15 +136,41 @@ cost is excluded. Worth doing, but it is not where the 12 ms lives.
 **Where the 12 ms does live.** The one-time 12.19 ms is the 53 MB of
 execution-storage allocation and zeroing. Its lifetime is exactly that of the
 outer GRAPH task's packed output buffer, so it can come from the same
-`PTO2TaskAllocator::alloc` call as the outputs instead of a separate retained
+`TaskAllocator::alloc` call as the outputs instead of a separate retained
 `rtMalloc` — removing both the allocations and the memsets, and making cold
 start converge with steady state. That is a separate change; this amendment only
 records why it, and not batching, is the one that moves the 12 ms.
 
+## Amendment — the integrity hash the verify gate existed for is gone
+
+The one-time verify gate described above no longer hashes anything. A Definition
+image was walked three times per bind for it — zero-filled and hashed on the
+recorder thread, then hashed again on the AICPU at the object's first execution,
+~1 MB per dsv4 bind each time — and none of those passes was what bounded a
+device-side read. `graph_definition_array` checks every section's offset,
+alignment and extent against `total_bytes`, and `bind_graph_topology` walks the
+whole edge list; both are independent of the hash and both stay.
+
+So `content_hash` is removed from `GraphDefinition` and from the object header,
+along with `verify_state` and its spin-wait. What the device checks before it
+reads a section offset is now O(1) framing: `magic`, `definition_bytes` against
+the image's own `total_bytes`, and the header's `full_key` against the image's.
+The whole-image zero-fill went with it — every section is written in full by the
+fill except `fanout_offsets`, which is accumulated and is now explicitly zeroed
+on its own.
+
+Two things this gives up, both deliberately: a stale or mis-packed byte in the
+retained staging block, and "same `full_key`, different bytes", are no longer
+detected at run time. The first is covered instead by
+`GraphDefinitionObject.RejectsHeaderFramingAnotherGraph` in
+`tests/ut/cpp/common/test_hbg_graph_cache.cpp`, which pins that a header framing
+an image of another Graph is refused.
+
 ## Notes
 
 - The first-cut device verify gate returned "busy-looking" nulls to peer
-  submissions and surfaced as `sched_error_code=5 INVALID_ARGS`; the fix is
-  the spin-wait on `verify_state` (dispatch-path legal: spin, no sleep).
+  submissions and surfaced as `sched_error_code=5 INVALID_ARGS`; the fix was
+  the spin-wait on `verify_state` (dispatch-path legal: spin, no sleep). Both the
+  gate and the spin are gone — see the amendment above.
 - `graph record` (245–687 µs) remains per-run and untouched — the per-run
   Definition cache discard is a separate, still-open item (KNOWN_ISSUES).

@@ -25,8 +25,8 @@
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
-#include "runtime_core.h"
-#include "shared_memory.h"
+#include "host_build_graph/runtime_core.h"
+#include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -34,7 +34,7 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-static void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
+static void latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
     if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
         return;
     }
@@ -55,30 +55,30 @@ void SchedulerContext::fail_scheduler(Runtime *runtime, int32_t thread_idx, int3
     }
 }
 
-LoopAction SchedulerContext::handle_orchestrator_exit(
-    int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
-) {
+LoopAction
+SchedulerContext::check_latched_sched_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime) {
     if (completed_.load(std::memory_order_acquire)) {
         return LoopAction::BREAK_LOOP;
     }
-    int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-    if (orch_err != SIMPLER_ERROR_NONE) {
+    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
+    if (sched_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR(
-            "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
+            "Thread %d: Scheduler fatal error detected (code=%d), sending EXIT_SIGNAL to all cores. "
             "completed_tasks=%d, total_tasks=%d",
-            thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
+            thread_idx, sched_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
         if (!completed_.exchange(true, std::memory_order_acq_rel)) {
             emergency_shutdown(runtime);
         }
         return LoopAction::BREAK_LOOP;
     }
-    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
-    if (sched_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
+    return LoopAction::NONE;
+}
+
+LoopAction SchedulerContext::check_exit_conditions(
+    int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
+) {
+    if (check_latched_sched_error(thread_idx, header, runtime) == LoopAction::BREAK_LOOP) {
         return LoopAction::BREAK_LOOP;
     }
 
@@ -86,36 +86,15 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
     if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
         LOG_INFO(
-            "Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed),
-            task_count
+            "Thread %d: completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed), task_count
         );
         return LoopAction::BREAK_LOOP;
     }
     return LoopAction::NONE;
 }
 
-LoopAction
-SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime) {
-    if (completed_.load(std::memory_order_acquire)) {
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
-    if (orch_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-    int32_t sched_err = header->sched_error_code.load(std::memory_order_acquire);
-    if (sched_err != SIMPLER_ERROR_NONE) {
-        LOG_ERROR("Thread %d: Scheduler fatal error detected (code=%d)", thread_idx, sched_err);
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
-        return LoopAction::BREAK_LOOP;
-    }
-    return LoopAction::NONE;
+LoopAction SchedulerContext::check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime) {
+    return check_latched_sched_error(thread_idx, header, runtime);
 }
 
 // =============================================================================
@@ -134,7 +113,7 @@ SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHea
 //
 // Categories (and which thread emits them):
 //   SUMMARY  — completed / total counts and scan totals               (thread 0 only)
-//   TASK     — one per non-completed task scanned from shared rings   (thread 0 only)
+//   TASK     — one per non-completed task in the shared table          (thread 0 only)
 //              - state=RUNNING: includes running_on=[...] cross-ref
 //              - state=READY:   fanin satisfied but no idle core yet
 //              - state=WAIT:    includes missing_deps=N
@@ -173,8 +152,8 @@ void format_core_status(
     int64_t task_id_raw = -1;
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
-        kernel = core_state->running_slot_state->task->kernel_id[subslot];
-        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->task->task_id.raw);
+        kernel = core_state->running_slot_state->to_descriptor().kernel_id[subslot];
+        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->to_descriptor().task_id.raw);
     }
     uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
@@ -231,32 +210,33 @@ void SchedulerContext::log_stall_diagnostics(
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
 
-    // T0 owns the shared-ring scan; printing it from other threads would
+    // T0 owns the task-table scan; printing it from other threads would
     // produce identical TASK lines once per scheduler thread.
     if (thread_idx == 0) {
-        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
-        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
-        int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
-        submitted_in_ring += ring_task_count;
-        for (int32_t si = 0; si < ring_task_count; si++) {
-            ChipTaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
-            PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0;
+        SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+        // `task_count` is the run's task total, which both callers pass from
+        // total_tasks_. It bounds the scan as well as the SUMMARY line: every slot
+        // below it was claimed by the host orchestrator, and no slot above it was.
+        for (int32_t si = 0; si < task_count; si++) {
+            ChipTaskSlotState &slot_state = tasks.get_slot_state_by_task_id(si);
+            ChipTaskState st = slot_state.task_state.load(std::memory_order_relaxed);
             // Polling: no fanin_refcount. Recompute met/total from the inline
-            // fanin ids vs the ring completion_flags (rc = satisfied producers,
+            // fanin ids vs the completion_flags (rc = satisfied producers,
             // fi = raw producer count) so the stall dump still shows readiness.
-            int32_t fi = slot_state.payload != nullptr ? slot_state.payload->fanin_count : 0;
+            int32_t fi = slot_state.to_payload().fanin_count;
             int32_t rc = 0;
-            if (slot_state.payload != nullptr) {
-                const int32_t *fanin = slot_state.payload->fanin_data();
+            {
+                const int32_t *fanin = slot_state.to_payload().fanin_data();
                 for (int32_t k = 0; k < fi; k++) {
-                    if (ring.is_completion_flag_set(fanin[k], std::memory_order_relaxed)) rc++;
+                    if (tasks.is_completion_flag_set(fanin[k], std::memory_order_relaxed)) rc++;
                 }
             }
-            int32_t kid_aic = slot_state.task->kernel_id[0];
-            int32_t kid_aiv0 = slot_state.task->kernel_id[1];
-            int32_t kid_aiv1 = slot_state.task->kernel_id[2];
-            int64_t task_id = static_cast<int64_t>(slot_state.task->task_id.raw);
-            if (st >= PTO2_TASK_COMPLETED) continue;
+            int32_t kid_aic = slot_state.to_descriptor().kernel_id[0];
+            int32_t kid_aiv0 = slot_state.to_descriptor().kernel_id[1];
+            int32_t kid_aiv1 = slot_state.to_descriptor().kernel_id[2];
+            int64_t task_id = static_cast<int64_t>(slot_state.to_descriptor().task_id.raw);
+            if (st >= CHIP_TASK_COMPLETED) continue;
             // task_state has no intermediate ready/running value — it
             // stays PENDING until the worker stores COMPLETED. Classify
             // by the ground truth instead: a slot is RUNNING iff some
@@ -307,12 +287,11 @@ void SchedulerContext::log_stall_diagnostics(
                 thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
             );
         }
-        int32_t effective_total = task_count > 0 ? task_count : submitted_in_ring;
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
         LOG_INFO(
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
             "scan_ready=%d scan_waiting=%d scan_running=%d",
-            thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting, cnt_running
+            thread_idx, idle_iterations, c, task_count, last_progress_count, cnt_ready, cnt_waiting, cnt_running
         );
     }
 
@@ -370,7 +349,7 @@ void SchedulerContext::log_shutdown_stall_snapshot(
 }
 
 int32_t SchedulerContext::handle_timeout_exit(
-    int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
+    int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
     int32_t last_progress_count
 #if SIMPLER_DFX
     ,
@@ -388,19 +367,23 @@ int32_t SchedulerContext::handle_timeout_exit(
         // Capture the in-flight kernels' partial output before signalling the
         // cores to exit, so the dump reflects the live stuck state.
         if (is_dump_args_enabled()) {
-            dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, cores_total_num_,
+            dump_running_task_outputs(
+                cores_total_num_,
                 [this](int32_t cid) {
                     return core_exec_states_[cid].running_slot_state;
                 },
-                [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
-                    return get_function_bin_addr(func_id);
-                },
-                [](const ChipTaskSlotState &slot_state) {
-                    return &slot_state.payload->dump_metadata;
+                [this, thread_idx](const ChipTaskSlotState &slot_state) {
+                    dump_args_for_task<SUBTASK_SLOT_COUNT>(
+                        thread_idx, slot_state.to_descriptor(), slot_state.to_payload(), slot_state.active_mask,
+                        ArgsDumpStage::AFTER_COMPLETION,
+                        [](ActiveMask active_mask, int raw_subtask_id) {
+                            return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
+                        },
+                        [this](int32_t func_id) {
+                            return get_function_bin_addr(func_id);
+                        },
+                        &slot_state.to_payload().dump_metadata
+                    );
                 }
             );
         }
@@ -434,7 +417,7 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, int32_t cur
 
 #if SIMPLER_SCHED_PROFILING
     {
-        PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
+        SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
         uint64_t complete_poll =
             (chip_swimlane.sched_complete_cycle > otc_total + chip_swimlane.sched_complete_perf_cycle) ?
@@ -909,22 +892,11 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     }
 #endif
 
-    // Initialize task counters. Task count comes from PTO2 shared memory.
-    if (runtime->get_gm_sm_ptr()) {
-        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        // Read at one-time boot init, before the SM is reset for the run, so a ring
-        // not yet written holds uninitialized memory (0xbe... under ASAN's
-        // malloc-fill). Only a plausible count is taken — (0,
-        // PTO2_TASK_WINDOW_SIZE], since the ring cannot hold more than its task
-        // window — so any garbage pattern, negative or positive, leaves the count
-        // at 0, which is the correct value at boot.
-        int32_t pto2_count = 0;
-        int32_t ring_tasks = header->ring.fc.current_task_index.load(std::memory_order_acquire);
-        if (ring_tasks > 0 && ring_tasks <= PTO2_TASK_WINDOW_SIZE) pto2_count = ring_tasks;
-        total_tasks_ = pto2_count;
-    } else {
-        total_tasks_ = 0;
-    }
+    // Initialize task counters. Task count comes from shared memory.
+    // 0 is the correct count at boot: the graph is not attached yet, and
+    // on_graph_attached latches the host-built total before releasing any
+    // scheduler thread.
+    total_tasks_ = 0;
     completed_tasks_.store(0, std::memory_order_release);
 
     // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
@@ -962,7 +934,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // live on a later line).
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
         for (int32_t buf = 0; buf < 2; buf++) {
-            PTO2DispatchPayload &dp = payload_per_core_[core_id][buf];
+            DispatchPayload &dp = payload_per_core_[core_id][buf];
             AsyncCtx &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;
@@ -1051,32 +1023,23 @@ void SchedulerContext::bind_runtime(RuntimeContext *rt) {
 }
 
 // =============================================================================
-// Post-orchestration bookkeeping. Runs once on the boot leader after the
-// host-built image is attached; latches total_tasks_ and folds inline-completed
-// tasks (or shuts down on a fatal orchestration error). The caller publishes
-// runtime_init_ready_ (release) after this returns — that store is what makes
-// total_tasks_ visible to the scheduler threads, which acquire it before
-// dispatching.
+// Post-attach bookkeeping. Runs once on the boot leader after the host-built
+// image is attached; latches total_tasks_, sizes the per-S queues to it, and
+// folds inline-completed tasks. classify_ready_ is released after this call and
+// is what publishes total_tasks_ to the peer threads, which acquire it before
+// classify_partition reads the count.
 // =============================================================================
-void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, RuntimeContext *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
-) {
+void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks) {
     total_tasks_ = total_tasks;
 
     // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
     // releases runtime_init_ready_ — no scheduler thread can push until then.
-    // Completed-but-unresolved tasks in flight are bounded by BOTH the total task
-    // count and the ring's task window (a task must occupy a ring slot to run and
-    // complete), so size to the tighter of the two, rounded up to a power of two
-    // and floored at 256. The window already caps this, so there is no artificial
-    // ceiling and a producer never has to spin on a full queue.
+    // Completed-but-unresolved tasks in flight are bounded by the run's task count
+    // (a task must have been submitted to run and complete), so size to that,
+    // rounded up to a power of two and floored at 256. That bound is exact, so
+    // there is no artificial ceiling and a producer never has to spin on a full
+    // queue.
     uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
-    if (sched_->ring_sched_state.ring != nullptr) {
-        uint64_t window = static_cast<uint64_t>(sched_->ring_sched_state.ring->task_window_mask) + 1;
-        if (window < sp_bound) {
-            sp_bound = window;
-        }
-    }
     uint64_t sp_cap = 256;
     while (sp_cap < sp_bound) {
         sp_cap <<= 1;
@@ -1093,17 +1056,6 @@ void SchedulerContext::on_orchestration_done(
 #if SIMPLER_SCHED_PROFILING
         rt->scheduler->tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
-    }
-
-    // Check for fatal error from orchestration; if so, shut down immediately.
-    int32_t orch_err = 0;
-    if (sched_->sm_header) {
-        orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_relaxed);
-    }
-    if (orch_err != SIMPLER_ERROR_NONE) {
-        if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-            emergency_shutdown(runtime);
-        }
     }
 
     // The polling initial classify (seed the ready queues + wake lists for the
@@ -1132,30 +1084,30 @@ void SchedulerContext::on_orchestration_done(
 // their external fanin follows the same ready/wake classification as any other
 // outer task.
 void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
-    if (completed_.load(std::memory_order_acquire) || sched_->ring_sched_state.ring == nullptr) {
+    if (completed_.load(std::memory_order_acquire) || sched_->task_view.tasks == nullptr) {
         return;
     }
-    PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
-    const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    const int32_t submitted = total_tasks_;
     // Disjoint contiguous slices covering [0, submitted): thread t owns
     // [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
     for (int32_t id = lo; id < hi; id++) {
-        if (ring.is_completion_flag_set(id)) {
+        if (tasks.is_completion_flag_set(id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
-        ChipTaskSlotState &slot = ring.get_slot_state_by_task_id(id);
+        ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
             if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.task->task_id.raw, thread_idx)) return;
+            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {
             sched_->push_ready_routed(&slot);
         } else {
-            int32_t prod_local = slot.payload->fanin_data()[state];
-            sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &slot);
+            int32_t prod_local = slot.to_payload().fanin_data()[state];
+            sched_->register_wake(&tasks.get_slot_state_by_task_id(prod_local), &slot);
         }
     }
 }

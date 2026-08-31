@@ -37,14 +37,14 @@
 #include "runtime_types.h"  // SIMPLER_ERROR_*
 #include "submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "types.h"          // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"      // ChipStorageTaskArgs, ChipTensor
-#include "tensor.h"         // ChipTensor, TensorCreateInfo
+#include "task_args.h"      // ChipStorageTaskArgs, simpler::tmr::Tensor
+#include "tensor.h"         // simpler::tmr::Tensor, TensorCreateInfo
 
 // =============================================================================
-// ChipTensor Factory Helpers
+// simpler::tmr::Tensor Factory Helpers
 // =============================================================================
 
-// make_tensor_external(...) — canonical factory for pre-allocated external
+// simpler::tmr::make_tensor_external(...) — canonical factory for pre-allocated external
 // memory — is defined in the unified tensor.h (common), so host and runtime
 // build ChipTensors through the same controlled path.
 
@@ -80,9 +80,11 @@ typedef struct RuntimeOps {
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+    );
     void (*set_tensor_data)(
-        RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(RuntimeContext *rt, const CoreTaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(RuntimeContext *rt, const CoreTaskArgs &args);
@@ -108,7 +110,7 @@ typedef struct RuntimeOps {
  */
 struct RuntimeContext {
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode;
+    ScopeMode pending_scope_mode;
 };
 
 // =============================================================================
@@ -208,7 +210,7 @@ static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
     return rt->ops->submit_dummy_task(rt, args);
 }
 
-static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
+static inline void rt_scope_begin(ScopeMode mode = ScopeMode::AUTO) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
@@ -281,7 +283,7 @@ static inline bool rt_is_fatal() {
  * are read immediately without waiting.
  */
 template <typename T = uint64_t>
-static inline T get_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return from_u64<T>(0);
@@ -313,11 +315,12 @@ static inline T get_tensor_data(const ChipTensor &tensor, uint32_t ndims, const 
  * consumer tracking via fanout_refcount.
  *
  * The tensor must already have an allocated buffer (addr != 0).
- * For runtime-created outputs, call this only on the ChipTensor returned by
+ * For runtime-created outputs, call this only on the simpler::tmr::Tensor returned by
  * add_output(TensorCreateInfo) after submit returns.
  */
 template <typename T = uint64_t>
-static inline void set_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+static inline void
+set_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
@@ -335,7 +338,7 @@ static inline void set_tensor_data(const ChipTensor &tensor, uint32_t ndims, con
 class ScopeGuard {
 public:
     explicit ScopeGuard(
-        PTO2ScopeMode mode = PTO2ScopeMode::AUTO, const char *file = __builtin_FILE(), int line = __builtin_LINE()
+        ScopeMode mode = ScopeMode::AUTO, const char *file = __builtin_FILE(), int line = __builtin_LINE()
     ) :
         rt_(current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
@@ -379,8 +382,8 @@ private:
  * This struct is defined identically in runtime_core.h (with an include
  * guard) so the executor can use the same type without including this header.
  */
-#ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
-#define PTO2_ORCHESTRATION_CONFIG_DEFINED
+#ifndef ORCHESTRATION_CONFIG_DEFINED
+#define ORCHESTRATION_CONFIG_DEFINED
 struct OrchestrationConfig {
     int expected_arg_count;
 };

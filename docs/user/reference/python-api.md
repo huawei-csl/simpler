@@ -17,7 +17,7 @@ extension.
 from simpler import Worker           # or: from simpler.worker import Worker
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
-    ChipTensor, CoreCallable, DataType,
+    ChipTensor, CoreCallable, DataType, TaskArgs, TaskHandle,
 )
 from simpler_setup import KernelCompiler, SceneTestCase, scene_test
 ```
@@ -62,10 +62,16 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | ------ | ----- |
 | `malloc(size, worker_id=0) -> int` | Returns a device pointer as an integer |
 | `free(ptr, worker_id=0)` | |
-| `copy_to(dst, src)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `dst` may be a `base + offset` interior handle as long as `[dst, dst + size)` lies within one live allocation (partial update of a persistent buffer) |
-| `copy_from(dst, src)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). `src` may be an interior handle whose `[src, src + size)` lies within one live device allocation |
+| `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
+| `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `handle.tensor(shapes, dtype)` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
+
+A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
+dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior view of that
+allocation; it is a different canonical identity that names no allocation at all, and is refused.
+Both offsets are bounded together with the length against the *registered* extent, so an offset
+cannot walk a legal-looking length past the end.
 
 ### Execution
 
@@ -84,7 +90,8 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 
 | Method | Notes |
 | ------ | ----- |
-| `submit_next_level(callable_handle, args, config=None, *, worker: int)` | Hands a `ChipCallable` to one chip child. `worker` is keyword-only |
+| `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
+| `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
 | `allocate_domain(name, workers, window_size, buffers=[...])` | Context manager returning a handle indexed by domain-local rank |
 | `malloc(worker_id, size) -> int` | **Argument order is `(worker_id, size)`** — the reverse of `Worker.malloc(size, worker_id=0)` |
@@ -105,6 +112,13 @@ ChipCallable.build(
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the
 orchestration submits. `ChipCallable` exposes `binary_size`.
+
+For L3+ graph construction, `TaskArgs.add_dep(*handles)` adds `WAIT | RETAIN`
+edges: each consumer waits for its producers and keeps their task-owned
+resources alive until it completes. `TaskArgs.add_dep_wait(*handles)` adds
+ordering-only `WAIT` edges. Handles must come from a NEXT_LEVEL submit in the
+same orchestration run; they are opaque and cannot be constructed by the
+caller.
 
 ```python
 args = ChipStorageTaskArgs()

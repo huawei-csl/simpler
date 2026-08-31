@@ -18,11 +18,16 @@
 #include <cstddef>
 #include <type_traits>
 
-#include "runtime_types.h"
+#include "host_build_graph/task_id_encoding.h"
+#include "host_build_graph/runtime_types.h"
 #include "tensor.h"
 
-inline constexpr uint32_t GRAPH_MAX_NODES = 1024;
-inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_NODES = 4;
+inline constexpr uint32_t MAX_IN_GRAPH_TASKS = 1024;
+static_assert(
+    MAX_IN_GRAPH_TASKS <= (1u << simpler::hbg::IN_GRAPH_TASK_INDEX_BITS),
+    "an in-graph task index must fit the low field of an IN_GRAPH task id"
+);
+inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 
 enum class GraphTensorSource : uint8_t {
     BOUNDARY_EXACT = 0,
@@ -31,7 +36,7 @@ enum class GraphTensorSource : uint8_t {
     OWN_OUTPUT = 3,
 };
 
-// Wire representation of ChipTensor. ChipTensor itself is a host/runtime C++ type with
+// Wire representation of simpler::hbg::Tensor. simpler::hbg::Tensor itself is a host/runtime C++ type with
 // 64-byte alignment and helper methods; placing it inside vector<std::byte>
 // would not guarantee that alignment. Keep the boundary image C-compatible and
 // copy only semantic fields into this naturally 8-byte-aligned POD.
@@ -74,7 +79,7 @@ struct GraphScalarSourceRef {
     uint8_t reserved;
 };
 
-// Wire representation of a node's dispatch predicate. The operand's absolute GM
+// Wire representation of an in-graph task's dispatch predicate. The operand's absolute GM
 // address is not replay-invariant, so the Definition names the tensor the
 // operand element sits in plus its element offset within that tensor;
 // materialize rebinds the tensor for the execution and resolves the pair into
@@ -83,7 +88,7 @@ struct GraphPredicate {
     GraphTensor operand;
     GraphTensorSourceRef operand_source;
     // Element index into the rebound operand tensor, added to its start_offset.
-    // Fixed at record time: a Graph with a variable ChipTensor shape is rejected
+    // Fixed at record time: a Graph with a variable simpler::hbg::Tensor shape is rejected
     // before recording, so the operand's strides cannot change across replays.
     uint64_t elem_offset;
     int64_t target;
@@ -92,15 +97,15 @@ struct GraphPredicate {
     uint8_t reserved[6];
 };
 
-struct GraphNodeDefinition {
-    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
+struct InGraphTaskDefinition {
+    int32_t kernel_id[SUBTASK_SLOT_COUNT];
     uint8_t active_mask;
     uint8_t task_attrs;
     int16_t logical_block_num;
     int16_t total_required_subtasks;
-    // One-based index into the Definition's predicate array; 0 means the node
-    // carries no dispatch predicate. Biased so that a zeroed GraphNodeDefinition
-    // is a valid predicate-free node. Predicated nodes are rare, so the
+    // One-based index into the Definition's predicate array; 0 means the task
+    // carries no dispatch predicate. Biased so that a zeroed InGraphTaskDefinition
+    // is a valid predicate-free task. Predicated tasks are rare, so the
     // predicates live in their own array rather than inline.
     uint16_t predicate_slot;
     int32_t tensor_count;
@@ -124,32 +129,37 @@ struct GraphBoundarySignature {
     uint8_t reserved;
 };
 
-// Header prefixing each device-resident Definition object. The definition
-// buffer uploaded by the host is [GraphDefinitionHeader][GraphDefinition image];
-// verify_state gates the one-time integrity hash so submissions sharing one
-// Definition each pay only a state load.
 inline constexpr uint64_t GRAPH_DEFINITION_OBJECT_MAGIC = 0x4752415048455844ULL;
 
-enum class GraphDefinitionVerifyState : uint32_t {
-    UPLOADED = 0,
-    VERIFYING = 1,
-    VERIFIED = 2,
-    INVALID = 3,
-};
+// Every Definition object is [GraphDefinitionHeader][Definition image], aligned to
+// this and padded to a multiple of it. A Definition section is reached as an offset
+// from the image base, and the widest one may ask for max_align_t, so this is what
+// an image base has to carry; the header in front preserves it because its own size
+// is a multiple of it. Both the recorder that claims room for an object and the
+// upload that packs them share the value.
+inline constexpr size_t GRAPH_DEFINITION_OBJECT_ALIGN = alignof(std::max_align_t);
 
-struct GraphDefinitionHeader {
+// Header prefixing each device-resident Definition object. The definition buffer
+// uploaded by the host is [GraphDefinitionHeader][GraphDefinition image], and these
+// three fields are the framing the device checks before it reads a section offset
+// out of the image: the object is one of ours, it is the size the upload recorded,
+// and it holds the Graph the outer task was bound to.
+//
+// alignas, not a pad field: the image starts immediately behind the header and its
+// sections are offsets from that base, so the header's own size has to be a multiple
+// of the object alignment.
+struct alignas(GRAPH_DEFINITION_OBJECT_ALIGN) GraphDefinitionHeader {
     uint64_t magic;
-    std::atomic<uint32_t> verify_state;
-    uint32_t definition_bytes;
-    uint64_t content_hash;
     uint64_t full_key;
+    uint32_t definition_bytes;
 };
 
+static_assert(std::is_trivially_copyable_v<GraphDefinitionHeader>);
 static_assert(std::is_standard_layout_v<GraphDefinitionHeader>);
+static_assert(sizeof(GraphDefinitionHeader) % GRAPH_DEFINITION_OBJECT_ALIGN == 0);
 
 struct GraphDefinition {
     uint64_t full_key;
-    uint64_t content_hash;
     uint64_t required_heap;
     uint32_t total_bytes;
     uint32_t task_count;
@@ -160,17 +170,18 @@ struct GraphDefinition {
     uint32_t tensor_arg_count;
     uint32_t scalar_arg_count;
     uint32_t predicate_count;
-    // Bytes the GraphExecution header, node array and node argument pools need in
-    // the outer GRAPH task's heap tail. Invocation boundaries live in the outer
-    // task payload's compact argument-pool regions instead.
+    // Bytes the GraphExecution header, in-graph task array and in-graph task
+    // argument pools need in the outer Graph task's heap tail. Invocation
+    // boundaries live in the outer task payload's compact argument-pool regions
+    // instead.
     uint32_t execution_storage_bytes;
     uint32_t off_fanout_offsets;
     uint32_t off_fanout_indices;
     uint32_t off_fanin_offsets;
     uint32_t off_fanin_indices;
     uint32_t off_root_indices;
-    uint32_t off_node_offsets;
-    uint32_t off_nodes;
+    uint32_t off_in_graph_task_offsets;
+    uint32_t off_in_graph_tasks;
     uint32_t off_tensors;
     uint32_t off_tensor_sources;
     uint32_t off_scalars;
@@ -179,111 +190,14 @@ struct GraphDefinition {
     uint32_t off_predicates;
 };
 
-inline uint64_t graph_definition_hash_rotl(uint64_t value, uint32_t shift) {
-    return (value << shift) | (value >> (64U - shift));
-}
-
-inline uint64_t graph_definition_hash_round(uint64_t accumulator, uint64_t input) {
-    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
-    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
-    accumulator += input * PRIME2;
-    accumulator = graph_definition_hash_rotl(accumulator, 31);
-    return accumulator * PRIME1;
-}
-
-inline uint64_t graph_definition_hash_word(const uint8_t *bytes, size_t offset) {
-    constexpr size_t CONTENT_HASH_OFFSET = offsetof(GraphDefinition, content_hash);
-    static_assert(CONTENT_HASH_OFFSET % sizeof(uint64_t) == 0);
-    if (offset == CONTENT_HASH_OFFSET) return 0;
-    uint64_t word = 0;
-    __builtin_memcpy(&word, bytes + offset, sizeof(word));
-    return word;
-}
-
-// The Definition hash follows XXH64's four-lane structure so large images do
-// not serialize one multiply per word, and is bit-identical to XXH64 with this
-// seed for any image whose content_hash field is already zero.
-//
-// `data` must be the base of a GraphDefinition image: the word at
-// offsetof(GraphDefinition, content_hash) is read as zero, which is what lets
-// the device verify in place instead of copying the image to clear that field.
-// Hashing any other buffer, or a subrange that does not start at the image base,
-// silently substitutes zero for eight bytes of it.
-//
-// Definitions are rebuilt and rehashed by the same runtime version, so this is
-// an integrity checksum rather than a persisted wire-format identifier.
-inline uint64_t graph_definition_content_hash(const void *data, size_t size) {
-    constexpr uint64_t SEED = 1469598103934665603ULL;
-    constexpr uint64_t PRIME1 = 11400714785074694791ULL;
-    constexpr uint64_t PRIME2 = 14029467366897019727ULL;
-    constexpr uint64_t PRIME3 = 1609587929392839161ULL;
-    constexpr uint64_t PRIME4 = 9650029242287828579ULL;
-    constexpr uint64_t PRIME5 = 2870177450012600261ULL;
-    const auto *bytes = static_cast<const uint8_t *>(data);
-    size_t offset = 0;
-    uint64_t hash = 0;
-
-    if (size >= 32) {
-        uint64_t lane1 = SEED + PRIME1 + PRIME2;
-        uint64_t lane2 = SEED + PRIME2;
-        uint64_t lane3 = SEED;
-        uint64_t lane4 = SEED - PRIME1;
-        const size_t stripes_end = size - 32;
-        do {
-            lane1 = graph_definition_hash_round(lane1, graph_definition_hash_word(bytes, offset));
-            lane2 = graph_definition_hash_round(lane2, graph_definition_hash_word(bytes, offset + 8));
-            lane3 = graph_definition_hash_round(lane3, graph_definition_hash_word(bytes, offset + 16));
-            lane4 = graph_definition_hash_round(lane4, graph_definition_hash_word(bytes, offset + 24));
-            offset += 32;
-        } while (offset <= stripes_end);
-        hash = graph_definition_hash_rotl(lane1, 1) + graph_definition_hash_rotl(lane2, 7) +
-               graph_definition_hash_rotl(lane3, 12) + graph_definition_hash_rotl(lane4, 18);
-        hash ^= graph_definition_hash_round(0, lane1);
-        hash = hash * PRIME1 + PRIME4;
-        hash ^= graph_definition_hash_round(0, lane2);
-        hash = hash * PRIME1 + PRIME4;
-        hash ^= graph_definition_hash_round(0, lane3);
-        hash = hash * PRIME1 + PRIME4;
-        hash ^= graph_definition_hash_round(0, lane4);
-        hash = hash * PRIME1 + PRIME4;
-    } else {
-        hash = SEED + PRIME5;
-    }
-
-    hash += size;
-    while (offset + sizeof(uint64_t) <= size) {
-        const uint64_t mixed = graph_definition_hash_round(0, graph_definition_hash_word(bytes, offset));
-        hash ^= mixed;
-        hash = graph_definition_hash_rotl(hash, 27) * PRIME1 + PRIME4;
-        offset += sizeof(uint64_t);
-    }
-    if (offset + sizeof(uint32_t) <= size) {
-        uint32_t word = 0;
-        __builtin_memcpy(&word, bytes + offset, sizeof(word));
-        hash ^= static_cast<uint64_t>(word) * PRIME1;
-        hash = graph_definition_hash_rotl(hash, 23) * PRIME2 + PRIME3;
-        offset += sizeof(uint32_t);
-    }
-    while (offset < size) {
-        hash ^= static_cast<uint64_t>(bytes[offset]) * PRIME5;
-        hash = graph_definition_hash_rotl(hash, 11) * PRIME1;
-        ++offset;
-    }
-    hash ^= hash >> 33;
-    hash *= PRIME2;
-    hash ^= hash >> 29;
-    hash *= PRIME3;
-    hash ^= hash >> 32;
-    return hash;
-}
 static_assert(std::is_trivially_copyable_v<GraphTensorSourceRef>);
 static_assert(std::is_standard_layout_v<GraphTensorSourceRef>);
 static_assert(std::is_trivially_copyable_v<GraphTensor>);
 static_assert(std::is_standard_layout_v<GraphTensor>);
 static_assert(std::is_trivially_copyable_v<GraphScalarSourceRef>);
 static_assert(std::is_standard_layout_v<GraphScalarSourceRef>);
-static_assert(std::is_trivially_copyable_v<GraphNodeDefinition>);
-static_assert(std::is_standard_layout_v<GraphNodeDefinition>);
+static_assert(std::is_trivially_copyable_v<InGraphTaskDefinition>);
+static_assert(std::is_standard_layout_v<InGraphTaskDefinition>);
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
 static_assert(std::is_trivially_copyable_v<GraphBoundarySignature>);
@@ -298,7 +212,7 @@ static_assert(std::is_standard_layout_v<GraphDefinition>);
 // type that asked for more would make every one of those stores undefined, with
 // no diagnostic.
 static_assert(
-    alignof(GraphNodeDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
+    alignof(InGraphTaskDefinition) <= alignof(std::max_align_t) && alignof(GraphTensor) <= alignof(std::max_align_t) &&
         alignof(GraphTensorSourceRef) <= alignof(std::max_align_t) &&
         alignof(GraphScalarSourceRef) <= alignof(std::max_align_t) &&
         alignof(GraphBoundarySignature) <= alignof(std::max_align_t) &&
@@ -306,7 +220,7 @@ static_assert(
     "a Definition section type must not be over-aligned: its storage is a byte vector"
 );
 
-inline GraphTensor graph_tensor_pack(const ChipTensor &tensor) {
+inline GraphTensor graph_tensor_pack(const simpler::hbg::Tensor &tensor) {
     GraphTensor packed{};
     packed.buffer_addr = tensor.buffer.addr;
     packed.buffer_size = tensor.buffer.size;
@@ -326,7 +240,7 @@ inline GraphTensor graph_tensor_pack(const ChipTensor &tensor) {
     return packed;
 }
 
-inline void graph_tensor_unpack(const GraphTensor &packed, ChipTensor *tensor) {
+inline void graph_tensor_unpack(const GraphTensor &packed, simpler::hbg::Tensor *tensor) {
     tensor->buffer = PTOBufferHandle{packed.buffer_addr, packed.buffer_size};
     tensor->owner_task_id = TaskId{packed.owner_task_id};
     tensor->start_offset = packed.start_offset;
@@ -399,16 +313,6 @@ enum class GraphMaterializeResult : uint8_t {
     PREPARED = 3,
 };
 
-struct alignas(64) GraphNodeStorage {
-    PTO2TaskDescriptor task;
-    ChipTaskSlotState slot;
-    // The payload carries its argument regions as deltas into pools past the node
-    // array, so its size is the same for every node and the slot names it by a delta
-    // from the slot's own address. Field order here therefore constrains nothing, and
-    // node_at strides the storage by this type.
-    PTO2TaskPayload payload;
-};
-
 inline constexpr uint8_t GRAPH_EXECUTION_STATE_MASK = 0x7;
 inline constexpr uint8_t GRAPH_EXECUTION_EXTERNAL_READY = 0x8;
 
@@ -418,27 +322,27 @@ struct GraphExecution {
     // per-submission gate object.
     std::atomic<uint8_t> state{static_cast<uint8_t>(GraphExecutionState::SUBMITTED)};
     std::atomic<uint8_t> materialize_busy{0};
-    std::atomic<int32_t> remaining_nodes{0};
-    std::atomic<int32_t> retired_nodes{0};
-    // Incremental activation: nodes in [0, published_nodes) are fully
+    std::atomic<int32_t> remaining_tasks{0};
+    std::atomic<int32_t> retired_tasks{0};
+    // Incremental activation: tasks in [0, published_tasks) are fully
     // materialized and registered, so a route pass may consider them. route_cursor
-    // is the next such node index a route pass will claim; roots below it have
+    // is the next such task index a route pass will claim; roots below it have
     // been pushed to the ready queue exactly once. Both advance monotonically and
     // reset per (re)submission.
-    std::atomic<int32_t> published_nodes{0};
+    std::atomic<int32_t> published_tasks{0};
     std::atomic<int32_t> route_cursor{0};
-    int32_t node_count{0};
-    int32_t materialized_nodes{0};
-    int32_t constructed_nodes{0};
+    int32_t task_count{0};
+    int32_t materialized_tasks{0};
+    int32_t constructed_tasks{0};
     uint32_t consumed_tensor_args{0};
     ChipTaskSlotState *outer_slot{nullptr};
-    GraphNodeStorage *nodes{nullptr};
-    GraphNodeStorage *node_storage{nullptr};
-    // This execution's node argument pools, in the storage tail past node_storage.
-    // Every node payload's tensor and scalar deltas point here; its pool position is
+    ChipTaskStorage *tasks{nullptr};
+    ChipTaskStorage *task_storage{nullptr};
+    // This execution's task argument pools, in the storage tail past task_storage.
+    // Every task payload's tensor and scalar deltas point here; its pool position is
     // the Definition's tensor_offset / scalar_offset.
-    ChipTensor *node_tensor_pool{nullptr};
-    uint64_t *node_scalar_pool{nullptr};
+    simpler::hbg::Tensor *task_tensor_pool{nullptr};
+    uint64_t *task_scalar_pool{nullptr};
     const GraphDefinition *definition{nullptr};
     const uint32_t *fanin_offsets{nullptr};
     const uint16_t *fanin_indices{nullptr};
@@ -447,68 +351,71 @@ struct GraphExecution {
     const uint64_t *boundary_scalars{nullptr};
     uint32_t boundary_scalar_count{0};
 
-    GraphNodeStorage &node_at(int32_t index) const { return node_storage[index]; }
+    ChipTaskStorage &task_at(int32_t index) const { return task_storage[index]; }
 };
 
-static_assert(std::is_trivially_destructible_v<GraphNodeStorage>);
-// The tensor pool starts right after the node array, and the scalar pool starts
+static_assert(std::is_trivially_destructible_v<ChipTaskStorage>);
+// The tensor pool starts right after the in-graph task array, and the scalar pool starts
 // after a whole number of ChipTensors.
 static_assert(
-    alignof(GraphNodeStorage) % alignof(ChipTensor) == 0,
-    "a node entry must be at least ChipTensor-aligned: the tensor pool follows the node array"
+    alignof(ChipTaskStorage) % alignof(simpler::hbg::Tensor) == 0,
+    "an in-graph task entry must be at least simpler::hbg::Tensor-aligned: the tensor pool follows the "
+    "in-graph task array"
 );
-static_assert(sizeof(ChipTensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned");
+static_assert(
+    sizeof(simpler::hbg::Tensor) % alignof(uint64_t) == 0, "the tensor stride must keep the scalar pool aligned"
+);
 static_assert(std::is_trivially_destructible_v<GraphExecution>);
 // The whole storage is aligned for its widest member, so one base check covers the
-// header as well as the node array that follows it.
+// header as well as the in-graph task array that follows it.
 static_assert(
-    alignof(GraphNodeStorage) % alignof(GraphExecution) == 0,
-    "the node array's alignment must subsume the execution header's"
+    alignof(ChipTaskStorage) % alignof(GraphExecution) == 0,
+    "the in-graph task array's alignment must subsume the execution header's"
 );
-static_assert(sizeof(GraphTensor) <= sizeof(ChipTensor));
+static_assert(sizeof(GraphTensor) <= sizeof(simpler::hbg::Tensor));
 
 inline constexpr size_t graph_boundary_tensor_pool_slots(uint32_t tensor_count) {
     const size_t bytes = static_cast<size_t>(tensor_count) * sizeof(GraphTensor);
-    return (bytes + sizeof(ChipTensor) - 1) / sizeof(ChipTensor);
+    return (bytes + sizeof(simpler::hbg::Tensor) - 1) / sizeof(simpler::hbg::Tensor);
 }
 
 // The outer GRAPH task's heap tail occupies
-// [GraphExecution][GraphNodeStorage x node_count][ChipTensor x tensor_arg_count]
+// [GraphExecution][ChipTaskStorage x task_count][simpler::hbg::Tensor x tensor_arg_count]
 // [uint64_t x scalar_arg_count].
 //
-// The last two regions are the node payloads' argument pools, indexed by the
+// The last two regions are the in-graph task payloads' argument pools, indexed by the
 // Definition's own tensor_offset / scalar_offset — which is why the Definition's
-// arg-table counts size them rather than a per-node sum: node i's arguments occupy
-// [offset, offset + count) in both the table and the pool. There is no fanin region:
-// node dependencies live in the Definition's fanin CSR, so a node's fanin_count stays
-// 0 and its fanin delta unbound.
+// arg-table counts size them rather than a per-task sum: in-graph task i's arguments
+// occupy [offset, offset + count) in both the table and the pool. There is no fanin
+// region: an in-graph task's dependencies live in the Definition's fanin CSR, so its
+// fanin_count stays 0 and its fanin delta unbound.
 struct GraphExecutionStorageLayout {
-    size_t nodes_offset;
+    size_t tasks_offset;
     size_t tensors_offset;
     size_t scalars_offset;
     size_t total_bytes;
 };
 
 inline bool graph_execution_storage_layout(
-    int32_t node_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, GraphExecutionStorageLayout *out
+    int32_t task_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, GraphExecutionStorageLayout *out
 ) {
-    if (out == nullptr || node_count <= 0 || node_count > static_cast<int32_t>(GRAPH_MAX_NODES)) {
+    if (out == nullptr || task_count <= 0 || task_count > static_cast<int32_t>(MAX_IN_GRAPH_TASKS)) {
         return false;
     }
-    constexpr size_t ALIGNMENT = alignof(GraphNodeStorage);
-    out->nodes_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
-    out->tensors_offset = out->nodes_offset + static_cast<size_t>(node_count) * sizeof(GraphNodeStorage);
-    out->scalars_offset = out->tensors_offset + static_cast<size_t>(tensor_arg_count) * sizeof(ChipTensor);
+    constexpr size_t ALIGNMENT = alignof(ChipTaskStorage);
+    out->tasks_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    out->tensors_offset = out->tasks_offset + static_cast<size_t>(task_count) * sizeof(ChipTaskStorage);
+    out->scalars_offset = out->tensors_offset + static_cast<size_t>(tensor_arg_count) * sizeof(simpler::hbg::Tensor);
     out->total_bytes = out->scalars_offset + static_cast<size_t>(scalar_arg_count) * sizeof(uint64_t);
     return true;
 }
 
 inline bool graph_execution_storage_bytes(
-    int32_t node_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, size_t *storage_bytes
+    int32_t task_count, uint32_t tensor_arg_count, uint32_t scalar_arg_count, size_t *storage_bytes
 ) {
     GraphExecutionStorageLayout layout{};
     if (storage_bytes == nullptr ||
-        !graph_execution_storage_layout(node_count, tensor_arg_count, scalar_arg_count, &layout)) {
+        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, &layout)) {
         return false;
     }
     *storage_bytes = layout.total_bytes;
@@ -517,12 +424,8 @@ inline bool graph_execution_storage_bytes(
 
 GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot);
 GraphMaterializeResult graph_execution_materialize_slice(
-    ChipTaskSlotState &outer_slot, GraphExecution &execution, int32_t max_nodes, int32_t *nodes_materialized = nullptr
+    ChipTaskSlotState &outer_slot, GraphExecution &execution, int32_t max_tasks, int32_t *tasks_materialized = nullptr
 );
-
-inline GraphExecution *graph_execution_from_slot(ChipTaskSlotState &slot) {
-    return slot.task_kind == TaskKind::GRAPH_NODE ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
-}
 
 // An outer GRAPH slot's graph_context holds the shared Definition's device address
 // until graph_execution_localize replaces it with the execution, so this cast is only
@@ -579,14 +482,14 @@ inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
             GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
-inline bool graph_execution_complete_node(GraphExecution &execution) {
-    return execution.remaining_nodes.fetch_sub(1, std::memory_order_acq_rel) == 1;
+inline bool graph_execution_complete_in_graph_task(GraphExecution &execution) {
+    return execution.remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
 
 inline void graph_execution_mark_completed(GraphExecution &execution) {
     graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
 }
 
-inline void graph_execution_retire_node(GraphExecution &execution) {
-    execution.retired_nodes.fetch_add(1, std::memory_order_release);
+inline void graph_execution_retire_in_graph_task(GraphExecution &execution) {
+    execution.retired_tasks.fetch_add(1, std::memory_order_release);
 }

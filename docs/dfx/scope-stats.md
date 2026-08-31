@@ -43,12 +43,19 @@ schema.
 The metadata line is also the quickest way to verify per-ring runtime sizing.
 For example, after running with:
 
+```python
+# In the scene test's CASES entry -- ring sizing is per task, so it travels with
+# the case rather than with the process:
+"config": {
+    "runtime_env": {
+        "ring_task_window": [8192, 16384, 131072, 524288],
+        "ring_heap": [134217728, 268435456, 402653184, 536870912],
+        "ring_dep_pool": [4096, 8192, 16384, 32768],
+    }
+}
+```
+
 ```bash
-CASE=...
-NAME=...
-PTO2_RING_TASK_WINDOW=8192,16384,131072,524288 \
-PTO2_RING_HEAP=134217728,268435456,402653184,536870912 \
-PTO2_RING_DEP_POOL=4096,8192,16384,32768 \
 python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
 ```
 
@@ -150,7 +157,7 @@ only the `real_occupancy` curve.
   by site to compute the metrics above.
 - **Per-ring.** Each ring's task window, heap, and dep pool are tracked
   independently; a scope only ever touches its own ring
-  (`ring = min(depth, MAX_RING_DEPTH−1)`).
+  (`ring = min(depth, CHIP_MAX_RING_DEPTH−1)`).
 - **Capacity denominators.** The `*_max` capacities in the metadata line
   are snapshots of what the runtime actually configured for that run, so
   `used/cap` ratios are exact.
@@ -161,13 +168,11 @@ only the `real_occupancy` curve.
 ## 3. Output: `scope_stats.jsonl`
 
 NDJSON. Line 1 is run metadata; each subsequent line is one scope
-sample (`begin` or `end`). Schema version 6 (bumped from 5 when
-`heap_start`/`heap_end` changed from wrapping ring offsets to monotonic
-cumulative bytes — a `version == 5` file's heap fields wrap, a `version == 6`
-file's do not):
+sample (`begin` or `end`). `heap_start`/`heap_end` are monotonic cumulative
+bytes, not wrapping ring offsets:
 
 ```json
-{"version": 6, "fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
+{"fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
 {"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0}
 {"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5}
 ```
@@ -176,7 +181,6 @@ Metadata line (line 1):
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `version` | int | Schema version (`6`) |
 | `fatal` | bool | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
 | `dropped` | uint | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
 | `total` | uint | Total records the device attempted (collected + dropped) |
@@ -298,7 +302,7 @@ the host to chase a device pointer into the orchestration `.so`'s string
 table. `on_fatal` sets `header.fatal_latched`, surfacing as
 `"fatal": true`; the host still emits whatever records made it.
 
-`ring_id` outside `[0, PTO2_SCOPE_STATS_MAX_RING_DEPTH)` is silently
+`ring_id` outside `[0, SCOPE_STATS_MAX_RING_DEPTH)` is silently
 dropped. Caps are copied verbatim into the buffer header so the host can
 render `used/cap` without a second device→host query.
 

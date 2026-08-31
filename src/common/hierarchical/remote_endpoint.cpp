@@ -541,6 +541,7 @@ void RemoteL3SocketTransport::write_all(
 }
 
 std::vector<uint8_t> RemoteL3SocketTransport::read_frame(std::chrono::steady_clock::time_point deadline) {
+    last_read_deadline_ = deadline;
     std::vector<uint8_t> frame(remote_l3::FRAME_HEADER_BYTES);
     size_t off = 0;
     while (off < remote_l3::FRAME_HEADER_BYTES) {
@@ -727,7 +728,7 @@ MpiGroupMailboxChannel::MpiGroupMailboxChannel(
     if (std::memcmp(mailbox_ + OFF_MAGIC, MAGIC, sizeof(MAGIC)) != 0) {
         throw std::invalid_argument("MpiGroupMailboxChannel: mailbox magic mismatch");
     }
-    if (read_u32(OFF_PROTOCOL_VERSION) != PROTOCOL_VERSION || read_u32(OFF_HEADER_BYTES) != HEADER_BYTES) {
+    if (read_u32(OFF_HEADER_BYTES) != HEADER_BYTES) {
         throw std::invalid_argument("MpiGroupMailboxChannel: mailbox protocol mismatch");
     }
     if (read_u64(OFF_MAILBOX_BYTES) != MAILBOX_BYTES ||

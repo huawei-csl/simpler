@@ -1,7 +1,7 @@
 # Global DFX Backpressure — block-on-contention + dual-signal freeze
 
 The shared design for how every DFX profiling subsystem (ChipSwimlane, PMU,
-DepGen, ArgsDump, ScopeStats, tensor_dump) reacts when the host collector
+DepGen, ArgsDump, ScopeStats) reacts when the host collector
 cannot keep the device-side buffer pool refilled. It replaces the older
 "bounded wait, then drop the record" model with a **resident block-on-contention
 freeze**: an AICPU writer that runs out of ready-queue space or free buffers
@@ -68,7 +68,7 @@ Three primitives in `dfx_backpressure_device.h`, driven from
    pre-release queue writes are visible to the reads that follow.
 3. **Leader park** — `wait_for_release` is used only by a leader whose own
    reclaim depends on the host completing a full open→drain→release cycle on the
-   free-queue side (only tensor_dump's arena barrier today). It spins on the
+   free-queue side (only args_dump's arena barrier today). It spins on the
    **disjunction** `fq_contended || fq_freeze_active`.
 
 The push and pop loops in the engine bridge the host round-trip: raising
@@ -86,9 +86,16 @@ Every barrier and contention spin is bounded by
 scales per arch — a2a3 50 MHz, a5 1000 MHz). The budget exists **only** to break
 an infinite spin on host crash or hardware failure; it is not a normal-path
 wait. When it expires the writer breaks to its single failure exit
-(`return false`), and the caller (`switch_buffer`) accounts the dropped records.
-A 30-second expiry therefore means "the host is gone", not "the buffer was
-briefly full".
+(`return false`) only while ownership remains on the device: a full ready queue
+before publication, or an empty free queue while claiming a replacement. The
+caller then accounts the affected records as dropped.
+
+The push gate runs after the writer publishes the ready entry and advances the
+queue tail. That tail advance transfers ownership to the host and cannot be
+rolled back, so a push-gate timeout ends the park but the enqueue remains
+successful; reporting failure there would let the caller clear and reuse a
+host-owned buffer. A 30-second expiry still means "the host is gone", not "the
+buffer was briefly full".
 
 ## Host side — the freeze state machine
 
@@ -121,12 +128,12 @@ gap with no immediate re-stall.
 ### Per-subsystem release predicate
 
 `backpressure_release_ready()` is a CRTP hook, default `true`. A subsystem whose
-collector owns a separate, independently-overwritten region must override it to
-hold the release until that region is drained — otherwise the device resumes and
-overwrites not-yet-pulled data. Only **tensor_dump** does this today: RQ-empty
-alone does not imply its payload arena has been pulled. The hook is evaluated on
-the replenish thread inside the freeze loop, so overrides must be cheap,
-non-blocking, and read only atomics.
+collector owns a separate reusable region must override it to hold the release
+until that region is drained — otherwise the device can reuse bytes the host has
+not pulled. Only **args_dump** does this today: RQ-empty alone does not imply its
+payload arena has been pulled. The hook is evaluated on the replenish thread
+inside the freeze loop, so overrides must be cheap, non-blocking, and read only
+atomics.
 
 ## Two correctness arguments
 

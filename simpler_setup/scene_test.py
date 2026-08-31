@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import logging
 import os
 import platform as host_platform
@@ -32,11 +33,12 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
+from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from .compile_pool import compile_slot, current_compile_workers
-from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, TIMING, configure_logging
 from .pto_isa import ensure_pto_isa_root
 from .scene_test_cache import (
     compile_artifact_key,
@@ -50,6 +52,8 @@ logger = logging.getLogger(__name__)
 _compile_cache: dict[tuple, object] = {}
 
 _CASE_CONFIG_KEYS = frozenset({"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers"})
+_TORCH_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
+_TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT = 64
 _RUNTIME_ENV_KEYS = frozenset({"ring_task_window", "ring_heap", "ring_dep_pool"})
 
 
@@ -73,7 +77,7 @@ def _validate_diagnostic_flags(*, chip_swimlane: int, swimlane_overhead: bool) -
         raise ValueError("--enable-swimlane-overhead requires --enable-chip-swimlane")
 
 
-def _effective_diagnostic_options(
+def effective_diagnostic_options(
     rounds: int,
     *,
     chip_swimlane: int,
@@ -101,6 +105,55 @@ def _effective_diagnostic_options(
         if warn and enabled:
             logger.warning("%s disabled: --rounds > 1", name)
     return _DiagnosticOptions(0, 0, 0, False, False, False)
+
+
+@cache
+def _log_torch_backend_autoload_once() -> None:
+    """Record torch backend autoload configuration and module state once."""
+    raw_setting = os.environ.get(_TORCH_BACKEND_AUTOLOAD_ENV)
+    if raw_setting is None:
+        setting = "unset"
+    elif raw_setting in {"0", "1"}:
+        setting = raw_setting
+    else:
+        setting = "invalid"
+    raw_truncated = raw_setting is not None and len(raw_setting) > _TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT
+    raw_value = None if raw_setting is None else raw_setting[:_TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT]
+    raw_json = json.dumps(raw_value, ensure_ascii=True)
+    # torch._is_device_backend_autoload_enabled() uses getenv(..., "1") == "1".
+    effective = "enabled" if (raw_setting is None or raw_setting == "1") else "disabled"
+
+    # SceneTest configures TIMING on "simpler"; the module logger filters this level.
+    logging.getLogger("simpler").log(
+        TIMING,
+        "torch_backend_autoload setting=%s raw=%s raw_truncated=%s effective=%s torch_imported=%s torch_npu_loaded=%s",
+        setting,
+        raw_json,
+        str(raw_truncated).lower(),
+        effective,
+        str("torch" in sys.modules).lower(),
+        str("torch_npu" in sys.modules).lower(),
+    )
+
+
+def log_torch_backend_autoload_once() -> None:
+    """Emit the shared autoload-state record from a standalone driver."""
+    _log_torch_backend_autoload_once()
+
+
+def standalone_pytest_options(request) -> dict:
+    """Forward the common scene-test CLI surface through a thin pytest wrapper."""
+    getoption = request.config.getoption
+    return {
+        "rounds": getoption("--rounds", default=1),
+        "skip_golden": getoption("--skip-golden", default=False),
+        "enable_chip_swimlane": getoption("--enable-chip-swimlane", default=0),
+        "dump_args": getoption("--dump-args", default=0),
+        "enable_pmu": getoption("--enable-pmu", default=0),
+        "enable_dep_gen": getoption("--enable-dep-gen", default=False),
+        "enable_scope_stats": getoption("--enable-scope-stats", default=False),
+        "enable_swimlane_overhead": getoption("--enable-swimlane-overhead", default=False),
+    }
 
 
 def _pto_isa_compile_cache_token() -> str:
@@ -963,7 +1016,7 @@ def _outputs_dir() -> Path:
     return _project_root() / "outputs"
 
 
-def _build_output_prefix(case_label: str) -> Path:
+def build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
@@ -1140,6 +1193,53 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def finalize_diagnostic_outputs(
+    case_label: str,
+    output_prefix: str | Path,
+    *,
+    callable_spec: dict | None = None,
+    chip_swimlane: int = 0,
+    dep_gen: bool = False,
+    scope_stats: bool = False,
+    swimlane_overhead: bool = False,
+) -> None:
+    """Run the postprocessors shared by SceneTest and standalone drivers."""
+    prefix = Path(output_prefix)
+    if chip_swimlane:
+        _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec, enable_overhead=swimlane_overhead)
+    if dep_gen:
+        _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
+    if scope_stats:
+        _plot_case_scope_stats(case_label, prefix)
+
+
+def _name_failing_case(exc: BaseException, cls_name: str, case_name: str) -> None:
+    """Prefix `exc`'s message with the class and case that raised it, in place.
+
+    The exception object, its type, its traceback and its attributes all survive,
+    which two callers depend on:
+
+    - A negative scene test asserts on the exception its own orchestration raised
+      (`TestAllreduceIbingNranksError` expects `ValueError`). Re-raising a wrapper
+      of a fixed type makes such a test unable to pass however it is written.
+    - `conftest._requires_l2_worker_retirement` gates on
+      `issubclass(excinfo.type, RuntimeError)` before matching device-poison codes
+      in the message. Every code and marker it looks for comes out of the native
+      layer as a `RuntimeError`, so preserving the type keeps it classifiable.
+
+    `str(exc)` keeps the original text after the prefix, so both that classifier
+    and `pytest.raises(match=...)` still match on it.
+
+    Only `args[0]` is rewritten. An exception that renders itself from dedicated
+    attributes rather than from `args` (`OSError` and its errno/strerror) simply
+    does not gain the prefix; it is never left inconsistent. Python 3.11's
+    `BaseException.add_note` would express this directly, but `requires-python` is
+    `>=3.9`.
+    """
+    context = f"SceneTest case failed: {cls_name}::{case_name}"
+    exc.args = (f"{context}: {exc}", *exc.args[1:]) if exc.args else (context,)
+
+
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
     worker,
     cls_inst,
@@ -1179,7 +1279,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         # scope_stats writes below the per-case output prefix, so it uses the
         # same output-prefix allocation as the other diagnostics.
-        prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
+        prefix = build_output_prefix(case_label) if diagnostics_on else Path("")
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -1196,19 +1296,18 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         except Exception as exc:
-            raise RuntimeError(f"SceneTest case failed: {cls_name}::{case['name']}: {exc}") from exc
+            _name_failing_case(exc, cls_name, case["name"])
+            raise
         finally:
-            if enable_chip_swimlane:
-                _convert_case_swimlane(
-                    case_label,
-                    prefix,
-                    callable_spec=callable_spec,
-                    enable_overhead=enable_swimlane_overhead,
-                )
-            if enable_dep_gen:
-                _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
-            if enable_scope_stats:
-                _plot_case_scope_stats(case_label, prefix)
+            finalize_diagnostic_outputs(
+                case_label,
+                prefix,
+                callable_spec=callable_spec,
+                chip_swimlane=enable_chip_swimlane,
+                dep_gen=enable_dep_gen,
+                scope_stats=enable_scope_stats,
+                swimlane_overhead=enable_swimlane_overhead,
+            )
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -1223,8 +1322,15 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
             raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
 
 
-def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
-    """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``."""
+def compile_chip_callable_spec(spec, platform, runtime, cache_key):
+    """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``.
+
+    The one compile path for a `CALLABLE`-shaped spec dict, whoever owns the
+    Worker: the `SceneTestCase` classes below, the `st_worker` pytest fixture,
+    and standalone cases that drive an L3 Worker themselves. Key it through
+    ``l3_compile_cache_key`` so every path shares one cache entry per
+    orchestration.
+    """
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -1468,7 +1574,7 @@ class SceneTestCase:
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
         cache_key = (cls.__module__, cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
-        return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
+        return compile_chip_callable_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
     def _compile_l3_callables(cls, platform):
@@ -1478,7 +1584,7 @@ class SceneTestCase:
             if "orchestration" in entry:
                 name = entry["name"]
                 cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
+                chip = compile_chip_callable_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         return compiled
@@ -1541,8 +1647,8 @@ class SceneTestCase:
         # 0 = auto: DeviceRunner uses the architecture default.
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 0)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
-        # nested under the "runtime_env" key. Takes precedence over the
-        # PTO2_RING_* env vars / RUNTIME_ENV. Each value is either a scalar
+        # nested under the "runtime_env" key. This is the only way to size the
+        # rings -- there is no process-wide env. Each value is either a scalar
         # (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
         # (per-ring); the binding accepts both forms.
         runtime_env = config_dict.get("runtime_env", {})
@@ -1556,7 +1662,7 @@ class SceneTestCase:
         config.enable_scope_stats = enable_scope_stats
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
-        # directory built by _build_output_prefix().
+        # directory built by build_output_prefix().
         if output_prefix:
             config.output_prefix = str(output_prefix)
         return config
@@ -1660,6 +1766,8 @@ class SceneTestCase:
             with _golden_thread_cap():
                 self.compute_golden(golden_args, params)
 
+        _log_torch_backend_autoload_once()
+
         # Save initial output tensor values for reset between rounds
         initial_outputs = {}
         if rounds > 1:
@@ -1678,7 +1786,7 @@ class SceneTestCase:
                     getattr(test_args, name).copy_(initial)
 
             # Every diagnostic reaching this loop is already multi-round-safe:
-            # _effective_diagnostic_options zeroes all of them when rounds > 1,
+            # effective_diagnostic_options zeroes all of them when rounds > 1,
             # so no per-round masking belongs here.
             config = self._build_config(
                 config_dict,
@@ -1743,6 +1851,8 @@ class SceneTestCase:
         # reset, dispatch, and compare below all operate on the rehosted views.
         rehosted = _RehostedTaskArgs(worker, test_args)
         try:
+            _log_torch_backend_autoload_once()
+
             # Save initial tensor values for reset between rounds
             all_tensor_names = test_args.tensor_names()
             initial_tensors = {}
@@ -1796,13 +1906,27 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _effective_enable_chip_swimlane(request) -> int:
+        """Return the multi-round-safe chip-swimlane level for extension hooks."""
+        return effective_diagnostic_options(
+            request.config.getoption("--rounds", default=1),
+            chip_swimlane=request.config.getoption("--enable-chip-swimlane", default=0),
+            dump_args=0,
+            pmu=0,
+            dep_gen=False,
+            scope_stats=False,
+            swimlane_overhead=False,
+            warn=False,
+        ).chip_swimlane
+
+    @staticmethod
     def _effective_enable_dep_gen(request) -> bool:
         """Return the multi-round-safe dep-gen setting for extension hooks.
 
         Subclass hooks use the same effective-value rule as the main run path
         without emitting an additional user-facing warning.
         """
-        return _effective_diagnostic_options(
+        return effective_diagnostic_options(
             request.config.getoption("--rounds", default=1),
             chip_swimlane=0,
             dump_args=0,
@@ -1832,7 +1956,7 @@ class SceneTestCase:
         enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
         enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
-        diagnostics = _effective_diagnostic_options(
+        diagnostics = effective_diagnostic_options(
             rounds,
             chip_swimlane=enable_chip_swimlane,
             dump_args=enable_dump_args,
@@ -2052,7 +2176,7 @@ class SceneTestCase:
         # Resolved before the eager PTO-ISA checkout below so a rejected flag
         # combination costs no clone.
         try:
-            diagnostics = _effective_diagnostic_options(
+            diagnostics = effective_diagnostic_options(
                 args.rounds,
                 chip_swimlane=args.enable_chip_swimlane,
                 dump_args=args.dump_args,
@@ -2087,17 +2211,17 @@ class SceneTestCase:
         # slot but the dispatcher doesn't actually run tests here.
         args.device = device_ids[0]
 
-        # Resolve -j (max parallel) — 'auto' is CPU-aware on sim, device-count on hardware.
+        # Resolve --max-parallel; 'auto' is CPU-aware on sim and device-count on hardware.
         if args.max_parallel in (None, "", "auto"):
             args.max_parallel = default_max_parallel(args.platform, device_ids)
         else:
             try:
                 args.max_parallel = int(args.max_parallel)
             except (TypeError, ValueError):
-                print(f"ERROR: -j must be 'auto' or an integer, got {args.max_parallel!r}", file=sys.stderr)
+                print(f"ERROR: --max-parallel must be 'auto' or an integer, got {args.max_parallel!r}", file=sys.stderr)
                 sys.exit(2)
             if args.max_parallel < 1:
-                print(f"ERROR: -j must be >= 1, got {args.max_parallel}", file=sys.stderr)
+                print(f"ERROR: --max-parallel must be >= 1, got {args.max_parallel}", file=sys.stderr)
                 sys.exit(2)
         # Profiling + parallelism is safe: each test case sets its own
         # `output_prefix` on CallConfig (see run_class_cases) so diagnostic
@@ -2324,9 +2448,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     l2_failed = False
     for rt in sorted(l2_by_runtime):
         classes = l2_by_runtime[rt]
-        # Chunk count = min(-j, number of classes). We intentionally do NOT
+        # Chunk count = min(--max-parallel, number of classes). We intentionally do NOT
         # include len(device_ids) here: each chunk uses 1 device and at most
-        # max_parallel chunks run concurrently, so a pool bigger than -j just
+        # max_parallel chunks run concurrently, so a larger device pool just
         # leaves unused ids. Fewer, larger chunks also amortize ChipWorker
         # init (layer-4 reuse) over more cases.
         n = min(args.max_parallel, len(classes))
@@ -2473,7 +2597,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
             elif "orchestration" in entry:
                 name = entry["name"]
                 cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, args.platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
+                chip = compile_chip_callable_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle
                 cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])

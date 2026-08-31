@@ -14,52 +14,85 @@ still yields its whole host picture.
 
 ## The recipe
 
-Fill in `ENVS`, `CASE`, `TAIL` from the two tables below, then run it verbatim.
+Fill in `NAME`, `RUN`, `DEVICES`, `TIMEOUT`, `CASE` from the case table and
+`ENVS`, `TAIL` from the mode table, then run it verbatim.
 `pip install --no-build-isolation -e .` first, and again after every `HEAD` move.
 
 ```bash
 HEAD_SHA=$(git rev-parse --short HEAD)
-LOG="outputs/bind_${HEAD_SHA}.log"; mkdir -p outputs
+NAME="<case>_<mode>"                    # e.g. qwen_numbers — see below
+RUN=<n>                                 # repetition: 1, 2, … within one A/B session
+LOG="outputs/bind_${NAME}_${HEAD_SHA}_r${RUN}.log"; mkdir -p outputs
+[ -e "$LOG" ] && { echo "refusing to overwrite $LOG — bump RUN"; exit 1; }
 MARK="outputs/.bind_start"; : >"$MARK"   # fixed mtime; "$LOG" keeps being appended to
 
-ENVS="SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 SIMPLER_LOG_LEVEL=TIMING \
+DEVICES=<N>                                            # per case
+TIMEOUT=<seconds>                                      # per case
+ENVS="SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 \
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 SIMPLER_SKIP_DEVICE_RUN=1"          # + mode delta
-CASE="examples/.../test_<case>.py -p a2a3 \
---case <Class>:: --skip-golden"                       # + manual mode and level, per case
-TAIL="--rounds 6"                                                    # per mode
+CASE="examples/.../<entry>.py -p a2a3"                # exactly as the case table gives it
+TAIL="--rounds 6 --log-level timing"                                 # per mode
 
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
 echo "[stamp] $HEAD_SHA env $ENVS python $CASE $TAIL" >"$LOG"
-task-submit --device auto --device-num <N> --timeout 3600 --max-time 3600 \
+task-submit --device auto --device-num "$DEVICES" --timeout "$TIMEOUT" --max-time "$TIMEOUT" \
   --run "env $ENVS python $CASE $TAIL -d \$TASK_DEVICE" >>"$LOG" 2>&1
-grep -c 'bind phase=' "$LOG"          # must be > 0
+grep -c 'bind phase=' "$LOG"          # numbers mode: must be > 0
 ```
 
 `env` prefixes the assignments so they survive coming from a variable, and the
 `[stamp]` line is the same string that runs — which is what makes two logs
 comparable. Never hand-edit one arm's command without the other's.
 
+**`$LOG` is opened with a truncating `>`, so its name has to separate every run
+this skill tells you to make.** `NAME` separates the two cases and the two modes,
+`HEAD_SHA` the two arms of a comparison, and `RUN` the repetitions — the
+comparison protocol runs each arm more than once, so `base, measure, base,
+measure` is two runs per commit that agree on case, mode and sha. The guard turns
+a forgotten `RUN` into a refusal; without all three fields a later run silently
+destroys an earlier log, and its own output looks entirely normal.
+
+**`--log-level timing` pins a condition rather than enabling anything.**
+`python/simpler/_log.py` puts the `simpler` logger at TIMING on import and
+`Worker` snapshots that one logger for the host log and for every forked chip
+child, so the `bind phase=` records are already on without it. What passing it
+buys is the `[stamp]` line: the level is the one measurement condition with no
+record of its own in the log — unlike `torch_backend_autoload` — so a run that
+omits the flag leaves it implicit in whatever that commit's default happens to
+be. Two arms of a cross-commit A/B can then run at different levels with neither
+stamp showing it.
+
+**In timeline mode that last check reports 0 on a run that worked.** A diagnostic
+flag makes `CallConfig.output_prefix` non-empty, and a non-empty prefix moves
+every host-log record — `bind phase=` lines and `[STRACE]` spans alike — out of
+`$LOG` into `outputs/<case>_<ts>/host.<pid>.log`, one file per process. Grep those
+instead, and feed the finisher both (see the timeline command below).
+
 ## The two cases
 
 | Property | dsv4 FLASH decode | qwen3-14b decode |
 | -------- | ----------------- | ---------------- |
-| `--device-num` | 2 | 1 |
-| `CASE` example | `examples/a2a3/host_build_graph/deepseek_v4_flash_decode/test_deepseek_v4_flash_decode.py` | `examples/a2a3/host_build_graph/qwen3_14b_decode/test_qwen3_14b_decode.py` |
-| `--case` | `TestDeepseekV4FlashDecodeHostBuildGraph::` | `TestQwen314BDecodeHostBuildGraph::` |
-| manual mode | none | **add** `--manual only` |
-| level | `level=3`, so **add** `--runtime host_build_graph --level 3` | `level=2`, add nothing |
-| timeout | 3600 (cold compile is minutes) | 2400 |
+| `NAME` prefix | `dsv4` | `qwen` |
+| `DEVICES` | 2 | 1 |
+| entry point | standalone driver — it owns its `Worker`, so no `--case` / `--manual` / `--level` and no module runner | standalone driver with the same ownership model |
+| `CASE` | `examples/a2a3/host_build_graph/deepseek_v4_flash_decode/main.py -p a2a3 --skip-golden` | `examples/a2a3/host_build_graph/qwen3_14b_decode/main.py -p a2a3 --skip-golden` |
+| parameters | child memory; **`--skip-golden` is not optional here** — without it the driver first streams a 42.6 GiB-per-rank fixture you are not measuring | device-resident buffers; the valid fixture is streamed once, and `--skip-golden` skips only torch/D2H |
+| `TIMEOUT` | 3600 (cold compile is minutes) | 2400 |
+| emits `torch_backend_autoload` | **no** — the parser says so above the table, and a dsv4 A/B has no in-log witness for the autoload state | yes |
 
-The `--level 3` addition is not optional for dsv4: without it the module runner
-captures the child's stdout and the log ends up with zero `bind phase=` lines
-while the run still passes.
+Neither case needs a `--level`: each driver runs its `Worker` in this process,
+so its chip children write straight to the log the `task-submit --run` command
+is redirected into. (Under the scene-test module runner they did not: it
+captured the child's stdout and the log ended up with zero `bind phase=` lines
+while the run still passed.)
 
 ## The two modes
 
 | Field | numbers | timeline |
 | ----- | ------- | -------- |
+| `NAME` suffix | `_numbers` | `_timeline` |
 | `ENVS` delta | none | `+ SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` |
-| `TAIL` | `--rounds 6` | `--rounds 1 --enable-pmu 2` |
+| `TAIL` | `--rounds 6 --log-level timing` | `--rounds 1 --enable-pmu 2 --log-level timing` |
 | finish with | the parser, below | `strace_timing`, below |
 
 `--rounds > 1` force-disables every diagnostic (it warns per flag), so one run
@@ -69,20 +102,27 @@ per-event artifact a directory; `--enable-chip-swimlane` raises
 `NotImplementedError` at level 3.
 
 ```bash
-# numbers
+# numbers — the bind lines are in $LOG, since no diagnostic flag is on
 python -m simpler_setup.tools.hbg_bind_phases "$LOG" --rounds 6
 
 # timeline — only an artifact newer than this run's own marker counts
 RECORDS=$(find outputs -name host_phase_records.jsonl -newer "$MARK")
 echo "$RECORDS"          # must name exactly one file; empty ⇒ this run wrote none,
                          # so stop rather than reading a previous run's artifact
-python -m simpler_setup.tools.strace_timing "$LOG" --host-phase-records "$RECORDS" \
-  --swimlane "$(dirname "$RECORDS")/host_swimlane.json"      # load in ui.perfetto.dev
+D=$(dirname "$RECORDS")
+grep -c 'bind phase=' "$D"/host.*.log    # must be > 0; $LOG has none in this mode
+# The clock anchors are split — the invoking process wrote its own to $LOG, each
+# chip child wrote its own under $D — so parse the concatenation, not either half.
+cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
+python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
+  --host-phase-records "$RECORDS" \
+  --swimlane "$D/host_swimlane.json"                          # load in ui.perfetto.dev
 ```
 
 ## Before reporting a number
 
-- `grep -c 'bind phase='` was `> 0`, and the table shows a `[stamp]` line.
+- `grep -c 'bind phase='` was `> 0` — in `$LOG` for numbers mode, in
+  `$D/host.*.log` for timeline mode — and the table shows a `[stamp]` line.
 - Quote the stamp with the number. A number without the command and commit that
   produced it cannot be compared to anything.
 - Comparing two branches has three more rules, all of them learned the hard way —

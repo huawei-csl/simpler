@@ -9,12 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_
-#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_
+#pragma once
 
 #include <stdint.h>
 
-#include "constants.h"
+#include "host_build_graph/constants.h"
 
 // Types shared across the AICore↔AICPU boundary.
 //
@@ -54,15 +53,13 @@ struct DeferredCompletionEntry {
 
 static_assert(sizeof(DeferredCompletionEntry) == 32, "DeferredCompletionEntry layout drift");
 
-struct alignas(PTO2_ALIGN_SIZE) DeferredCompletionSlab {
+struct alignas(CHIP_ALIGN_SIZE) DeferredCompletionSlab {
     volatile uint32_t count;
     volatile int32_t error_code;
     DeferredCompletionEntry entries[MAX_COMPLETIONS_PER_TASK];
 };
 
 static_assert(
-    sizeof(DeferredCompletionSlab) % PTO2_ALIGN_SIZE == 0,
+    sizeof(DeferredCompletionSlab) % CHIP_ALIGN_SIZE == 0,
     "DeferredCompletionSlab size must preserve array element cache-line boundaries"
 );
-
-#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_AICORE_COMPLETION_MAILBOX_TYPES_H_

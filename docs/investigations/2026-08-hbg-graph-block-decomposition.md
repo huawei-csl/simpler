@@ -3,6 +3,11 @@
 **Date**: 2026-08-19, revised 2026-08-20
 **Verdict**: adopted at seven Definitions, once #1929 removed the single recording slot the first measurement failed against — the win is smaller than the orchestration window alone suggests, because seven Definitions are seven images to upload
 
+> **Names in this entry are the ones in use at the time.** A task inside a Graph
+> body was a "node" and the record phase was `record_node`; they are now an
+> in-graph task and `record_in_graph_task`. `strace_timing.py` still accepts the
+> old phase name, so logs from this investigation remain readable.
+
 ## Question
 
 `examples/a2a3/host_build_graph/deepseek_v4_flash_decode` casts its 43-layer
@@ -182,11 +187,13 @@ The stage this was aimed at is still not where the case's host time lives.
 `record_node` + `build_definition` + `graph_upload` are rebuilt from scratch on
 every run because the Definition cache lives in the per-run `GraphHostState`:
 roughly half the host prepare path re-deriving artifacts identical to the
-previous run's. And the `bind` stage as a whole is dominated by neither, at
-**2.65 s** for `args` (staging this network's weights) and 312 ms for
-`host_view_close` against ~4 ms of orchestration — the orchestration window is
-the interesting number only because the weight staging is a fixture artifact a
-serving loop would pay once.
+previous run's. And at the measured commit the `bind` stage as a whole is
+dominated by neither, at **2.65 s** for `args` (staging this network's weights
+and registering their device buffers) and 312 ms for `host_view_close` against
+~4 ms of orchestration. The staging-view change later removed those per-tensor
+registrations, so current runs report `host_view_close count=0 bytes=0`; the
+remaining weight-staging cost is still a fixture artifact a serving loop would
+pay once.
 
 ## What is still open
 

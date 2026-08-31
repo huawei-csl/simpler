@@ -12,10 +12,10 @@
 /**
  * @file dep_gen_replay.cpp
  * @brief Replay in-memory DepGenRecord stream → deps.json (strided tensor
- *        representation, tensor-annotated) via a host-resident PTO2TensorMap,
+ *        representation, tensor-annotated) via a host-resident ChipTensorMap,
  *        with a differential check against the runtime template `compute_task_fanin`.
  *
- * Two passes run per record against two parallel PTO2TensorMap instances that
+ * Two passes run per record against two parallel ChipTensorMap instances that
  * evolve in lockstep:
  *
  *   ORACLE pass (read-only contract):
@@ -29,7 +29,7 @@
  *   ANNOT pass (this file's feature):
  *     Inlines the same STEP A (creator retention) + STEP B (tensormap lookup)
  *     against `tm_annot`, but the callback fires with the full
- *     `PTO2TensorMapEntry&` + the consumer ChipTensor* + the arg index, so the
+ *     `ChipTensorMapEntry&` + the consumer simpler::tmr::Tensor* + the arg index, so the
  *     replay can record per-edge tensor metadata (producer/consumer
  *     shape/offset, dtype, version).
  *
@@ -42,8 +42,10 @@
  * knows to mirror the change in the annot pass.
  *
  * STEP 1 (explicit_deps) is emitted at the call site (per dep_compute.h's
- * "kept at call site" note); both passes run the same explicit-deps loop, so
- * the comparison covers it too.
+ * "kept at call site" note). Both passes seed explicit edges from the same
+ * captured dep/kind arrays, so the differential check includes their effect
+ * but cannot independently validate those bytes. Scene tests validate the
+ * capture/replay round-trip for explicit kinds.
  *
  * STEP 4 (`register_task_outputs`) runs on BOTH tensor maps after both passes
  * complete, keeping `tm_oracle` and `tm_annot` bit-equivalent for the next
@@ -73,6 +75,7 @@
 #include "data_type.h"
 #include "dep_compute.h"
 #include "task_id.h"
+#include "tensormap_and_ringbuffer/task_id_encoding.h"
 #include "tensormap.h"
 #include "tensor.h"
 
@@ -162,7 +165,7 @@ const char *overlap_status_str(OverlapStatus s) {
 // TENSORMAP source only — the explicit/creator emit paths don't have a
 // matched tensormap entry to copy from.
 //
-// Slice description follows the strided ChipTensor model: (start_offset, strides[])
+// Slice description follows the strided simpler::tmr::Tensor model: (start_offset, strides[])
 // in element units. Byte offset of element coords[] is
 //   (start_offset + Σ coords[i] · strides[i]) · dtype_bytes
 struct EdgeAnnot {
@@ -173,7 +176,7 @@ struct EdgeAnnot {
     DepFlags flags;         // per-edge WAIT/RETAIN semantics carried into deps.json
     OverlapStatus overlap;  // only meaningful for TENSORMAP
     uint64_t tensor_id;     // 0 for EXPLICIT
-    // Consumer side (the ChipTensor the submitting task is reading).
+    // Consumer side (the simpler::tmr::Tensor the submitting task is reading).
     uint8_t consumer_dtype;
     uint32_t consumer_ndims;
     uint32_t consumer_shape[MAX_TENSOR_DIMS];
@@ -201,7 +204,7 @@ struct TensorTableEntry {
 // One arg slot of a task, captured for the `tasks[].args[]` block so
 // downstream viewers can render per-task input / output compartments without
 // having to scan every edge. `has_tensor_info` is false only for OUTPUT slots:
-// the runtime hasn't materialized a ChipTensor yet at submit_task time, so the
+// the runtime hasn't materialized a simpler::tmr::Tensor yet at submit_task time, so the
 // captured blob is zeroed.
 struct TaskArgEntry {
     int32_t idx;
@@ -264,7 +267,8 @@ uint64_t make_tensor_id(uint64_t buffer_addr, int32_t version) {
 // per-edge fields describe the slice via (start_offset, strides[]). Subsequent
 // sightings of the same (addr, version) are no-ops.
 uint64_t register_tensor(
-    std::unordered_map<uint64_t, size_t> &index_by_id, std::vector<TensorTableEntry> &table, const ChipTensor &t
+    std::unordered_map<uint64_t, size_t> &index_by_id, std::vector<TensorTableEntry> &table,
+    const simpler::tmr::Tensor &t
 ) {
     uint64_t id = make_tensor_id(t.buffer.addr, t.version);
     auto it = index_by_id.find(id);
@@ -283,9 +287,9 @@ uint64_t register_tensor(
     return id;
 }
 
-// Copy a ChipTensor's slice description (shape + start_offset + stride) into an
+// Copy a simpler::tmr::Tensor's slice description (shape + start_offset + stride) into an
 // EdgeAnnot's consumer_* fields.
-void fill_consumer(EdgeAnnot &e, const ChipTensor &t) {
+void fill_consumer(EdgeAnnot &e, const simpler::tmr::Tensor &t) {
     e.consumer_dtype = static_cast<uint8_t>(t.dtype);
     e.consumer_ndims = t.ndims;
     e.consumer_start_offset = t.start_offset;
@@ -295,9 +299,9 @@ void fill_consumer(EdgeAnnot &e, const ChipTensor &t) {
     }
 }
 
-// Copy a PTO2TensorMapEntry's slice description into an EdgeAnnot's producer_*
+// Copy a ChipTensorMapEntry's slice description into an EdgeAnnot's producer_*
 // fields. Only called from the TENSORMAP emit path.
-void fill_producer(EdgeAnnot &e, const PTO2TensorMapEntry &entry) {
+void fill_producer(EdgeAnnot &e, const ChipTensorMapEntry &entry) {
     e.producer_ndims = entry.ndims;
     e.producer_start_offset = entry.start_offset;
     for (uint32_t i = 0; i < entry.ndims && i < MAX_TENSOR_DIMS; i++) {
@@ -425,7 +429,7 @@ bool write_deps_json(
 
 template <typename EmitTM, typename EmitCreator>
 void annot_pass(
-    const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_manual_scope, EmitCreator emit_creator,
+    const DepInputs &inputs, ChipTensorMap &tensor_map, bool in_manual_scope, EmitCreator emit_creator,
     EmitTM emit_tensormap
 ) {
     if (in_manual_scope) {
@@ -436,7 +440,7 @@ void annot_pass(
         if (ptype == TensorArgType::OUTPUT) {
             continue;
         }
-        const ChipTensor *tensor = &inputs.tensors[i].ref();
+        const simpler::tmr::Tensor *tensor = &inputs.tensors[i].ref();
 
         // STEP A: creator retention.
         TaskId owner = tensor->owner_task_id;
@@ -452,7 +456,7 @@ void annot_pass(
             continue;
         }
 
-        tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
+        tensor_map.lookup(*tensor, [&](ChipTensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
             emit_tensormap(entry.producer_task_id, i, *tensor, entry, overlap_status);
             if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
                 tensor_map.remove_entry(entry);
@@ -485,8 +489,8 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     uint32_t max_local[CHIP_MAX_RING_DEPTH] = {0};
     for (size_t i = 0; i < num_records; i++) {
         TaskId tid{records[i].task_id};
-        uint8_t ring = tid.ring();
-        uint32_t local = tid.local();
+        uint8_t ring = simpler::tmr::task_ring(tid);
+        uint32_t local = simpler::tmr::task_local_id(tid);
         if (ring < CHIP_MAX_RING_DEPTH && local > max_local[ring]) {
             max_local[ring] = local;
         }
@@ -498,12 +502,12 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
 
     int32_t output_count = count_outputs(records, num_records);
     int32_t pool_size = output_count + (output_count / 10) + 64;
-    if (pool_size < PTO2_TENSORMAP_POOL_SIZE) {
-        pool_size = PTO2_TENSORMAP_POOL_SIZE;
+    if (pool_size < CHIP_TENSORMAP_POOL_SIZE) {
+        pool_size = CHIP_TENSORMAP_POOL_SIZE;
     }
 
-    PTO2TensorMap tm_oracle;
-    PTO2TensorMap tm_annot;
+    ChipTensorMap tm_oracle;
+    ChipTensorMap tm_annot;
     std::memset(&tm_oracle, 0, sizeof(tm_oracle));
     std::memset(&tm_annot, 0, sizeof(tm_annot));
 
@@ -512,12 +516,12 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     DeviceArena replay_arena;
 
     auto oracle_layout =
-        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+        ChipTensorMap::reserve_layout(replay_arena, CHIP_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
     auto annot_layout =
-        PTO2TensorMap::reserve_layout(replay_arena, PTO2_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
+        ChipTensorMap::reserve_layout(replay_arena, CHIP_TENSORMAP_NUM_BUCKETS, pool_size, task_window_sizes);
     if (replay_arena.commit() == nullptr || !tm_oracle.init_data_from_layout(oracle_layout, replay_arena) ||
         !tm_annot.init_data_from_layout(annot_layout, replay_arena)) {
-        LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", PTO2_TENSORMAP_NUM_BUCKETS, pool_size);
+        LOG_ERROR("dep_gen replay: tensormap.init failed (buckets=%d, pool=%d)", CHIP_TENSORMAP_NUM_BUCKETS, pool_size);
         return -3;
     }
     // Replay tensormaps live entirely on host; only arena-internal pointer
@@ -536,17 +540,19 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     TensorArgType atype_buf[CORE_MAX_TENSOR_ARGS];
 
     // Per-record producer ID -> accumulated DepFlags — must match runtime's
-    // PTO2FaninBuilder::append_fanin_or_fail semantics, which collapses STEP 1
+    // FaninBuilder::append_fanin_or_fail semantics, which collapses STEP 1
     // (explicit_deps) + STEP A (creator retention) + STEP B (tensormap lookup)
     // into a single per-task fanin edge and OR-accumulates its flags. Both oracle
     // and annot use this same semantics so the divergence check compares the
     // (producer, flags) mapping rather than the producer-ID set alone.
     std::unordered_map<uint64_t, DepFlags> oracle_preds;
     std::unordered_map<uint64_t, DepFlags> annot_preds;
+    std::unordered_map<uint64_t, size_t> explicit_edge_index;
 
     // Scratch buffer for assembling full dep lists across overflow chains.
     // Declared outside the loop so it can be reused (clear() keeps capacity).
     std::vector<uint64_t> full_deps_buf;
+    std::vector<uint8_t> full_kinds_buf;
 
     for (size_t rec_i = 0; rec_i < num_records; rec_i++) {
         const DepGenRecord &rec = records[rec_i];
@@ -561,28 +567,31 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
 
         oracle_preds.clear();
         annot_preds.clear();
+        explicit_edge_index.clear();
 
         int32_t tc = static_cast<int32_t>(rec.tensor_count);
         if (tc > CORE_MAX_TENSOR_ARGS) {
             tc = CORE_MAX_TENSOR_ARGS;
         }
         for (int32_t i = 0; i < tc; i++) {
-            tref_buf[i] = reinterpret_cast<const ChipTensor *>(&rec.tensors[i][0]);
+            tref_buf[i] = reinterpret_cast<const simpler::tmr::Tensor *>(&rec.tensors[i][0]);
             atype_buf[i] = static_cast<TensorArgType>(rec.arg_types[i]);
         }
 
         // Assemble the full dep list. Fast path: ≤ DEP_GEN_MAX_EXPLICIT_DEPS,
         // no chain, point straight at rec.explicit_deps. Slow path: gather
-        // base + chain into full_deps_buf and point at the buffer.
+        // base + chain into full_deps_buf/full_kinds_buf and point at the buffers.
         //
         // `explicit_dep_count` / `over->dep_count` originate from device
         // shared memory and are bounded by the writer to the array sizes, but
         // we clamp on read too so a corrupted record never drives an OOB read
-        // off the end of rec.explicit_deps[64] / over->deps[582].
+        // off the end of rec.explicit_deps[64] / over->deps[524].
         const uint64_t *deps_data;
+        const uint8_t *kinds_data;
         int32_t dc;
         if (rec.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
             full_deps_buf.clear();
+            full_kinds_buf.clear();
             uint16_t base_dc = rec.explicit_dep_count;
             if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
                 LOG_ERROR(
@@ -592,7 +601,9 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 base_dc = DEP_GEN_MAX_EXPLICIT_DEPS;
             }
             full_deps_buf.reserve(static_cast<size_t>(base_dc) + DEP_GEN_OVERFLOW_DEPS_PER_RECORD);
+            full_kinds_buf.reserve(static_cast<size_t>(base_dc) + DEP_GEN_OVERFLOW_DEPS_PER_RECORD);
             full_deps_buf.insert(full_deps_buf.end(), rec.explicit_deps, rec.explicit_deps + base_dc);
+            full_kinds_buf.insert(full_kinds_buf.end(), rec.explicit_dep_kinds, rec.explicit_dep_kinds + base_dc);
             bool chain_complete = false;
             for (size_t j = rec_i + 1; j < num_records; j++) {
                 const DepGenRecord &maybe = records[j];
@@ -621,6 +632,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                     over_dc = DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
                 }
                 full_deps_buf.insert(full_deps_buf.end(), over->deps, over->deps + over_dc);
+                full_kinds_buf.insert(full_kinds_buf.end(), over->kinds, over->kinds + over_dc);
                 if (over->flags & DEP_GEN_FLAG_LAST_OVERFLOW) {
                     chain_complete = true;
                     break;
@@ -634,9 +646,11 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 );
             }
             deps_data = full_deps_buf.data();
+            kinds_data = full_kinds_buf.data();
             dc = static_cast<int32_t>(full_deps_buf.size());
         } else {
             deps_data = rec.explicit_deps;
+            kinds_data = rec.explicit_dep_kinds;
             uint16_t base_dc = rec.explicit_dep_count;
             if (base_dc > DEP_GEN_MAX_EXPLICIT_DEPS) {
                 LOG_ERROR(
@@ -658,7 +672,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // Register tasks[] entry (with per-arg slot info) and any unseen
         // tensors[] entries up-front. ChipTensors are registered from the
         // consumer-side blob so raw_shapes / dtype are populated (the
-        // producer-side PTO2TensorMapEntry drops raw_shapes to fit in two
+        // producer-side ChipTensorMapEntry drops raw_shapes to fit in two
         // cache lines).
         TaskTableEntry task_entry;
         task_entry.task_id = rec.task_id;
@@ -674,12 +688,12 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             slot.idx = i;
             slot.arg_type = atype_buf[i];
             if (atype_buf[i] == TensorArgType::OUTPUT) {
-                // OUTPUT blob is zero at submit time (writer has no ChipTensor
+                // OUTPUT blob is zero at submit time (writer has no simpler::tmr::Tensor
                 // yet); leave has_tensor_info=false. Viewers render this as
                 // a placeholder "alloc" output slot.
                 slot.has_tensor_info = false;
             } else {
-                const ChipTensor &t = tref_buf[i].ref();
+                const simpler::tmr::Tensor &t = tref_buf[i].ref();
                 register_tensor(tensor_index, tensor_table, t);
                 slot.has_tensor_info = true;
                 slot.tensor_id = make_tensor_id(t.buffer.addr, t.version);
@@ -696,27 +710,43 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         task_table.push_back(std::move(task_entry));
 
         // ============ STEP 1 — explicit_deps (call-site emit) ============
-        // Same loop on both passes; they MUST produce identical sets here
-        // because they read the same record. Annot records explicit edges
-        // with consumer_arg_idx = -1 (not tied to any tensor arg). Reads
-        // from deps_data (base record's explicit_deps[] on fast path, the
-        // gathered base+chain buffer on overflow path).
+        // Both passes seed explicit edges from the same captured record. The
+        // differential check therefore covers their interaction with creator
+        // and tensormap edges, while scene tests independently validate the
+        // captured kind bytes. Annot records explicit edges with
+        // consumer_arg_idx = -1 (not tied to any tensor arg). deps_data comes
+        // from the base record on the fast path or the gathered base+chain
+        // buffer on overflow; kinds_data is its parallel semantics array.
         for (int32_t i = 0; i < dc; i++) {
             uint64_t pred_raw = deps_data[i];
-            // Explicit deps are recorded conservatively as DEP_WAIT|DEP_RETAIN;
-            // the DepGenRecord does not carry per-dep kinds, matching Arg's
-            // set_dependencies default.
-            oracle_preds[pred_raw] |= (DEP_WAIT | DEP_RETAIN);
+            const uint8_t raw_kind = kinds_data[i];
+            constexpr uint8_t kKnownDepFlags = static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN);
+            if ((raw_kind & static_cast<uint8_t>(~kKnownDepFlags)) != 0) {
+                // Unknown semantics make the artifact untrustworthy. Reject
+                // the trace instead of emitting a plausible but altered graph.
+                LOG_ERROR(
+                    "dep_gen replay: invalid explicit dep flags 0x%02x at task_id=%" PRIu64 " dep_idx=%d", raw_kind,
+                    rec.task_id, i
+                );
+                tm_oracle.destroy();
+                tm_annot.destroy();
+                return -7;
+            }
+            const DepFlags kind = static_cast<DepFlags>(raw_kind);
+            oracle_preds[pred_raw] |= kind;
             bool first = annot_preds.find(pred_raw) == annot_preds.end();
-            annot_preds[pred_raw] |= (DEP_WAIT | DEP_RETAIN);
+            annot_preds[pred_raw] |= kind;
             if (first) {
                 EdgeAnnot e{};
                 e.pred = pred_raw;
                 e.succ = rec.task_id;
                 e.consumer_arg_idx = -1;
                 e.source = EdgeSource::EXPLICIT;
-                e.flags = DEP_WAIT | DEP_RETAIN;
+                e.flags = kind;
+                explicit_edge_index.emplace(pred_raw, annot_edges.size());
                 annot_edges.push_back(e);
+            } else {
+                annot_edges[explicit_edge_index.at(pred_raw)].flags |= kind;
             }
         }
 
@@ -736,10 +766,14 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         annot_pass(
             inputs, tm_annot, in_manual_scope,
             // emit_creator(producer, arg_idx, consumer_tensor)
-            [&](TaskId producer, int32_t arg_idx, const ChipTensor &consumer) {
+            [&](TaskId producer, int32_t arg_idx, const simpler::tmr::Tensor &consumer) {
                 bool first = annot_preds.find(producer.raw) == annot_preds.end();
                 annot_preds[producer.raw] |= (DEP_WAIT | DEP_RETAIN);
                 if (!first) {
+                    auto explicit_it = explicit_edge_index.find(producer.raw);
+                    if (explicit_it != explicit_edge_index.end()) {
+                        annot_edges[explicit_it->second].flags |= (DEP_WAIT | DEP_RETAIN);
+                    }
                     return;  // already covered by an earlier emit on this record
                 }
                 EdgeAnnot e{};
@@ -753,7 +787,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 annot_edges.push_back(e);
             },
             // emit_tensormap(producer, arg_idx, consumer_tensor, entry, status)
-            [&](TaskId producer, int32_t arg_idx, const ChipTensor &consumer, const PTO2TensorMapEntry &entry,
+            [&](TaskId producer, int32_t arg_idx, const simpler::tmr::Tensor &consumer, const ChipTensorMapEntry &entry,
                 OverlapStatus status) {
                 // Per-(succ, arg_idx, producer_buffer_addr, producer_version)
                 // dedup gives us "the same producer slice fired twice for the
@@ -761,7 +795,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 // the same producer (different version), or two different
                 // producers, both yield their own edges. The producer-id-set
                 // comparison below uses annot_preds, which dedups by pred
-                // only, matching runtime PTO2FaninBuilder semantics.
+                // only, matching runtime FaninBuilder semantics.
                 annot_preds[producer.raw] |= DEP_WAIT;
                 EdgeAnnot e{};
                 e.pred = producer.raw;
