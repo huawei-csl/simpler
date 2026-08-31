@@ -527,6 +527,13 @@ class KernelCompiler:
         cmd = [self.ccec.cxx_path, *self.ccec.get_compile_flags(core_type=core_type)]
         cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
+        # AICore-side TraCR markers (aicore/tracr_aicore_emit.h) compile to
+        # nothing without this, so a kernel may call them unguarded. Mirrors the
+        # orchestration compile path; the AICore emitter reads the counter
+        # directly, so it needs neither TRACR_DISABLE_FLUSH nor USE_HW_COUNTER.
+        if os.getenv("BUILD_TRACR", "OFF") == "ON":
+            cmd.append("-DENABLE_TRACR")
+
         for inc_dir in self.get_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
@@ -742,6 +749,13 @@ class KernelCompiler:
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path, *self.gxx15.get_compile_flags(core_type=core_type)]
         cmd += self._sanitizer_flags(self.gxx15)
+
+        # AICore-side TraCR markers (aicore/tracr_aicore_emit.h) compile to
+        # nothing without this, so a kernel may call them unguarded. Mirrors the
+        # orchestration compile path; the AICore emitter reads the counter
+        # directly, so it needs neither TRACR_DISABLE_FLUSH nor USE_HW_COUNTER.
+        if os.getenv("BUILD_TRACR", "OFF") == "ON":
+            cmd.append("-DENABLE_TRACR")
 
         # Add PTO ISA header paths if provided. The path always comes from
         # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,

@@ -46,6 +46,11 @@
  * be sorted by timestamp and never sorts one itself, so a wrap would silently
  * produce mis-ordered output and corrupt sync anchors.
  *
+ * Every entry point is defined unconditionally but compiles to nothing without
+ * `-DENABLE_TRACR`, so a kernel may call these unguarded and a production build
+ * pays neither a GM store nor a clock read. This mirrors the contract
+ * orchestration codegen already relies on for TraCR's own macros.
+ *
  * No cache maintenance here. The buffer has a single reader, on the host, after
  * the kernel has completed, so ordering comes from the task-completion path
  * that already precedes the copy back. A design where the AICPU drains buffers
@@ -100,11 +105,16 @@ __aicore__ __attribute__((always_inline)) inline int tracr_aicore_capacity(int w
 /** Open a buffer for writing. Required before the first emit. No-op for a
  *  worker that is not the designated writer. */
 __aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ int64_t *buf, int capacity) {
+#ifndef ENABLE_TRACR
+    (void)buf;
+    (void)capacity;
+#else
     if (capacity < 0) {
         return;
     }
     buf[0] = 0;
     buf[1] = 0;
+#endif
 }
 
 /**
@@ -115,6 +125,14 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ 
 __aicore__ __attribute__((always_inline)) inline void tracr_aicore_emit(
     __gm__ int64_t *buf, int capacity, uint32_t channel, uint32_t event, uint32_t extra, uint64_t ticks
 ) {
+#ifndef ENABLE_TRACR
+    (void)buf;
+    (void)capacity;
+    (void)channel;
+    (void)event;
+    (void)extra;
+    (void)ticks;
+#else
     if (capacity < 0) {
         return;
     }
@@ -128,6 +146,7 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_emit(
     buf[base] = static_cast<int64_t>(word0);
     buf[base + 1] = static_cast<int64_t>(ticks * static_cast<uint64_t>(kTracrNsPerTick));
     buf[0] = n + 1;
+#endif
 }
 
 /** Open a span on `channel` with marker type `event`. */
