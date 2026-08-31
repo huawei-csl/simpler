@@ -11,7 +11,7 @@ The `error hint:` line that sent you here is the second of a pair:
 ```text
 [ERROR] simpler runtime failed: orch_error_code=1 sched_error_code=0 runtime_status=-1
 [ERROR] error detail: orch_error_code=1 SCOPE_DEADLOCK - tasks submitted in one scope ...
-[ERROR] error hint: raise ring_task_window (PTO2_RING_TASK_WINDOW) or split the scope ...
+[ERROR] error hint: raise runtime_env.ring_task_window or split the scope ...
 ```
 
 `error detail:` gives the **name** and a full description of the mechanism.
@@ -32,9 +32,13 @@ grep -E "orch_error_code=|sched_error_code=|sub_class=|error detail:" <run log>
 The `host_build_graph` runtime runs orchestration on the host, transfers the
 prepared image to the AICPU, and runs scheduling there. The
 `tensormap_and_ringbuffer` runtime runs both orchestration and scheduling on the
-AICPU. On a fatal condition the runtime **latches** a code into the shared-memory
-header; the host reads it back in `validate_runtime_impl` and prints the lines
-above.
+AICPU. On a fatal condition the runtime **latches** a code, which the host reads
+back in `validate_runtime_impl` to print the lines above. Where it is latched
+follows where the reporter runs: a scheduler code goes into the shared-memory
+header, and so does an orchestrator code under `tensormap_and_ringbuffer`, whose
+orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
+its code stays in host memory (`OrchestratorState::fatal_code`) and never crosses
+to the device — a refused bind reports it without the device having run at all.
 
 At most one of `orch_error_code` (1-11) and `sched_error_code` (100+) is ever
 non-zero. `runtime_status` is just the latched code negated.
@@ -108,7 +112,19 @@ layer to go looking in, which is what these columns are for.
 | 101 | ASYNC_COMPLETION_INVALID | kernel (async) |
 | 102 | ASYNC_WAIT_OVERFLOW | kernel (async) |
 | 103 | ASYNC_REGISTRATION_FAILED | runtime-internal |
-| 104 | READY_QUEUE_OVERFLOW | runtime-internal / config |
+| 104 | READY_QUEUE_OVERFLOW | host bind / runtime-internal / config |
+
+### READY_QUEUE_OVERFLOW origins
+
+Code 104 can be reported before or after device execution starts:
+
+- **Host bind:** one ready queue has more than 32768 reachable tasks. This is
+  the supported single-queue population ceiling; larger graphs are rejected
+  during bind and never reach the device. Split the graph or reduce the number
+  of tasks routed to that queue.
+- **Device scheduler:** a queue push found no free slot after bind accepted the
+  graph. Use the reported queue and occupancy details to investigate a runtime
+  accounting error or an incompatible configuration.
 
 ### SCHEDULER_TIMEOUT sub-classes
 
@@ -116,7 +132,7 @@ Code 100 is a funnel. The runtime sub-classifies it on device and prints the
 verdict plus locators, so you rarely need the device log:
 
 ```text
-[ERROR] PTO2 scheduler timeout sub_class=S1:running-stalled (detail=1) completed=0/1 \
+[ERROR] scheduler timeout sub_class=S1:running-stalled (detail=1) completed=0/1 \
         running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=42 stuck_core=5
 ```
 
@@ -198,7 +214,7 @@ enforces coverage. Edit those and the log carries the new code correctly:
 | ---- | ----- |
 | runtime code names / descriptions / hints | `src/common/runtime_status/error_names.h` |
 | host-side CANN names / descriptions / hints | `src/common/platform/include/host/acl_error_names.h` |
-| `SCHEDULER_TIMEOUT` sub-class labels | `src/{arch}/runtime/{host_build_graph,tensormap_and_ringbuffer}/common/runtime_status.h` |
+| `SCHEDULER_TIMEOUT` sub-class labels | `src/common/host_build_graph/runtime_status.h`, `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h` |
 | completeness test | `tests/ut/cpp/common/test_error_code_names.cpp` |
 
 **This page does not need updating for a new code** — deliberately. The tables
@@ -208,7 +224,8 @@ time, so there is nothing to drift out of sync.
 
 ## References
 
-- Code definitions: `src/{arch}/runtime/{host_build_graph,tensormap_and_ringbuffer}/common/runtime_status.h`
+- Code definitions: `src/common/host_build_graph/runtime_status.h`,
+  `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h`
 - Host print site: `.../host/runtime_maker.cpp` (`validate_runtime_impl`)
 - Sub-class logic: `.../runtime/scheduler/scheduler_cold_path.cpp` (`classify_stall_reason`)
 - End-to-end negative tests: `tests/st/runtime_fatal_codes/`

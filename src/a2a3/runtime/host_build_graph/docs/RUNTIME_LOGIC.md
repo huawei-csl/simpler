@@ -52,8 +52,9 @@ For each run, the host:
 5. finalizes task counts and the graph image; and
 6. copies the shared-memory image and the arena's copied zone to the device.
 
-An orchestration fatal stops this sequence and is propagated through
-`orch_error_code`.
+An orchestration fatal stops this sequence before the upload. The orchestrator
+runs on the host, so its code is latched in `OrchestratorState::fatal_code` and
+never reaches shared memory; the bind maps it onto the status the caller sees.
 
 ### 2.3 Device Execution and Teardown
 
@@ -72,8 +73,8 @@ The shared image uses three per-slot structures:
 
 | Structure | Purpose |
 | --------- | ------- |
-| `PTO2TaskDescriptor` | Full task ID, kernel IDs, packed-buffer addresses |
-| `PTO2TaskPayload` | Argument counts, predicate, dispatch metadata, and a delta naming each of its tensor, scalar and fanin regions — the arguments themselves live in the pool segments, so the payload is a fixed three cache lines regardless of the argument caps |
+| `TaskDescriptor` | Full task ID, kernel IDs, packed-buffer addresses |
+| `TaskPayload` | Argument counts, predicate, dispatch metadata, and a delta naming each of its tensor, scalar and fanin regions — the arguments themselves live in the pool segments, so the payload is a fixed three cache lines regardless of the argument caps |
 | `ChipTaskSlotState` | Active mask, attributes, block/subtask counters, completion state, task/payload bindings |
 
 The host/device boundary is POD and position-independent. Fanins are integer
@@ -102,7 +103,7 @@ reserves them in this order:
 
 | Zone | Regions | Copied | Allocated on device | Written by |
 | ---- | ------- | ------ | ------------------- | ---------- |
-| device-only | `sm_handle`, the completion mailbox, `PTO2SchedulerState` and its thirteen queue slot arrays | never | yes | AICPU at boot |
+| device-only | `sm_handle`, the completion mailbox, `SchedulerState` and its thirteen queue slot arrays | never | yes | AICPU at boot |
 | copied | `[off_copied_begin, off_copied_end)`: the runtime header | whole zone, one copy | yes | host |
 
 The copied zone comes last, so `bind` is a single contiguous `copy_to_device`
@@ -114,7 +115,7 @@ a boundary from which region happens to be reserved first —
 **Why the orchestrator is not in the arena at all.** hbg has no device-side
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
 table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
-therefore a plain host object that owns those arrays — `PTO2OrchestratorState::init`
+therefore a plain host object that owns those arrays — `OrchestratorState::init`
 allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
 before the copied zone is uploaded, so no host address crosses the boundary. A
 `static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
@@ -122,10 +123,11 @@ putting an owning member back inside it. The one orchestrator value the device-s
 scheduler reads, the count of tasks completed inline during orchestration, is a
 scalar `rt_orchestration_done` publishes into the runtime header.
 
-**Why the scheduler state is device-written.** `PTO2SchedulerState` holds no
-per-run content: `sm_header` and the ring pointer derive from a pooled SM base,
-queue capacities are compile-time constants, hbg never advances
-`last_task_alive`, and it has no host-side entry point at all. So the host would
+**Why the scheduler state is device-written.** `SchedulerState` holds no
+per-run content: `sm_header` and the task-header pointer derive from a pooled SM base,
+queue capacities are compile-time constants, polling reserves no wiring or
+dependency pool (readiness comes from the task table's `completion_flags`, which
+the task header owns), and it has no host-side entry point at all. So the host would
 only be writing an initialization pattern — 203,392 bytes
 of it, dominated by `AsyncWaitList::entries` — for the device to receive and never
 read. `RuntimeContext` therefore holds a *pointer* to it, wired from
@@ -137,10 +139,10 @@ when that slot's `sequence` already equals `pos`, so an empty queue is a
 match and every later position reads a lower sequence, which is the full-queue
 signal, so such a queue accepts one push and then reports full. The ramp is
 mandatory but it is a function of `capacity` alone, so
-`PTO2SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
+`SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
 shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
-`total_tasks`: graph execution expands a GRAPH task into on-device nodes that push
-past the host task count, so every slot must carry a valid sequence.
+`total_tasks`: graph execution expands a GRAPH task into on-device in-graph tasks that
+push past the host task count, so every slot must carry a valid sequence.
 
 Both run before the boot thread publishes `runtime_init_ready_`, which is what
 releases the peer threads into the dispatch loop, so no push can observe an
@@ -150,7 +152,7 @@ uninitialized queue.
 slot's sequence tracks the position it serves, and `pop` releases a slot with
 exactly the value the next lap's `push` expects. A drained queue is therefore
 already an empty queue, which is why `tensormap_and_ringbuffer` can leave
-`PTO2ReadyQueue::reset_for_reuse()` empty and never touch the positions. hbg
+`ChipReadyQueue::reset_for_reuse()` empty and never touch the positions. hbg
 re-establishes both on every attach today because the queue *headers* are reset
 per bind; the combination to avoid is resetting the positions while leaving the
 sequences mid-lap, which makes `push` read a sequence above its position and spin
@@ -172,32 +174,49 @@ pins the invariant that makes that safe.
 
 ### 3.2 Bounded H2D Upload
 
-The shared-memory mirror is sized to ring capacity (task window) but a run only
+The shared-memory mirror is dimensioned for the run's configured task count
+(`runtime_env.ring_task_window`, default `CHIP_DEFAULT_GRAPH_TASKS`) but a run only
 writes `[0, total_tasks)`, and the device boots scheduler-only and reads no SM slot
 past `total_tasks`. So the SM H2D shipped each run is bounded, not capacity-sized —
 the contract that keeps `bind` proportional to the workload.
 
 The header is zeroed on the host; `descriptors`, `payloads`, `slot_states` and
-`completion_flags` are each written per task at submit and H2D-uploaded bounded to
-`[0, total_tasks)`. Per-slot reset is init-on-write in `orch::prepare_task` as each
-slot is claimed — there is no window-wide reset. The four segments travel as four
-copies rather than one because ring-sized tails separate their live prefixes.
+`completion_flags` are each written per task at submit. Per-slot reset is
+init-on-write in `orch::prepare_task` as each slot is claimed — there is no
+table-wide reset. In the mirror those four live prefixes are a full reservation
+apart, so `compact_live_image` restacks them (plus the three argument pools) into
+an image pitched to `total_tasks`, where they are contiguous and travel as **one**
+`copy_to_device`. The device attaches with the same pitch.
+
+The mirror itself is the platform runner's, one buffer per pipeline slot, held
+across binds and grown to the largest capacity any bind has asked for
+(`HostApi::acquire_sm_mirror`). At the configured task capacity it is tens of MB,
+so a per-bind buffer is an `mmap` and an `munmap` per bind. The block is handed
+over uninitialized, so first touch still commits it and a run pays only for the
+bytes it writes. Init-on-write is what makes the reuse safe, and reuse does not
+weaken it: every byte a device-side reader reaches inside a shipped prefix is
+written by the bind that ships it. The one shipped byte range no reader reaches is
+the alignment padding the fanin cursor rounds past, which lies outside every
+payload's `fanin_count`.
 
 ## 4. Whole-Graph Capacity
 
-The runtime uses one task ring, one graph heap, and one TensorMap pool. They are
+The runtime uses one task table, one graph heap, and one TensorMap pool. They are
 capacity-bounded storage, not streaming flow-control buffers:
 
-- the task ring and the graph heap are forward-only bump allocators;
+- the task table and the graph heap are forward-only bump allocators;
 - task slots and heap bytes are never recycled mid-run; and
 - TensorMap entries are held for the whole run.
 
 There is no reclaim channel from the scheduler back to the allocator, so the
-allocators carry no reclaim pointer and no back-pressure wait.
+allocators carry no reclaim pointer and no back-pressure wait. A task id is
+therefore also its slot index: ids run `0..capacity-1`, never wrap, and every
+segment is indexed by the id directly — there is no slot mask, so the capacity need
+not be a power of two.
 
 `completed_watermark` records the contiguous prefix of completed device tasks.
-It supports completion/consumer metadata only; it does not reclaim the task ring
-or heap.
+It supports completion/consumer metadata only; it reclaims neither task slots
+nor heap.
 
 There is no post-run sweep that makes graph space reusable. Runtime destruction
 releases the complete arena, and the next run starts from a newly initialized
@@ -205,23 +224,31 @@ image.
 
 ### 4.1 Allocation Failure
 
-The graph must fit the configured task window, heap, fanin capacity, and
-TensorMap pool. Because nothing is reclaimed, a request that does not fit can
-never become satisfiable — the allocator names the exhausted resource and fails
-on the spot. There is no wait and no timeout.
+The graph must fit the configured task count, the fanin capacity, and the TensorMap
+pool. The task count comes from `runtime_env.ring_task_window` (default
+`CHIP_DEFAULT_GRAPH_TASKS`); the host mirror is allocated at that size and
+committed by first touch, so a run pays only for the slots it writes. Because
+nothing is reclaimed, a request that does not fit can never become satisfiable —
+the allocator names the exhausted resource and fails on the spot. There is no wait
+and no timeout.
 
 Representative allocator output is:
 
 ```text
-FATAL: Graph Heap Exhausted!
-The whole graph must fit the configured ring; nothing is reclaimed mid-run.
-  Task window: used=.../...
-  Graph heap:  used=.../..., available=...
-  Requested:   ... bytes + 1 task slot
+FATAL: Graph Too Large!
+The whole graph must fit at once; nothing is reclaimed mid-run.
+  Tasks:      used=.../...
+  Graph heap: used=.../..., available=...
+  Requested:  ... bytes + 1 task slot
 ```
 
 This is host-orchestration logging. The allocator records the corresponding
 runtime error and unwinds; it does not terminate the process directly.
+
+The graph heap is not one of those capacities. Orchestration allocates it out of
+a virtual window, and its device region is committed afterwards at the size the
+graph turned out to need, so a graph too large for the device fails at that
+commit — which names the byte count it asked for — rather than in the allocator.
 
 ## 5. Submission and Dependencies
 
@@ -309,9 +336,11 @@ a slot is used, preventing masked-slot aliasing. See
 
 ## 9. Errors and Diagnostics
 
-The runtime latches orchestration and scheduler errors in shared memory and maps
-them to the negative run status observed by the host. Important validation paths
-include:
+The runtime latches a fatal code and maps it to the negative run status the host
+observes. The two reporters latch in different places: a scheduler code goes into
+the shared-memory header, and an orchestration code into
+`OrchestratorState::fatal_code` in host memory, since this runtime's orchestrator
+runs on the host. Important validation paths include:
 
 - invalid arguments (`-5`);
 - sync-start residency violations (`-7`);

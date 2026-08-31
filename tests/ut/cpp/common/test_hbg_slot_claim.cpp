@@ -18,40 +18,53 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
+#include "graph_execution.h"
 #include "graph_host_state.h"
-#include "orchestrator.h"
-#include "shared_memory.h"
+#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
+#include "host_build_graph/task_id_encoding.h"
 
 class HbgSlotClaimTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
     DeviceArena runtime_arena;
-    PTO2SharedMemoryHandle *sm_handle = nullptr;
-    PTO2OrchestratorState orch{};
-    PTO2SchedulerState sched{};
-    PTO2SchedulerLayout sched_layout{};
+    SharedMemoryHandle *sm_handle = nullptr;
+    OrchestratorState orch{};
+    SchedulerState sched{};
+    SchedulerLayout sched_layout{};
     GraphHostStatePtr graph_state;
     std::vector<char> gm_heap;
+    // Stands in for a bind's retained staging: the Definition objects are built
+    // in here rather than in a buffer of their own.
+    std::vector<std::byte> definition_staging;
 
     static constexpr size_t HEAP_BYTES = 64 * 1024;
+    static constexpr size_t STAGING_BYTES = 256 * 1024;
 
     void SetUp() override {
-        sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
+        sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
         gm_heap.resize(HEAP_BYTES);
 
-        sched_layout = PTO2SchedulerState::reserve_layout(runtime_arena);
+        sched_layout = SchedulerState::reserve_layout(runtime_arena);
         ASSERT_NE(runtime_arena.commit(), nullptr);
 
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, PTO2_TASK_WINDOW_SIZE, &sched));
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS, &sched));
 
-        graph_state = make_graph_host_state();
+        definition_staging.assign(STAGING_BYTES, std::byte{0});
+        GraphDefinitionArena arena{};
+        arena.base = definition_staging.data();
+        arena.capacity = definition_staging.size();
+        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
+        graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
         orch.graph_host_state = graph_state.get();
     }
@@ -69,25 +82,25 @@ protected:
     // pass left is what the claim has to overwrite. Every value here is one a
     // completed task really leaves behind.
     void poison_slot(int32_t slot) {
-        ChipTaskSlotState &state = sm_handle->header->ring.get_slot_state_by_slot(slot);
+        ChipTaskSlotState &state = sm_handle->header->tasks.get_slot_state_by_task_id(slot);
         state.wake_list_head.store(WAKE_LIST_SENTINEL, std::memory_order_relaxed);
-        state.next_in_wake_list = &sm_handle->header->ring.get_slot_state_by_slot(slot + 1);
+        state.next_in_wake_list = &sm_handle->header->tasks.get_slot_state_by_task_id(slot + 1);
         state.any_subtask_deferred.store(true, std::memory_order_relaxed);
         state.completed_subtasks.store(7, std::memory_order_relaxed);
         state.next_block_idx.store(3, std::memory_order_relaxed);
-        state.graph_node_index = 11;
-        sm_handle->header->ring.completion_flags[slot].store(1, std::memory_order_relaxed);
+        state.in_graph_task_index = 11;
+        sm_handle->header->tasks.completion_flags[slot].store(1, std::memory_order_relaxed);
     }
 
     void expect_slot_pristine(int32_t slot) {
-        ChipTaskSlotState &state = sm_handle->header->ring.get_slot_state_by_slot(slot);
+        ChipTaskSlotState &state = sm_handle->header->tasks.get_slot_state_by_task_id(slot);
         EXPECT_EQ(state.wake_list_head.load(std::memory_order_relaxed), nullptr)
             << "a stale SENTINEL closes the wake list, so no consumer can register on this producer";
         EXPECT_EQ(state.next_in_wake_list, nullptr);
         EXPECT_FALSE(state.has_any_subtask_deferred());
         EXPECT_EQ(state.completed_subtasks.load(std::memory_order_relaxed), 0);
         EXPECT_EQ(state.next_block_idx.load(std::memory_order_relaxed), 0);
-        EXPECT_EQ(sm_handle->header->ring.completion_flags[slot].load(std::memory_order_relaxed), 0)
+        EXPECT_EQ(sm_handle->header->tasks.completion_flags[slot].load(std::memory_order_relaxed), 0)
             << "a stale completion flag reports this task done before it has run";
     }
 };
@@ -97,7 +110,7 @@ TEST_F(HbgSlotClaimTest, OrdinarySubmitClaimsAPoisonedSlot) {
 
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
-    ChipTensor boundary = make_tensor_external(storage.data(), shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
 
     orch.begin_scope();
     CoreTaskArgs args;
@@ -107,7 +120,7 @@ TEST_F(HbgSlotClaimTest, OrdinarySubmitClaimsAPoisonedSlot) {
     expect_slot_pristine(0);
 }
 
-// The outer task of a recorded Graph takes a ring slot like any other task, and
+// The outer task of a recorded Graph takes a table slot like any other task, and
 // takes it through its own placement rather than through prepare_task — so it
 // needs the same claim-time reset. It occupies one heap block and one slot for a
 // whole sub-DAG, which is exactly why it is easy to overlook.
@@ -116,7 +129,7 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
 
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
-    ChipTensor boundary = make_tensor_external(storage.data(), shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
 
     orch.begin_scope();
     // A Graph boundary carries the wider arg type: graph_begin deep-copies it for the
@@ -131,13 +144,13 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
     ASSERT_NE(graph.recording_handle, nullptr);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
-    CoreTaskArgs node_args;
-    node_args.add_input(boundary);
-    ASSERT_TRUE(orch.submit_dummy_task(node_args).task_id().is_valid());
+    CoreTaskArgs task_args;
+    task_args.add_input(boundary);
+    ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
     ASSERT_EQ(orch.task_allocator.active_count(), 1);
 
-    ChipTaskSlotState &outer = sm_handle->header->ring.get_slot_state_by_slot(0);
+    ChipTaskSlotState &outer = sm_handle->header->tasks.get_slot_state_by_task_id(0);
     ASSERT_EQ(outer.task_kind, TaskKind::GRAPH);
     expect_slot_pristine(0);
 }
@@ -147,7 +160,7 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
 TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
-    ChipTensor boundary = make_tensor_external(storage.data(), shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
 
     orch.begin_scope();
     // A Graph boundary carries the wider arg type: graph_begin deep-copies it for the
@@ -157,15 +170,15 @@ TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     const GraphScopeResult recorded = orch.graph_begin(0x51ADC1A2, boundary_args, 0x1736);
     ASSERT_TRUE(recorded.recording);
     ASSERT_TRUE(orch.graph_prepare(recorded.recording_handle, boundary_args));
-    CoreTaskArgs node_args;
-    node_args.add_input(boundary);
-    ASSERT_TRUE(orch.submit_dummy_task(node_args).task_id().is_valid());
+    CoreTaskArgs task_args;
+    task_args.add_input(boundary);
+    ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
     poison_slot(1);
     const GraphScopeResult replay = orch.graph_begin(0x51ADC1A2, boundary_args, 0x1736);
     ASSERT_TRUE(replay.task_id.is_valid());
-    ASSERT_EQ(replay.task_id.local(), 1u);
+    ASSERT_EQ(simpler::hbg::task_local_id(replay.task_id), 1u);
 
     expect_slot_pristine(1);
 }

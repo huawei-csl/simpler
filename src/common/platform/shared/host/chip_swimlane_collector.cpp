@@ -1046,7 +1046,6 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     }
     if (clock_correlation_session_.started()) {
         outfile << ",\n    \"clock_anchors\": {";
-        outfile << "\n      \"schema_version\": 1,";
         outfile << "\n      \"provider\": \"" << clock_correlation_session_.provider_name() << "\",";
         outfile << "\n      \"device_timestamp_unit\": \"syscnt_cycles\",";
         outfile << "\n      \"raw_device_timestamp_unit\": \"" << clock_correlation_session_.raw_device_timestamp_unit()
@@ -1158,6 +1157,8 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                 return "early_dispatch";
             case ChipSwimlaneSchedPhaseKind::Resolve:
                 return "resolve";
+            case ChipSwimlaneSchedPhaseKind::ResolveStandalone:
+                return "resolve_standalone";
             case ChipSwimlaneSchedPhaseKind::DummyTask:
                 return "dummy_task";
             case ChipSwimlaneSchedPhaseKind::PredicatedSkip:

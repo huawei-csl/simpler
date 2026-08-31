@@ -38,6 +38,7 @@ CASES = {
     "mixed_subtask_overflow": 1,
     "unbound_owner_read": 2,
     "unbound_owner_write": 3,
+    "in_graph_task_dependency": 4,
 }
 
 

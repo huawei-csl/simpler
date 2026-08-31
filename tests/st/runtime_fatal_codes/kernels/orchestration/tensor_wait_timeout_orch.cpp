@@ -15,7 +15,7 @@
  * Submits an AIC kernel that spins forever, then reads its output with
  * get_tensor_data. Because the output has a producer in the TensorMap,
  * get_tensor_data spin-waits for that producer to complete — which never
- * happens — so after PTO2_TENSOR_DATA_TIMEOUT_CYCLES (15e9 cycles == 15 s at the
+ * happens — so after TENSOR_DATA_TIMEOUT_CYCLES (15e9 cycles == 15 s at the
  * 1 GHz AICPU counter) the orchestrator latches TENSOR_WAIT_TIMEOUT.
  *
  * Onboard only (the hang kernel would spin the simulator forever). The test
@@ -51,7 +51,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     // Reading the hung producer's output blocks until it completes (it never
     // does) -> TENSOR_WAIT_TIMEOUT after the fixed data-wait timeout.
-    const ChipTensor &out = outs.get_ref(0);
+    const simpler::tmr::Tensor &out = outs.get_ref(0);
     uint32_t idx[1] = {0};
     (void)get_tensor_data(out, 1, idx);
 }

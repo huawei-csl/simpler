@@ -14,7 +14,7 @@
  *
  * This module owns the host-side state and methods that are identical
  * between the two onboard arches today:
- *   - The `MemoryAllocator` and the three `DeviceArena`s (gm heap, PTO2
+ *   - The `MemoryAllocator` and the three `DeviceArena`s (gm heap, shared memory
  *     SM, runtime arena) backing the per-Worker pooled regions.
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
@@ -144,8 +144,11 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
-    void *
-    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
+    int acquire_graph_definition_block(
+        uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **staging_out
+    );
+    void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
+    int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -165,7 +168,7 @@ public:
     virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     /**
-     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
+     * Commit the three per-Worker pooled regions (GM heap, shared
      * shared memory, trb prebuilt runtime arena) as three independent
      * device allocations. Must be called before any `acquire_pooled_*`.
      * Idempotent on identical (or smaller) sizes; an equal-or-smaller
@@ -186,7 +189,7 @@ public:
     int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM / runtime arena base pointer of the
+     * Return the pooled GM heap / shared memory / runtime arena base pointer of the
      * selected arena bank. `setup_static_arena` (arch subclass) must have
      * already committed the relevant region on that bank; otherwise returns
      * nullptr. The runtime arena accessor is trb-only — hbg's
@@ -508,7 +511,7 @@ public:
 
     // ---- Virtual entry points called by the shared c_api ----------------
     //
-    // The shared `pto_runtime_c_api` glue (`src/common/platform/onboard/host/
+    // The shared `runtime_c_api` glue (`src/common/platform/onboard/host/
     // c_api_shared.cpp`) works through `DeviceRunnerBase *` and dispatches
     // through these virtuals. Each arch's `DeviceRunner` overrides the
     // enqueue/poll/drain lifecycle and `finalize`; a2a3 and a5 both override
@@ -968,16 +971,19 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
-    void release_graph_definition_buffers();
+    void release_graph_definition_blocks();
+
+    /** Drop every retained host SM mirror, returning its pages to the allocator. */
+    void release_sm_mirrors();
 
     /**
-     * Drop the retained graph-definition buffers without freeing them.
+     * Drop the retained graph-definition blocks without freeing the device side.
      *
-     * The fatal counterpart of release_graph_definition_buffers(): a force reset
-     * has already invalidated every allocation, so only the host-side map is
-     * cleared.
+     * The fatal counterpart of release_graph_definition_blocks(): a force reset
+     * has already invalidated every device allocation, so only the host-side
+     * bookkeeping and staging are dropped.
      */
-    void abandon_graph_definition_buffers();
+    void abandon_graph_definition_blocks();
 
     /**
      * Clear host-side ownership after a fatal device failure without issuing
@@ -1133,19 +1139,41 @@ protected:
     // the grow/pack logic lives in trb bind.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // One retained device block: the raw allocation plus the aligned address
-    // handed out. Backs the Graph Definition cache below.
-    struct RetainedGraphBuffer {
+    // Graph Definition storage, one retained block per pipeline slot — see
+    // HostApi acquire_graph_definition_block. `staging` is the host block the
+    // run's Definition objects are packed into and stays allocated across runs,
+    // so a bind neither acquires nor returns host memory for them; the device
+    // side is the raw allocation plus the aligned address handed out. One block
+    // per slot rather than one per Definition: every Definition of a run is
+    // packed end to end and shipped by a single H2D, and every submission
+    // references the device-resident copy of its own Definition.
+    struct RetainedGraphBlock {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};
         std::size_t capacity{0};
+        std::vector<std::byte> staging;
     };
-    // Graph Definition storage, one retained block per (pipeline slot,
-    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
-    // content identity rather than occurrence: every submission of one run
-    // references the same device-resident Definition.
-    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
-    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
+    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    // Host mirror of the runtime shared memory, one retained buffer per pipeline
+    // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
+    // whole shared-memory image here and the bind ships the live prefix, so the
+    // buffer is capacity-sized (tens of MB) and stays mapped across binds: one
+    // buffer per slot rather than one per bind, because two binds in different
+    // slots are in flight at once. `capacity` counts the raw block, which is over-allocated
+    // by the requested alignment so the aligned address handed out has the
+    // requested bytes behind it.
+    //
+    // The block is never value-initialized. The caller's layout is init-on-write
+    // and it ships only the prefixes it wrote, so the resident set is the pages a
+    // bind touches rather than the whole capacity — which is also why this is not a
+    // std::vector: `resize` would zero every page of a capacity the caller writes
+    // a fraction of, and would copy the old bytes on growth for a buffer whose
+    // contents mean nothing between binds.
+    struct RetainedSmMirror {
+        std::unique_ptr<std::byte[]> storage;
+        std::size_t capacity{0};
+    };
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so

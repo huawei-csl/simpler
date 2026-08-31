@@ -14,7 +14,8 @@
  * Wraps DataType, ChipTensor, ChipStorageTaskArgs, TaskArgs (unified
  * vector-backed builder with per-tensor TensorArgType tags), TensorArgType,
  * ArgDirection, CoreCallable, ChipCallable, and helper functions from
- * data_type.h / tensor.h / task_args.h / arg_direction.h / callable.h.
+ * data_type.h / tensor.h / task_args.h / task_args_wire.h / arg_direction.h /
+ * callable.h.
  */
 
 #include <nanobind/nanobind.h>
@@ -66,7 +67,7 @@
 #include "dma_workspace.h"
 #include "worker_chip_orch_comm.h"
 #include "worker_bind.h"
-#include "task_args.h"
+#include "task_args_wire.h"
 #include "tensor.h"
 
 namespace nb = nanobind;
@@ -617,6 +618,11 @@ public:
         return active_leases_;
     }
 
+    bool closing() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return state_ == State::CLOSING;
+    }
+
     void close() {
         std::unique_ptr<RegionMapping> mapping;
         std::exception_ptr close_error;
@@ -727,6 +733,15 @@ public:
             throw std::runtime_error("mapped-region handle is closed or unknown");
         }
         return it->second->active_leases();
+    }
+
+    bool closing(uint64_t handle) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = regions_.find(handle);
+        if (it == regions_.end()) {
+            throw std::runtime_error("mapped-region handle is closed or unknown");
+        }
+        return it->second->closing();
     }
 
     void close(uint64_t handle) {
@@ -1620,7 +1635,7 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
     // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
+        static_cast<AddressSpace>(addr_space)
     );
 }
 
@@ -1699,6 +1714,27 @@ NB_MODULE(_task_interface, m) {
         "Return whether this extension currently emits TIMING-level host spans."
     );
     m.def(
+        "_host_log_directory",
+        [] {
+            const char *bound = HostLogger::get_instance().log_directory();
+            return bound == nullptr ? std::string() : std::string(bound);
+        },
+        "The directory this process's host log is written to, or an empty string while it writes to stderr."
+    );
+    m.def(
+        "_emit_host_log",
+        [](int level, const std::string &func, const std::string &message) {
+            if (!simpler::log::is_valid_level(level)) return false;
+            HostLogger::get_instance().log(
+                static_cast<simpler::log::LogLevel>(level), func.c_str(), "%s", message.c_str()
+            );
+            return true;
+        },
+        nb::arg("level"), nb::arg("func"), nb::arg("message"),
+        "Emit one already-formatted message through the host logger, so a Python record carries the same envelope, "
+        "clock and destination as a C++ one. Returns false for a level outside the ladder."
+    );
+    m.def(
         "_initialize_host_log",
         [](int level) {
             if (!simpler::log::is_valid_level(level)) return false;
@@ -1706,6 +1742,18 @@ NB_MODULE(_task_interface, m) {
             return true;
         },
         nb::arg("level"), "Seed the process-owned host-log state before workers fork or load runtime modules."
+    );
+    m.def(
+        "_set_host_log_directory",
+        [](const std::string &path) {
+            HostLogger::get_instance().set_log_directory(path.c_str());
+            const char *bound = HostLogger::get_instance().log_directory();
+            return bound == nullptr ? std::string() : std::string(bound);
+        },
+        nb::arg("path"),
+        "Write this process's host log to <path>/host.<pid>.log instead of stderr, and return the directory "
+        "actually in effect. Applies to every record this logger writes, including the host spans Python emits. "
+        "The first non-empty path in a process wins; an empty path leaves the logger on stderr."
     );
     m.def(
         "_set_host_span_level_prefix",
@@ -1913,8 +1961,8 @@ NB_MODULE(_task_interface, m) {
     // that does not fit its backing cannot be built in the first place.
     //
     // No bytes cross this binding in either direction. Python builds a Tensor from its fields and
-    // receives one already decoded; turning mailbox bytes into a Tensor is task_args.h's job, and
-    // keeping that the only decode path is what makes validate_tensor a gate rather than a habit.
+    // receives one already decoded; turning mailbox bytes into a Tensor is task_args_wire.h's job,
+    // and keeping that the only decode path is what makes validate_tensor a gate rather than a habit.
     nb::class_<Tensor>(m, "Tensor")
         .def(
             "__init__",
@@ -2016,7 +2064,7 @@ NB_MODULE(_task_interface, m) {
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
+                    child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
                 );
             },
             // The keyword stays `child_memory` while the C++ field is `address_space`: it is the
@@ -2064,7 +2112,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.address_space
+                    static_cast<uint32_t>(n), self.dtype, self.address_space
                 );
             }
         )
@@ -2119,7 +2167,7 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro(
             "is_contiguous",
             [](const ChipTensor &self) -> bool {
-                return self.is_contiguous;
+                return self.is_contiguous();
             }
         )
 
@@ -2215,6 +2263,8 @@ NB_MODULE(_task_interface, m) {
         .value("OUTPUT_EXISTING", TensorArgType::OUTPUT_EXISTING)
         .value("NO_DEP", TensorArgType::NO_DEP);
 
+    nb::class_<TaskHandle>(m, "TaskHandle");
+
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
@@ -2234,6 +2284,42 @@ NB_MODULE(_task_interface, m) {
         .def(
             "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
             "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+        )
+
+        .def(
+            "add_dep",
+            [](TaskArgs &self, nb::args deps) {
+                if (deps.size() == 0) {
+                    throw std::invalid_argument("TaskArgs.add_dep requires at least one TaskHandle");
+                }
+                for (nb::handle dep : deps) {
+                    if (!nb::isinstance<TaskHandle>(dep)) {
+                        throw nb::type_error("TaskArgs.add_dep arguments must be TaskHandle objects");
+                    }
+                }
+                for (nb::handle dep : deps) {
+                    self.add_dep(nb::cast<const TaskHandle &>(dep));
+                }
+            },
+            "Add dependencies that retain each producer until this task completes."
+        )
+
+        .def(
+            "add_dep_wait",
+            [](TaskArgs &self, nb::args deps) {
+                if (deps.size() == 0) {
+                    throw std::invalid_argument("TaskArgs.add_dep_wait requires at least one TaskHandle");
+                }
+                for (nb::handle dep : deps) {
+                    if (!nb::isinstance<TaskHandle>(dep)) {
+                        throw nb::type_error("TaskArgs.add_dep_wait arguments must be TaskHandle objects");
+                    }
+                }
+                for (nb::handle dep : deps) {
+                    self.add_dep_wait(nb::cast<const TaskHandle &>(dep));
+                }
+            },
+            "Add one or more ordering-only dependencies returned by an Orchestrator submit."
         )
 
         .def(
@@ -2538,7 +2624,7 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
-    // --- RuntimeEnv (per-task PTO2_RING_* overrides; nested under CallConfig.runtime_env) ---
+    // --- RuntimeEnv (per-task ring sizing; nested under CallConfig.runtime_env) ---
     // Each ring resource is exposed as ONE property that accepts either an int
     // (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
     // (per-ring). The value always reads back as a list — the wire layout is the
@@ -2747,6 +2833,20 @@ NB_MODULE(_task_interface, m) {
     // Per-stage run timing (host wall, on-NPU device wall + AICPU phase
     // breakdown) is no longer returned from run(); the platform emits it as
     // `[STRACE]` log markers — parse with simpler_setup.tools.strace_timing.
+
+    nb::class_<DeviceMemoryInfo>(m, "DeviceMemoryInfo")
+        .def_ro("free_bytes", &DeviceMemoryInfo::free_bytes)
+        .def_ro("total_bytes", &DeviceMemoryInfo::total_bytes)
+        .def(
+            "__iter__",
+            [](const DeviceMemoryInfo &self) {
+                return nb::make_tuple(self.free_bytes, self.total_bytes).attr("__iter__")();
+            }
+        )
+        .def("__repr__", [](const DeviceMemoryInfo &self) {
+            return "DeviceMemoryInfo(free_bytes=" + std::to_string(self.free_bytes) +
+                   ", total_bytes=" + std::to_string(self.total_bytes) + ")";
+        });
 
     nb::class_<ChipWorkerNativeRun>(m, "_ChipWorkerNativeRun")
         .def_ro("slot_id", &ChipWorkerNativeRun::slot_id)
@@ -3034,6 +3134,18 @@ NB_MODULE(_task_interface, m) {
             "initialized. Lets downstream runtimes subtract simpler's own HBM "
             "from their cache budget (it may be invisible to aclrtGetMemInfo)."
         )
+        .def(
+            "device_memory_info",
+            [](const ChipWorker &self) {
+                try {
+                    return self.device_memory_info();
+                } catch (const UnsupportedRuntimeOperation &e) {
+                    PyErr_SetString(PyExc_NotImplementedError, e.what());
+                    throw nb::python_error();
+                }
+            },
+            "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
+        )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
@@ -3239,6 +3351,13 @@ NB_MODULE(_task_interface, m) {
         nb::arg("handle"), "Return the number of in-flight native operations holding this mapped region."
     );
     m.def(
+        "_region_closing_for_test",
+        [](uint64_t handle) {
+            return region_registry().closing(handle);
+        },
+        nb::arg("handle"), "Report whether close is waiting for mapped-region leases."
+    );
+    m.def(
         "_region_take_cleanup_error",
         [](const std::string &owner_token) {
             if (owner_token.empty()) {
@@ -3393,6 +3512,13 @@ NB_MODULE(_task_interface, m) {
             return region_registry().active_leases(handle);
         },
         nb::arg("handle"), "Return the number of in-flight native operations holding this mapped region."
+    );
+    m.def(
+        "_worker_host_mapped_region_closing_for_test",
+        [](uint64_t handle) {
+            return region_registry().closing(handle);
+        },
+        nb::arg("handle"), "Report whether close is waiting for L3 Host mapped-region leases."
     );
     m.def(
         "_worker_host_mapped_region_take_cleanup_error",

@@ -51,10 +51,12 @@ from .task_interface import (
     CommBufferSpec,
     CommDomainHandle,
     DataType,
+    DeviceMemoryInfo,
     GlobalCommDomainHandle,
     GlobalCommDomainView,
     RemoteAddressSpace,
     TaskArgs,
+    TaskHandle,
     _empty_remote_sidecar_for,
     _remote_sidecar_for,
     _RemoteTaskArgsSidecar,
@@ -305,12 +307,16 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int):
+    def submit_next_level(
+        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int
+    ) -> TaskHandle:
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
         ``worker`` is the exact stable NEXT_LEVEL worker id that runs the
         task. For L3 chip dispatch, these are the existing chip worker ids.
+        Returns an opaque ``TaskHandle`` accepted by ``TaskArgs.add_dep`` or
+        ``TaskArgs.add_dep_wait`` during the same orchestration run.
         """
         cfg = config if config is not None else CallConfig()
         cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
@@ -343,9 +349,9 @@ class Orchestrator:
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
-        child_ptrs = worker._child_ptrs_in_args(c_args) if worker is not None else []
+        device_args = worker._device_identities_in_args(c_args) if worker is not None else []
         prov_guard: Any = contextlib.nullcontext()
-        if child_ptrs and worker is not None:
+        if device_args and worker is not None:
             prov_guard = worker._child_prov_lock
         _tracr.mark_set("SubmitNextLevel", cpp_worker_id)
         # Stamp a causal-flow id onto this submit's config so the device work it
@@ -358,13 +364,18 @@ class Orchestrator:
             _tracr.flow_start(fid)
         try:
             with prov_guard:
-                if child_ptrs and worker is not None:
-                    worker._child_prov_check_dispatch(child_ptrs, cpp_worker_id, api="submit_next_level")
+                if device_args and worker is not None:
+                    worker._child_prov_check_dispatch_locked(
+                        device_args,
+                        cpp_worker_id,
+                        args=c_args,
+                        api="submit_next_level",
+                    )
                 if worker is not None:
                     worker._adopt_remote_sidecar_refs((remote_sidecar,))
                     worker._record_touched_identities(c_args)
                 _admit_task_submission(self._worker)
-                self._o.submit_next_level(
+                return self._o.submit_next_level(
                     digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
                 )
         finally:
@@ -377,7 +388,7 @@ class Orchestrator:
         config: CallConfig | None = None,
         *,
         workers: list,
-    ):
+    ) -> TaskHandle:
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
         ``workers`` contains the exact stable NEXT_LEVEL worker id for each
@@ -386,6 +397,7 @@ class Orchestrator:
         ``args_list`` becomes one per-rank mailbox request: MPI rank
         ``workers[i]`` executes only ``args_list[i]``. A single worker id remains
         directed and is never silently widened to the whole group.
+        Returns one opaque ``TaskHandle`` for the group DAG node.
         """
         cfg = config if config is not None else CallConfig()
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
@@ -457,13 +469,12 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
-        member_checks: list[tuple[list[tuple[int, int]], int]] = []
+        member_checks: list[tuple[list[tuple[CanonicalIdentity, int]], int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
-                child_ptrs = worker._child_ptrs_in_args(c_args)
-                if not child_ptrs:
-                    continue
-                member_checks.append((child_ptrs, worker_ids[g]))
+                device_args = worker._device_identities_in_args(c_args)
+                if device_args:
+                    member_checks.append((device_args, worker_ids[g], c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
@@ -481,16 +492,21 @@ class Orchestrator:
                 _tracr.flow_start(fid_base + member)
         try:
             with prov_guard:
-                for child_ptrs, target_worker_id in member_checks:
-                    assert worker is not None  # member_checks is only populated when worker is present
-                    worker._child_prov_check_dispatch(child_ptrs, target_worker_id, api="submit_next_level_group")
+                for device_args, target_worker_id, c_args in member_checks:
+                    assert worker is not None
+                    worker._child_prov_check_dispatch_locked(
+                        device_args,
+                        target_worker_id,
+                        args=c_args,
+                        api="submit_next_level_group",
+                    )
                 if worker is not None and remote_sidecars is not None:
                     worker._adopt_remote_sidecar_refs(remote_sidecars)
                 if worker is not None:
                     for c_args in c_args_list:
                         worker._record_touched_identities(c_args)
                 _admit_task_submission(self._worker)
-                self._o.submit_next_level_group(
+                return self._o.submit_next_level_group(
                     digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
                 )
         finally:
@@ -766,6 +782,11 @@ class Orchestrator:
         with self._control_admission("committed_device_memory"):
             return int(self._o.committed_device_memory(int(worker_id)))
 
+    def device_memory_info(self, worker_id: int) -> DeviceMemoryInfo:
+        """Device-wide ACL_HBM_MEM free/total byte snapshot for *worker_id*."""
+        with self._control_admission("device_memory_info"):
+            return self._o.device_memory_info(int(worker_id))
+
     # A Worker is the only allocator. The Orchestrator exposes thin wrappers that delegate to the
     # bound Worker's implementation so an orchestration fn can allocate / copy / free without reaching
     # for the Worker — each forwards to the Worker's no-lease in-run path (the run already holds it).
@@ -783,17 +804,21 @@ class Orchestrator:
             raise RuntimeError("orch.free requires a Worker context")
         self._worker.free(handle)
 
-    def copy_to(self, dst: Buffer, src) -> None:
-        """H2D: copy host ``src`` into device handle ``dst``. Delegates to ``Worker.copy_to``."""
+    def copy_to(self, dst: Buffer, src, *, dst_offset: int = 0, src_offset: int = 0, nbytes: int | None = None) -> None:
+        """H2D: copy ``nbytes`` from ``src_offset`` in host ``src`` to ``dst_offset`` in device
+        ``dst``. Delegates to ``Worker.copy_to``."""
         if self._worker is None:
             raise RuntimeError("orch.copy_to requires a Worker context")
-        self._worker.copy_to(dst, src)
+        self._worker.copy_to(dst, src, dst_offset=dst_offset, src_offset=src_offset, nbytes=nbytes)
 
-    def copy_from(self, dst, src: Buffer) -> None:
-        """D2H: copy device handle ``src`` into host ``dst``. Delegates to ``Worker.copy_from``."""
+    def copy_from(
+        self, dst, src: Buffer, *, dst_offset: int = 0, src_offset: int = 0, nbytes: int | None = None
+    ) -> None:
+        """D2H: copy ``nbytes`` from ``src_offset`` in device ``src`` to ``dst_offset`` in host
+        ``dst``. Delegates to ``Worker.copy_from``."""
         if self._worker is None:
             raise RuntimeError("orch.copy_from requires a Worker context")
-        self._worker.copy_from(dst, src)
+        self._worker.copy_from(dst, src, dst_offset=dst_offset, src_offset=src_offset, nbytes=nbytes)
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> Buffer:
         """Allocate a runtime-managed intermediate buffer; returns a ``Buffer``.

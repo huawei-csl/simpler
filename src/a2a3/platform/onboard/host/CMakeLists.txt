@@ -97,6 +97,8 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
+simpler_configure_profiling(host_runtime)
 
 # TraCR
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)

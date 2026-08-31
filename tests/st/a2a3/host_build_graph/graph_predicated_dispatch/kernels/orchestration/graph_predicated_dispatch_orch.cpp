@@ -63,7 +63,7 @@
 
 namespace {
 
-CoreTaskPredicate gate_predicate(const ChipTensor &gate, uint32_t index) {
+CoreTaskPredicate gate_predicate(const simpler::hbg::Tensor &gate, uint32_t index) {
     CoreTaskPredicate pred;
     pred.operand.tensor = &gate;
     pred.operand.ndims = 1;
@@ -75,25 +75,25 @@ CoreTaskPredicate gate_predicate(const ChipTensor &gate, uint32_t index) {
 
 void layer(const GraphTaskArgs &args, int variant) {
     (void)variant;
-    const ChipTensor &x = args.tensor(0).ref();
-    const ChipTensor &y = args.tensor(1).ref();
-    const ChipTensor &boundary_gate = args.tensor(2).ref();
+    const simpler::hbg::Tensor &x = args.tensor(0).ref();
+    const simpler::hbg::Tensor &y = args.tensor(1).ref();
+    const simpler::hbg::Tensor &boundary_gate = args.tensor(2).ref();
 
     // A view of the boundary gate: same buffer, shifted start_offset, so the
     // recorder classifies it BOUNDARY_VIEW rather than BOUNDARY_EXACT.
     const std::array<uint32_t, 1> view_shape{GATE_VIEW_ELEMS};
     const std::array<uint32_t, 1> view_offset{GATE_VIEW_BASE};
-    const ChipTensor gate_view = boundary_gate.view(view_shape.data(), view_offset.data());
+    const simpler::hbg::Tensor gate_view = boundary_gate.view(view_shape.data(), view_offset.data());
 
     // Graph-internal predicate operand: its address is the recording's virtual
-    // one, so replay can only read it once materialize has rebound the node.
+    // one, so replay can only read it once materialize has rebound the tensor.
     const std::array<uint32_t, 1> gate_shape{GATE_ELEMS};
     TensorCreateInfo gate_info(gate_shape.data(), static_cast<uint32_t>(gate_shape.size()), DataType::INT32);
     CoreTaskArgs gate_args;
     gate_args.add_output(gate_info);
     gate_args.add_scalar(args.scalar(0));
     TaskOutputTensors gate_outputs = rt_submit_aic_task(FUNC_WRITE_GATE, gate_args);
-    ChipTensor internal_gate = gate_outputs.get_ref(0);
+    simpler::hbg::Tensor internal_gate = gate_outputs.get_ref(0);
     TaskId gate_tid = gate_outputs.task_id();
 
     // X is a boundary tensor, so the four tasks below share no Graph-internal

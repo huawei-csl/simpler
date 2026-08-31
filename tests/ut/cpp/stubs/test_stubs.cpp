@@ -110,7 +110,7 @@ void flush_range_impl(const void * /* addr */, size_t /* size */) {}
 // platform_regs.h stub (get_reg_ptr)
 // =============================================================================
 
-// PTO2SchedulerState::ring_one_doorbell (scheduler.h, speculative
+// SchedulerState::ring_one_doorbell (scheduler.h, speculative
 // early-dispatch) is an inline that resolves a register id to its MMIO pointer
 // via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
 // host UT runner; hand back writable static storage (8 bytes — the doorbell is a
@@ -131,6 +131,16 @@ void reset_test_reg_stub() {
 uint64_t get_test_reg_stub_value() { return g_test_reg; }
 
 uint64_t get_test_reg_stub_base_addr() { return g_test_reg_base_addr; }
+
+// =============================================================================
+// orchestrator.cpp stub (graph_recorder_stand_up_storage)
+// =============================================================================
+
+// A recorder worker stands its recording storage up as it starts
+// (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the pool's own
+// threading test does not link -- and does not need, since nothing it records reaches the
+// storage. Weak so a test that links the orchestrator gets the real one.
+__attribute__((weak)) bool graph_recorder_stand_up_storage() { return true; }
 
 // =============================================================================
 // runtime_maker.cpp stub (bind_callable_to_runtime_impl)

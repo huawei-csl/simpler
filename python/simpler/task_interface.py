@@ -10,10 +10,10 @@
 """Public Python API for task_interface nanobind bindings.
 
 Re-exports the canonical C++ types (DataType, ChipTensor, ChipStorageTaskArgs, TaskArgs,
-TensorArgType) plus ``scalar_to_uint64``, and re-exports the address-free ``Tensor`` — the task
-argument users build — from ``simpler.buffer``. Torch-aware helpers (``make_chip_tensor_arg``,
-``torch_dtype_to_datatype``) live in ``simpler_setup.torch_interop`` — this module has no torch
-dependency.
+TaskHandle, TensorArgType) plus ``scalar_to_uint64``, and re-exports the address-free ``Tensor`` —
+the task argument users build — from ``simpler.buffer``. Torch-aware helpers
+(``make_chip_tensor_arg``, ``torch_dtype_to_datatype``) live in ``simpler_setup.torch_interop`` —
+this module has no torch dependency.
 
 ``ChipTensor`` is the chip-only POD the runtime ABI expects, paired with
 ``ChipStorageTaskArgs`` on the direct ``ChipWorker`` path; it carries a
@@ -59,8 +59,10 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ChipTensor,
     CoreCallable,
     DataType,
+    DeviceMemoryInfo,
     RuntimeEnv,
     TaskArgs,
+    TaskHandle,
     TaskState,
     TensorArgType,
     WorkerType,
@@ -70,6 +72,12 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     get_dtype_name,
     get_element_size,
     read_args_from_blob,
+)
+from _task_interface import (
+    _emit_host_log as _native_emit_host_log,
+)
+from _task_interface import (
+    _host_log_directory as _native_host_log_directory,
 )
 from _task_interface import (
     _initialize_host_log as _native_initialize_host_log,
@@ -146,6 +154,7 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 
 __all__ = [
     "DataType",
+    "DeviceMemoryInfo",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -154,6 +163,7 @@ __all__ = [
     "ChipStorageTaskArgs",
     "TensorArgType",
     "TaskArgs",
+    "TaskHandle",
     "RemoteAddressSpace",
     "RemoteBufferHandle",
     "RemoteBufferExport",
@@ -798,13 +808,16 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
         placeholder = remote_sidecar_tensor(
             shapes=tuple(int(s) for s in tensor.shape),
             dtype=int(tensor.dtype.value),
-            nbytes=int(nbytes),
+            # A remote placeholder is still a normal Tensor record on the wire: its descriptor
+            # spans the complete handle backing, while the sidecar records this view's nbytes.
+            nbytes=int(handle.nbytes),
             owner_worker_id=0 if inline else int(handle.owner_worker_id),
             buffer_id=0 if inline else int(handle._buffer_id),
             generation=0 if inline else int(handle._generation),
             address_space=(
                 AddressSpace.DEVICE if handle.address_space == RemoteAddressSpace.REMOTE_DEVICE else AddressSpace.HOST
             ),
+            byte_offset=int(tensor.offset),
         )
         _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
@@ -1228,13 +1241,21 @@ class GlobalCommDomainView:
 
 
 def _initialize_host_log(log_level: int | None = None) -> None:
-    """Seed the extension-owned host-log state before runtime use or fork."""
-    if log_level is None:
-        from . import _log  # noqa: PLC0415
+    """Seed the extension-owned host-log state before runtime use or fork.
 
+    Also points the Python `simpler` logger at that same host logger, so the two
+    stop being separate logging systems that agree only on a threshold. This is
+    the right moment for it: the extension is loaded by definition here, whereas
+    installing the handler at import time would put the extension on the import
+    path of the logging surface.
+    """
+    from . import _log  # noqa: PLC0415
+
+    if log_level is None:
         log_level = _log.get_current_config()
     if not _native_initialize_host_log(int(log_level)):
         raise ValueError(f"unsupported simpler log threshold: {log_level}")
+    _log.attach_unified_log_handler(_native_emit_host_log, _native_host_log_directory)
 
 
 class ChipWorker:
@@ -1686,3 +1707,7 @@ class ChipWorker:
     def committed_device_memory(self) -> int:
         """Total device HBM (bytes) committed by this chip worker's MemoryAllocator."""
         return int(self._impl.committed_device_memory)
+
+    def device_memory_info(self) -> DeviceMemoryInfo:
+        """Device-wide ACL_HBM_MEM free/total byte snapshot."""
+        return self._impl.device_memory_info()

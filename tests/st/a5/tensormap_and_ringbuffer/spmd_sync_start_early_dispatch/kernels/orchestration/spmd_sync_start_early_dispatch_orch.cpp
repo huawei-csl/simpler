@@ -48,7 +48,7 @@ static constexpr int64_t PRODUCER_SPIN_ITERS = 10000000;
 
 static constexpr int32_t PRODUCER_BLOCKS = 50;
 
-static TaskId submit_producer(const ChipTensor &out, int16_t core_num, int64_t base_cl, bool early_on) {
+static TaskId submit_producer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, bool early_on) {
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
@@ -58,7 +58,7 @@ static TaskId submit_producer(const ChipTensor &out, int16_t core_num, int64_t b
     return rt_submit_aic_task(FUNC_SPMD_WRITE_AIC, args).task_id();
 }
 
-static void submit_sync_consumer(const ChipTensor &out, int16_t core_num, int64_t base_cl, TaskId dep) {
+static void submit_sync_consumer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, TaskId dep) {
     MixedKernels kernels;
     kernels.aic_kernel_id = FUNC_SPMD_MIX_AIC;
     kernels.aiv0_kernel_id = FUNC_SPMD_MIX_AIV0;
@@ -73,8 +73,8 @@ static void submit_sync_consumer(const ChipTensor &out, int16_t core_num, int64_
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
-    const ChipTensor &ext_output = orch_args.tensor(0).ref();
-    const ChipTensor &layout = orch_args.tensor(1).ref();
+    const simpler::tmr::Tensor &ext_output = orch_args.tensor(0).ref();
+    const simpler::tmr::Tensor &layout = orch_args.tensor(1).ref();
     const bool early_on = orch_args.scalar(0) != 0;
 
     // The consumer must occupy every AIC slot for the strand this case looks
@@ -83,7 +83,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // the device on purpose; it carries no sync_start, so no cap applies.
     const int32_t sync_blocks = rt_available_cluster_count();
 
-    rt_scope_begin(PTO2ScopeMode::MANUAL);
+    rt_scope_begin(ScopeMode::MANUAL);
     TaskId prod = submit_producer(ext_output, PRODUCER_BLOCKS, 0, early_on);
     submit_sync_consumer(ext_output, static_cast<int16_t>(sync_blocks), PRODUCER_BLOCKS, prod);
     rt_scope_end();

@@ -351,6 +351,45 @@ def test_host_swimlane_names_the_scheduler_lane_from_every_role_it_emits():
     assert thread_names == {(41, 411): "scheduler"}
 
 
+def test_a_scheduler_loop_span_lands_on_the_scheduler_lane_and_no_invocation():
+    """It is the one host span that belongs to no run, and both views must cope.
+
+    A loop iteration drains completions and dispatches tasks belonging to
+    whichever runs happened to be ready, so it carries no `run_id` and its `inv`
+    is 0 rather than a run epoch. The swimlane still has to place it — `role`
+    names the lane, which is why the attribute is there and not inferred from the
+    name — and the invocation-keyed views still have to leave it out, or every
+    one of them gains a forged invocation 0.
+    """
+    lines = [
+        _span_record(
+            pid=41,
+            tid=411,
+            inv=0,
+            name="node.scheduler_loop",
+            ts=1_400,
+            dur=120,
+            attrs="role=scheduler drained=2 dispatched=1 drain_ns=40 spins=917",
+        )
+    ]
+    spans = list(parse_spans(lines))
+
+    assert invocation_spans(spans) == []
+
+    trace = to_host_swimlane(spans)
+    thread_names = {
+        (event["pid"], event["tid"]): event["args"]["name"]
+        for event in trace["traceEvents"]
+        if event["ph"] == "M" and event["name"] == "thread_name"
+    }
+    assert thread_names == {(41, 411): "scheduler"}
+
+    slices = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+    assert [event["name"] for event in slices] == ["node.scheduler_loop"]
+    assert slices[0]["args"]["spins"] == 917
+    assert slices[0]["args"]["drained"] == 2
+
+
 def test_parse_spans_decodes_percent_escaped_name_and_attribute_values():
     """`encode_host_span_field` escapes whatever would otherwise be record grammar."""
     lines = [
@@ -589,6 +628,84 @@ def test_swimlane_cli_writes_trace(tmp_path):
     trace = json.loads(output_path.read_text(encoding="utf-8"))
     event = next(event for event in trace["traceEvents"] if event.get("name") == "node.graph_build")
     assert event["args"]["wall_ts_ns"] == "1700000000000000050"
+
+
+def test_cli_reads_every_input_so_a_run_needs_no_manual_merge(tmp_path, capsys):
+    """A run's per-process logs, passed together.
+
+    Records carry their own pid, so concatenating inputs is all the merge that
+    was ever needed — but the tool used to take one path, which left the merge to
+    whoever ran it.
+    """
+    first = tmp_path / "host.71.log"
+    second = tmp_path / "host.72.log"
+    # Each process's own file carries its anchor ahead of its records.
+    first.write_text(
+        _anchor_record(71, 50, 1_700_000_000_000_000_000)
+        + _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10),
+        encoding="utf-8",
+    )
+    second.write_text(
+        _anchor_record(72, 60, 1_700_000_000_000_000_010)
+        + _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "swimlane.json"
+
+    assert main([str(first), str(second), "--swimlane", str(output_path)]) == 0
+
+    trace = json.loads(output_path.read_text(encoding="utf-8"))
+    assert {event["pid"] for event in trace["traceEvents"] if event.get("ph") == "X"} == {71, 72}
+    assert {int(anchor["pid"]) for anchor in trace["clockAnchors"]} == {71, 72}
+    assert "no [CLOCK_ANCHOR] record" not in capsys.readouterr().err
+
+
+def test_cli_expands_a_run_directory_to_its_per_process_log_files(tmp_path):
+    """A run's output_prefix can be passed as-is."""
+    prefix = tmp_path / "case_20260824"
+    prefix.mkdir()
+    (prefix / "host.71.log").write_text(
+        _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10), encoding="utf-8"
+    )
+    (prefix / "host.72.log").write_text(
+        _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20), encoding="utf-8"
+    )
+    # A sibling artifact must not be read as a log.
+    (prefix / "pmu.csv").write_text("not,a,log\n", encoding="utf-8")
+    output_path = tmp_path / "swimlane.json"
+
+    assert main([str(prefix), "--swimlane", str(output_path)]) == 0
+
+    trace = json.loads(output_path.read_text(encoding="utf-8"))
+    assert {event["pid"] for event in trace["traceEvents"] if event.get("ph") == "X"} == {71, 72}
+
+
+def test_cli_rejects_a_directory_with_no_span_files(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    with pytest.raises(SystemExit, match="holds no host\\."):
+        main([str(empty)])
+
+
+def test_cli_warns_when_a_pid_emitted_spans_without_a_clock_anchor(tmp_path, capsys):
+    """An incomplete input leaves those pids monotonic-only.
+
+    `clockAnchors` is then simply absent from the output rather than wrong, which
+    is exactly the kind of loss nobody notices.
+    """
+    log_file = tmp_path / "host.71.log"
+    log_file.write_text(
+        _span_record(pid=71, tid=710, inv=1, name="node.submit", ts=100, dur=10)
+        + _span_record(pid=72, tid=720, inv=1, name="chip.run", ts=200, dur=20),
+        encoding="utf-8",
+    )
+
+    assert main([str(log_file)]) == 0
+
+    err = capsys.readouterr().err
+    assert "no [CLOCK_ANCHOR] record for pid(s) 71, 72" in err
+    assert "check that every input is complete" in err
 
 
 def test_cli_warns_when_one_pid_has_multiple_clock_anchors(tmp_path, capsys):
@@ -868,7 +985,7 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
             "inv": 5,
             "records": [
                 {"phase": "args", "start_ns": 1_000, "end_ns": 1_100, "detail": 4096, "tid": 9},
-                {"phase": "record_node", "start_ns": 1_150, "end_ns": 1_230, "detail": 4, "tid": 42},
+                {"phase": "record_in_graph_task", "start_ns": 1_150, "end_ns": 1_230, "detail": 4, "tid": 42},
                 {"phase": "graph_submit", "start_ns": 1_200, "end_ns": 1_250, "detail": 77, "tid": 9},
             ],
         }
@@ -884,7 +1001,7 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
     assert by_name["chip.run.bind.host_orch.graph_submit"].depth == bind_depth + 2
     assert by_name["chip.run.bind.args"].ts == 1_000
     assert by_name["chip.run.bind.args"].dur == 100
-    assert by_name["chip.run.bind.host_orch.record_node"].tid == 42
+    assert by_name["chip.run.bind.host_orch.record_in_graph_task"].tid == 42
     assert by_name["chip.run.bind.host_orch.graph_submit"].tid == 9
 
     trace = to_host_swimlane(spans + out)
@@ -897,6 +1014,39 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
     assert lane_names[42] == "graph record worker"
 
 
+def test_host_record_spans_put_the_pre_rename_record_phase_on_the_recorder_lane():
+    """A log written before the phase was renamed still lands on the recorder lane.
+
+    The runtime emitted `record_node` for what is now `record_in_graph_task`, and
+    an unrecognised phase name is attributed to host_main rather than rejected —
+    so dropping the old spelling would silently redraw every archived log's
+    recorder work onto the main lane.
+    """
+    spans = list(parse_spans([_span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=900, dur=500)]))
+    passes = [
+        {
+            "pid": 9,
+            "inv": 5,
+            "records": [
+                {"phase": "record_node", "start_ns": 1_000, "end_ns": 1_080, "detail": 4, "tid": 42},
+            ],
+        }
+    ]
+
+    out, orphaned, _ = host_record_spans(spans, passes)
+
+    assert orphaned == 0
+    by_name = {span.name: span for span in out}
+    assert by_name["chip.run.bind.host_orch.record_node"].tid == 42
+    trace = to_host_swimlane(spans + out)
+    lane_names = {
+        event["tid"]: event["args"]["name"]
+        for event in trace["traceEvents"]
+        if event["ph"] == "M" and event["name"] == "thread_name"
+    }
+    assert lane_names[42] == "graph record worker"
+
+
 def test_host_record_spans_keep_legacy_recording_on_main_lane():
     spans = list(parse_spans([_span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=900, dur=500)]))
     passes = [
@@ -904,7 +1054,7 @@ def test_host_record_spans_keep_legacy_recording_on_main_lane():
             "pid": 9,
             "inv": 5,
             "records": [
-                {"phase": "record_node", "start_ns": 1_000, "end_ns": 1_080, "detail": 4},
+                {"phase": "record_in_graph_task", "start_ns": 1_000, "end_ns": 1_080, "detail": 4},
                 {"phase": "build_definition", "start_ns": 1_100, "end_ns": 1_180, "detail": 4},
                 {"phase": "graph_submit", "start_ns": 1_200, "end_ns": 1_250, "detail": 77},
             ],

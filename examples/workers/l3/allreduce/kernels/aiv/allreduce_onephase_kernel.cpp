@@ -68,10 +68,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // mispairs silently rather than warning.
     constexpr uint32_t kBarrierSeq = 0;
 
-    __gm__ ChipTensor *input_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
-    __gm__ ChipTensor *output_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
-    __gm__ ChipTensor *scratch_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[2]);
-    __gm__ ChipTensor *timing_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[3]);
+    __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *output_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *scratch_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *timing_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
     int nranks = static_cast<int>(args[4]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[5]);
 

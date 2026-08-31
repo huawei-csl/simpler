@@ -44,20 +44,21 @@
 #include <vector>
 
 // Type headers needed by orchestration
-#include "common.h"            // framework_bind_runtime / framework_current_runtime
-#include "graph_cache.h"       // Graph Execution key and result helpers
-#include "graph_host_state.h"  // GRAPH_MAX_DEFINITIONS
-#include "runtime_types.h"     // SIMPLER_ERROR_*
-#include "submit_types.h"      // MixedKernels, INVALID_KERNEL_ID, subtask slots
-#include "types.h"             // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"         // ChipStorageTaskArgs, ChipTensor
-#include "tensor.h"            // ChipTensor, TensorCreateInfo
+#include "host_build_graph/common.h"            // framework_bind_runtime / framework_current_runtime
+#include "common/host_phase_kind.h"             // HostPhaseKind, for the phase records below
+#include "host_build_graph/graph_cache.h"       // Graph Execution key and result helpers
+#include "host_build_graph/graph_host_state.h"  // GRAPH_MAX_DEFINITIONS
+#include "host_build_graph/runtime_types.h"     // SIMPLER_ERROR_*
+#include "host_build_graph/submit_types.h"      // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "types.h"                              // Arg, TaskOutputTensors, TensorArgType
+#include "task_args.h"                          // ChipStorageTaskArgs, simpler::hbg::Tensor
+#include "tensor.h"                             // simpler::hbg::Tensor, TensorCreateInfo
 
 // =============================================================================
-// ChipTensor Factory Helpers
+// simpler::hbg::Tensor Factory Helpers
 // =============================================================================
 
-// make_tensor_external(...) — canonical factory for pre-allocated external
+// simpler::hbg::make_tensor_external(...) — canonical factory for pre-allocated external
 // memory — is defined in the unified tensor.h (common), so host and runtime
 // build ChipTensors through the same controlled path.
 
@@ -93,9 +94,11 @@ typedef struct RuntimeOps {
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(
+        RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+    );
     void (*set_tensor_data)(
-        RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(RuntimeContext *rt, const CoreTaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(RuntimeContext *rt, const CoreTaskArgs &args);
@@ -119,6 +122,16 @@ typedef struct RuntimeOps {
     // the two must stay in lockstep field for field, since the runtime fills the table
     // and this .so calls through it.
     void (*record_orch_phase)(uint32_t kind, uint64_t start_ns, uint64_t end_ns, uint64_t detail);
+    // Queue one Graph body for asynchronous recording, and drain every queued one.
+    // `job` is a `std::function<void(GraphTaskArgs &)> *` the pool moves out of --
+    // whether or not it queues it, since start() takes the callable before it checks
+    // capacity -- so the caller must not invoke it afterwards. Nothing is owned across
+    // the boundary either way: the caller's std::function destructs normally, empty or
+    // not, and rt_graph_submit's fallback re-runs its own copy of the body. The pool is
+    // runtime-owned (host/graph_recorder_pool.h) and the AICPU build links a refusing
+    // fallback, which is what makes the device path record synchronously.
+    bool (*graph_record_start)(RuntimeContext *rt, const GraphTaskArgs &args, void *job);
+    void (*graph_record_wait)(RuntimeContext *rt);
 } RuntimeOps;
 
 /**
@@ -131,246 +144,8 @@ typedef struct RuntimeOps {
  */
 struct RuntimeContext {
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode;
+    ScopeMode pending_scope_mode;
 };
-
-class GraphOwnedArgs {
-public:
-    GraphOwnedArgs() { std::memset(tensors_.data(), 0, sizeof(tensors_)); }
-
-    // The arrays below are sized to the Graph boundary's own capacity, so a
-    // source GraphTaskArgs cannot report more args than they hold and the copy
-    // loops need no runtime bound.
-    void assign(const GraphTaskArgs &source) {
-        args_.reset();
-        for (int32_t i = 0; i < source.tensor_count(); ++i) {
-            tensors_[static_cast<size_t>(i)].copy(source.tensor(i).ref());
-            switch (source.tag(i)) {
-            case TensorArgType::INPUT:
-                args_.add_input(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::OUTPUT_EXISTING:
-                args_.add_output(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::INOUT:
-                args_.add_inout(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::NO_DEP:
-                args_.add_no_dep(tensors_[static_cast<size_t>(i)]);
-                break;
-            case TensorArgType::OUTPUT:
-                args_.set_error("Runtime-allocated output is not supported at a Graph boundary");
-                break;
-            }
-        }
-        for (int32_t i = 0; i < source.scalar_count(); ++i) {
-            scalars_[static_cast<size_t>(i)] = source.scalar(i);
-            args_.add_scalar(scalars_[static_cast<size_t>(i)]);
-        }
-        args_.launch_spec = source.launch_spec;
-        args_.set_allow_early_resolve(source.allow_early_resolve());
-        if (source.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
-            args_.set_task_timing_slot(source.task_timing_slot());
-        }
-        args_.set_predicate(source.predicate());
-    }
-
-    GraphTaskArgs &args() { return args_; }
-
-private:
-    std::array<ChipTensor, GRAPH_MAX_TENSOR_ARGS> tensors_{};
-    std::array<uint64_t, GRAPH_MAX_SCALAR_ARGS> scalars_{};
-    GraphTaskArgs args_;
-};
-
-class GraphAsyncRecordingState {
-public:
-    GraphAsyncRecordingState() {
-        for (size_t i = 0; i < kJobCapacity; ++i) {
-            free_owned_args_[i] = kJobCapacity - i - 1;
-        }
-    }
-    ~GraphAsyncRecordingState() { shutdown(); }
-
-    GraphAsyncRecordingState(const GraphAsyncRecordingState &) = delete;
-    GraphAsyncRecordingState &operator=(const GraphAsyncRecordingState &) = delete;
-
-    // A workload that cuts its forward pass into up to eight Definitions should
-    // not create pthreads between outer shell submissions. Callable registration
-    // parks those workers before the first run; start() can still grow to the
-    // Definition limit if a workload records more identities concurrently.
-    bool prewarm() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (stopping_) return false;
-        while (workers_.size() < kPrewarmedWorkerCount) {
-            if (!create_worker_locked()) break;
-        }
-        const size_t target = workers_.size();
-        cv_.wait(lock, [&]() {
-            return ready_workers_ >= target || stopping_;
-        });
-        return !stopping_ && target == kPrewarmedWorkerCount;
-    }
-
-    template <typename Job>
-    bool start(const GraphTaskArgs &args, Job &&job) {
-        std::function<void(GraphTaskArgs &)> next;
-        try {
-            next = std::forward<Job>(job);
-        } catch (...) {
-            return false;
-        }
-
-        size_t owned_args_index;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_ || free_owned_args_count_ == 0 || job_count_ == kJobCapacity) return false;
-            owned_args_index = free_owned_args_[--free_owned_args_count_];
-        }
-        owned_args_[owned_args_index].assign(args);
-
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (stopping_) {
-            free_owned_args_[free_owned_args_count_++] = owned_args_index;
-            return false;
-        }
-        PendingJob &pending = jobs_[job_tail_];
-        pending.function = std::move(next);
-        pending.owned_args_index = owned_args_index;
-        job_tail_ = (job_tail_ + 1) % kJobCapacity;
-        job_count_++;
-        const size_t desired_workers = std::min(kMaxWorkerCount, job_count_ + active_jobs_);
-        while (workers_.size() < desired_workers) {
-            if (!create_worker_locked()) break;
-        }
-        if (workers_.empty()) {
-            job_tail_ = (job_tail_ + kJobCapacity - 1) % kJobCapacity;
-            PendingJob &rollback = jobs_[job_tail_];
-            rollback.function = {};
-            job_count_--;
-            free_owned_args_[free_owned_args_count_++] = rollback.owned_args_index;
-            return false;
-        }
-        lock.unlock();
-        cv_.notify_one();
-        // graph_begin() has already installed the keyed in-flight entry and
-        // submitted the zero-heap outer shell. Enqueuing the private job is
-        // therefore the last dependency of the caller; graph_prepare() and all
-        // node recording may start after later shells are submitted.
-        return true;
-    }
-
-    // Wait for every queued and running recording. A recording thread returns
-    // immediately: it may reach this through rt_orchestration_done in a Graph body
-    // and must never wait for its own job, nor for a sibling's — the sibling makes
-    // progress independently and waiting on it would trade a recording thread for
-    // nothing.
-    void wait() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (is_worker_thread_locked(std::this_thread::get_id())) return;
-        cv_.wait(lock, [&]() {
-            return job_count_ == 0 && active_jobs_ == 0;
-        });
-    }
-
-private:
-    static constexpr size_t kPrewarmedWorkerCount = 8;
-    static constexpr size_t kMaxWorkerCount = GRAPH_MAX_DEFINITIONS;
-    static constexpr size_t kJobCapacity = GRAPH_MAX_DEFINITIONS;
-
-    struct PendingJob {
-        std::function<void(GraphTaskArgs &)> function;
-        size_t owned_args_index{0};
-    };
-
-    bool is_worker_thread_locked(std::thread::id id) const {
-        for (const std::thread &worker : workers_) {
-            if (worker.get_id() == id) return true;
-        }
-        return false;
-    }
-
-    bool create_worker_locked() {
-        if (stopping_ || workers_.size() >= kMaxWorkerCount) return false;
-        try {
-            workers_.emplace_back([this]() {
-                run();
-            });
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    void run() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            ready_workers_++;
-        }
-        cv_.notify_all();
-        for (;;) {
-            PendingJob current;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [&]() {
-                    return job_count_ != 0 || stopping_;
-                });
-                if (stopping_ && job_count_ == 0) return;
-                PendingJob &pending = jobs_[job_head_];
-                current.function = std::move(pending.function);
-                current.owned_args_index = pending.owned_args_index;
-                job_head_ = (job_head_ + 1) % kJobCapacity;
-                job_count_--;
-                active_jobs_++;
-            }
-            current.function(owned_args_[current.owned_args_index].args());
-            current.function = {};
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                free_owned_args_[free_owned_args_count_++] = current.owned_args_index;
-                active_jobs_--;
-            }
-            cv_.notify_all();
-        }
-    }
-
-    void shutdown() {
-        wait();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-        }
-        cv_.notify_all();
-        for (std::thread &worker : workers_) {
-            if (worker.joinable()) worker.join();
-        }
-    }
-
-    std::vector<std::thread> workers_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::array<GraphOwnedArgs, kJobCapacity> owned_args_;
-    std::array<size_t, kJobCapacity> free_owned_args_{};
-    std::array<PendingJob, kJobCapacity> jobs_;
-    size_t free_owned_args_count_{kJobCapacity};
-    size_t job_head_{0};
-    size_t job_tail_{0};
-    size_t job_count_{0};
-    size_t ready_workers_{0};
-    size_t active_jobs_{0};
-    bool stopping_{false};
-};
-
-// External linkage on purpose: `static inline` would give every translation
-// unit that submits a Graph its own recorder and its own worker threads, so a
-// commit reached from one TU would not wait for a recording another TU started.
-// Vague linkage keeps one instance — and one pool — per loaded SO.
-inline GraphAsyncRecordingState &rt_graph_async_recording() {
-    // Keep the bounded pool alive across runs so steady-state misses pay only a
-    // condition-variable wakeup. The SO's destructor joins it before dlclose.
-    static GraphAsyncRecordingState state;
-    return state;
-}
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
@@ -519,23 +294,31 @@ static inline void rt_graph_abort(void *recording_handle) {
 
 // Finish the recording pass and publish its Definition. The calling thread
 // finalizes the already-submitted outer Graph shells in rt_graph_commit.
+//
+// No is_fatal() short-circuit: a prepared recording has to leave RECORDING even when
+// the run has already failed, or graph_commit's drain never completes. graph_end
+// retires the entry it bound on every path that has one — published, unsupported,
+// key-mismatched, or fatal — so `false` here means "no Definition", never "the entry
+// is still yours to retire". That is why no caller pairs this with an abort.
+//
+// The null-op guard is defensive only: hbg's ops table always carries graph_end
+// (runtime_core.cpp), and a table without it would have no graph_begin either, so
+// no recording could be open to end. It reports false rather than the older `true`
+// because nothing was published.
 static inline bool rt_graph_end() {
     RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt) || rt->ops->graph_end == nullptr) {
-        return true;
-    }
+    if (rt->ops->graph_end == nullptr) return false;
     return rt->ops->graph_end(rt);
 }
 
 static inline void rt_graph_commit() {
-    GraphAsyncRecordingState &async = rt_graph_async_recording();
-    async.wait();
-
     RuntimeContext *rt = current_runtime();
+    if (rt->ops->graph_record_wait != nullptr) rt->ops->graph_record_wait(rt);
+
     if (!rt->ops->is_fatal(rt) && rt->ops->graph_commit != nullptr) rt->ops->graph_commit(rt);
 }
 
-static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
+static inline void rt_scope_begin(ScopeMode mode = ScopeMode::AUTO) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
@@ -597,16 +380,9 @@ static inline bool rt_is_fatal() {
 // orchestration code does between submissions, and no existing marker separates them.
 // These accumulators do, in the .so where that code actually runs.
 // ============================================================================
-// The three submission segments the runtime cannot see, spelled as plain integers for
-// the same reason the orchestrator core does it: this .so cannot include the platform's
-// profiling header. Pinned against HostPhaseKind by static_asserts in host_phase_trace.
-enum class RtOrchPhase : uint32_t {
-    SubmitAdmit = 20,
-    RecordHandoff = 21,
-    GeneratedArgs = 22,
-};
-
-inline void rt_record_orch_phase(RtOrchPhase phase, uint64_t start_ns, uint64_t end_ns, uint64_t detail) {
+// The three submission segments the runtime cannot see, filed under the
+// OrchSubmitAdmit / OrchRecordHandoff / OrchGeneratedArgs kinds.
+inline void rt_record_orch_phase(HostPhaseKind phase, uint64_t start_ns, uint64_t end_ns, uint64_t detail) {
     const RuntimeOps *ops = current_runtime()->ops;
     if (ops->record_orch_phase != nullptr) {
         ops->record_orch_phase(static_cast<uint32_t>(phase), start_ns, end_ns, detail);
@@ -649,7 +425,7 @@ inline uint64_t rt_orch_phase_now_ns() {
  * registered host view; either use is reported as an invalid argument.
  */
 template <typename T = uint64_t>
-static inline T get_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return from_u64<T>(0);
@@ -672,7 +448,8 @@ static inline T get_tensor_data(const ChipTensor &tensor, uint32_t ndims, const 
  * is rejected as an invalid argument.
  */
 template <typename T = uint64_t>
-static inline void set_tensor_data(const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+static inline void
+set_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
@@ -689,7 +466,7 @@ static inline void set_tensor_data(const ChipTensor &tensor, uint32_t ndims, con
  */
 class ScopeGuard {
 public:
-    explicit ScopeGuard(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) :
+    explicit ScopeGuard(ScopeMode mode = ScopeMode::AUTO) :
         rt_(current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
             rt_->pending_scope_mode = mode;
@@ -754,7 +531,7 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     constexpr uint64_t kBindBoundaryNs = 1000000;
     const uint64_t _between = _phase.prev_exit_ns == 0 ? 0 : _entry_ns - _phase.prev_exit_ns;
     if (_between != 0 && _between < kBindBoundaryNs) {
-        rt_record_orch_phase(RtOrchPhase::GeneratedArgs, _phase.prev_exit_ns, _entry_ns, _phase.count);
+        rt_record_orch_phase(HostPhaseKind::OrchGeneratedArgs, _phase.prev_exit_ns, _entry_ns, _phase.count);
     }
     if (!rt_graph_args_cacheable(args)) {
         invoke(args);
@@ -762,25 +539,38 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         return GraphSubmitResult{};
     }
     const uint64_t _admitted_ns = rt_orch_phase_now_ns();
-    rt_record_orch_phase(RtOrchPhase::SubmitAdmit, _entry_ns, _admitted_ns, graph_key);
+    rt_record_orch_phase(HostPhaseKind::OrchSubmitAdmit, _entry_ns, _admitted_ns, graph_key);
     GraphScopeResult result = rt_graph_begin(graph_key, args);
     const uint64_t _begun_ns = rt_orch_phase_now_ns();
     if (result.recording) {
-        GraphAsyncRecordingState &async = rt_graph_async_recording();
         void *handle = result.recording_handle;
-        auto record = [invoke, handle](GraphTaskArgs &record_args) mutable {
+        // A std::function rather than a bare lambda because the pool takes it as one
+        // through the ops table's void *.
+        std::function<void(GraphTaskArgs &)> job = [invoke, handle](GraphTaskArgs &record_args) mutable {
             try {
                 if (!rt_graph_prepare(handle, record_args)) {
                     rt_graph_abort(handle);
                     return;
                 }
                 invoke(record_args);
+                // Not paired with an abort: graph_end retires the entry it bound on
+                // every path that has one, including the fatal one. A second abort
+                // would race graph_commit's drain, which frees the entry after
+                // releasing recording_mutex — so the mutex this would take is no
+                // protection against touching it.
                 (void)rt_graph_end();
             } catch (...) {
                 rt_graph_abort(handle);
             }
         };
-        if (!async.start(args, std::move(record))) {
+        // The pool takes the callable whether or not it queues it: start() moves it into
+        // its own storage before it checks capacity, so `job` is empty either way. That
+        // costs nothing here, because the fallback below re-runs `invoke` -- captured by
+        // value, so unaffected -- rather than the job.
+        RuntimeContext *record_rt = current_runtime();
+        const bool queued =
+            record_rt->ops->graph_record_start != nullptr && record_rt->ops->graph_record_start(record_rt, args, &job);
+        if (!queued) {
             try {
                 if (!rt_graph_prepare(handle, args)) {
                     rt_graph_abort(handle);
@@ -804,8 +594,8 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // Handing the recording to a worker. Measured at 10-75 us per start and covered
         // by no other record: it runs after rt_graph_begin returns, so a swimlane shows
         // it as a gap with no recorder active — which is what it is, the recorder has
-        // not reached its first node yet.
-        rt_record_orch_phase(RtOrchPhase::RecordHandoff, _begun_ns, _exit_ns, graph_key);
+        // not reached its first in-graph task yet.
+        rt_record_orch_phase(HostPhaseKind::OrchRecordHandoff, _begun_ns, _exit_ns, graph_key);
     }
     _phase.count++;
     _phase.prev_exit_ns = _exit_ns;
@@ -876,8 +666,8 @@ rt_submit_graph(GraphFunctionWithConfig<Config...> function, const GraphTaskArgs
  * This struct is defined identically in runtime_core.h (with an include
  * guard) so the executor can use the same type without including this header.
  */
-#ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
-#define PTO2_ORCHESTRATION_CONFIG_DEFINED
+#ifndef ORCHESTRATION_CONFIG_DEFINED
+#define ORCHESTRATION_CONFIG_DEFINED
 struct OrchestrationConfig {
     int expected_arg_count;
 };

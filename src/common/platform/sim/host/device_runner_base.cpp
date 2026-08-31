@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -28,7 +30,7 @@
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
-#include "task_args.h"
+#include "task_args_wire.h"
 #include "utils/elf_build_id.h"
 
 #ifdef ENABLE_TRACR
@@ -132,7 +134,7 @@ int SimDeviceRunnerBase::setup_static_arena(
 ) {
     if (arena_bank >= arena_banks_.size()) return PTO_RUNTIME_ERR_INTERNAL;
     ArenaBank &bank = this->arena_bank(arena_bank);
-    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
@@ -384,46 +386,97 @@ void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void 
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *SimDeviceRunnerBase::acquire_graph_definition_buffer(
-    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
+int SimDeviceRunnerBase::acquire_graph_definition_block(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
-    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
+    if (device_out == nullptr || staging_out == nullptr) return -1;
+    *device_out = nullptr;
+    *staging_out = nullptr;
+    if (pipeline_slot >= graph_definition_blocks_.size() || bytes == 0 || alignment == 0 ||
         (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return nullptr;
+        return -1;
     }
-    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.aligned_addr == nullptr || block.capacity < bytes ||
+        reinterpret_cast<uintptr_t>(block.aligned_addr) % alignment != 0) {
+        const size_t allocation_bytes = bytes + alignment - 1;
+        void *allocation = mem_alloc_.alloc(allocation_bytes);
+        if (allocation == nullptr) return -1;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+        if (raw > UINTPTR_MAX - (alignment - 1)) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+        if (device_memset(aligned_addr, 0, bytes) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        if (block.allocation != nullptr && mem_alloc_.free(block.allocation) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        block.allocation = allocation;
+        block.aligned_addr = aligned_addr;
+        block.capacity = bytes;
     }
-
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
+    // Grow-only and never shrunk, so a steady-state bind assembles its objects
+    // in host memory it neither acquires nor returns.
+    if (block.staging.size() < bytes) block.staging.resize(bytes);
+    *device_out = block.aligned_addr;
+    *staging_out = block.staging.data();
+    return 0;
 }
 
-void SimDeviceRunnerBase::release_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        for (auto &entry : by_key) {
-            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
-        }
-        by_key.clear();
+void SimDeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (addr != nullptr) *addr = nullptr;
+    if (size != nullptr) *size = 0;
+    if (pipeline_slot >= graph_definition_blocks_.size()) return;
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.staging.empty()) return;
+    if (addr != nullptr) *addr = block.staging.data();
+    if (size != nullptr) *size = block.staging.size();
+}
+
+int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= sm_mirrors_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+        bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &mirror = sm_mirrors_[pipeline_slot];
+    // Grow-only and never shrunk: the task capacity is fixed for a given run
+    // configuration, so past the first bind the image is written into host pages
+    // that are already mapped, and each page of it faults once per process rather
+    // than once per bind.
+    const size_t needed = bytes + alignment - 1;
+    if (mirror.capacity < needed) {
+        // `new[]` on a trivially-typed array default-initializes, so the block
+        // costs no page until a bind writes one; make_unique would zero it. The
+        // outgoing block's bytes are not carried over, because nothing reads a byte
+        // this bind did not write.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        mirror.storage = std::move(storage);
+        mirror.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void SimDeviceRunnerBase::release_sm_mirrors() {
+    for (RetainedSmMirror &mirror : sm_mirrors_) {
+        mirror.storage.reset();
+        mirror.capacity = 0;
+    }
+}
+
+void SimDeviceRunnerBase::release_graph_definition_blocks() {
+    for (RetainedGraphBlock &block : graph_definition_blocks_) {
+        if (block.allocation != nullptr) mem_alloc_.free(block.allocation);
+        block = RetainedGraphBlock{};
     }
 }
 

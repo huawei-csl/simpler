@@ -26,22 +26,28 @@ PHASE_LINE = re.compile(r"bind phase=(\w+) start_ns=(\d+) dur_ns=(\d+)")
 # The recipe's first log line, recording the command and the commit the run used.
 # Two runs are comparable only if it matches, so it is echoed above the table.
 STAMP_LINE = re.compile(r"^\[stamp\] (.*)$")
+_JSON_STRING = r'"(?:\\.|[^"\\])*"'
+TORCH_AUTOLOAD_LINE = re.compile(
+    rf"(torch_backend_autoload setting=\S+ "
+    rf"(?:raw=(?:null|{_JSON_STRING}) raw_truncated=(?:true|false) )?effective=\S+ "
+    r"torch_imported=(?:true|false) torch_npu_loaded=(?:true|false))"
+)
 
 # The segments between "the caller's data is in place" and "the device can run".
-# `args` and `host_view_close` are per-byte costs over the weights the case
-# stages, so they belong to getting the weights resident, not to dispatch.
+# `args` is a per-byte staging cost. `host_view_close` remains excluded for
+# comparison with historical mapped-view logs; current binds close no mappings.
 CONTROL_PLANE = ("host_orch", "graph_upload", "relocate", "sm_h2d", "arena_h2d")
 
 # Display order: the bind stage's own sequence, so a reader can follow it down.
 PHASE_ORDER = (
     "args",
     "arena_build",
-    "static_arena",
-    "gm_heap",
-    "shared_mem",
     "runtime_init",
     "host_orch",
     "graph_upload",
+    "static_arena",
+    "shared_mem",
+    "gm_heap",
     "relocate",
     "sm_h2d",
     "arena_h2d",
@@ -83,6 +89,22 @@ def parse_stamp(path: str) -> str:
     return ""
 
 
+def parse_torch_autoload(path: str) -> list[str]:
+    """Unique torch backend autoload records in log order."""
+    records: list[str] = []
+    seen: set[str] = set()
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = TORCH_AUTOLOAD_LINE.search(line)
+            if match is None:
+                continue
+            record = match.group(1)
+            if record not in seen:
+                seen.add(record)
+                records.append(record)
+    return records
+
+
 def spread(values: list[float]) -> tuple[float, float, float]:
     """Minimum, median and maximum. The median averages the two central values."""
     return min(values), statistics.median(values), max(values)
@@ -106,9 +128,11 @@ def main() -> int:
     binds = parse_binds(args.log)
     if not binds:
         print(
-            f"{args.log}: no `bind phase=` lines. SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 and "
-            "SIMPLER_LOG_LEVEL=TIMING must both be set, and a multi-device case must be "
-            "invoked as its own child command -- see docs/dfx/hbg-bind-phases.md.",
+            f"{args.log}: no `bind phase=` lines. Either SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 "
+            "was not set, or a diagnostic flag made CallConfig.output_prefix non-empty and "
+            "moved the whole host log to outputs/<case>_<ts>/host.<pid>.log -- parse those "
+            "instead. The log level is not a cause: TIMING is the default. "
+            "See docs/dfx/hbg-bind-phases.md.",
             file=sys.stderr,
         )
         return 1
@@ -134,6 +158,13 @@ def main() -> int:
     else:
         print("  (no `[stamp]` line: the command and commit behind these numbers have")
         print("   to be established by hand before comparing them to anything)")
+    torch_autoload = parse_torch_autoload(args.log)
+    if torch_autoload:
+        for record in torch_autoload:
+            print(f"  {record}")
+    else:
+        print("  (no `torch_backend_autoload` record: backend-autoload state")
+        print("   must be established before comparing this log)")
     print(f"  {len(binds)} binds, {len(warm)} warm ({dropped} cold dropped, ranks={ranks})\n")
     print(f"  {'phase':<18}{'min':>10}{'median':>10}{'max':>10}   n")
     for phase in PHASE_ORDER:
@@ -170,7 +201,7 @@ def main() -> int:
             print(f"    WARNING: {', '.join(partial)} is missing from some binds but not all;")
             print("    those binds are excluded, and the total may not describe the run")
         print("\n  Compare by min, over the same phase set, against a log with the same")
-        print("  stamp; see docs/dfx/hbg-bind-phases.md 'Comparing two branches'.")
+        print("  stamp and torch autoload state; see docs/dfx/hbg-bind-phases.md 'Comparing two branches'.")
     else:
         print(f"\n  no bind carries any of {CONTROL_PLANE}; the control-plane total is not computable")
     return 0

@@ -44,7 +44,7 @@
 #include <vector>
 
 #include "../task_interface/call_config.h"
-#include "../task_interface/task_args.h"
+#include "../task_interface/task_args_wire.h"
 #include "../worker/runtime_c_api.h"
 
 // =============================================================================
@@ -113,7 +113,7 @@ struct TensorKeyHash {
 // Constants
 // =============================================================================
 
-// User-visible scope-nesting cap. Matches L2 PTO2_MAX_SCOPE_DEPTH.
+// User-visible scope-nesting cap. Matches L2 CHIP_MAX_SCOPE_DEPTH.
 static constexpr int32_t MAX_SCOPE_DEPTH = 64;
 
 // Number of independent HeapRing layers inside Ring. Scope depth maps
@@ -360,12 +360,12 @@ struct TaskSlotState {
     std::atomic<bool> failure_propagation_pending{false};
 
     // --- Fanout, plus the slot's pre-dispatch state transitions ---
-    // orch adds consumers; scheduler traverses on completion. The same mutex
+    // orch adds wait consumers; scheduler traverses on completion. The same mutex
     // covers every BUILDING/PENDING -> {READY, FAILED} transition and the
     // fields each of those decisions reads.
     std::mutex fanout_mu;
     std::vector<TaskSlot> fanout_consumers;
-    int32_t fanout_total{0};                  // 1 (scope ref) + fanout_consumers.size()
+    int32_t fanout_total{0};                  // scope ref + retained consumer refs
     std::atomic<int32_t> fanout_released{0};  // incremented as each ref is released
 
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---

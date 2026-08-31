@@ -52,9 +52,9 @@
  * Runtime execution mode
  */
 enum RuntimeMode {
-    PTO2_MODE_EXECUTE = 0,    // Execute tasks on workers
-    PTO2_MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
-    PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
+    MODE_EXECUTE = 0,    // Execute tasks on workers
+    MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
+    MODE_GRAPH_ONLY = 2  // Build graph only, no execution
 };
 
 /**
@@ -83,9 +83,11 @@ struct RuntimeOps {
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+    );
     void (*set_tensor_data)(
-        RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(RuntimeContext *rt, const CoreTaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(RuntimeContext *rt, const CoreTaskArgs &args);
@@ -122,8 +124,8 @@ struct ArenaSizingKey {
  */
 struct ArenaOffsets {
     size_t off_sm_handle{0};
-    PTO2OrchestratorLayout orch;
-    PTO2SchedulerLayout sched;
+    OrchestratorLayout orch;
+    SchedulerLayout sched;
     size_t off_runtime{0};
     size_t off_mailbox{0};
 
@@ -153,12 +155,12 @@ struct RuntimeArenaLayout {
 struct RuntimeContext {
     // Ops table (first field — used by orchestration .so via function pointers)
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode;
+    ScopeMode pending_scope_mode;
 
     // Components
-    PTO2SharedMemoryHandle *sm_handle;
-    PTO2OrchestratorState orchestrator;
-    PTO2SchedulerState scheduler;
+    SharedMemoryHandle *sm_handle;
+    OrchestratorState orchestrator;
+    SchedulerState scheduler;
     AICoreCompletionMailbox *aicore_mailbox;
 
     // GM Heap for output buffers
@@ -195,7 +197,7 @@ struct RuntimeContext {
  * Phase 2/3.
  */
 RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = CHIP_DEP_LIST_POOL_SIZE
 );
 RuntimeArenaLayout runtime_reserve_layout(
     DeviceArena &arena, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
@@ -295,7 +297,8 @@ void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, c
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-uint64_t get_tensor_data(RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[]);
+uint64_t
+get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
@@ -303,15 +306,15 @@ uint64_t get_tensor_data(RuntimeContext *rt, const ChipTensor &tensor, uint32_t 
  * See set_tensor_data in orchestration_api.h for full documentation.
  */
 void set_tensor_data(
-    RuntimeContext *rt, const ChipTensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 );
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().
  * Shared definition with orchestration_api.h (same layout, guarded).
  */
-#ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
-#define PTO2_ORCHESTRATION_CONFIG_DEFINED
+#ifndef ORCHESTRATION_CONFIG_DEFINED
+#define ORCHESTRATION_CONFIG_DEFINED
 struct OrchestrationConfig {
     int expected_arg_count;
 };

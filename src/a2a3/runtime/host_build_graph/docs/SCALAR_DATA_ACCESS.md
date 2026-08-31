@@ -70,11 +70,13 @@ it derives for itself, from a heap block whose prior contents it never reads.
 
 Before a wait slot is used, the runtime verifies:
 
-- the task ID is valid and belongs to the single HBG ring;
-- the selected ring slot has a bound task descriptor; and
+- the task ID is valid and lies in the `GLOBAL` id space — an `IN_GRAPH` id packs
+  its Graph task and task index into the low bits, so it indexes no task table
+  slot (see `src/common/host_build_graph/task_id_encoding.h`);
+- the task table slot that ID indexes has a bound task descriptor; and
 - the descriptor's full task ID matches the tensor's owner/producer ID.
 
-The full-ID check prevents a masked ring-slot lookup from aliasing an unused or
+The full-ID check prevents a slot lookup from aliasing an unused or
 different task. A failure latches `SIMPLER_ERROR_INVALID_ARGS` and the run returns
 status `-5`; reads return zero and writes stop only after that fatal status is
 recorded.
