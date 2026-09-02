@@ -21,8 +21,8 @@ from tests.st.a2a3.tensormap_and_ringbuffer.spmd_paged_attention.test_spmd_paged
 
 
 # M4 sweeps the AICPU thread count without editing this file:
-#   SAC_THREADS=1|2|3|4  (default 1, the M2/M3 single-threaded baseline)
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "1"))
+#   SAC_THREADS=1|2|3|4  (default 4; set 1 for the single-threaded correctness gate)
+_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestSpmdPagedAttentionScanAndClaim(_TmrBase):

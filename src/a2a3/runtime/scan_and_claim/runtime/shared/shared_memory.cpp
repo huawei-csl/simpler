@@ -55,6 +55,14 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t pitch) {
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
     ring.slot_states = (ChipTaskSlotState *)(base + off.slot_states);
     ring.completion_flags = (std::atomic<uint8_t> *)(base + off.completion_flags);
+    // scan_and_claim dependency counters + fanout CSR. Their starts are
+    // pitch-only by construction (they precede every pool-sized segment), so the
+    // zeroed pool extents above do not disturb them. fanout_ids' LENGTH does
+    // depend on the pool extent, but no consumer needs it: the device bounds its
+    // walks by fanout_offsets' contents.
+    ring.fanin_remaining = (std::atomic<int16_t> *)(base + off.fanin_remaining);
+    ring.fanout_offsets = (int32_t *)(base + off.fanout_offsets);
+    ring.fanout_ids = (int32_t *)(base + off.fanout_ids);
 }
 
 bool PTO2SharedMemoryHandle::init(

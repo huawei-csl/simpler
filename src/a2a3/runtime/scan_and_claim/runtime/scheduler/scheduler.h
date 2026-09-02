@@ -681,11 +681,15 @@ struct PTO2SchedulerState {
             // the graph and the run dies of a forward-progress timeout.
             if (s.task_kind == TaskKind::GRAPH || s.task_kind == TaskKind::GRAPH_NODE) continue;
 
-            // Dependencies, re-derived from the flags on every visit. There is no
-            // READY memo in v1: a repeat fanin check is a handful of byte loads,
-            // and skipping the memo removes a whole state and its transitions
-            // from the first version that has to be debugged.
-            if (classify_fanin_state(&s) >= 0) continue;
+            // Dependencies via the counter: one acquire load instead of walking
+            // the fanin list. fanin_remaining[i] counts producers not yet
+            // retired; the host wrote the initial value into the image and every
+            // producer's retire decrements it (release RMW), so reading 0 with
+            // acquire guarantees ALL producers' outputs are visible (RMWs form a
+            // release sequence). The flags stay authoritative for the cursor and
+            // the host; classify_fanin_state remains for the paths that still
+            // key on flags -- the two views describe the same monotonic facts.
+            if (ring.fanin_pending(i)) continue;
 
             const PTO2ResourceShape shape = s.active_mask.to_shape();
             const bool predicate_failed =
@@ -765,6 +769,13 @@ struct PTO2SchedulerState {
 
         slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
         ring.set_completion_flag(task_id);
+        // Counter-based dependency resolution: tell every consumer one of its
+        // producers retired. Runs exactly once per task, because
+        // on_mixed_task_complete itself does (the last-subtask winner, or the
+        // flag-CAS winner for dep-only tasks) -- a duplicated call here would
+        // over-decrement and make a consumer ready EARLY, which is a wrong-answer
+        // bug, not a hang. Ordered after the output publish like the flag.
+        ring.resolve_fanouts(task_id);
 
         // scan_and_claim: no wake-list drain, and no push of newly-ready
         // consumers. Publishing the completion_flags byte IS the notification —

@@ -132,6 +132,41 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
         );
     }
 
+    // scan_and_claim: counter-based dependency resolution.
+    //
+    // fanin_remaining[slot] = how many of this task's producers have not yet
+    // retired. Written by the host into the image (initial value = fanin_count,
+    // so there is no device-side seeding), decremented by producers at retire,
+    // and read by the scan: 0 means every dependency is met.
+    //
+    // The completion_flags stay authoritative alongside this: the cursor's
+    // contiguous walk, the host wait, and the dep-only claim all key on flags.
+    // The counters are an index over the same monotonic facts, not a second
+    // source of truth.
+    std::atomic<int16_t> *fanin_remaining;
+    int32_t *fanout_offsets;  // CSR row starts: consumers of task t are
+    int32_t *fanout_ids;      //   fanout_ids[fanout_offsets[t] .. fanout_offsets[t+1])
+
+    bool fanin_pending(int32_t local_id, std::memory_order order = std::memory_order_acquire) const {
+        return fanin_remaining[local_id & task_window_mask].load(order) != 0;
+    }
+
+    // Producer-side half of the protocol: called exactly once per task, at
+    // retire, AFTER the task's outputs are published (same ordering rule as
+    // set_completion_flag). Each decrement is a release RMW; atomic RMWs form a
+    // release sequence, so a consumer whose acquire load reads the final 0
+    // synchronizes with EVERY producer's decrement, not just the last one --
+    // which is exactly the "all my producers' outputs are visible" guarantee
+    // the scan needs from a single load.
+    void resolve_fanouts(int32_t local_id) {
+        const int32_t slot = local_id & task_window_mask;
+        const int32_t begin = fanout_offsets[slot];
+        const int32_t end = fanout_offsets[slot + 1];
+        for (int32_t k = begin; k < end; ++k) {
+            fanin_remaining[fanout_ids[k] & task_window_mask].fetch_sub(1, std::memory_order_release);
+        }
+    }
+
     // set completion flag first before updating the watermark (logic requirement)
     void update_completed_watermark() {
         int32_t curr_watermark = completed_watermark.load(std::memory_order_acquire);
@@ -177,7 +212,11 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     }
 };
 
-static_assert(sizeof(PTO2SharedMemoryRingHeader) == 192, "PTO2SharedMemoryRingHeader layout drift");
+// scan_and_claim's ring header deliberately diverges from hbg's (192 B): the
+// three dependency-counter/CSR pointers grow it to 216, padded to alignas(64).
+// Both sides of the ABI compile from THIS header, so the divergence is safe --
+// these asserts exist to catch unintentional drift, and this change is not that.
+static_assert(sizeof(PTO2SharedMemoryRingHeader) == 256, "PTO2SharedMemoryRingHeader layout drift");
 static_assert(
     offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 152,
     "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
@@ -211,10 +250,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
-static_assert(sizeof(PTO2SharedMemoryHeader) == 256, "PTO2SharedMemoryHeader layout drift");
-static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 200, "PTO2SharedMemoryHeader total_size layout drift");
+static_assert(sizeof(PTO2SharedMemoryHeader) == 320, "PTO2SharedMemoryHeader layout drift");
+static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 264, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 208, "PTO2SharedMemoryHeader orch_error_code layout drift"
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 272, "PTO2SharedMemoryHeader orch_error_code layout drift"
 );
 
 // =============================================================================
@@ -336,6 +375,14 @@ struct PTO2RingSegmentOffsets {
     uint64_t payloads;
     uint64_t slot_states;
     uint64_t completion_flags;  // polling-completion byte array (1 byte/slot)
+    // scan_and_claim dependency counters + fanout CSR. Placed BEFORE the pools on
+    // purpose: their starts must depend on the slot pitch alone, because the
+    // device's setup_pointers computes offsets with the pool extents zeroed.
+    // (fanout_ids' LENGTH is pool-sized, but nothing after it is device-resolved
+    // by offset, and the device bounds its walks by fanout_offsets' contents.)
+    uint64_t fanin_remaining;  // one atomic<int16_t> per slot: producers left
+    uint64_t fanout_offsets;   // CSR row starts, (slots + 1) x int32
+    uint64_t fanout_ids;       // CSR consumer ids, sized like fanin_pool
     uint64_t fanin_pool;
     uint64_t tensor_pool;
     uint64_t scalar_pool;
@@ -378,6 +425,14 @@ inline PTO2RingSegmentOffsets ring_segment_offsets(const RingImageExtents &e) no
     off += PTO2_ALIGN_UP(e.slots * sizeof(ChipTaskSlotState), PTO2_ALIGN_SIZE);
     o.completion_flags = off;
     off += PTO2_ALIGN_UP(e.slots * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
+    o.fanin_remaining = off;
+    off += PTO2_ALIGN_UP(e.slots * sizeof(std::atomic<int16_t>), PTO2_ALIGN_SIZE);
+    o.fanout_offsets = off;
+    off += PTO2_ALIGN_UP((e.slots + 1) * sizeof(int32_t), PTO2_ALIGN_SIZE);
+    o.fanout_ids = off;
+    // Total fanout edges == total fanin edges, so the CSR id array is sized
+    // exactly like fanin_pool (and compacts by the same used.fanin_elems).
+    off += PTO2_ALIGN_UP(e.fanin_elems * sizeof(int32_t), PTO2_ALIGN_SIZE);
     o.fanin_pool = off;
     off += PTO2_ALIGN_UP(e.fanin_elems * sizeof(int32_t), PTO2_ALIGN_SIZE);
     o.tensor_pool = off;
@@ -468,6 +523,9 @@ compact_live_image(const char *mirror_base, uint64_t task_window_size, const Bin
     out_ring.task_payloads = nullptr;
     out_ring.slot_states = nullptr;
     out_ring.completion_flags = nullptr;
+    out_ring.fanin_remaining = nullptr;
+    out_ring.fanout_offsets = nullptr;
+    out_ring.fanout_ids = nullptr;
 
     const uint64_t nt = used.submitted_tasks;
     std::memcpy(out_base + to.descriptors, mirror_base + from.descriptors, nt * sizeof(PTO2TaskDescriptor));
@@ -518,6 +576,60 @@ compact_live_image(const char *mirror_base, uint64_t task_window_size, const Bin
             src_fanin == nullptr ? nullptr : out_fanin + (src_fanin - mirror_fanin)
         );
     }
+    // ---- scan_and_claim: build the dependency counters + fanout CSR ----
+    // Done here, into the image, because this is the one host-side point that
+    // already has every payload's re-bound fanin region and runs on every bind
+    // before the upload. Initial counter values ride the H2D like any other
+    // segment: no device-side seeding pass exists or is needed.
+    {
+        auto *remaining = reinterpret_cast<std::atomic<int16_t> *>(out_base + to.fanin_remaining);
+        auto *fo = reinterpret_cast<int32_t *>(out_base + to.fanout_offsets);
+        auto *fids = reinterpret_cast<int32_t *>(out_base + to.fanout_ids);
+        // A producer whose completion flag is ALREADY SET here never runs on the
+        // device and therefore never decrements anyone: hidden-alloc producers
+        // complete inline during host orchestration and pre-publish their flag
+        // (see the "must publish its flag too" comment in orch prepare). The
+        // flags model steps past them transparently; the counter model must do
+        // the same by NOT counting them -- count an inline-completed producer
+        // and its consumers are stranded at remaining > 0 forever. The flags
+        // were memcpy'd into the image above, so read them from there.
+        const auto *done = reinterpret_cast<const std::atomic<uint8_t> *>(out_base + to.completion_flags);
+        auto producer_pending = [&](int32_t p2) {
+            return done[p2].load(std::memory_order_relaxed) == 0;
+        };
+        for (uint64_t k = 0; k <= nt; ++k) fo[k] = 0;
+        // pass 1: counters + fanout histogram (counts land at fo[p + 1])
+        for (uint64_t i2 = 0; i2 < nt; ++i2) {
+            const int32_t fc = out_payloads[i2].fanin_count;
+            always_assert(fc >= 0 && fc <= INT16_MAX);
+            const int32_t *fan = out_payloads[i2].fanin_data();
+            int16_t pending = 0;
+            for (int32_t e2 = 0; e2 < fc; ++e2) {
+                const uint64_t prod = static_cast<uint64_t>(fan[e2]);
+                always_assert(prod < nt);  // topological submission order
+                if (!producer_pending(static_cast<int32_t>(prod))) continue;
+                pending++;
+                fo[prod + 1]++;
+            }
+            remaining[i2].store(pending, std::memory_order_relaxed);
+        }
+        // pass 2: prefix sum -> fo[p] = start of p's consumer range
+        for (uint64_t k = 1; k <= nt; ++k) fo[k] += fo[k - 1];
+        // pass 3: fill, using fo[p] as the insertion cursor (classic in-place CSR:
+        // afterwards fo[p] holds p's END == p+1's start, fixed by the shift below).
+        // Skips must MIRROR pass 1 exactly, or rows and counts disagree.
+        for (uint64_t i2 = 0; i2 < nt; ++i2) {
+            const int32_t fc = out_payloads[i2].fanin_count;
+            const int32_t *fan = out_payloads[i2].fanin_data();
+            for (int32_t e2 = 0; e2 < fc; ++e2) {
+                if (!producer_pending(fan[e2])) continue;
+                fids[fo[fan[e2]]++] = static_cast<int32_t>(i2);
+            }
+        }
+        for (uint64_t k = nt; k >= 1; --k) fo[k] = fo[k - 1];
+        fo[0] = 0;
+    }
+
     return to.end;
 }
 
