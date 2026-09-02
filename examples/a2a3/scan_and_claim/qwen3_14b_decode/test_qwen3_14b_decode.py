@@ -74,7 +74,12 @@ class TestQwen314BDecodeScanAndClaim(_TmrBase):
             "name": "StressBatch16Seq3500",
             "platforms": ["a2a3"],
             "manual": True,
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {
+                "aicpu_thread_num": _SAC_THREADS,
+                # ~19.2K tasks exceed the 16384 default window; host-orch holds all
+                # 40 layers' intermediates live at once. Env sizing is retired on main.
+                "runtime_env": {"ring_task_window": 32768, "ring_heap": 1073741824},
+            },
             "params": {"seed": 1234, "seq_len": 3500},
         },
     ]

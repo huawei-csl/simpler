@@ -82,7 +82,11 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
             # a large PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP if needed.
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {"aicpu_thread_num": _SAC_THREADS,
+                       # whole-graph-resident: window and heap must hold the entire
+                       # graph. The PTO2_RING_* env vars are retired on main (warn +
+                       # ignore), so sizing lives here, per case.
+                       "runtime_env": {"ring_task_window": 131072, "ring_heap": 2147483648}},
             "manual": True,
             "params": {
                 "batch": 256,
@@ -98,7 +102,11 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {"aicpu_thread_num": _SAC_THREADS,
+                       # whole-graph-resident: window and heap must hold the entire
+                       # graph. The PTO2_RING_* env vars are retired on main (warn +
+                       # ignore), so sizing lives here, per case.
+                       "runtime_env": {"ring_task_window": 65536, "ring_heap": 1073741824}},
             "manual": True,
             "params": {
                 "batch": 64,
