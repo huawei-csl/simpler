@@ -34,6 +34,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
+#include "common/platform_config.h"  // PLATFORM_MAX_AICPU_THREADS for the deferred-ready FIFOs
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
@@ -638,8 +639,31 @@ struct PTO2SchedulerState {
     // the position forward so bounding it costs coverage-per-pass, not coverage.
     static constexpr int SCAN_CAP = 128;
 
+    // Per-thread deferred-ready FIFO: consumer ids whose fanin count hit zero
+    // (observed by resolve_fanouts at some retire on this thread) and which are
+    // not yet fully claimed. pop_ready_tasks_batch services this list BEFORE
+    // the window scan, so a consumer readied by a FIN on this thread's core
+    // dispatches on the very next pass instead of waiting for a scan cursor to
+    // crawl to its slot — the discovery-latency fix for sparse ready sets
+    // (the serialized drain tail). Single-owner: only thread t reads or writes
+    // deferred_ready_[t], so no atomics; alignas keeps neighbors off each
+    // other's cache lines.
+    //
+    // The list is a latency optimization, not a correctness structure: it is
+    // bounded (an append to a full list is dropped), entries go stale (a peer's
+    // scan claims the task first), and anything it loses the window scan
+    // rediscovers from the flags/counters. An entry is removed once its task is
+    // retired, fully claimed, or stale; a partially claimed SPMD task stays
+    // listed so follow-up pops keep offering its remaining blocks.
+    struct alignas(64) DeferredReadyFifo {
+        static constexpr int32_t CAP = 256;
+        int32_t ids[CAP];
+        int32_t count{0};
+    };
+    DeferredReadyFifo deferred_ready_[PLATFORM_MAX_AICPU_THREADS]{};
+
     int scan_ready_tasks_batch(
-        PTO2ResourceShape want_shape, ChipTaskSlotState **out, int max_count, [[maybe_unused]] int thread_idx,
+        PTO2ResourceShape want_shape, ChipTaskSlotState **out, int max_count, int thread_idx,
         int32_t &out_retired, int32_t &resume
     ) {
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
@@ -709,11 +733,7 @@ struct PTO2SchedulerState {
                 // same dep-only task ready in the same instant. The flag CAS
                 // makes exactly one of them the retirer; the loser skips.
                 if (!ring.try_claim_completion_flag(i)) continue;
-#if SIMPLER_SCHED_PROFILING
                 TaskCompletionOutcome outcome = complete_task(s, thread_idx);
-#else
-                TaskCompletionOutcome outcome = complete_task(s);
-#endif
                 if (outcome.error_code == SIMPLER_ERROR_NONE) {
                     out_retired += outcome.stream_tasks_completed;
                 }
@@ -757,32 +777,96 @@ struct PTO2SchedulerState {
         return found;
     }
 
+    // Serves pop_ready_tasks_batch from this thread's deferred-ready FIFO,
+    // ahead of any window scan. Applies the scan's guards in the scan's order;
+    // the fanin test alone is unnecessary — an id enters the list only at its
+    // zero-crossing, and a counter at 0 stays 0. Dep-only tasks retire inline
+    // exactly as in the scan, and their own zero-crossings append to this same
+    // FIFO mid-iteration (`fifo.count` is re-read every step; appends land past
+    // the read cursor and compaction writes only behind it), so dummy chains
+    // cascade within a single call. Entries whose shape was not asked for, and
+    // tasks with unclaimed blocks remaining, stay listed for later calls.
+    int service_deferred_ready(
+        PTO2ResourceShape want_shape, ChipTaskSlotState **out, int max_count, int thread_idx, int32_t &out_retired
+    ) {
+        DeferredReadyFifo &fifo = deferred_ready_[thread_idx];
+        if (fifo.count == 0) return 0;
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        int found = 0;
+        int32_t kept = 0;
+        for (int32_t idx = 0; idx < fifo.count; ++idx) {
+            const int32_t i = fifo.ids[idx];
+            bool keep = false;
+            do {
+                if (ring.is_completion_flag_set(i)) break;  // retired by a peer's claim
+                ChipTaskSlotState &s = ring.get_slot_state_by_task_id(i);
+                if (s.task == nullptr || s.payload == nullptr) break;
+                if (s.task_kind == TaskKind::GRAPH || s.task_kind == TaskKind::GRAPH_NODE) break;
+
+                // Cross-round staleness test. Within one round a listed id's
+                // counter is 0 forever — counters only count down and each
+                // producer decrements exactly once — so a nonzero counter
+                // proves this id survived from a previous round's window,
+                // where the re-uploaded image gave the slot a fresh fanin
+                // count. Dispatching it would run a task whose producers have
+                // not finished; drop it instead.
+                if (ring.fanin_pending(i)) break;
+
+                const PTO2ResourceShape shape = s.active_mask.to_shape();
+                const bool predicate_failed = s.task_attrs.has_predicate() && !s.payload->predicate.pass();
+                if (shape == PTO2ResourceShape::DUMMY || predicate_failed) {
+                    // Same claim rule as the scan: the flag CAS elects exactly one
+                    // retirer among this FIFO, peer FIFOs, and peer scans.
+                    if (!ring.try_claim_completion_flag(i)) break;
+                    TaskCompletionOutcome outcome = complete_task(s, thread_idx);
+                    if (outcome.error_code == SIMPLER_ERROR_NONE) {
+                        out_retired += outcome.stream_tasks_completed;
+                    }
+                    break;
+                }
+                if (s.next_block_idx.load(std::memory_order_acquire) >= s.logical_block_num) break;  // fully claimed
+                keep = true;  // unclaimed blocks remain — offer again until fully claimed or stale
+                if (shape != want_shape || found >= max_count) break;
+                out[found++] = &s;
+            } while (false);
+            if (keep) fifo.ids[kept++] = fifo.ids[idx];
+        }
+        fifo.count = kept;
+        return found;
+    }
+
     // Producer completion under polling: publish the host-visible task_state
     // mirror + the device-visible completion_flags byte, drain the wake list
     // (route/re-register each waiter), then CAS-advance the monotonic
     // completed_watermark (load-bearing: the host wait_for_consumers gates on
     // watermark >= producer.last_consumer_local_id). Whole-graph-resident hbg
     // has no device slot reclaim, so no advance_ring_pointers here.
-    void on_mixed_task_complete(ChipTaskSlotState &slot_state) {
+    void on_mixed_task_complete(ChipTaskSlotState &slot_state, int thread_idx) {
         const int32_t task_id = static_cast<int32_t>(slot_state.task->task_id.local());
         PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
 
         slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
         ring.set_completion_flag(task_id);
         // Counter-based dependency resolution: tell every consumer one of its
-        // producers retired. Runs exactly once per task, because
-        // on_mixed_task_complete itself does (the last-subtask winner, or the
-        // flag-CAS winner for dep-only tasks) -- a duplicated call here would
-        // over-decrement and make a consumer ready EARLY, which is a wrong-answer
-        // bug, not a hang. Ordered after the output publish like the flag.
-        ring.resolve_fanouts(task_id);
+        // producers retired, and remember — in this thread's deferred-ready
+        // FIFO — every consumer this retire made ready, so the next dispatch
+        // pass places it without waiting for a scan cursor. Runs exactly once
+        // per task, because on_mixed_task_complete itself does (the
+        // last-subtask winner, or the flag-CAS winner for dep-only tasks) -- a
+        // duplicated call here would over-decrement and make a consumer ready
+        // EARLY, which is a wrong-answer bug, not a hang. Ordered after the
+        // output publish like the flag.
+        DeferredReadyFifo &fifo = deferred_ready_[thread_idx];
+        fifo.count += ring.resolve_fanouts(task_id, &fifo.ids[fifo.count], DeferredReadyFifo::CAP - fifo.count);
 
-        // scan_and_claim: no wake-list drain, and no push of newly-ready
-        // consumers. Publishing the completion_flags byte IS the notification —
-        // every scheduler thread re-derives readiness from those flags on its
-        // next scan, so a consumer that became ready here is found by whoever
-        // scans past it next. This is the whole point of the design: there is no
-        // wakeup to lose, so there is no protocol to get wrong.
+        // scan_and_claim: no wake-list drain, and no cross-thread hand-off of
+        // newly-ready consumers. Publishing the completion_flags byte and the
+        // counter decrements IS the authoritative notification — every
+        // scheduler thread re-derives readiness from them on its next scan, so
+        // a FIFO entry that overflows, goes stale, or is claimed by a peer
+        // first costs nothing. The FIFO is a single-owner latency hint in
+        // front of scan rediscovery, not a hand-off protocol: there is still
+        // no wakeup to lose.
         //
         // set_completion_flag is a release store and the payload writes precede
         // it, so a consumer that observes the flag (acquire, via
@@ -1163,20 +1247,14 @@ struct PTO2SchedulerState {
         int32_t error_code{SIMPLER_ERROR_NONE};
     };
 
-    TaskCompletionOutcome complete_task(
-        ChipTaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
+    TaskCompletionOutcome complete_task(ChipTaskSlotState &slot_state, int thread_idx) {
         TaskCompletionOutcome outcome;
         if (slot_state.task_kind != TaskKind::GRAPH_NODE) {
 #if SIMPLER_SCHED_PROFILING
             CompletionStats stats = on_task_complete(slot_state, thread_idx);
             outcome.fanout_edges = static_cast<uint32_t>(stats.fanout_edges);
 #else
-            outcome.fanout_edges = on_task_complete(slot_state);
+            outcome.fanout_edges = on_task_complete(slot_state, thread_idx);
 #endif
             outcome.stream_tasks_completed = 1;
             return outcome;
@@ -1221,7 +1299,7 @@ struct PTO2SchedulerState {
         // the outer ring task exactly once, waking external consumers and
         // contributing the one task the host actually submitted.
         if (execution->outer_slot != nullptr) {
-            on_mixed_task_complete(*execution->outer_slot);
+            on_mixed_task_complete(*execution->outer_slot, thread_idx);
             outcome.stream_tasks_completed = 1;
         }
         graph_execution_mark_completed(*execution);
@@ -1258,20 +1336,13 @@ struct PTO2SchedulerState {
 #else
     uint32_t
 #endif
-    on_task_complete(
-        ChipTaskSlotState &slot_state
-#if SIMPLER_SCHED_PROFILING
-        ,
-        int thread_idx
-#endif
-    ) {
+    on_task_complete(ChipTaskSlotState &slot_state, int thread_idx) {
         // Polling completion: publish the host-visible task_state mirror + the
         // device-visible completion_flags byte, drain the wake list (route or
         // re-register each waiter), and advance the watermark. Replaces the
         // fanout-list walk + fanin_refcount decrements of the wiring model.
-        on_mixed_task_complete(slot_state);
+        on_mixed_task_complete(slot_state, thread_idx);
 #if SIMPLER_SCHED_PROFILING
-        (void)thread_idx;
         // Resolved-successor accounting is not tracked on the polling path (the
         // producer no longer enumerates its consumers); report 0 for the DFX bar.
         return CompletionStats{0, 0, 0, true};
@@ -1335,11 +1406,7 @@ inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, ChipTaskSlotState &slot_state) {
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
     PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state, sink.thread_idx);
-#else
-    PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state);
-#endif
     if (outcome.error_code != SIMPLER_ERROR_NONE) {
         sink.error_code = outcome.error_code;
         return false;
@@ -1350,21 +1417,14 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 }
 
 template <bool Profiling>
-inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched
-#if SIMPLER_SCHED_PROFILING
-    ,
-    int thread_idx
-#endif
-) {
+inline AsyncPollResult
+AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, int thread_idx) {
     AsyncPollResult result;
     if (!try_lock()) return result;
 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
-#if SIMPLER_SCHED_PROFILING
     sink.thread_idx = thread_idx;
-#endif
 
     int32_t drain_err = SIMPLER_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -1406,11 +1466,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
-#if SIMPLER_SCHED_PROFILING
             PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state, thread_idx);
-#else
-            PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state);
-#endif
             if (outcome.error_code != SIMPLER_ERROR_NONE) {
                 result.error_code = outcome.error_code;
                 result.failed_slot_state = entry.slot_state;

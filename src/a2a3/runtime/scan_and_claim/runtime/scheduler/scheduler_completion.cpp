@@ -196,11 +196,7 @@ void SchedulerContext::complete_slot_task(
         // (hbg's 3S+1P had stopped using it, hence the [[maybe_unused]] on the
         // parameter) so the caller's progress accounting and hang detection see
         // the completion on the thread that observed it.
-#if SIMPLER_SCHED_PROFILING
         PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state, thread_idx);
-#else
-        PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state);
-#endif
         if (outcome.error_code != SIMPLER_ERROR_NONE) {
             // complete_slot_task has no Runtime* to hand fail_scheduler, so latch
             // the code and let the dispatch loop raise it on the next turn.

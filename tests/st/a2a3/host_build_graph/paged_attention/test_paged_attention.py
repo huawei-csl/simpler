@@ -72,10 +72,11 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             # ~64K tasks, and host-orchestration populates the whole task graph
             # before the device schedules — so the ring/heap cannot reclaim
             # mid-orchestration and must hold the entire graph at once. That
-            # exceeds the default ring window / GM heap. Run it explicitly with
-            # a large PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP if needed.
+            # exceeds the default ring window / GM heap; the per-case
+            # "runtime_env" below sizes both.
             "name": "Case1",
             "platforms": ["a2a3"],
+            "config": {"runtime_env": {"ring_task_window": 131072, "ring_heap": 2147483648}},
             "manual": True,
             "params": {
                 "batch": 256,
@@ -91,6 +92,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
+            "config": {"runtime_env": {"ring_task_window": 65536, "ring_heap": 1073741824}},
             "manual": True,
             "params": {
                 "batch": 64,

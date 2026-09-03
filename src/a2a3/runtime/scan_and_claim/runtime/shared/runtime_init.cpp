@@ -131,6 +131,13 @@ bool PTO2SchedulerState::init_data_from_layout(
     }
     ready_queue_init_data_from_layout(&sched->early_sync_start_queue, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
 
+    // The state is arena-cast (no constructor runs, arena memory is not
+    // zeroed), so the deferred-ready FIFOs must be emptied here like every
+    // other field.
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
+        sched->deferred_ready_[i].count = 0;
+    }
+
     // Polling: no dep_pool arena region to initialize.
     (void)arena;
     (void)layout;
@@ -156,6 +163,12 @@ void PTO2SchedulerState::seed_queue_slots() {
         sched->early_dispatch_queues[i].seed_slots();
     }
     sched->early_sync_start_queue.seed_slots();
+    // Same arena-cast rule as init_data_from_layout: the deferred-ready FIFOs
+    // hold garbage until explicitly emptied, and this is the device-side hook
+    // that runs before any dispatch.
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
+        sched->deferred_ready_[i].count = 0;
+    }
 }
 
 void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena) {

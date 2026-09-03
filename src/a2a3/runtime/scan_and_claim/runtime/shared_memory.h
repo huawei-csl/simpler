@@ -158,13 +158,30 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     // synchronizes with EVERY producer's decrement, not just the last one --
     // which is exactly the "all my producers' outputs are visible" guarantee
     // the scan needs from a single load.
-    void resolve_fanouts(int32_t local_id) {
+    //
+    // fetch_sub returning 1 means THIS decrement drove the count to 0: the
+    // caller is the unique observer of that zero-crossing (every other
+    // producer saw a larger value), so a collected id can never be reported
+    // twice. Up to `cap` zero-crossed consumer ids are written to
+    // `zero_crossed`; an overflowing id is left uncollected -- the window
+    // scan rediscovers it positionally, so dropping costs latency, never
+    // correctness. The acquire fence pairs with the release sequence the
+    // final decrement read from: after it, every producer's outputs are
+    // visible to this thread, which may therefore dispatch the collected
+    // consumers immediately.
+    int32_t resolve_fanouts(int32_t local_id, int32_t *zero_crossed, int32_t cap) {
         const int32_t slot = local_id & task_window_mask;
         const int32_t begin = fanout_offsets[slot];
         const int32_t end = fanout_offsets[slot + 1];
+        int32_t n = 0;
         for (int32_t k = begin; k < end; ++k) {
-            fanin_remaining[fanout_ids[k] & task_window_mask].fetch_sub(1, std::memory_order_release);
+            const int32_t consumer = fanout_ids[k];
+            if (fanin_remaining[consumer & task_window_mask].fetch_sub(1, std::memory_order_release) == 1) {
+                if (n < cap) zero_crossed[n++] = consumer;
+            }
         }
+        if (n > 0) std::atomic_thread_fence(std::memory_order_acquire);
+        return n;
     }
 
     // set completion flag first before updating the watermark (logic requirement)

@@ -104,22 +104,31 @@ int SchedulerContext::pop_ready_tasks_batch(
 ) {
     (void)queues;
     // Inline retirements (dummy / predicate-false) are completions that no core
-    // will ever report, so they are accounted here, at the one place every scan
-    // funnels through.
+    // will ever report, so they are accounted here, at the one place every
+    // discovery source funnels through.
     int32_t retired_inline = 0;
+    // Discovery order: the thread's deferred-ready FIFO first (consumers whose
+    // zero-crossing this thread observed at a retire — placed with no scan
+    // latency), then the window scan for the remainder. Both sources feed the
+    // same out[] under the same contract, so dispatch_shape is agnostic to
+    // which one found a task.
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #if SIMPLER_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
-    int count = sched_->scan_ready_tasks_batch(
-        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
-    );
+#endif
+#endif
+    int count = sched_->service_deferred_ready(shape, out, max_count, thread_idx, retired_inline);
+    if (count < max_count) {
+        count += sched_->scan_ready_tasks_batch(
+            shape, out + count, max_count - count, thread_idx, retired_inline,
+            scan_resume_[thread_idx][static_cast<int32_t>(shape)]
+        );
+    }
+#if SIMPLER_DFX
+#if SIMPLER_SCHED_PROFILING
     chip_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
-#else
-    int count = sched_->scan_ready_tasks_batch(
-        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
-    );
 #endif
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -128,15 +137,6 @@ int SchedulerContext::pop_ready_tasks_batch(
             chip_swimlane.pop_miss++;
         }
     }
-    if (retired_inline > 0) {
-        completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
-        inline_retired_this_pass_[thread_idx] += retired_inline;
-    }
-    return count;
-#else
-    int count = sched_->scan_ready_tasks_batch(
-        shape, out, max_count, thread_idx, retired_inline, scan_resume_[thread_idx][static_cast<int32_t>(shape)]
-    );
 #endif
     if (retired_inline > 0) {
         completed_tasks_.fetch_add(retired_inline, std::memory_order_relaxed);
@@ -1101,13 +1101,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // hbg only ever called it from the single P thread.
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
-            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_
-#if SIMPLER_SCHED_PROFILING
-                ,
-                thread_idx
-#endif
-            );
+            AsyncPollResult poll_result =
+                sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, thread_idx);
             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
                 fail_scheduler(runtime, thread_idx, poll_result.error_code);
                 break;
