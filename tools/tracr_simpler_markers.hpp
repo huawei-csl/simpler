@@ -45,18 +45,35 @@ inline thread_local int g_TraCR_thread_idx{-1};
 // Removed as dead in every runtime (zero call sites in hbg, tmr, sac, platform
 // or common): Read_Dimensions, Reshape_Kernels, Pre_Loop_Info, PTO2_SCOPE_.
 //
-// Which runtime uses what, so an unused-looking marker is not deleted by
-// mistake: Orchestrating / Phase3 / DLL_loading / Allocating / Barrier are
-// tensormap_and_ringbuffer's (it orchestrates on device); Resolving is
-// host_build_graph's dedicated resolution thread (3S+1P). scan_and_claim uses
-// neither -- it has no device orchestrator and no P thread.
+// Which runtime marks what, so an unused-looking marker is not deleted by
+// mistake, and so a name can be trusted to mean the same thing in every trace:
+//
+//   Retiring          all three: poll own cores' registers, complete each FIN
+//   Draining_Sync     all three: the sync_start stop-the-world drain
+//   Dispatching       hbg, tmr: the MIX-strict-priority dispatch phase
+//   Scanning          sac: a dispatch pass whose work came from the window scan
+//   Dispatching_Eager sac: a pass whose work came from the deferred-ready FIFO
+//                     (a producer's own zero-crossing) -- the two are mutually
+//                     exclusive per pass, so their bar counts give the split
+//                     between event-driven and positional discovery
+//   Retiring_Inline   sac: dependency-only tasks retired inside the scan
+//   Retiring_Dummy    tmr: dependency-only tasks popped from its dummy queue
+//   Idle              sac: a pass that made no forward progress
+//   Drain             hbg, tmr: idle-pass deferred producer-release drain
+//   Resolving         hbg: its dedicated resolution thread (3S+1P)
+//   Orchestrating / DLL_loading / Allocating / Barrier
+//                     tmr: it orchestrates on device
+//
+// sac has neither a device orchestrator nor a P thread, so it marks no
+// Orchestrating and no Resolving -- their absence from a trace is itself the
+// architectural statement.
 #define MARKER_TYPES       \
     X(Orchestrating)       \
     X(Scheduling)          \
-    X(Phase1)              \
-    X(Phase2)              \
-    X(Phase3)              \
-    X(Phase4)              \
+    X(Retiring)            \
+    X(Draining_Sync)       \
+    X(Retiring_Dummy)      \
+    X(Dispatching)         \
     X(Drain)               \
     X(Initializing)        \
     X(De_Initializing)     \
@@ -69,7 +86,8 @@ inline thread_local int g_TraCR_thread_idx{-1};
     /* --- scan_and_claim --- appended, so existing ids stay put --- */ \
     X(Scanning)            \
     X(Retiring_Inline)     \
-    X(Idle)
+    X(Idle)                \
+    X(Dispatching_Eager)
 
 enum MarkerType {
 #define X(name) name,

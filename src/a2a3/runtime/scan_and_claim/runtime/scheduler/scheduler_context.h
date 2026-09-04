@@ -254,6 +254,11 @@ private:
     // of dummies does not count toward the hang budget.
     int32_t inline_retired_this_pass_[MAX_AICPU_THREADS]{};
 
+    // Tasks this pass took from the deferred-ready FIFO rather than the window
+    // scan. Read by the dispatch loop to mark the pass `Dispatching_Eager` vs
+    // `Scanning`, so a trace shows how much discovery is event-driven.
+    int32_t eager_found_this_pass_[MAX_AICPU_THREADS]{};
+
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};

@@ -120,6 +120,7 @@ int SchedulerContext::pop_ready_tasks_batch(
 #endif
 #endif
     int count = sched_->service_deferred_ready(shape, out, max_count, thread_idx, retired_inline);
+    eager_found_this_pass_[thread_idx] += count;
     if (count < max_count) {
         count += sched_->scan_ready_tasks_batch(
             shape, out + count, max_count - count, thread_idx, retired_inline,
@@ -1050,7 +1051,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Retiring, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -1149,7 +1150,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Draining_Sync, 0);
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1236,20 +1237,29 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        // Phase 3 (dependency-only dummy / predicate-failed retirement) runs on
-        // the resolution thread P, not here — see run_resolution_thread.
+        // Dependency-only retirement has no phase of its own: it happens inside
+        // discovery, at the point readiness is established (Retiring_Inline).
 
-        // Phase 4: MIX-strict-priority dispatch with phase-split and
-        // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-        // sac's dispatch phase IS the bounded scan (discovery + placement in one),
-        // so name it for what it does rather than hbg's phase number.
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scanning, 0);
-
+        // Discovery + placement in one phase, marked after the fact by which
+        // source supplied the work: the deferred-ready FIFO (event-driven, a
+        // producer's own zero-crossing) or the window scan (positional). The
+        // two markers are mutually exclusive per pass, so their bar counts in a
+        // trace are the split between the two discovery mechanisms.
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
         inline_retired_this_pass_[thread_idx] = 0;
+        eager_found_this_pass_[thread_idx] = 0;
+        // Marked before the call so this span covers dispatch alone, matching
+        // what hbg and tmr attribute to Dispatching; the source-classifying
+        // marker below then covers only the pass tail.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dispatching, 0);
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        if (eager_found_this_pass_[thread_idx] > 0) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dispatching_Eager, 0);
+        } else {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scanning, 0);
+        }
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
         // covers the actual publish work — not the trailing second-poll /
