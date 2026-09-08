@@ -47,7 +47,7 @@ static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR
 static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
 static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_DELTA_OFFSET);
 static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_DELTA_OFFSET);
-static_assert(sizeof(ChipTensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
+static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
 
 // =============================================================================
 // Dispatch helpers
@@ -172,7 +172,7 @@ void SchedulerContext::build_payload(
         // Both regions are resolved once: the args[] stores below could alias the
         // payload as far as the compiler knows, so re-resolving a delta per element
         // would reload it on every iteration.
-        const ChipTensor *tensors = payload.tensor_data();
+        const Tensor *tensors = payload.tensor_data();
         const int32_t tensor_count = payload.tensor_count;
         for (int32_t i = 0; i < tensor_count; i++) {
             dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&tensors[i]);
@@ -263,7 +263,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     uint64_t *dispatch_timestamp_slot = nullptr;
 #if SIMPLER_DFX
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         dispatch_timestamp_slot =
             to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
     }
@@ -279,18 +279,10 @@ int SchedulerContext::prepare_block_for_dispatch(
     int32_t block_idx, PublishHandle *out_handles, bool force_gate
 ) {
 #if SIMPLER_DFX
-    if (is_dump_args_enabled()) {
-        dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-            thread_idx, slot_state, ArgsDumpStage::BEFORE_DISPATCH,
-            [](ActiveMask active_mask, int raw_subtask_id) {
-                return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-            },
-            [this](int32_t func_id) {
-                return get_function_bin_addr(func_id);
-            },
-            &slot_state.payload->dump_metadata
-        );
-    }
+        // The args dump is not ported: dump_args_for_task now takes the task's
+        // descriptor and payload separately, via accessors this runtime's slot
+        // state does not carry. Nothing else depends on it -- it is a debug dump
+        // behind is_dump_args_enabled() -- so it is left out rather than guessed at.
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     if (shape == PTO2ResourceShape::MIX) {
@@ -417,7 +409,7 @@ void SchedulerContext::dispatch_shape(
             wmb();
             uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = get_sys_cnt_aicpu();
             }
 #endif
@@ -1462,9 +1454,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 #endif
 #if SIMPLER_DFX
-    if (is_dump_args_enabled()) {
-        dump_args_flush(thread_idx);
-    }
+        // The args dump is not ported: dump_args_for_task now takes the task's
+        // descriptor and payload separately, via accessors this runtime's slot
+        // state does not carry. Nothing else depends on it -- it is a debug dump
+        // behind is_dump_args_enabled() -- so it is left out rather than guessed at.
 #endif
 #if SIMPLER_DFX
     if (is_pmu_enabled()) {

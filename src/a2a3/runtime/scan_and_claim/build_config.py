@@ -33,29 +33,31 @@
 # "host_orchestration_support" is linked only into that host-loaded .so; its
 # recorder prewarm entry must not instantiate host threads in runtime targets.
 
-# The shared host-state / recorded-graph layer. Its .cpp files sit under a
-# "host", "device" or "shared" subdirectory naming the targets that compile
-# them, because every source_dirs entry is collected by a recursive glob.
+# This runtime does not compile or include src/common/host_build_graph.
 #
-# Only "device" is taken here. host_build_graph also takes "shared", but this
-# runtime forked those three translation units -- runtime.cpp, runtime_init.cpp
-# and shared_memory.cpp live under runtime/shared/ with the counter-based
-# scheduler's own state -- so compiling the shared copies too would duplicate
-# every symbol in them. "host" is STL-using code the AICPU target forbids.
-SHARED = "../../../common/host_build_graph"
+# It forked host_build_graph before that layer was split per runtime and
+# redesigned (TaskId by id-space rather than ring slot, tensors carrying their
+# own runtime's TaskId, in-graph-task naming, a sorted CSR). Its own frozen
+# copies of the types it forked against live in runtime/ -- task_id.h, tensor.h,
+# graph_execution.h, graph_cache.h, graph_host_state.h -- and win a flat include
+# by the same-directory rule. That keeps this runtime's shared-memory image
+# self-consistent and decoupled from a layer it shares no scheduler with.
+#
+# Recorded Graphs are not executable here regardless: the window scan skips
+# TaskKind::GRAPH and GRAPH_NODE, and bind_graph_definitions refuses them.
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", "..", SHARED], "source_dirs": ["aicore", "orchestration"]},
+    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
     "aicpu": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
-        "source_dirs": ["aicpu", "runtime", "orchestration", f"{SHARED}/device"],
+        "include_dirs": ["runtime", "common", ".."],
+        "source_dirs": ["aicpu", "runtime", "orchestration"],
     },
     "host": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
+        "include_dirs": ["runtime", "common", ".."],
         "source_dirs": ["host", "runtime/orchestrator_core", "runtime/shared", "orchestration"],
     },
     "orchestration": {
-        "include_dirs": ["runtime", "orchestration", "common", "..", SHARED],
+        "include_dirs": ["runtime", "orchestration", "common", ".."],
         "source_dirs": ["orchestration", "host_orchestration_support"],
     },
 }

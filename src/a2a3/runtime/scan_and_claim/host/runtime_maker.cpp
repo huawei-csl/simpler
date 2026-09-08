@@ -408,93 +408,23 @@ struct DefinitionUploads {
 // device initial classify replaces that pointer with an execution constructed in
 // the outer task's own heap.
 bool bind_graph_definitions(const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads) {
+    (void)api;
     *uploads = DefinitionUploads{};
     const size_t count = graph_host_upload_count(graph_state);
-    GraphHostDefinitionList definitions = graph_host_definitions(graph_state);
-    struct UploadedDefinition {
-        void *device_object;               // GM address; host must not dereference
-        const GraphDefinition *host_view;  // the host-side image the object was built from
-    };
-    std::unordered_map<uint64_t, UploadedDefinition> definition_objects;
-    for (const GraphHostDefinition &entry : definitions.entries) {
-        if (entry.data == nullptr || entry.bytes < sizeof(GraphDefinition)) continue;
-        const auto *definition = reinterpret_cast<const GraphDefinition *>(entry.data);
-        if (definition->total_bytes != entry.bytes || definition->full_key != entry.full_key) continue;
-        const size_t object_bytes = sizeof(GraphDefinitionHeader) + entry.bytes;
-        void *object =
-            api->acquire_graph_definition_buffer(entry.full_key, object_bytes, alignof(GraphDefinitionHeader));
-        if (object == nullptr) {
-            LOG_ERROR(
-                "host-orch: failed to retain %zu bytes for Graph Definition key=%#llx", object_bytes,
-                static_cast<unsigned long long>(entry.full_key)
-            );
-            return false;
-        }
-        std::vector<std::byte> staging(object_bytes, std::byte{0});
-        auto *header = reinterpret_cast<GraphDefinitionHeader *>(staging.data());
-        header->magic = GRAPH_DEFINITION_OBJECT_MAGIC;
-        header->verify_state.store(
-            static_cast<uint32_t>(GraphDefinitionVerifyState::UPLOADED), std::memory_order_relaxed
-        );
-        header->definition_bytes = static_cast<uint32_t>(entry.bytes);
-        header->content_hash = definition->content_hash;
-        header->full_key = definition->full_key;
-        std::memcpy(staging.data() + sizeof(GraphDefinitionHeader), entry.data, entry.bytes);
-        if (api->copy_to_device(object, staging.data(), object_bytes) != 0) {
-            LOG_ERROR("host-orch: failed to upload Graph Definition object");
-            return false;
-        }
-        definition_objects.emplace(definition->full_key, UploadedDefinition{object, definition});
-        uploads->count++;
-        uploads->bytes += object_bytes;
-    }
-
-    for (size_t index = 0; index < count; ++index) {
-        std::optional<GraphHostUpload> upload = graph_host_upload(graph_state, index);
-        if (!upload.has_value() || upload->outer_slot == nullptr || upload->outer_slot->task_kind != TaskKind::GRAPH ||
-            upload->outer_slot->task == nullptr || upload->outer_slot->payload == nullptr) {
-            LOG_ERROR("host-orch: invalid pending Graph task");
-            return false;
-        }
-        auto object_it = definition_objects.find(upload->full_key);
-        if (object_it == definition_objects.end() || object_it->second.device_object == nullptr ||
-            object_it->second.host_view == nullptr ||
-            object_it->second.host_view->content_hash != upload->definition_hash) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
-            return false;
-        }
-        const GraphDefinition *definition = object_it->second.host_view;
-        GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count == 0 || definition->task_count > GRAPH_MAX_NODES ||
-            definition->full_key != upload->full_key ||
-            !graph_execution_storage_layout(
-                static_cast<int32_t>(definition->task_count), definition->tensor_arg_count,
-                definition->scalar_arg_count, &storage_layout
-            ) ||
-            storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->payload->tensor_count != static_cast<int32_t>(definition->boundary_count) ||
-            upload->outer_slot->payload->scalar_count != static_cast<int32_t>(definition->boundary_scalar_count)) {
-            LOG_ERROR("host-orch: invalid Graph Definition for task");
-            return false;
-        }
-        const uintptr_t outer_base = reinterpret_cast<uintptr_t>(upload->outer_slot->task->packed_buffer_base);
-        const uintptr_t outer_end = reinterpret_cast<uintptr_t>(upload->outer_slot->task->packed_buffer_end);
-        if (outer_end < outer_base || definition->required_heap > UINTPTR_MAX - outer_base ||
-            storage_layout.total_bytes > outer_end - outer_base ||
-            definition->required_heap > outer_end - outer_base - storage_layout.total_bytes) {
-            LOG_ERROR("host-orch: Graph runtime storage does not fit its outer task heap");
-            return false;
-        }
-        const uintptr_t storage_addr = outer_base + definition->required_heap;
-        if (storage_addr % alignof(GraphNodeStorage) != 0) {
-            LOG_ERROR("host-orch: Graph runtime storage address is misaligned");
-            return false;
-        }
-        upload->outer_slot->graph_context = reinterpret_cast<GraphDefinition *>(
-            reinterpret_cast<uintptr_t>(object_it->second.device_object) + sizeof(GraphDefinitionHeader)
-        );
-    }
-    return true;
+    if (count == 0) return true;
+    // Recorded Graphs are not executable on this runtime: the window scan skips
+    // TaskKind::GRAPH and GRAPH_NODE outright, so no outer Graph task can reach a
+    // core. Binding one would upload Definitions the device then never replays and
+    // stall on a task that is structurally undispatchable, so refuse at bind where
+    // the caller still gets an error, rather than on device where it looks like a
+    // scheduler hang. Both models that used recorded Graphs also exist as
+    // flattened ring-task scenes, which is the supported path here.
+    LOG_ERROR(
+        "host-orch: scan_and_claim cannot bind recorded Graphs (%zu Definition upload(s) requested); "
+        "run the flattened ring-task scene instead",
+        count
+    );
+    return false;
 }
 
 struct GraphHostStateBinding {
@@ -945,11 +875,11 @@ extern "C" int bind_callable_to_runtime_impl(
     uint64_t staged_bytes = 0;
     int staged_tensors = 0;
     for (int i = 0; i < tensor_count; i++) {
-        ChipTensor t = orch_args->tensor(i);
+        Tensor t = Tensor::from_boundary(orch_args->tensor(i));
 
         if (t.is_device_memory()) {
-            LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
-            device_args.add_tensor(t);
+            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            device_args.add_tensor(t.to_boundary());
             continue;
         }
 
@@ -985,7 +915,7 @@ extern "C" int bind_callable_to_runtime_impl(
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
-        LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
         // control tensors (e.g. paged_attention's context_lens/block_table) via
@@ -1003,7 +933,7 @@ extern "C" int bind_callable_to_runtime_impl(
         }
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        device_args.add_tensor(t);
+        device_args.add_tensor(t.to_boundary());
     }
     for (int i = 0; i < scalar_count; i++) {
         device_args.add_scalar(orch_args->scalar(i));
@@ -1182,7 +1112,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
     int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
-    LOG_INFO("ChipTensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO("Tensor pairs to process: %d", tensor_pair_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
@@ -1206,13 +1136,13 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
             // Skip if device pointer is null
             if (pair.dev_ptr == nullptr) {
-                LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
+                LOG_WARN("Tensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (pair.host_ptr == nullptr) {
-                LOG_DEBUG("ChipTensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -1220,7 +1150,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still device_free'd in the cleanup loop below.
             if (!pair.needs_copy_back) {
-                LOG_DEBUG("ChipTensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
@@ -1229,7 +1159,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
             }
         }
     }

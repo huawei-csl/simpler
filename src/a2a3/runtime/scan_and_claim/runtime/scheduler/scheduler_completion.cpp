@@ -176,18 +176,10 @@ void SchedulerContext::complete_slot_task(
 
     if (task_complete && !defer_completion_to_consumer) {
 #if SIMPLER_DFX
-        if (is_dump_args_enabled()) {
-            dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, slot_state, ArgsDumpStage::AFTER_COMPLETION,
-                [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
-                    return get_function_bin_addr(func_id);
-                },
-                &slot_state.payload->dump_metadata
-            );
-        }
+        // The args dump is not ported: dump_args_for_task now takes the task's
+        // descriptor and payload separately, via accessors this runtime's slot
+        // state does not carry. Nothing else depends on it -- it is a debug dump
+        // behind is_dump_args_enabled() -- so it is left out rather than guessed at.
 #endif
         // scan_and_claim: the thread that dispatched the task retires it, here,
         // inline. There is no hand-off hop: complete_task publishes the
@@ -220,7 +212,7 @@ void SchedulerContext::complete_slot_task(
     // timestamps via complete_task. Bypassing here saves the per-completion
     // hot-path cost (counter inc + ring lookup + record store + wmb + buffer
     // rotation bookkeeping) for runs that only want AICore timing.
-    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
@@ -277,7 +269,7 @@ void SchedulerContext::flush_dispatch_burst(int32_t thread_idx, DispatchBurst &b
         wmb();
         uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
             dispatch_ts = get_sys_cnt_aicpu();
         }
 #endif
@@ -477,7 +469,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // charge AICPU completion-processing cost to the (end → finish)
         // span, masking the actual FIN-delivery latency.
         uint64_t finish_ts = 0;
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
             finish_ts = get_sys_cnt_aicpu();
         }
 #endif
@@ -701,7 +693,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
             }
 #endif

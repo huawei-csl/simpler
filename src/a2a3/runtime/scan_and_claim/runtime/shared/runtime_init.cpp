@@ -238,7 +238,7 @@ bool PTO2OrchestratorState::init(
     auto *sm_bytes = static_cast<char *>(sm_base);
     const auto pools = pto2_sm_layout::ring_segment_offsets(pto2_sm_layout::mirror_extents(task_window_size));
     orch->fanin_pool = reinterpret_cast<int32_t *>(sm_bytes + pools.fanin_pool);
-    orch->tensor_pool = reinterpret_cast<ChipTensor *>(sm_bytes + pools.tensor_pool);
+    orch->tensor_pool = reinterpret_cast<Tensor *>(sm_bytes + pools.tensor_pool);
     orch->scalar_pool = reinterpret_cast<uint64_t *>(sm_bytes + pools.scalar_pool);
 
     // Polling: no fanin-spill pool — producer ids are inline on the payload.

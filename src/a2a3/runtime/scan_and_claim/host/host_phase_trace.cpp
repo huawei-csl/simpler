@@ -171,13 +171,13 @@ bool is_bind_kind(uint32_t kind) { return kind < static_cast<uint32_t>(HostPhase
 // every orchestrator kind, and a silent shift would file each record under its
 // neighbour's name.
 static_assert(
-    static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask) == 12,
-    "HostOrchPhase in the orchestrator core hardcodes 12..22; update both together"
+    static_cast<uint32_t>(HostPhaseKind::OrchSubmitTask) == 10,
+    "HostOrchPhase in the orchestrator core hardcodes 10..20; update both together"
 );
-static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGraphCommit) == 19, "same");
+static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGraphCommit) == 17, "same");
 // The orchestration .so spells these three as plain integers too — it cannot include
 // this header either (see RtOrchPhase in orchestration_api.h).
-static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGeneratedArgs) == 22, "same");
+static_assert(static_cast<uint32_t>(HostPhaseKind::OrchGeneratedArgs) == 20, "same");
 
 // Opt-in spelling shared by this runtime's switches, matching the runtime's
 // other default-off switch, SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE, so that
