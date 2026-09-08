@@ -44,6 +44,14 @@
 #include <vector>
 
 // Type headers needed by orchestration
+// Spelled through ".." (src/{arch}/runtime) rather than as "tensor.h", because the
+// platform's global include directories are searched BEFORE this runtime's and
+// carry task_interface/tensor.h -- the boundary type. The scene and example
+// orchestration sources live outside this tree, so the same-directory rule that
+// resolves a flat include inside runtime/ does not apply to them; this path does.
+// It also brings the simpler::hbg::Tensor alias the shared scene sources name.
+#include "scan_and_claim/runtime/tensor.h"
+
 #include "common.h"            // framework_bind_runtime / framework_current_runtime
 #include "graph_cache.h"       // Graph Execution key and result helpers
 #include "graph_host_state.h"  // GRAPH_MAX_DEFINITIONS
