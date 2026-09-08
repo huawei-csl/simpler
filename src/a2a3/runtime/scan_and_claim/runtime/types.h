@@ -702,13 +702,21 @@ struct ChipTaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
     // Build from the executor's ChipStorageTaskArgs: each input becomes a
     // TensorRef pointing at src's Tensor, so `src` must outlive this (on the
     // executor path src is runtime->orch_args_storage_, alive for the whole run).
+    // Rich storage the TensorRefs point at. ChipStorageTaskArgs is the wire/ABI
+    // type and carries the boundary ChipTensor, which has none of the scheduling
+    // fields, so the adopted rich form needs an address that outlives this call --
+    // add_input stores a pointer, and a loop-local copy would dangle. Before the
+    // boundary and internal tensors were separate types this pointed straight
+    // into `src`; host_build_graph solves it with a separate EntryArgsStorage.
+    Tensor adopted_[CHIP_MAX_TENSOR_ARGS];
+
     void create_from_chip_args(const ChipStorageTaskArgs &src) {
         reset();
         for (int32_t i = 0; i < src.tensor_count(); ++i) {
-            // Entry inputs are external submit-time tensors; the entry binds them
-            // by const Tensor& (replacing from_tensor_arg's old version/manual_dep
-            // reset), so this invariant is what keeps that binding behavior-preserving.
-            const Tensor t = Tensor::from_boundary(src.tensor(i));
+            // Adoption leaves every entry input external: no producing task, no
+            // overlap version, default dependency treatment.
+            adopted_[i] = Tensor::from_boundary(src.tensor(i));
+            const Tensor &t = adopted_[i];
             debug_assert(!t.manual_dep && t.version == 0);
             add_input(t);
         }

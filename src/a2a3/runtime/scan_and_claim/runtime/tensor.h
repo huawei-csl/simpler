@@ -28,6 +28,16 @@
 #include "data_type.h"
 #include "task_id.h"
 
+// Defined inside simpler::hbg, mirroring host_build_graph, because the scene and
+// example orchestration sources are shared with it and spell the type qualified
+// -- simpler::hbg::Tensor (1246 uses), simpler::hbg::make_tensor_external (30) --
+// codegen having no runtime to pick. Those .cpp files are reused verbatim by this
+// runtime's generated scenes, so it has to answer to the same spelling. Safe only
+// because this runtime includes none of src/common/host_build_graph, so the real
+// declarations are never in scope to collide with.
+namespace simpler::hbg {
+
+
 /**
  * Buffer Handle
  *
@@ -576,19 +586,8 @@ inline Tensor make_tensor_strided(
     t.buffer.size = t.extent_elem_cache * get_element_size(dtype);
     return t;
 }
-
-// The scene and example orchestration sources are shared with host_build_graph
-// and spell these two names qualified -- `simpler::hbg::Tensor` (1246 uses) and
-// `simpler::hbg::make_tensor_external` (30) -- because codegen has no runtime to
-// pick. This runtime's scenes are generated subclasses that reuse those exact
-// .cpp files, so it has to answer to the same spelling.
-//
-// Occupying that namespace is safe precisely because this runtime compiles and
-// includes none of src/common/host_build_graph (see build_config.py): the real
-// simpler::hbg declarations are never in scope here, so there is nothing to
-// collide with. The two names resolve to this runtime's own frozen type and
-// factory.
-namespace simpler::hbg {
-using Tensor = ::Tensor;
-using ::make_tensor_external;
 }  // namespace simpler::hbg
+
+// The runtime's own sources name these unqualified.
+using Tensor = simpler::hbg::Tensor;
+using simpler::hbg::make_tensor_external;
