@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Unit tests for host_build_graph's PTO2TaskAllocator (ring_buffer.h).
+ * Unit tests for host_build_graph's TaskAllocator (ring_buffer.h).
  *
  * host_build_graph is whole-graph-resident: the device runs only after the host
  * has built the whole graph, so neither the task ring nor the graph heap is ever
@@ -25,8 +25,8 @@
  *   cannot arrive, and there is no wall-clock deadlock backstop.
  * - Zero-size allocation is a no-op returning the current top. Two consecutive
  *   zero-size allocs return the SAME pointer.
- * - Task ids start at 0 and are capped by the window, so they cannot approach
- *   INT32_MAX.
+ * - Task ids start at 0 and are capped by the capacity, so they cannot approach
+ *   INT32_MAX, and each id is its own task-table slot.
  */
 
 #include <gtest/gtest.h>
@@ -35,24 +35,22 @@
 #include <cstring>
 #include <set>
 
-#include "ring_buffer.h"
+#include "host_build_graph/task_allocator.h"
 #include "task_interface/assert_compat.h"
 
 class HbgTaskAllocatorTest : public ::testing::Test {
 protected:
-    static constexpr int32_t WINDOW_SIZE = 16;
+    static constexpr int32_t MAX_TASKS = 16;
     static constexpr uint64_t HEAP_SIZE = 4096;
 
     alignas(64) uint8_t heap_buf[HEAP_SIZE]{};
-    std::atomic<int32_t> current_index{0};
     std::atomic<int32_t> error_code{SIMPLER_ERROR_NONE};
-    PTO2TaskAllocator allocator{};
+    TaskAllocator allocator{};
 
     void SetUp() override {
         std::memset(heap_buf, 0, sizeof(heap_buf));
-        current_index.store(0);
         error_code.store(SIMPLER_ERROR_NONE);
-        allocator.init(WINDOW_SIZE, &current_index, heap_buf, HEAP_SIZE, &error_code);
+        allocator.init(MAX_TASKS, heap_buf, HEAP_SIZE, &error_code);
     }
 };
 
@@ -61,7 +59,7 @@ protected:
 // =============================================================================
 
 TEST_F(HbgTaskAllocatorTest, InitialState) {
-    EXPECT_EQ(allocator.window_size(), WINDOW_SIZE);
+    EXPECT_EQ(allocator.capacity(), MAX_TASKS);
     EXPECT_EQ(allocator.active_count(), 0);
     EXPECT_EQ(allocator.heap_top(), 0u);
     EXPECT_EQ(allocator.heap_capacity(), HEAP_SIZE);
@@ -73,9 +71,8 @@ TEST_F(HbgTaskAllocatorTest, AllocNonZeroSize) {
     auto result = allocator.alloc(100);
     ASSERT_FALSE(result.failed());
     EXPECT_EQ(result.task_id, 0);
-    EXPECT_EQ(result.slot, 0);
     EXPECT_NE(result.packed_base, nullptr);
-    uint64_t expected_aligned = PTO2_ALIGN_UP(100u, PTO2_ALIGN_SIZE);
+    uint64_t expected_aligned = CHIP_ALIGN_UP(100u, CHIP_ALIGN_SIZE);
     EXPECT_EQ(expected_aligned, 128u);
     EXPECT_EQ(allocator.heap_top(), expected_aligned);
     EXPECT_EQ(
@@ -90,11 +87,9 @@ TEST_F(HbgTaskAllocatorTest, SequentialTaskIds) {
         auto result = allocator.alloc(0);
         ASSERT_FALSE(result.failed()) << "Alloc failed at i=" << i;
         EXPECT_EQ(result.task_id, prev_id + 1) << "Task IDs must be monotonically increasing";
-        EXPECT_EQ(result.slot, result.task_id & (WINDOW_SIZE - 1));
         prev_id = result.task_id;
     }
-    EXPECT_EQ(allocator.active_count(), 5);
-    EXPECT_EQ(current_index.load(), 5) << "Head is published to shared memory";
+    EXPECT_EQ(allocator.active_count(), 5) << "the next id is both the occupancy and the run's total";
 }
 
 TEST_F(HbgTaskAllocatorTest, OutputSizeAlignment) {
@@ -108,15 +103,39 @@ TEST_F(HbgTaskAllocatorTest, OutputSizeAlignment) {
     EXPECT_EQ(allocator.heap_top(), 192u);
 }
 
-TEST_F(HbgTaskAllocatorTest, SlotMappingPowerOfTwoWindow) {
-    std::set<int32_t> slots;
-    for (int i = 0; i < WINDOW_SIZE; i++) {
+// A task id IS its task-table index: ids run 0..capacity-1 with no wrap, so the
+// whole table is addressed exactly once and no two tasks share a slot.
+TEST_F(HbgTaskAllocatorTest, TaskIdIsItsOwnSlot) {
+    std::set<int32_t> ids;
+    for (int i = 0; i < MAX_TASKS; i++) {
         auto r = allocator.alloc(0);
         ASSERT_FALSE(r.failed());
-        EXPECT_EQ(r.slot, r.task_id & (WINDOW_SIZE - 1));
-        slots.insert(r.slot);
+        EXPECT_EQ(r.task_id, i) << "ids are handed out in order, with no wrap";
+        ids.insert(r.task_id);
     }
-    EXPECT_EQ(slots.size(), static_cast<size_t>(WINDOW_SIZE)) << "Every configured slot is usable exactly once";
+    EXPECT_EQ(ids.size(), static_cast<size_t>(MAX_TASKS)) << "Every slot is usable exactly once";
+    EXPECT_TRUE(allocator.alloc(0).failed()) << "the capacity is terminal, not a wrap point";
+}
+
+// Nothing masks with the capacity, so it need not be a power of two: an odd count
+// hands out exactly that many ids and then reports exhaustion. This is what lets a
+// bind pass an arbitrary runtime_env.ring_task_window straight through.
+TEST_F(HbgTaskAllocatorTest, NonPowerOfTwoCapacitySaturatesExactly) {
+    constexpr int32_t ODD_CAPACITY = 10;
+    TaskAllocator odd{};
+    odd.init(ODD_CAPACITY, heap_buf, HEAP_SIZE, &error_code);
+    EXPECT_EQ(odd.capacity(), ODD_CAPACITY);
+
+    for (int32_t i = 0; i < ODD_CAPACITY; i++) {
+        auto r = odd.alloc(0);
+        ASSERT_FALSE(r.failed()) << "Alloc failed at i=" << i;
+        EXPECT_EQ(r.task_id, i) << "ids run 0..capacity-1 for an odd capacity too";
+    }
+    EXPECT_EQ(odd.active_count(), ODD_CAPACITY);
+
+    auto overflow = odd.alloc(0);
+    EXPECT_TRUE(overflow.failed()) << "the odd capacity is the cap, not rounded up to a power of two";
+    EXPECT_EQ(error_code.load(), SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK);
 }
 
 // Zero-size allocs return the same address and don't advance the top.
@@ -182,20 +201,18 @@ TEST_F(HbgTaskAllocatorTest, AllocLargerThanHeap) {
     EXPECT_EQ(error_code.load(), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
 }
 
-TEST_F(HbgTaskAllocatorTest, TaskWindowSaturates) {
-    for (int i = 0; i < WINDOW_SIZE; i++) {
+TEST_F(HbgTaskAllocatorTest, TaskCapacitySaturates) {
+    for (int i = 0; i < MAX_TASKS; i++) {
         auto r = allocator.alloc(0);
         ASSERT_FALSE(r.failed()) << "Alloc failed at i=" << i;
         EXPECT_EQ(r.task_id, i);
     }
-    EXPECT_EQ(allocator.active_count(), WINDOW_SIZE);
-    EXPECT_EQ(current_index.load(), WINDOW_SIZE);
+    EXPECT_EQ(allocator.active_count(), MAX_TASKS);
 
     auto overflow = allocator.alloc(0);
     EXPECT_TRUE(overflow.failed());
     EXPECT_EQ(error_code.load(), SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK);
-    EXPECT_EQ(allocator.active_count(), WINDOW_SIZE);
-    EXPECT_EQ(current_index.load(), WINDOW_SIZE) << "A rejected allocation must not publish a new task";
+    EXPECT_EQ(allocator.active_count(), MAX_TASKS) << "A rejected allocation must not consume a slot";
 }
 
 // A failing alloc leaves the heap pointer untouched, so the reported figures
@@ -204,12 +221,10 @@ TEST_F(HbgTaskAllocatorTest, FailedHeapAllocLeavesStateUnchanged) {
     ASSERT_FALSE(allocator.alloc(1024).failed());
     uint64_t top_before = allocator.heap_top();
     int32_t count_before = allocator.active_count();
-    int32_t current_index_before = current_index.load();
 
     EXPECT_TRUE(allocator.alloc(HEAP_SIZE).failed());
     EXPECT_EQ(allocator.heap_top(), top_before) << "Heap pointer must not move on failure";
-    EXPECT_EQ(allocator.active_count(), count_before) << "No task slot is consumed on failure";
-    EXPECT_EQ(current_index.load(), current_index_before) << "No task index is published on failure";
+    EXPECT_EQ(allocator.active_count(), count_before) << "No task slot is consumed and no task id handed out";
 }
 
 // Once a fatal is latched, alloc() short-circuits without overwriting the first
@@ -277,16 +292,35 @@ TEST_F(HbgTaskAllocatorTest, LatchedFatalShortCircuitsReserveDeferredHeap) {
     EXPECT_EQ(allocator.heap_top(), 0u);
 }
 
-// Graph recording addresses its internal nodes' outputs from
+// Graph recording addresses its in-graph tasks' outputs from
 // GRAPH_RECORD_VIRTUAL_BASE upward and classifies internal vs boundary tensor
 // sources by address-range containment alone. A real heap that reached into that
 // range would silently misclassify, so init() refuses it.
 TEST_F(HbgTaskAllocatorTest, InitRejectsAHeapOverlappingTheRecordingVirtualRange) {
-    PTO2TaskAllocator overlapping{};
+    TaskAllocator overlapping{};
     auto *base = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE);
-    EXPECT_THROW(overlapping.init(WINDOW_SIZE, &current_index, base, HEAP_SIZE, &error_code), AssertionError);
+    EXPECT_THROW(overlapping.init(MAX_TASKS, base, HEAP_SIZE, &error_code), AssertionError);
 
-    PTO2TaskAllocator straddling{};
+    TaskAllocator straddling{};
     auto *just_below = reinterpret_cast<void *>(GRAPH_RECORD_VIRTUAL_BASE - 64);
-    EXPECT_THROW(straddling.init(WINDOW_SIZE, &current_index, just_below, HEAP_SIZE, &error_code), AssertionError);
+    EXPECT_THROW(straddling.init(MAX_TASKS, just_below, HEAP_SIZE, &error_code), AssertionError);
+}
+
+// What the production path passes: the graph heap is allocated out of the virtual
+// window, because its device region is committed only once this allocator has
+// revealed how many bytes the graph needs. The window ends exactly where Graph
+// recording's begins, so the disjointness check above holds at equality — which is
+// what makes the two windows provably non-overlapping rather than merely far apart.
+TEST_F(HbgTaskAllocatorTest, AcceptsTheVirtualHeapWindow) {
+    EXPECT_EQ(HEAP_VIRTUAL_BASE + HEAP_VIRTUAL_CAPACITY, GRAPH_RECORD_VIRTUAL_BASE);
+
+    TaskAllocator virtual_heap{};
+    auto *base = reinterpret_cast<void *>(HEAP_VIRTUAL_BASE);
+    virtual_heap.init(MAX_TASKS, base, HEAP_VIRTUAL_CAPACITY, &error_code);
+    EXPECT_EQ(virtual_heap.heap_capacity(), HEAP_VIRTUAL_CAPACITY);
+
+    auto r = virtual_heap.alloc(64);
+    ASSERT_FALSE(r.failed());
+    EXPECT_EQ(reinterpret_cast<uint64_t>(r.packed_base), HEAP_VIRTUAL_BASE);
+    EXPECT_EQ(virtual_heap.heap_used_bytes(), 64u);
 }

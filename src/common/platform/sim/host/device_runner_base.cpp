@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -27,8 +29,9 @@
 #include "chip_callable_layout.h"
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
+#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
-#include "task_args.h"
+#include "task_args_wire.h"
 #include "utils/elf_build_id.h"
 
 namespace simpler::common::sim_host {
@@ -128,7 +131,7 @@ int SimDeviceRunnerBase::setup_static_arena(
 ) {
     if (arena_bank >= arena_banks_.size()) return PTO_RUNTIME_ERR_INTERNAL;
     ArenaBank &bank = this->arena_bank(arena_bank);
-    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
@@ -299,6 +302,46 @@ int SimDeviceRunnerBase::ensure_device_initialized() {
     return ensure_binaries_loaded();
 }
 
+int SimDeviceRunnerBase::ensure_dma_workspace_provisioned() {
+    if (dma_workspace_handle_ != nullptr) {
+        return 0;
+    }
+    const uint32_t supported = dma_workspace_supported_mask();
+    constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
+    if (sdma_requested_ && (supported & kSdmaBit) == 0) {
+        LOG_ERROR("dma workspace: SDMA requested where unsupported (supported=0x%x)", supported);
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    const uint32_t required_mask = sdma_requested_ ? supported : (supported & ~kSdmaBit);
+    if (required_mask == 0) {
+        return 0;
+    }
+    if ((required_mask & (required_mask - 1)) != 0) {
+        LOG_ERROR(
+            "dma workspace: mask=0x%x names %d engines; one handle owns one provider", required_mask,
+            __builtin_popcount(required_mask)
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        dma_workspace_addr_[kind] = 0;
+    }
+
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("dma workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+            dma_workspace_addr_[kind] = 0;
+        }
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
     if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
         config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
@@ -374,46 +417,97 @@ void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void 
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *SimDeviceRunnerBase::acquire_graph_definition_buffer(
-    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
+int SimDeviceRunnerBase::acquire_graph_definition_block(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
-    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
+    if (device_out == nullptr || staging_out == nullptr) return -1;
+    *device_out = nullptr;
+    *staging_out = nullptr;
+    if (pipeline_slot >= graph_definition_blocks_.size() || bytes == 0 || alignment == 0 ||
         (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return nullptr;
+        return -1;
     }
-    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.aligned_addr == nullptr || block.capacity < bytes ||
+        reinterpret_cast<uintptr_t>(block.aligned_addr) % alignment != 0) {
+        const size_t allocation_bytes = bytes + alignment - 1;
+        void *allocation = mem_alloc_.alloc(allocation_bytes);
+        if (allocation == nullptr) return -1;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+        if (raw > UINTPTR_MAX - (alignment - 1)) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+        if (device_memset(aligned_addr, 0, bytes) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        if (block.allocation != nullptr && mem_alloc_.free(block.allocation) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        block.allocation = allocation;
+        block.aligned_addr = aligned_addr;
+        block.capacity = bytes;
     }
-
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
+    // Grow-only and never shrunk, so a steady-state bind assembles its objects
+    // in host memory it neither acquires nor returns.
+    if (block.staging.size() < bytes) block.staging.resize(bytes);
+    *device_out = block.aligned_addr;
+    *staging_out = block.staging.data();
+    return 0;
 }
 
-void SimDeviceRunnerBase::release_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        for (auto &entry : by_key) {
-            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
-        }
-        by_key.clear();
+void SimDeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (addr != nullptr) *addr = nullptr;
+    if (size != nullptr) *size = 0;
+    if (pipeline_slot >= graph_definition_blocks_.size()) return;
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.staging.empty()) return;
+    if (addr != nullptr) *addr = block.staging.data();
+    if (size != nullptr) *size = block.staging.size();
+}
+
+int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= sm_mirrors_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+        bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &mirror = sm_mirrors_[pipeline_slot];
+    // Grow-only and never shrunk: the task capacity is fixed for a given run
+    // configuration, so past the first bind the image is written into host pages
+    // that are already mapped, and each page of it faults once per process rather
+    // than once per bind.
+    const size_t needed = bytes + alignment - 1;
+    if (mirror.capacity < needed) {
+        // `new[]` on a trivially-typed array default-initializes, so the block
+        // costs no page until a bind writes one; make_unique would zero it. The
+        // outgoing block's bytes are not carried over, because nothing reads a byte
+        // this bind did not write.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        mirror.storage = std::move(storage);
+        mirror.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void SimDeviceRunnerBase::release_sm_mirrors() {
+    for (RetainedSmMirror &mirror : sm_mirrors_) {
+        mirror.storage.reset();
+        mirror.capacity = 0;
+    }
+}
+
+void SimDeviceRunnerBase::release_graph_definition_blocks() {
+    for (RetainedGraphBlock &block : graph_definition_blocks_) {
+        if (block.allocation != nullptr) mem_alloc_.free(block.allocation);
+        block = RetainedGraphBlock{};
     }
 }
 
@@ -668,6 +762,7 @@ void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_scope_stats_enabled(config.enable_scope_stats != 0);
+    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
@@ -690,8 +785,14 @@ HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_want
     }
     if (!swimlane_wants_records) return pool;
 
-    // Only the chip-swimlane reader places these records against device
-    // timestamps, so only it needs the two clocks anchored.
+    begin_clock_correlation_session_if_needed();
+    return pool;
+}
+
+void SimDeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
+    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
+        return;
+    }
     try {
         clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
         chip_swimlane_collector_.begin_clock_correlation_session(
@@ -712,7 +813,6 @@ HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_want
             chip_swimlane_collector_.finish_clock_correlation_session();
         }
     }
-    return pool;
 }
 
 void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
@@ -722,6 +822,73 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
         host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
         host_phase_records_.dropped_records()
     );
+}
+
+void SimDeviceRunnerBase::start_shared_collectors_for_run() {
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_chip_swimlane_) {
+        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    if (enable_dump_args_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
+    }
+}
+
+void SimDeviceRunnerBase::write_host_phase_records_artifact() {
+    // Every phase this records is produced on the host during bind and the store
+    // is finished before launch, so it touches no device state and is callable
+    // from any point after bind — including a path that never launched.
+    // `output_prefix_` is non-empty exactly when this run produces diagnostic
+    // artifacts, and the store writes a pass at most once.
+    if (!output_prefix_.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    }
+}
+
+void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+    // The order is fixed by three couplings, not by preference: the clock
+    // correlation session closes before the swimlane export reads it, the host
+    // phase records reach the collector before that same export serializes them,
+    // and each collector drains before it reconciles before it exports.
+    // Diagnostic exports use the per-task `output_prefix_` directory the user set
+    // on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    finish_clock_correlation_session(device_execution_complete);
+    if (enable_chip_swimlane_) {
+        chip_swimlane_collector_.quiesce();
+        chip_swimlane_collector_.read_phase_header_metadata();
+        chip_swimlane_collector_.reconcile_counters();
+        publish_host_phase_records_to_swimlane();
+        publish_chip_swimlane_runtime_extensions();
+        chip_swimlane_collector_.export_swimlane_json();
+    }
+
+    write_host_phase_records_artifact();
+
+    if (enable_dump_args_) {
+        dump_collector_.quiesce();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+    }
+
+    if (enable_pmu_) {
+        pmu_collector_.quiesce();
+        pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.quiesce();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
+    }
 }
 
 void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {

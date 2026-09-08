@@ -102,6 +102,8 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
+simpler_configure_profiling(host_runtime)
 add_custom_command(TARGET host_runtime POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_cpu_topo_fallback.json"
@@ -139,7 +141,13 @@ target_compile_options(host_runtime
 
 # Platform name baked into the shared get_platform() impl in
 # src/common/platform/shared/host/platform_compile_info.cpp.
-target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
+if(NOT DEFINED SIMPLER_RUNTIME_NAME OR SIMPLER_RUNTIME_NAME STREQUAL "")
+    message(FATAL_ERROR "host_runtime requires -DSIMPLER_RUNTIME_NAME=<runtime>")
+endif()
+target_compile_definitions(host_runtime PRIVATE
+    SIMPLER_PLATFORM_NAME="a5"
+    SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
+)
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)

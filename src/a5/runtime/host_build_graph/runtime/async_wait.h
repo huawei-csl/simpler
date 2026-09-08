@@ -12,17 +12,16 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 
-#include "aicpu/platform_regs.h"
 #include "backend/sdma/sdma_completion_scheduler.h"
-#include "intrinsic.h"
 #include "aicore_completion_mailbox.h"
-#include "completion_token.h"
-#include "runtime_types.h"
+#include "aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_token.h"
+#include "host_build_graph/runtime_status.h"
+#include "host_build_graph/runtime_types.h"
 
-struct PTO2SchedulerState;
+struct SchedulerState;
 struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
@@ -33,7 +32,7 @@ inline constexpr int32_t MAX_ASYNC_WAITS = 64;
 // application layer: translating drained messages into wait-list state.
 
 inline uintptr_t mailbox_cache_line(const volatile void *addr) {
-    return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
+    return reinterpret_cast<uintptr_t>(addr) & ~(static_cast<uintptr_t>(CHIP_ALIGN_SIZE) - 1u);
 }
 
 struct CompletionCondition;
@@ -124,7 +123,7 @@ struct AsyncWaitEntry {
 
 struct AsyncPollResult {
     int32_t completed{0};  // Host-submitted stream tasks completed.
-    int32_t resolved{0};   // All task completions, including internal Graph nodes.
+    int32_t resolved{0};   // All task completions, including in-graph tasks.
     int32_t error_code{SIMPLER_ERROR_NONE};
     ChipTaskSlotState *failed_slot_state{nullptr};
 };
@@ -154,6 +153,17 @@ struct AsyncWaitList {
     // Read by scheduler shutdown / l2 perf summary; not on the hot path.
     std::atomic<uint64_t> mpsc_skipped_count{0};
 
+    // Empty state of a wait list sitting on the arena's device-only zone, whose
+    // bytes are whatever the pooled allocation last held. `count` bounds every
+    // read of entries[], and a drain assigns an entry in full before raising the
+    // count that admits it, so clearing the three scalars is the whole reset —
+    // the 190 KB entries[] region needs no per-bind sweep.
+    void reset_for_reuse() {
+        busy.store(0, std::memory_order_relaxed);
+        count = 0;
+        mpsc_skipped_count.store(0, std::memory_order_relaxed);
+    }
+
     bool try_lock() {
         int32_t expected = 0;
         return busy.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
@@ -172,7 +182,7 @@ struct AsyncWaitList {
     // NotDeferred tasks inline (without storing a transient entry in
     // entries[]).
     struct DrainCompletionSink {
-        PTO2SchedulerState *sched{nullptr};
+        SchedulerState *sched{nullptr};
         int32_t inline_completed{0};
         int32_t inline_resolved{0};
         int32_t error_code{SIMPLER_ERROR_NONE};
@@ -293,7 +303,7 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched
+        AICoreCompletionMailbox *aicore_mailbox, SchedulerState *sched
 #if SIMPLER_SCHED_PROFILING
         ,
         int thread_idx

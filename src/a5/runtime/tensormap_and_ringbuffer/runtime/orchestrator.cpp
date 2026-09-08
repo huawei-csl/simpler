@@ -10,7 +10,7 @@
  */
 
 /**
- * PTO Runtime2 - Orchestrator Implementation
+ * tensormap_and_ringbuffer orchestrator implementation
  *
  * Implements orchestrator state management, scope handling, and task submission.
  *
@@ -32,6 +32,7 @@
 #include "dep_compute.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
+#include "tensormap_and_ringbuffer/task_id.h"
 #include "tensormap.h"
 #include "types.h"
 #include "tensor.h"
@@ -41,11 +42,12 @@
 #include "aicpu/args_dump_aicpu.h"
 #endif
 
-// Verify the captured ChipTensor blob size in DepGenRecord matches the runtime
-// ChipTensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
+// Verify the captured simpler::tmr::Tensor blob size in DepGenRecord matches the runtime
+// simpler::tmr::Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
 // including runtime/tensor.h, so this check lives at the orch callsite.
 static_assert(
-    sizeof(ChipTensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot size out of sync with sizeof(ChipTensor)"
+    sizeof(simpler::tmr::Tensor) == DEP_GEN_TENSOR_SIZE,
+    "DepGenRecord::tensors slot size out of sync with sizeof(simpler::tmr::Tensor)"
 );
 // DEP_GEN_MAX_EXPLICIT_DEPS is a diagnostic-side capture cap only; the runtime
 // imposes no hard cap on explicit dep count. If a submit exceeds this cap,
@@ -60,7 +62,8 @@ static_assert(
 // (same pattern as get_sys_cnt_aicpu / chip_swimlane_aicpu_record_orch_phase below).
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
 __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
-    uint64_t, bool, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, int, const int32_t[3]
+    uint64_t, bool, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, const uint8_t *, uint8_t,
+    int, const int32_t[3]
 ) {}
 
 // Scope_stats enable gate, queried via the same predicate idiom as
@@ -160,7 +163,7 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)
 #endif
 
-static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
+static int32_t orch_mark_fatal(OrchestratorState *orch, int32_t error_code) {
     always_assert(orch != nullptr);
     orch->fatal = true;
     if (error_code == SIMPLER_ERROR_NONE || orch->sm_header == nullptr) {
@@ -176,7 +179,7 @@ static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) 
 }
 
 static void
-orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
+orch_report_fatal_v(OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
     int32_t latched_code = orch_mark_fatal(orch, error_code);
 
 #if SIMPLER_DFX
@@ -205,7 +208,7 @@ orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char 
     unified_log_error(func, "FATAL(code=%d): %s", error_code, message);
 }
 
-void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, const char *fmt, ...) {
+void OrchestratorState::report_fatal(int32_t error_code, const char *func, const char *fmt, ...) {
     auto *orch = this;
     va_list args;
     va_start(args, fmt);
@@ -213,7 +216,7 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
     va_end(args);
 }
 
-static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
+static uint32_t next_fanin_seen_epoch(OrchestratorState *orch) {
     uint32_t next = orch->fanin_seen_current_epoch + 1;
     if (next == 0) {
         for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
@@ -228,8 +231,8 @@ static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     return next;
 }
 
-struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2OrchestratorState *orch, PTO2FaninPool &spill_pool, uint32_t seen_epoch) :
+struct FaninBuilder {
+    FaninBuilder(OrchestratorState *orch, FaninPool &spill_pool, uint32_t seen_epoch) :
         count(0),
         wait_count(0),
         spill_start(0),
@@ -238,15 +241,27 @@ struct PTO2FaninBuilder {
         spill_pool(spill_pool) {}
     int32_t count{0};       // total fanin edges (all flag combinations)
     int32_t wait_count{0};  // edges carrying DEP_WAIT — sizes readiness accounting
+    // Set when reduction cleared DEP_WAIT on an edge to a producer that does
+    // not allow early resolve; flushed to TaskPayload::early_dispatch_blocked.
+    bool reduced_unflagged_producer{false};
     int32_t spill_start{0};
-    PTO2OrchestratorState *orch{nullptr};
+    OrchestratorState *orch{nullptr};
     uint32_t seen_epoch{0};
-    PTO2FaninPool &spill_pool;
-    PTO2FaninSpillEntry inline_slots[PTO2_FANIN_INLINE_CAP];
+    FaninPool &spill_pool;
+    FaninSpillEntry inline_slots[CHIP_FANIN_INLINE_CAP];
 
     template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
+    FaninForEachReturn<Fn> for_each(Fn &&fn) const {
         return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+    }
+
+    // Mutating walk over the same edges for_each visits, handing the callback
+    // the entry itself so flags can be rewritten (used by the reduction pass).
+    template <typename Fn>
+    void for_each_entry(Fn &&fn) {
+        for (int32_t i = 0; i < count; i++) {
+            fn(entry_at(i));
+        }
     }
 
     bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
@@ -263,7 +278,7 @@ struct PTO2FaninBuilder {
     }
 
     // Append a new edge (caller has already claimed the producer's fanout pin).
-    void push_edge(PTO2FaninSpillEntry &entry, ChipTaskSlotState *prod_state, DepFlags kind) {
+    void push_edge(FaninSpillEntry &entry, ChipTaskSlotState *prod_state, DepFlags kind) {
         entry.set(prod_state, kind);
         count++;
         if (dep_has_wait(kind)) {
@@ -276,7 +291,7 @@ struct PTO2FaninBuilder {
     // edge instead of adding a second one — no extra fanout pin is claimed.
     void or_flags_into_existing(ChipTaskSlotState *prod_state, DepFlags kind) {
         for (int32_t i = 0; i < count; i++) {
-            PTO2FaninSpillEntry &entry = entry_at(i);
+            FaninSpillEntry &entry = entry_at(i);
             if (entry.slot_state() == prod_state) {
                 accumulate_flags(entry, kind);
                 return;
@@ -289,18 +304,18 @@ struct PTO2FaninBuilder {
     }
 
 private:
-    // The i-th appended fanin edge: inline for i < PTO2_FANIN_INLINE_CAP, else in
+    // The i-th appended fanin edge: inline for i < CHIP_FANIN_INLINE_CAP, else in
     // the spill ring at the same linear->physical position for_each_fanin_storage
     // walks. Single source of the wrap arithmetic.
-    PTO2FaninSpillEntry &entry_at(int32_t i) {
-        if (i < PTO2_FANIN_INLINE_CAP) {
+    FaninSpillEntry &entry_at(int32_t i) {
+        if (i < CHIP_FANIN_INLINE_CAP) {
             return inline_slots[i];
         }
-        int32_t spill_idx = i - PTO2_FANIN_INLINE_CAP;
+        int32_t spill_idx = i - CHIP_FANIN_INLINE_CAP;
         return spill_pool.base[(spill_start % spill_pool.capacity + spill_idx) % spill_pool.capacity];
     }
 
-    void accumulate_flags(PTO2FaninSpillEntry &entry, DepFlags kind) {
+    void accumulate_flags(FaninSpillEntry &entry, DepFlags kind) {
         bool had_wait = dep_has_wait(entry.flags());
         entry.add_flags(kind);
         if (!had_wait && dep_has_wait(kind)) {
@@ -310,8 +325,8 @@ private:
 };
 
 static bool append_fanin_or_fail(
-    PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, ChipTaskSlotState *prod_state,
-    TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id, DepFlags kind
+    OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, ChipTaskSlotState *prod_state,
+    TaskId producer_task_id, FaninBuilder *fanin_builder, uint8_t ring_id, DepFlags kind
 ) {
     // Decide-and-claim under the producer's fanout_lock. Two conditions make this
     // resolved slot a non-dependency, and both must be checked together with the
@@ -343,8 +358,8 @@ static bool append_fanin_or_fail(
     // edge so the stronger of several discovery reasons (creator vs modifier vs
     // explicit) always wins, independent of the order they are reached in.
     prod_state->lock_fanout();
-    bool gone = prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local() ||
-                prod_state->task_state.load(std::memory_order_acquire) == PTO2_TASK_CONSUMED;
+    bool gone = prod_state->task == nullptr || prod_state->task->task_id.local_id() != producer_task_id.local_id() ||
+                prod_state->task_state.load(std::memory_order_acquire) == CHIP_TASK_CONSUMED;
     bool already_seen = !gone && fanin_builder->mark_seen(prod_ring, prod_slot);
     bool claim = !gone && !already_seen;
     int32_t fanout_now = -1;
@@ -353,11 +368,11 @@ static bool append_fanin_or_fail(
         // count must never carry into bit31 (would corrupt the scope-release
         // flag) — true for any sane fanout (<< 2^31).
         assert(
-            (prod_state->fanout_count & ~PTO2_FANOUT_SCOPE_BIT) < (PTO2_FANOUT_SCOPE_BIT - 1) &&
+            (prod_state->fanout_count & ~FANOUT_SCOPE_BIT) < (FANOUT_SCOPE_BIT - 1) &&
             "fanout consumer count overflow into scope bit"
         );
         prod_state->fanout_count++;
-        fanout_now = static_cast<int32_t>(prod_state->fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
+        fanout_now = static_cast<int32_t>(prod_state->fanout_count & ~FANOUT_SCOPE_BIT);
     }
     prod_state->unlock_fanout();
 #if SIMPLER_ORCH_PROFILING
@@ -367,10 +382,10 @@ static bool append_fanin_or_fail(
     // Dense-fanout diagnostic, emitted outside fanout_lock (no logging under
     // the spinlock). The monotonic fanout_count++ crosses THRESHOLD+1 exactly
     // once, so each dense producer emits one debug message when enabled.
-    if (fanout_now == PTO2_DEP_DEGREE_DEBUG_THRESHOLD + 1) {
+    if (fanout_now == CHIP_DEP_DEGREE_DEBUG_THRESHOLD + 1) {
         LOG_DEBUG(
             "dense dependency: task ring=%u id=%u fanout>%d [orch submit]",
-            static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local(), PTO2_DEP_DEGREE_DEBUG_THRESHOLD
+            static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local_id(), CHIP_DEP_DEGREE_DEBUG_THRESHOLD
         );
     }
     // Stale/consumed producer: no edge at all.
@@ -383,40 +398,40 @@ static bool append_fanin_or_fail(
         return true;
     }
 
-    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
+    if (fanin_builder->count < CHIP_FANIN_INLINE_CAP) {
         fanin_builder->push_edge(fanin_builder->inline_slots[fanin_builder->count], prod_state, kind);
         return true;
     }
 
-    PTO2FaninPool &fanin_pool = fanin_builder->spill_pool;
+    FaninPool &fanin_pool = fanin_builder->spill_pool;
     if (!fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1)) {
         orch_mark_fatal(orch, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED);
         return false;
     }
     int32_t spill_idx = fanin_pool.top;
-    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
+    FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
         orch_mark_fatal(orch, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED);
         return false;
     }
-    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
+    if (fanin_builder->count == CHIP_FANIN_INLINE_CAP) {
         fanin_builder->spill_start = spill_idx;
     }
     fanin_builder->push_edge(*entry, prod_state, kind);
     return true;
 }
 
-static bool all_claimed_fanin_completed(const PTO2FaninBuilder &fanin_builder) {
+static bool all_claimed_fanin_completed(const FaninBuilder &fanin_builder) {
     if (fanin_builder.count == 0) return true;
     // Only DEP_WAIT edges gate readiness; a retention-only edge never blocks
     // dispatch, so it is treated as satisfied here.
     return fanin_builder.for_each([](ChipTaskSlotState *producer, DepFlags flags) -> bool {
         if (!dep_has_wait(flags)) return true;
-        return producer != nullptr && producer->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED;
+        return producer != nullptr && producer->task_state.load(std::memory_order_acquire) >= CHIP_TASK_COMPLETED;
     });
 }
 
-static bool all_claimed_fanin_allow_early_resolve(const PTO2FaninBuilder &fanin_builder) {
+static bool all_claimed_fanin_allow_early_resolve(const FaninBuilder &fanin_builder) {
     if (fanin_builder.count == 0) return true;
     return fanin_builder.for_each([](ChipTaskSlotState *producer, DepFlags flags) -> bool {
         if (!dep_has_wait(flags)) return true;
@@ -424,8 +439,102 @@ static bool all_claimed_fanin_allow_early_resolve(const PTO2FaninBuilder &fanin_
     });
 }
 
-void PTO2OrchestratorState::mark_dep_pool_position(ChipTaskSlotState &slot_state) {
-    PTO2SchedulerState *sched = scheduler;
+// Publish this task's frozen WAIT-ancestor bitmap. Runs once per submit, before
+// the slot becomes a producer of any later submit (single orchestrator thread),
+// so a reader always observes the entry of the task generation that owns the
+// slot.
+static void publish_wait_reach(OrchestratorState *orch, uint8_t ring, int32_t slot, uint64_t ancestors) {
+    orch->wait_reach[ring][slot].ancestors = ancestors;
+}
+
+// Resolve a producer slot pointer to its (ring, slot) index. ring_id is
+// per-slot invariant; pointer subtraction from the ring's slot_states base
+// never dereferences a possibly-reused slot.
+static bool slot_index_of(const OrchestratorState *orch, ChipTaskSlotState *p, uint8_t &ring, int32_t &slot) {
+    ring = p->ring_id;
+    if (ring >= CHIP_MAX_RING_DEPTH) return false;
+    const SharedMemoryRingHeader &r = orch->sm_header->rings[ring];
+    slot = static_cast<int32_t>(p - r.slot_states);
+    return slot >= 0 && static_cast<uint64_t>(slot) < r.task_window_size;
+}
+
+// Two-pass bounded transitive reduction of the WAIT graph, run once per submit
+// on the fully-built fanin, before it is flushed to the payload and wired.
+//
+// Pass 1 folds `direct` (this task's WAIT producers, one bit each at distance
+// d-1) and `via` (ancestors reachable through another direct WAIT producer q:
+// R[q] << d, distance addition), then publishes R[t] = direct | via. Pass 2
+// clears DEP_WAIT on any tracked candidate whose bit is set in `via` — some
+// direct producer proves a WAIT path p -> ... -> q -> t — demoting
+// WAIT|RETAIN to RETAIN and WAIT-only to DEP_NONE (the entry stays in storage
+// so its submit-claim pin is released by the !DEP_RETAIN paths). Both passes
+// recompute d from the same seqs and fold with OR, so candidate enumeration
+// order (creator vs tensormap vs explicit) cannot change the result.
+//
+// Only DEP_WAIT edges participate in reachability: a RETAIN-only candidate
+// sets no bit and merges no ancestors, because the last hop to t must be a
+// WAIT edge for the path to carry ordering. A candidate with
+// d > WAIT_REACH_WINDOW keeps its WAIT and contributes nothing to R[t] — it
+// and all its ancestors are unrepresentable in the window. d == WAIT_REACH_
+// WINDOW sets only the direct bit: the shift would be undefined and every
+// ancestor of that producer already lies outside t's window.
+//
+// Every producer in the builder is pinned for this submit: append_fanin_or_fail
+// claimed it with fanout_count++ under the producer's fanout_lock, atomically
+// with the consumed/generation check, for every edge regardless of DepFlags.
+// Slot rebind requires the CONSUMED flip (which requires
+// fanout_refcount == fanout_count) plus allocator reclaim, so a pinned
+// producer's slot — and therefore its wait_reach entry and seq — still belongs
+// to the claimed task for the whole reduction pass. The bitmap is a frozen
+// value published at the producer's own submit, so unlike a fanin-pointer
+// walk there is no staleness dimension beyond slot identity, and slot identity
+// is settled by the pin.
+static void reduce_wait_edges(OrchestratorState *orch, FaninBuilder *b, uint8_t ring, int32_t slot, uint64_t seq_t) {
+    uint64_t direct = 0;
+    uint64_t via = 0;
+    b->for_each([&](ChipTaskSlotState *p, DepFlags flags) {
+        if (!dep_has_wait(flags)) return;
+        uint8_t pring;
+        int32_t pslot;
+        if (!slot_index_of(orch, p, pring, pslot)) return;
+        const WaitReachEntry &entry = orch->wait_reach[pring][pslot];
+        uint64_t d = seq_t - entry.seq;  // global seq: ring-independent, unsigned-exact
+        if (d == 0 || d > static_cast<uint64_t>(WAIT_REACH_WINDOW)) return;
+        direct |= 1ull << (d - 1);
+        if (d < static_cast<uint64_t>(WAIT_REACH_WINDOW)) {
+            via |= entry.ancestors << d;
+        }
+    });
+    // A via bit lands at index (i + d) for ancestor bit i >= 0 of a producer at
+    // distance d >= 1, so index 0 is unreachable: the nearest direct producer
+    // can never be proven redundant. A set bit 0 means the shift-merge has
+    // drifted (the classic form is shifting by d - 1) and reduction is about to
+    // drop an edge nothing covers.
+    always_assert((via & 1ull) == 0 && "via bit 0 set: distance-1 producers are not reducible");
+    publish_wait_reach(orch, ring, slot, direct | via);
+    if (via == 0) return;
+    b->for_each_entry([&](FaninSpillEntry &entry) {
+        DepFlags f = entry.flags();
+        if (!dep_has_wait(f)) return;
+        uint8_t pring;
+        int32_t pslot;
+        if (!slot_index_of(orch, entry.slot_state(), pring, pslot)) return;
+        uint64_t d = seq_t - orch->wait_reach[pring][pslot].seq;
+        if (d == 0 || d > static_cast<uint64_t>(WAIT_REACH_WINDOW)) return;
+        if ((via & (1ull << (d - 1))) == 0) return;
+        // A producer that does not allow early resolve never propagates
+        // dispatch_fanin. Record that before the edge leaves wait_count, so the
+        // early-dispatch target keeps the unit this producer used to hold.
+        if (!entry.slot_state()->task_attrs.allow_early_resolve()) {
+            b->reduced_unflagged_producer = true;
+        }
+        entry.set(entry.slot_state(), static_cast<DepFlags>(f & ~DEP_WAIT));
+        b->wait_count--;
+    });
+}
+
+void OrchestratorState::mark_dep_pool_position(ChipTaskSlotState &slot_state) {
+    SchedulerState *sched = scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
     slot_state.dep_pool_mark = rss.dep_pool.top;
 #if SIMPLER_DFX
@@ -435,10 +544,10 @@ void PTO2OrchestratorState::mark_dep_pool_position(ChipTaskSlotState &slot_state
 #endif
 }
 
-void PTO2OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t wfanin) {
-    PTO2SchedulerState *sched = scheduler;
+void OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32_t wfanin) {
+    SchedulerState *sched = scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
-    PTO2TaskPayload *payload = slot_state.payload;
+    TaskPayload *payload = slot_state.payload;
     slot_state.fanin_count = wfanin + 1;
 
     int32_t completed_fanin = 0;
@@ -452,10 +561,13 @@ void PTO2OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32
         if (dep_has_wait(flags)) {
             producer->lock_fanout();
             int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+            // Only WAIT producers reach this check. An unflagged producer whose
+            // edge reduction demoted is not one of them, and is accounted for by
+            // early_dispatch_blocked raising early_dispatch_target instead.
             if (!early_disqualified && !producer->task_attrs.allow_early_resolve()) {
                 early_disqualified = true;
             }
-            if (pstate >= PTO2_TASK_COMPLETED) {
+            if (pstate >= CHIP_TASK_COMPLETED) {
                 completed_fanin++;
             } else {
                 producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
@@ -471,8 +583,9 @@ void PTO2OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32
         // consumer is linked. With the consumer now on fanout_head (or already
         // seen as completed), release it so the producer can be CONSUMED without
         // waiting for this consumer. A DEP_RETAIN edge keeps the pin until the
-        // consumer's on_task_release.
-        if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+        // consumer's on_task_release. A reduction-dropped (DEP_NONE) edge is
+        // released here too: it never links, so wiring is its only release point.
+        if (!dep_has_retain(flags)) {
             // Wiring-phase atomics (this release, plus the lock_fanout / dep_pool.prepend /
             // fanin_refcount ops around it) are not bucketed: g_orch_args_atomic_count
             // covers the submit/dep-claim phase only, whose g_orch_args_cycle window has
@@ -488,7 +601,8 @@ void PTO2OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32
         int32_t dispatch_fanin = payload->dispatch_fanin.fetch_add(early_seed, std::memory_order_acq_rel) + early_seed;
         // Fully pre-completed fanin routes normally. If any producer was live,
         // the exact-full increment must enqueue the early candidate.
-        if (completed_fanin != payload->fanin_actual_count && dispatch_fanin == payload->fanin_actual_count) {
+        int32_t target = payload->early_dispatch_target();
+        if (completed_fanin != target && dispatch_fanin == target) {
             sched->try_enqueue_early_dispatch_candidate(slot_state);
         }
     }
@@ -501,7 +615,7 @@ void PTO2OrchestratorState::wire_fanin_task(ChipTaskSlotState &slot_state, int32
     }
 }
 
-static ChipTaskSlotState *oldest_open_task_on_current_ring(const PTO2OrchestratorState *orch) {
+static ChipTaskSlotState *oldest_open_task_on_current_ring(const OrchestratorState *orch) {
     // Scope depth maps directly to a ring until the deepest ring, where all
     // further nested scopes share that ring. Its shallowest open scope begin
     // therefore marks the oldest task pinned by any open scope on this ring.
@@ -509,8 +623,8 @@ static ChipTaskSlotState *oldest_open_task_on_current_ring(const PTO2Orchestrato
     return begin < orch->scope_tasks_size ? orch->scope_tasks[begin] : nullptr;
 }
 
-static bool orch_wire_live_fanin_task(PTO2OrchestratorState *orch, ChipTaskSlotState &slot_state, int32_t wfanin) {
-    PTO2SchedulerState *sched = orch->scheduler;
+static bool orch_wire_live_fanin_task(OrchestratorState *orch, ChipTaskSlotState &slot_state, int32_t wfanin) {
+    SchedulerState *sched = orch->scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
 
     // dep_pool is orchestrator-exclusive (no lock). ensure_space waits for the
@@ -527,31 +641,31 @@ static bool orch_wire_live_fanin_task(PTO2OrchestratorState *orch, ChipTaskSlotS
     return true;
 }
 
-static void scope_tasks_push(PTO2OrchestratorState *orch, ChipTaskSlotState *task_slot_state);
+static void scope_tasks_push(OrchestratorState *orch, ChipTaskSlotState *task_slot_state);
 
-struct PTO2PreparedTask {
+struct PreparedTask {
     TaskId task_id = TaskId::invalid();
-    PTO2TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
-    PTO2TaskDescriptor *task = nullptr;
-    PTO2TaskPayload *payload = nullptr;
+    TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
+    TaskDescriptor *task = nullptr;
+    TaskPayload *payload = nullptr;
     ChipTaskSlotState *slot_state = nullptr;
+    uint64_t seq = 0;  // global submission sequence assigned in prepare_task
 };
 
-static PTO2OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
-    PTO2OutputLayout layout;
+static OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
+    OutputLayout layout;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) {
             continue;
         }
         layout.offsets[i] = layout.total_output_size;
-        layout.buffer_sizes[i] =
-            PTO2_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+        layout.buffer_sizes[i] = CHIP_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PACKED_OUTPUT_ALIGN);
         layout.total_output_size += layout.buffer_sizes[i];
     }
     return layout;
 }
 
-static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator, uint8_t ring_id) {
+static bool check_scope_can_accept_task(OrchestratorState *orch, TaskAllocator &allocator, uint8_t ring_id) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
     int32_t scope_task_count = orch->scope_tasks_size - orch->scope_begins[orch->scope_stack_top];
@@ -576,8 +690,8 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     LOG_ERROR("Solution:");
     LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
     LOG_ERROR("  2. Increase task window (current: %d)", allocator.window_size());
-    LOG_ERROR("     Compile-time: PTO2_TASK_WINDOW_SIZE in runtime_types.h");
-    LOG_ERROR("     Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2>");
+    LOG_ERROR("     Compile-time: CHIP_TASK_WINDOW_SIZE in runtime_types.h");
+    LOG_ERROR("     Per task:     CallConfig.runtime_env.ring_task_window=<power-of-2>");
     LOG_ERROR("  3. Split work across multiple scopes");
     LOG_ERROR("========================================");
     orch_mark_fatal(orch, SIMPLER_ERROR_SCOPE_DEADLOCK);
@@ -585,8 +699,8 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
 }
 
 static bool prepare_task(
-    PTO2OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
-    TaskAttrs task_attrs, PTO2PreparedTask *out
+    OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
+    TaskAttrs task_attrs, PreparedTask *out
 ) {
     uint8_t ring_id = orch->current_ring_id();
     auto &allocator = orch->rings[ring_id].task_allocator;
@@ -620,6 +734,20 @@ static bool prepare_task(
     out->slot_state->reset_for_reuse();
     out->slot_state->fanin_count = 0;
 
+    // Assign the global submission sequence and stamp the slot's side entry
+    // before any consumer can observe the slot: every task-consuming path runs
+    // on this single thread, and a later submit reaches this slot as a
+    // producer only after this submit returns. alloc_tensors shares this
+    // path, so hidden alloc tasks get a seq without entering
+    // submit_task_common.
+    //
+    // Both fields are written together so the entry always describes one task
+    // generation. An empty bitmap contributes no `via` bit, so a slot whose
+    // submit fails between here and reduce_wait_edges' publication carries a
+    // conservative entry rather than the previous generation's ancestors.
+    out->seq = orch->submit_seq++;
+    orch->wait_reach[ring_id][out->alloc_result.slot] = WaitReachEntry{0, out->seq};
+
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
@@ -639,13 +767,24 @@ static bool prepare_task(
     //   ring_id
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
-    out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    out->slot_state->task_state.store(CHIP_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.core_num();
     out->slot_state->total_required_subtasks =
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
+    if (task_attrs.requires_sync_start()) {
+        // Ordered before the wiring publish below, which is the first read of
+        // this slot by any scheduler thread, so the latch is set before the
+        // task can be routed to ready_sync_queues.
+        //
+        // Tier-0 priority is best-effort for an entry that becomes visible
+        // mid-iteration: a thread already past its Tier-0 checkpoint picks that
+        // entry up on its next pass, whether the checkpoint is this latch or
+        // the six queue probes it stands in for.
+        orch->scheduler->sync_task_seen.store(1, std::memory_order_release);
+    }
     // fanin_count is set during Orch-side wiring
     scope_tasks_push(orch, out->slot_state);
 
@@ -656,7 +795,7 @@ static bool prepare_task(
 // Scope Management
 // =============================================================================
 
-static void scope_tasks_push(PTO2OrchestratorState *orch, ChipTaskSlotState *task_slot_state) {
+static void scope_tasks_push(OrchestratorState *orch, ChipTaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         // scope_tasks lives in the per-Worker arena (single backing allocation),
         // so realloc is not legal. Capacity is the total in-flight slot budget
@@ -672,13 +811,13 @@ static void scope_tasks_push(PTO2OrchestratorState *orch, ChipTaskSlotState *tas
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }
 
-void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
+void OrchestratorState::begin_scope(ScopeMode mode) {
     auto *orch = this;
     if (orch->fatal) {
         return;
     }
     assert(orch->scope_stack_top < static_cast<int32_t>(orch->scope_stack_capacity - 1) && "Scope stack overflow");
-    if (mode == PTO2ScopeMode::AUTO && orch->in_manual_scope()) {
+    if (mode == ScopeMode::AUTO && orch->in_manual_scope()) {
         report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "auto scope nested inside manual scope is not supported"
         );
@@ -688,7 +827,7 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     bool already_in_manual_scope = orch->in_manual_scope();
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
-    if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
+    if (mode == ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
 #if SIMPLER_DFX
@@ -711,7 +850,7 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
 #endif
 }
 
-void PTO2OrchestratorState::end_scope() {
+void OrchestratorState::end_scope() {
     auto *orch = this;
     if (orch->fatal) {
         return;
@@ -747,7 +886,7 @@ void PTO2OrchestratorState::end_scope() {
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
     int32_t count = orch->scope_tasks_size - begin;
     if (ending_manual_scope) {
-        orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
+        orch->manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
     }
 
     if (orch->scheduler && count > 0) {
@@ -777,15 +916,15 @@ void PTO2OrchestratorState::end_scope() {
 // (no entry freed) is a genuine deadlock: latch SIMPLER_ERROR_TENSORMAP_OVERFLOW
 // and bail. Returns false on deadlock or on a fatal already latched by another
 // party. Cold path — the fast path returns immediately when the pool has room.
-static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t needed) {
-    PTO2TensorMap &tm = orch->tensor_map;
+static bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
+    ChipTensorMap &tm = orch->tensor_map;
     if (tm.free_entries() >= needed) {
         return true;
     }
 
     uint32_t all_ring_bits = 0;
     for (int32_t r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
-        all_ring_bits |= PTO2SchedulerState::ring_advance_pending_bit(r);
+        all_ring_bits |= SchedulerState::ring_advance_pending_bit(r);
     }
     // No acknowledgment is consumed here because TensorMap reclamation has no
     // structural head classification; repeated watermark reads are sufficient.
@@ -851,10 +990,10 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
             if (!block_timing) {
                 block_cycle0 = now;
                 block_timing = true;
-            } else if (now - block_cycle0 >= PTO2_PUBLICATION_REQUEST_TIMEOUT_CYCLES) {
+            } else if (now - block_cycle0 >= CHIP_PUBLICATION_REQUEST_TIMEOUT_CYCLES) {
                 request_reclaim_publication();
             }
-            if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
+            if (now - block_cycle0 >= ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: TensorMap Entry Pool Deadlock Detected!");
                 LOG_ERROR("========================================");
@@ -867,7 +1006,7 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
                 LOG_ERROR("  still move on rings with no registered outputs). Check TaskRing");
                 LOG_ERROR("  diagnostics for the stalled producer.");
                 LOG_ERROR("Solution:");
-                LOG_ERROR("  Increase PTO2_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
+                LOG_ERROR("  Increase CHIP_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
                 LOG_ERROR("========================================");
                 orch_mark_fatal(orch, SIMPLER_ERROR_TENSORMAP_OVERFLOW);
                 return false;
@@ -884,23 +1023,23 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
-    PTO2OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
     TaskOutputTensors result;
-    PTO2OutputLayout layout = calculate_output_layout(args);
-    PTO2PreparedTask prepared;
+    OutputLayout layout = calculate_output_layout(args);
+    PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
         return result;
     }
     uint8_t ring_id = prepared.task_id.ring();
-    PTO2SchedulerState *sched = orch->scheduler;
-    PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
+    SchedulerState *sched = orch->scheduler;
+    ChipRingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
     TaskId task_id = prepared.task_id;
     ChipTaskSlotState &cur_slot_state = *prepared.slot_state;
-    PTO2TaskDescriptor &task = *prepared.task;
-    PTO2TaskPayload &payload = *prepared.payload;
+    TaskDescriptor &task = *prepared.task;
+    TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
 
     // dep_gen capture point: snapshot the orch submit_task inputs while the
@@ -924,7 +1063,7 @@ static TaskOutputTensors submit_task_common(
         const int tc_raw = args.tensor_count();
         const int tc = tc_raw > MAX_TENSOR_ARGS ? MAX_TENSOR_ARGS : tc_raw;
         for (int i = 0; i < tc; i++) {
-            // OUTPUT slots carry create_info (not yet a ChipTensor); skip them —
+            // OUTPUT slots carry create_info (not yet a simpler::tmr::Tensor); skip them —
             // they have no producer to look up and replay's per-tensor loop
             // also skips OUTPUT.
             tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : &args.tensor(i).ref();
@@ -934,12 +1073,13 @@ static TaskOutputTensors submit_task_common(
         dep_gen_aicpu_record_submit(
             task_id.raw, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
             static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data()),
-            args.launch_spec.core_num(), kernel_ids_capture
+            reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
+            static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.core_num(), kernel_ids_capture
         );
     }
 #endif
 
-    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
+    FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -967,8 +1107,8 @@ static TaskOutputTensors submit_task_common(
             return result;
         }
         uint8_t dep_ring_id = dep_task_id.ring();
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
-        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
+        SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
+        int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local_id());
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) {
             continue;
@@ -991,8 +1131,8 @@ static TaskOutputTensors submit_task_common(
 
     auto runtime_emit = [&](TaskId producer_task_id, DepFlags kind) -> bool {
         uint8_t prod_ring = producer_task_id.ring();
-        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
-        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+        SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
+        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local_id()));
         ChipTaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
         return append_fanin_or_fail(
             orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id, kind
@@ -1023,9 +1163,9 @@ static TaskOutputTensors submit_task_common(
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
     task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = aiv1_kernel_id;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -1034,26 +1174,35 @@ static TaskOutputTensors submit_task_common(
     // the producer's fanout_lock. Doing it there (rather than a separate pass
     // here) is what prevents a producer from transitioning to CONSUMED between
     // the dependency decision and the claim.
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    // Every fanin edge produced here carries DEP_WAIT (creator = WAIT|RETAIN,
-    // modifier = WAIT, explicit defaults to WAIT|RETAIN or opts into WAIT), so
-    // wait_count == count. fanin_actual_count therefore doubles as the WAIT-edge
-    // count that the early-dispatch threshold (dispatch_fanin, which counts only
-    // WAIT producers) is compared against. A future RETAIN-only edge would break
-    // that equality and must carry its own WAIT-edge count for that comparison.
+    //
+    // Bounded transitive reduction runs on the fully-built fanin, before it is
+    // flushed to the payload and wired, so RETAIN-only and dropped edges are
+    // reflected in every downstream count. Publication of R[t] happens inside,
+    // so every slot that can later be read as a producer carries its own
+    // bitmap.
+    reduce_wait_edges(orch, &fanin_builder, ring_id, prepared.alloc_result.slot, prepared.seq);
+    int32_t inline_count = std::min(fanin_builder.count, CHIP_FANIN_INLINE_CAP);
+    // fanin_actual_count is the TOTAL edge count (for_each iteration and
+    // on_task_release walk every edge, including RETAIN-only and
+    // reduction-dropped ones); fanin_wait_count is the readiness WAIT-edge count
+    // after reduction, always <= fanin_actual_count. The early-dispatch
+    // denominator is early_dispatch_target(), which re-adds the unit a
+    // reduced-away unflagged producer used to hold.
     always_assert(
-        fanin_builder.wait_count == fanin_builder.count &&
-        "fanin_actual_count is the early-dispatch WAIT denominator; a non-WAIT edge needs a separate count"
+        fanin_builder.wait_count <= fanin_builder.count &&
+        "fanin_wait_count is the readiness WAIT denominator and never exceeds the edge total"
     );
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
+    payload.fanin_wait_count = fanin_builder.wait_count;
+    payload.early_dispatch_blocked = fanin_builder.reduced_unflagged_producer ? 1 : 0;
     // fanin_builder.count is finalized here and submit runs once per task, so
     // each dense consumer emits one debug message when enabled. This checks >
     // THRESHOLD because the count lands at its final total here.
-    if (fanin_builder.count > PTO2_DEP_DEGREE_DEBUG_THRESHOLD) {
+    if (fanin_builder.count > CHIP_DEP_DEGREE_DEBUG_THRESHOLD) {
         LOG_DEBUG(
             "dense dependency: task ring=%u id=%u fanin>%d [orch submit]", static_cast<unsigned>(task_id.ring()),
-            task_id.local(), PTO2_DEP_DEGREE_DEBUG_THRESHOLD
+            task_id.local_id(), CHIP_DEP_DEGREE_DEBUG_THRESHOLD
         );
     }
     payload.fanin_spill_start = fanin_builder.spill_start;
@@ -1066,7 +1215,7 @@ static TaskOutputTensors submit_task_common(
 
     // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
     // now so the scheduler can read it at the dispatch point with a single load,
-    // no Arg/ChipTensor access. Both branches write predicate.op explicitly because
+    // no Arg/simpler::tmr::Tensor access. Both branches write predicate.op explicitly because
     // payload slots are ring-reused; op == NONE means "always dispatch".
     {
         const CoreTaskPredicate &pred = args.predicate();
@@ -1113,14 +1262,15 @@ static TaskOutputTensors submit_task_common(
         int32_t ready_seed = fanin_builder.wait_count + 1;
         cur_slot_state.fanin_count = ready_seed;
         if (all_claimed_fanin_allow_early_resolve(fanin_builder)) {
-            payload.dispatch_fanin.store(fanin_builder.count, std::memory_order_release);
+            payload.dispatch_fanin.store(fanin_builder.wait_count, std::memory_order_release);
         }
         cur_slot_state.fanin_refcount.store(ready_seed, std::memory_order_release);
         // wire_fanin_task is skipped here, so its ordering-only pin release runs
-        // on this path too: an edge without retention drops its submit->wire pin
-        // so the (already completed) producer can be CONSUMED.
+        // on this path too: an edge without retention — including a
+        // reduction-dropped DEP_NONE edge — drops its submit->wire pin so the
+        // (already completed) producer can be CONSUMED.
         for_each_fanin_slot_state(payload, [&](ChipTaskSlotState *producer, DepFlags flags) {
-            if (dep_has_wait(flags) && !dep_has_retain(flags)) {
+            if (!dep_has_retain(flags)) {
                 sched->release_producer(*producer);  // wiring-phase atomic, not bucketed (see wire_fanin_task)
             }
         });
@@ -1145,7 +1295,7 @@ static TaskOutputTensors submit_task_common(
     return result;
 }
 
-TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
     auto *orch = this;
 
     // Orchestration API should short-circuit after fatal, but keep this entry
@@ -1176,13 +1326,13 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
 
     // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
     // it to the aiv0 slot.  This guarantees the dispatch path can always use
-    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
+    // SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
     // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
     // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(PTO2_SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(PTO2_SUBTASK_MASK_AIV1);
+    bool has_aic = active_mask.has_mask(SUBTASK_MASK_AIC);
+    bool has_aiv0 = active_mask.has_mask(SUBTASK_MASK_AIV0);
+    bool has_aiv1 = active_mask.has_mask(SUBTASK_MASK_AIV1);
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
@@ -1198,8 +1348,8 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
         // Deadlock check: block_num >= total available slots of the required type.
         // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
         // For AIV:     limit is total_aiv_count.
-        PTO2ResourceShape shape = active_mask.to_shape();
-        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
+        ResourceShape shape = active_mask.to_shape();
+        int32_t limit = (shape == ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
         if (limit > 0 && block_num > limit) {
             report_fatal(
                 SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
@@ -1225,7 +1375,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
 // AICore dispatch. Empty active_mask routes the slot to the DUMMY ready
 // bucket; dispatch loop short-circuits to completion. Accepts the same Arg
 // shape as submit_task; scalars are permitted but never consumed.
-TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const CoreTaskArgs &args) {
+TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args) {
     auto *orch = this;
 
     if (orch->fatal) {
@@ -1255,7 +1405,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const CoreTaskArgs &a
     );
 }
 
-TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
+TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
@@ -1292,16 +1442,16 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
         return TaskOutputTensors{};
     }
 
-    PTO2OutputLayout layout = calculate_output_layout(args);
-    PTO2PreparedTask prepared;
+    OutputLayout layout = calculate_output_layout(args);
+    PreparedTask prepared;
     // Kernel-less alloc task: no active subtasks, no dispatch-time attributes. The
     // early-dispatch hint is force-set below (see the flag-the-creator note).
     if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, TaskAttrs{}, &prepared)) {
         return TaskOutputTensors{};
     }
 
-    PTO2TaskDescriptor &task = *prepared.task;
-    PTO2TaskPayload &payload = *prepared.payload;
+    TaskDescriptor &task = *prepared.task;
+    TaskPayload &payload = *prepared.payload;
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -1313,9 +1463,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
 #endif
 
     task.task_id = prepared.task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
+    task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -1323,8 +1473,15 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
+    payload.fanin_wait_count = 0;
+    payload.early_dispatch_blocked = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
+    // A hidden alloc task has no WAIT predecessors: its reachability bitmap is
+    // empty and its seq was stamped by prepare_task, so a consumer reading it
+    // as a creator producer sees a valid, conservative entry rather than a
+    // stale slot generation.
+    publish_wait_reach(orch, prepared.task_id.ring(), prepared.alloc_result.slot, 0);
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
@@ -1367,7 +1524,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const CoreTaskArgs &args)
 // Flow Control
 // =============================================================================
 
-void PTO2OrchestratorState::mark_done() {
+void OrchestratorState::mark_done() {
     auto *orch = this;
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
@@ -1385,15 +1542,15 @@ void PTO2OrchestratorState::mark_done() {
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
-    orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
+    orch->manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
 #if !SIMPLER_ORCH_PROFILING && SIMPLER_DFX
     g_orch_submit_idx = 0;
 #endif
 }
 
 #if SIMPLER_ORCH_PROFILING
-PTO2OrchProfilingData orchestrator_get_profiling() {
-    PTO2OrchProfilingData d;
+OrchProfilingData orchestrator_get_profiling() {
+    OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
     d.args_cycle = g_orch_args_cycle;

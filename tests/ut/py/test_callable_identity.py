@@ -37,6 +37,7 @@ from simpler.callable_identity import (
     parse_python_import_target,
     validate_hashid,
 )
+from simpler.comm_endpoints import HOST_CPU
 from simpler.orchestrator import Orchestrator
 from simpler.remote_l3_protocol import (
     CallableKind,
@@ -105,7 +106,7 @@ def _remote_sleep_orch(orch, args, cfg):
 # A remote runner's orchestration function receives address-free wire ``Tensor`` args, so one that
 # computes in-process reaches the bytes the way every other consumer does: map the embedded
 # descriptor once, keyed by canonical identity, and index the view from the mapped base.
-_REMOTE_ORCH_IMPORTS = ImportRegistry(ImportContext(is_host_endpoint=True))
+_REMOTE_ORCH_IMPORTS = ImportRegistry(ImportContext(deployment=HOST_CPU))
 
 
 def _remote_u8_view(tensor):
@@ -813,6 +814,26 @@ def test_chip_submit_uses_chip_index_worker_id():
     call = fake.submit_next_level_args
     assert call[5] == 0
     assert call[6] == []
+
+
+def test_next_level_submit_returns_native_task_handle():
+    task_handle = object()
+
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+            return task_handle
+
+    handle = CallableHandle(
+        "sha256:" + "00" * 32,
+        "CHIP_CALLABLE",
+        "LOCAL_CHIP",
+    )
+    orch = Orchestrator(FakeCOrchestrator())
+
+    result = orch.submit_next_level(handle, TaskArgs(), worker=0)
+
+    assert result is task_handle
 
 
 def test_next_level_submit_requires_valid_explicit_targets():

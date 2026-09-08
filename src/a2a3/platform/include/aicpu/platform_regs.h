@@ -23,8 +23,7 @@
  * Implementation: src/platform/shared/aicpu/platform_regs.cpp (shared across all platforms)
  */
 
-#ifndef PLATFORM_AICPU_PLATFORM_REGS_H_
-#define PLATFORM_AICPU_PLATFORM_REGS_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -149,29 +148,35 @@ void platform_signal_aicore_exit(uint64_t reg_addr);
  */
 uint64_t platform_aicore_exit_deadline();
 
-/**
- * Wait for a signalled AICore to acknowledge exit, then quiesce its register
- * block (dispatch register back to idle, fast path closed).
- *
- * Pairs with platform_signal_aicore_exit when stopping several cores: signal
- * them all, take one deadline from platform_aicore_exit_deadline(), then finish
- * each core against that shared deadline.
- *
- * @param deadline absolute sys-cnt value to give up at.
- * @return 0 once the core acknowledges, -1 on timeout — an unresponsive core is
- *         left for the host's device reset to clear.
- */
-int32_t platform_finish_aicore_exit(uint64_t reg_addr, uint64_t deadline);
+// Quiesce a core whose COND the caller has already observed as EXITED: dispatch
+// back to idle, fast path closed, and the posted close read back so it is
+// complete. Issues no fence of its own — a caller closing several windows owes
+// one rmb() after the last call and before it publishes any return gate.
+void platform_close_aicore_window(uint64_t reg_addr);
 
-/**
- * Deinitialize AICore registers before termination
- *
- * This function sends exit signal and closes fast path control.
- *
- * @param reg_addr  Register base address of the AICore
- * @return 0 if the core acknowledged exit, non-zero on timeout
- */
-int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
+struct AicoreTeardownControl;
+
+struct AicoreExitTarget {
+    uint64_t reg_addr;
+    AicoreTeardownControl *teardown;
+};
+
+// Retires one exclusively-claimed set of cores: signal every member, collect
+// every ACK against one shared deadline, close every acknowledged window, then
+// release those workers. Callers claim their targets first, so concurrent
+// callers never name the same core and the set need not be the whole chip.
+// An unacknowledged core is neither closed nor released and stays the host
+// recovery path's responsibility.
+//
+// `released`, when non-null, receives one flag per target and lets the caller
+// name the cores it failed to retire; this layer takes no logging dependency.
+// Every path that returns fills those entries first, rejection included, so the
+// caller may read them without initializing the buffer; a `count` above
+// PLATFORM_MAX_CORES is rejected and only that many are filled.
+// Returns 0 when every target was released, -1 on timeout or invalid targets.
+int32_t platform_retire_aicore_group(
+    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
+);
 
 /**
  * Variant-specific AICore deinit wait timeout, in ticks of get_sys_cnt_aicpu.
@@ -199,5 +204,3 @@ uint64_t inner_get_deinit_timeout_ticks();
  * @return Physical core count (exclusive upper bound)
  */
 uint32_t platform_get_physical_cores_count();
-
-#endif  // PLATFORM_AICPU_PLATFORM_REGS_H_

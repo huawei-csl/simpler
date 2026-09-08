@@ -26,9 +26,9 @@ same mixed-task contract.
 
 The shared graph image separates stable task identity from scheduling state:
 
-- `PTO2TaskDescriptor` contains the task ID, kernel IDs, and packed-buffer
+- `TaskDescriptor` contains the task ID, kernel IDs, and packed-buffer
   addresses.
-- `PTO2TaskPayload` contains the argument counts, predicate, and a delta naming
+- `TaskPayload` contains the argument counts, predicate, and a delta naming
   each of its tensor, scalar and position-independent fanin-id regions. The
   arguments live in the pool segments, not in the payload.
 - `ChipTaskSlotState` contains the active mask, task attributes, logical block
@@ -111,7 +111,9 @@ the run.
 
 `host_build_graph` is whole-graph-resident. Task slots, heap bytes, fanin IDs,
 and TensorMap entries are not reclaimed while the graph is executing. The graph
-must fit the configured task window, heap, and TensorMap pool before launch.
+must fit the configured task count (`runtime_env.ring_task_window`) and the
+TensorMap pool before launch; the heap is not a third capacity, since its device
+region is committed after orchestration at the size the graph turned out to need.
 
 ## Validation
 

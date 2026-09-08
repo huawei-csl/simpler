@@ -29,9 +29,17 @@ Two host behaviours are exercised, because they genuinely differ:
 """
 
 import os
+import time
 
 import pytest
-from simpler.task_interface import ArgDirection, CallConfig, ChipCallable, CoreCallable
+from simpler.task_interface import (
+    ArgDirection,
+    CallConfig,
+    ChipCallable,
+    CoreCallable,
+    _flush_host_log,
+    _host_log_dropped_records,
+)
 from simpler.worker import Worker
 
 from simpler_setup.elf_parser import extract_text_section
@@ -47,6 +55,34 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.environ.get("SIMPLER_FATAL_CODES_RUNTIME", "tensormap_and_ringbuffer")
 KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
+
+
+def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, timeout_s: float = 5.0) -> str:
+    """Poll for required records and report queue loss instead of trusting one flush deadline."""
+    chunks: list[str] = []
+    deadline = time.monotonic() + timeout_s
+    last_flush = False
+    while True:
+        last_flush = _flush_host_log(100)
+        captured = capfd.readouterr()
+        chunks.extend((captured.err, captured.out))
+        log = "".join(chunks)
+        if all(marker in log for marker in markers):
+            dropped_after = _host_log_dropped_records()
+            assert dropped_after == dropped_before, (
+                f"host-log drop counter changed while waiting for {markers}: "
+                f"before={dropped_before}, after={dropped_after}"
+            )
+            return log
+        if time.monotonic() >= deadline:
+            dropped_after = _host_log_dropped_records()
+            missing = [marker for marker in markers if marker not in log]
+            raise AssertionError(
+                f"host-log records did not arrive within {timeout_s:.1f}s: missing={missing}, "
+                f"last_flush={last_flush}, dropped_delta={dropped_after - dropped_before}, tail={log[-2000:]!r}"
+            )
+        time.sleep(0.01)
+
 
 # case -> dict(orch, code, runtime_env, kernel, marker, explain)
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
@@ -133,7 +169,7 @@ CASES = {
         kernel_core="aic",
         onboard_only=True,  # a while(true) kernel would hang the simulator
         # The data-wait timeout is 15 s on both arches now that it is frequency-
-        # scaled (PTO2_TENSOR_DATA_TIMEOUT_MS, #1189) -- before that it was 15 s on
+        # scaled (TENSOR_DATA_TIMEOUT_MS, #1189) -- before that it was 15 s on
         # a5 but 300 s on a2a3, so this case used to be a5-only. Raise every other
         # watchdog above 15 s so the tensor-data wait wins the race and latches
         # code 8 before they reap the hung core.
@@ -212,11 +248,11 @@ CASES = {
     #   reproducible scheduler-timeout e2e case (aicore_hang_orch.cpp).
     #
     # -- Reachable only by exhausting a fixed compile-time cap --
-    # * TENSORMAP_OVERFLOW (11): the tensormap entry pool (PTO2_TENSORMAP_POOL_SIZE
+    # * TENSORMAP_OVERFLOW (11): the tensormap entry pool (CHIP_TENSORMAP_POOL_SIZE
     #   == 65536) is compile-time and not shrinkable via runtime_env, so wedging it
     #   needs a 65536-entry flood plus a stalled producer holding entries. Its latch
     #   is also orchestrator-level (a reclaim deadlock), so even a device UT would be
-    #   a runtime-integration test, not a PTO2TensorMap unit test.
+    #   a runtime-integration test, not a ChipTensorMap unit test.
     #
     # TENSOR_WAIT_TIMEOUT (8) IS covered (onboard, both arches) — see the
     # tensor_wait_timeout case.
@@ -310,13 +346,16 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
     case = CASES[case_name]
     if case.get("onboard_only"):
         pytest.skip("hang kernel would spin the simulator forever (no STARS watchdog on sim)")
+    dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, None, config)
-        captured = capfd.readouterr()
-        log = captured.err + captured.out
-        assert case["marker"] in log, f"missing '{case['marker']}' in host log"
+        log = _wait_for_host_log(
+            capfd,
+            (case["marker"], "error detail:", case["explain"], "error hint:"),
+            dropped_before,
+        )
         _assert_annotated(log, case)
     finally:
         worker.close()
@@ -331,6 +370,7 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
     configure_logging("error")
     case = CASES[case_name]
+    dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
         # On hardware the op-execute / stream-sync watchdog can surface a generic
@@ -338,9 +378,11 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         # run fails. The point of the test is the device-classified host LOG.
         with pytest.raises(RuntimeError):
             worker.run(handle, None, config)
-        captured = capfd.readouterr()
-        log = captured.err + captured.out
-        assert case["marker"] in log, f"device error class '{case['marker']}' not in host log"
+        log = _wait_for_host_log(
+            capfd,
+            (case["marker"], "error detail:", case["explain"], "error hint:"),
+            dropped_before,
+        )
         _assert_annotated(log, case)
     finally:
         worker.close()

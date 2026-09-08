@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime2 - Scheduler Implementation
+ * host_build_graph scheduler implementation
  *
  * Implements scheduler state management, ready queues, and task lifecycle.
  *
@@ -42,8 +42,8 @@ uint64_t g_sched_self_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_pop_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
 uint64_t g_sched_complete_count[PLATFORM_MAX_AICPU_THREADS] = {};
 
-PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
-    PTO2SchedProfilingData d;
+SchedProfilingData scheduler_get_profiling(int thread_idx) {
+    SchedProfilingData d;
     d.lock_cycle = std::exchange(g_sched_lock_cycle[thread_idx], 0);
     d.fanout_cycle = std::exchange(g_sched_fanout_cycle[thread_idx], 0);
     d.fanin_cycle = std::exchange(g_sched_fanin_cycle[thread_idx], 0);
@@ -65,7 +65,7 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 // Debug Utilities
 // =============================================================================
 
-void PTO2SchedulerState::print_stats() {
+void SchedulerState::print_stats() {
     LOG_DEBUG("=== Scheduler Statistics ===");
 #if SIMPLER_SCHED_PROFILING
     LOG_DEBUG("tasks_completed:   %lld", (long long)tasks_completed.load(std::memory_order_relaxed));
@@ -74,10 +74,10 @@ void PTO2SchedulerState::print_stats() {
     LOG_DEBUG("============================");
 }
 
-void PTO2SchedulerState::print_queues() {
-    PTO2SchedulerState *sched = this;
+void SchedulerState::print_queues() {
+    SchedulerState *sched = this;
     const char *shape_names[] = {"AIC", "AIV", "MIX"};
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         LOG_TIMING(
             "QPROBE rq[%s] pushes=%llu maxocc=%llu cap=%llu", shape_names[i],
             (unsigned long long)sched->ready_queues[i].enqueue_pos.load(std::memory_order_relaxed),
@@ -108,4 +108,31 @@ void PTO2SchedulerState::print_queues() {
         (unsigned long long)sched->early_sync_start_queue.enqueue_pos.load(std::memory_order_relaxed),
         (unsigned long long)sched->early_sync_start_queue.max_occupancy.load(std::memory_order_relaxed)
     );
+    const uint64_t pub_drops = sched->ed_publish_drain_drops.load(std::memory_order_relaxed);
+    LOG_TIMING(
+        "QPROBE ed_pubdrain pushes=%llu maxocc=%llu cap=%llu drops=%llu",
+        (unsigned long long)sched->ed_publish_drain_queue.enqueue_pos.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_drain_queue.max_occupancy.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_drain_queue.capacity, (unsigned long long)pub_drops
+    );
+    if (pub_drops > 0) {
+        LOG_WARN(
+            "[EARLY_DISPATCH] publish-drain queue dropped %llu chain(s); those candidates fell back to normal "
+            "dispatch",
+            (unsigned long long)pub_drops
+        );
+    }
+#if SIMPLER_SCHED_PROFILING
+    LOG_TIMING(
+        "QPROBE ed_publist registered=%llu immediate=%llu seals=%llu detached=%llu rescanned=%llu rehangs=%llu "
+        "ready=%llu",
+        (unsigned long long)sched->ed_publish_stats.registered.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.immediate_at_intake.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.publish_seals.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.chains_detached.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.waiters_rescanned.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.rehangs.load(std::memory_order_relaxed),
+        (unsigned long long)sched->ed_publish_stats.candidates_ready.load(std::memory_order_relaxed)
+    );
+#endif
 }

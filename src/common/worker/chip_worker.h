@@ -47,6 +47,11 @@ class ChipRun;
 class ChipRunLane;
 struct ChipRunLaneState;
 
+class UnsupportedRuntimeOperation : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class ChipWorker {
 public:
     ChipWorker() = default;
@@ -67,22 +72,25 @@ public:
     /// runtime-arena for its ring sizing right after the device comes up (the
     /// sizing is fork-constant, delivered by COW into init). A no-op for
     /// runtimes without a prebuilt arena.
-    /// `dma_workspace_mask` (a bitmask of DmaWorkspaceKind bits, 0 = none)
-    /// provisions those async-DMA workspaces once at init, so kernels can use
-    /// get_dma_workspace. Empty by default; a Worker that does not opt in creates
-    /// no SDMA streams. Provisioning fails fast (init throws) on a
-    /// platform/runtime that does not support a requested engine. The mask stays
-    /// a raw integer here so this platform-agnostic worker needs no platform
-    /// headers; the binding derives it from the DmaWorkspaceKind enum.
+    /// `enable_sdma` opts this Worker into the async-DMA (SDMA) workspace, so
+    /// kernels can use get_dma_workspace. Off by default; a Worker that does not
+    /// opt in creates no SDMA streams and its kernels read a zero address for
+    /// that engine. It names one engine rather than a set because SDMA is the
+    /// only one a caller can decline — every other supported engine is
+    /// provisioned unconditionally, and SDMA is conditional only because its
+    /// workspace is inseparable from 48 CP-process STARS streams whose
+    /// post-fault release CANN does not bound. Provisioning rides simpler_init,
+    /// so a platform/runtime without SDMA support fails init (this throws) and
+    /// no Worker reaches a run with a zero address it expected to be live.
     /// `sdma_warmup_path`, when non-empty, is the vector-only ELF that walks the
-    /// SDMA control path once per channel during that provisioning, moving the
-    /// cold-start cost off the first TPREFETCH_ASYNC. Optional: an empty path (or
-    /// an arch that builds no such ELF) only costs that first-call latency.
+    /// SDMA control path once per channel once that workspace is live, moving
+    /// the cold-start cost off the first TPREFETCH_ASYNC. Read only when
+    /// `enable_sdma` is set; an empty path (or an arch that builds no such ELF)
+    /// only costs that first-call latency.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
-        uint32_t dma_workspace_mask = 0, const std::string &sim_context_path = "",
-        const std::string &sdma_warmup_path = ""
+        bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = ""
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -242,6 +250,7 @@ public:
     /// pipeline slot, or 0 while that slot holds none.
     uint64_t retained_temp_addr(uint32_t slot_id) const;
     size_t committed_device_memory() const;
+    DeviceMemoryInfo device_memory_info() const;
 
 private:
     using CreateDeviceContextFn = void *(*)();
@@ -253,9 +262,11 @@ private:
     using GetRuntimeSizeFn = size_t (*)();
     using GetRuntimeAlignmentFn = size_t (*)();
     using GetCommittedDeviceMemoryFn = size_t (*)(void *);
+    using GetDeviceMemoryInfoFn = decltype(&device_memory_info_ctx);
     // From host_runtime.so. Single platform-side init that does (a) thread
     // attach + device-id record, (b) executor binary takeover, (c) onboard
-    // CANN dlog sync. Reads the current log level off HostLogger itself.
+    // CANN dlog sync, (d) async-DMA workspace provisioning. Reads the current
+    // log level off HostLogger itself.
     using SimplerInitFn = decltype(&simpler_init);
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = decltype(&simpler_run);
@@ -267,7 +278,6 @@ private:
     using GetPipelineContractFn = const PipelineContract *(*)();
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
-    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t, const void *, uint64_t);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -314,6 +324,7 @@ private:
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     GetRuntimeAlignmentFn get_runtime_alignment_fn_ = nullptr;
     GetCommittedDeviceMemoryFn device_committed_memory_fn_ = nullptr;
+    GetDeviceMemoryInfoFn device_memory_info_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
@@ -329,7 +340,6 @@ private:
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
-    SimplerProvisionDmaWorkspaceFn simpler_provision_dma_workspace_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;

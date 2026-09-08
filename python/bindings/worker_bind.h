@@ -264,8 +264,8 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int32_t worker_id,
-               const std::vector<int32_t> &eligible_worker_ids, nb::object remote_sidecar) {
-                self.submit_next_level(
+               const std::vector<int32_t> &eligible_worker_ids, nb::object remote_sidecar) -> TaskHandle {
+                return self.submit_next_level(
                     make_callable_identity(digest, kind, target_namespace), args, config, worker_id,
                     eligible_worker_ids, parse_remote_task_args_sidecar(remote_sidecar)
                 );
@@ -280,8 +280,8 @@ inline void bind_worker(nb::module_ &m) {
             "submit_next_level_group",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const std::vector<TaskArgs> &args_list, const CallConfig &config, const std::vector<int32_t> &worker_ids,
-               const std::vector<std::vector<int32_t>> &eligible_worker_ids, nb::object remote_sidecars) {
-                self.submit_next_level_group(
+               const std::vector<std::vector<int32_t>> &eligible_worker_ids, nb::object remote_sidecars) -> TaskHandle {
+                return self.submit_next_level_group(
                     make_callable_identity(digest, kind, target_namespace), args_list, config, worker_ids,
                     eligible_worker_ids, parse_remote_task_args_sidecars(remote_sidecars)
                 );
@@ -330,6 +330,14 @@ inline void bind_worker(nb::module_ &m) {
             "(tensors + pooled arenas + runtime buffers)."
         )
         .def(
+            "device_memory_info",
+            [](Orchestrator &self, int worker_id) {
+                return self.device_memory_info(worker_id);
+            },
+            nb::arg("worker_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Device-wide ACL_HBM_MEM free/total byte snapshot for a next-level worker."
+        )
+        .def(
             "alloc",
             [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype,
                const CanonicalIdentity &identity) {
@@ -375,6 +383,14 @@ inline void bind_worker(nb::module_ &m) {
             nb::call_guard<nb::gil_scoped_release>(), "Wait up to timeout_seconds for one run to become terminal."
         )
         .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
+        .def(
+            "_current_run_failed_for_test", &Orchestrator::current_building_run_failed_for_test,
+            "Report whether an asynchronous failure has reached the run whose graph is still being built."
+        )
+        .def(
+            "_begin_run_waiter_count_for_test", &Orchestrator::begin_run_waiter_count_for_test,
+            "Return the number of begin_run calls currently waiting for a pipeline slot."
+        )
         .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
 
     // --- Worker ---
@@ -444,22 +460,26 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "copy_to",
-            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
-                self.copy_to(worker_id, dst, src, nbytes);
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes,
+               uint64_t dst_offset, uint64_t src_offset) {
+                self.copy_to(worker_id, dst, src, CopySpan{nbytes, dst_offset, src_offset});
             },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "H2D copy: host `src` into device `dst`, both named by descriptor. The child resolves each "
-            "through its ImportRegistry, so neither end is an address minted in this process."
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"), nb::arg("dst_offset") = 0,
+            nb::arg("src_offset") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "H2D copy: `nbytes` from `src_offset` in host `src` into `dst_offset` in device `dst`, both "
+            "named by descriptor. The child resolves each through its ImportRegistry and applies the "
+            "offset itself, so neither end is an address minted in this process."
         )
         .def(
             "copy_from",
-            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
-                self.copy_from(worker_id, dst, src, nbytes);
+            [](Worker &self, int worker_id, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes,
+               uint64_t dst_offset, uint64_t src_offset) {
+                self.copy_from(worker_id, dst, src, CopySpan{nbytes, dst_offset, src_offset});
             },
-            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "D2H copy: device `src` into host `dst`, both named by descriptor."
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("nbytes"), nb::arg("dst_offset") = 0,
+            nb::arg("src_offset") = 0, nb::call_guard<nb::gil_scoped_release>(),
+            "D2H copy: `nbytes` from `src_offset` in device `src` into `dst_offset` in host `dst`, both "
+            "named by descriptor."
         )
         .def(
             "add_remote_l3_socket",
@@ -843,16 +863,6 @@ inline void bind_worker(nb::module_ &m) {
             "control_comm_init", &Worker::control_comm_init, nb::arg("worker_id"), nb::arg("request_shm_name"),
             nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_COMM_INIT (lazy base comm init)."
-        )
-        .def(
-            "control_region_allocate", &Worker::control_region_allocate, nb::arg("worker_id"),
-            nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_REGION_ALLOCATE."
-        )
-        .def(
-            "control_region_release", &Worker::control_region_release, nb::arg("worker_id"),
-            nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_REGION_RELEASE."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
@@ -919,12 +929,34 @@ inline void bind_worker(nb::module_ &m) {
         "wakes the word, or `timeout_s` elapses. May return spuriously; callers re-check the word."
     );
     m.def(
+        "_mailbox_wait_i32_result_for_test",
+        [](uint64_t addr, int32_t expected, double timeout_s) {
+            nb::gil_scoped_release release;
+            switch (mpi_group_mailbox::wait_word(reinterpret_cast<int32_t *>(addr), expected, timeout_s)) {
+            case mpi_group_mailbox::WaitWordResult::NO_WAIT:
+                return std::string("no_wait");
+            case mpi_group_mailbox::WaitWordResult::VALUE_MISMATCH:
+                return std::string("value_mismatch");
+            case mpi_group_mailbox::WaitWordResult::WOKEN:
+                return std::string("woken");
+            case mpi_group_mailbox::WaitWordResult::TIMED_OUT:
+                return std::string("timed_out");
+            case mpi_group_mailbox::WaitWordResult::INTERRUPTED:
+                return std::string("interrupted");
+            case mpi_group_mailbox::WaitWordResult::ERROR:
+                return std::string("error");
+            }
+            return std::string("error");
+        },
+        nb::arg("addr"), nb::arg("expected"), nb::arg("timeout_s"),
+        "Return why a mailbox-word wait ended, for deterministic timeout tests."
+    );
+    m.def(
         "_mpi_mailbox_layout",
         []() {
             using namespace mpi_group_mailbox;
             nb::dict layout;
             layout["MAGIC"] = nb::bytes(reinterpret_cast<const char *>(MAGIC), sizeof(MAGIC));
-            layout["PROTOCOL_VERSION"] = PROTOCOL_VERSION;
             layout["HEADER_BYTES"] = HEADER_BYTES;
             layout["PAYLOAD_BYTES"] = PAYLOAD_BYTES;
             layout["ERROR_BYTES"] = ERROR_BYTES;
@@ -933,7 +965,6 @@ inline void bind_worker(nb::module_ &m) {
             layout["ERROR_OFFSET"] = ERROR_OFFSET;
             layout["MAILBOX_BYTES"] = MAILBOX_BYTES;
             layout["OFF_MAGIC"] = OFF_MAGIC;
-            layout["OFF_PROTOCOL_VERSION"] = OFF_PROTOCOL_VERSION;
             layout["OFF_HEADER_BYTES"] = OFF_HEADER_BYTES;
             layout["OFF_MAILBOX_BYTES"] = OFF_MAILBOX_BYTES;
             layout["OFF_WORLD_SIZE"] = OFF_WORLD_SIZE;
@@ -976,10 +1007,13 @@ inline void bind_worker(nb::module_ &m) {
         "_read_control_copy_request",
         [](uint64_t frame_addr) {
             ControlCopyRequest request = read_control_copy_request(reinterpret_cast<const char *>(frame_addr));
-            return nb::make_tuple(request.dst, request.src, request.nbytes);
+            return nb::make_tuple(
+                request.dst, request.src, request.span.nbytes, request.span.dst_offset, request.span.src_offset
+            );
         },
         nb::arg("frame_addr"),
         "Decode the CTRL_COPY_TO / CTRL_COPY_FROM payload on the control frame at `frame_addr` into "
-        "`(dst_descriptor, src_descriptor, nbytes)`. Both descriptors are validated on the way out."
+        "`(dst_descriptor, src_descriptor, nbytes, dst_offset, src_offset)`. Both descriptors are "
+        "validated on the way out, and each offset+length is bounded against the backing it arrived with."
     );
 }

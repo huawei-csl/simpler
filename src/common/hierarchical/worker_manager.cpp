@@ -137,11 +137,14 @@ uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("con
 uint64_t WorkerEndpoint::control_committed_device_memory() {
     throw_unsupported_control("control_committed_device_memory");
 }
+DeviceMemoryInfo WorkerEndpoint::control_device_memory_info() {
+    throw_unsupported_control("control_device_memory_info");
+}
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
-void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_to");
 }
-void WorkerEndpoint::control_copy_from(const BufferDescriptor &, const BufferDescriptor &, uint64_t) {
+void WorkerEndpoint::control_copy_from(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_from");
 }
 void WorkerEndpoint::control_prepare(const uint8_t *) { throw_unsupported_control("control_prepare"); }
@@ -194,12 +197,6 @@ void WorkerEndpoint::control_alloc_domain(const char *, const char *) {
 }
 void WorkerEndpoint::control_release_domain(const char *) { throw_unsupported_control("control_release_domain"); }
 void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control("control_comm_init"); }
-void WorkerEndpoint::control_region_allocate(const char *, const char *) {
-    throw_unsupported_control("control_region_allocate");
-}
-void WorkerEndpoint::control_region_release(const char *, const char *) {
-    throw_unsupported_control("control_region_release");
-}
 
 void WorkerEndpoint::submit_progress(Ring *, const WorkerDispatch &) {
     throw std::runtime_error("progress submission is not supported by this WorkerEndpoint");
@@ -802,17 +799,24 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
 
     const uint64_t protocol = MAILBOX_TASK_PROTOCOL_VERSION;
     const uint64_t slot_id = state.pipeline_lease.slot_id;
+    const uint64_t task_slot = static_cast<uint64_t>(dispatch.task_slot);
+    const uint64_t group_index = static_cast<uint64_t>(dispatch.group_index);
+    const uint64_t group_size = static_cast<uint64_t>(state.group_size());
     std::memcpy(frame + MAILBOX_OFF_FRAME_PROTOCOL, &protocol, sizeof(protocol));
     std::memcpy(frame + MAILBOX_OFF_FRAME_RUN_ID, &state.run_id, sizeof(state.run_id));
     std::memcpy(frame + MAILBOX_OFF_FRAME_SLOT_ID, &slot_id, sizeof(slot_id));
     std::memcpy(frame + MAILBOX_OFF_FRAME_GENERATION, &state.pipeline_lease.generation, sizeof(uint64_t));
     std::memcpy(frame + MAILBOX_OFF_FRAME_DISPATCH_ID, &dispatch.dispatch_id, sizeof(dispatch.dispatch_id));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_TASK_SLOT, &task_slot, sizeof(task_slot));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_GROUP_INDEX, &group_index, sizeof(group_index));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_GROUP_SIZE, &group_size, sizeof(group_size));
 
     record.occupied = true;
     record.dispatch = dispatch;
     record.run_id = state.run_id;
     record.slot_id = slot_id;
     record.generation = state.pipeline_lease.generation;
+    record.group_size = group_size;
     write_mailbox_state(dispatch.prepare_only ? MailboxState::PREPARE_READY : MailboxState::TASK_READY, frame);
 }
 
@@ -822,15 +826,23 @@ bool LocalMailboxEndpoint::frame_identity_matches(const FrameRecord &record, con
     uint64_t slot_id = 0;
     uint64_t generation = 0;
     uint64_t dispatch_id = 0;
+    uint64_t task_slot = 0;
+    uint64_t group_index = 0;
+    uint64_t group_size = 0;
     PipelineSlotLease lease{};
     std::memcpy(&protocol, frame + MAILBOX_OFF_FRAME_PROTOCOL, sizeof(protocol));
     std::memcpy(&run_id, frame + MAILBOX_OFF_FRAME_RUN_ID, sizeof(run_id));
     std::memcpy(&slot_id, frame + MAILBOX_OFF_FRAME_SLOT_ID, sizeof(slot_id));
     std::memcpy(&generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(generation));
     std::memcpy(&dispatch_id, frame + MAILBOX_OFF_FRAME_DISPATCH_ID, sizeof(dispatch_id));
+    std::memcpy(&task_slot, frame + MAILBOX_OFF_FRAME_TASK_SLOT, sizeof(task_slot));
+    std::memcpy(&group_index, frame + MAILBOX_OFF_FRAME_GROUP_INDEX, sizeof(group_index));
+    std::memcpy(&group_size, frame + MAILBOX_OFF_FRAME_GROUP_SIZE, sizeof(group_size));
     std::memcpy(&lease, frame + MAILBOX_OFF_PIPELINE_LEASE, sizeof(lease));
     return protocol == MAILBOX_TASK_PROTOCOL_VERSION && run_id == record.run_id && slot_id == record.slot_id &&
            generation == record.generation && dispatch_id == record.dispatch.dispatch_id &&
+           task_slot == static_cast<uint64_t>(record.dispatch.task_slot) &&
+           group_index == static_cast<uint64_t>(record.dispatch.group_index) && group_size == record.group_size &&
            lease.slot_id == record.slot_id && lease.reserved == 0 && lease.generation == record.generation;
 }
 
@@ -1273,6 +1285,15 @@ uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
     return read_control_result(mbox());
 }
 
+DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_DEVICE_MEMORY_INFO);
+    run_control_command("control_device_memory_info");
+    DeviceMemoryInfo info{};
+    std::memcpy(&info, mbox() + CTRL_OFF_RESULT, sizeof(info));
+    return info;
+}
+
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
     write_control_args(mbox(), CTRL_PREPARE);
@@ -1383,17 +1404,19 @@ void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     run_control_command("control_free");
 }
 
-void LocalMailboxEndpoint::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void LocalMailboxEndpoint::control_copy_to(
+    const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
+) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, nbytes);
+    write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, span);
     run_control_command("control_copy_to");
 }
 
 void LocalMailboxEndpoint::control_copy_from(
-    const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes
+    const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, nbytes);
+    write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, span);
     run_control_command("control_copy_from");
 }
 
@@ -1447,28 +1470,6 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
     run_control_command("control_comm_init");
 }
 
-void LocalMailboxEndpoint::control_region_allocate(const char *request_shm_name, const char *reply_shm_name) {
-    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
-        throw std::runtime_error("control_region_allocate: request and reply shm names must be non-empty");
-    }
-    std::lock_guard<std::mutex> lk(mailbox_mu_);
-    uint64_t sub_cmd = CTRL_REGION_ALLOCATE;
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
-    run_control_command("control_region_allocate");
-}
-
-void LocalMailboxEndpoint::control_region_release(const char *request_shm_name, const char *reply_shm_name) {
-    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
-        throw std::runtime_error("control_region_release: request and reply shm names must be non-empty");
-    }
-    std::lock_guard<std::mutex> lk(mailbox_mu_);
-    uint64_t sub_cmd = CTRL_REGION_RELEASE;
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
-    run_control_command("control_region_release");
-}
-
 uint64_t WorkerThread::control_malloc(size_t size) {
     if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
     return endpoint_->control_malloc(size);
@@ -1477,6 +1478,11 @@ uint64_t WorkerThread::control_malloc(size_t size) {
 uint64_t WorkerThread::control_committed_device_memory() {
     if (!endpoint_) throw std::runtime_error("control_committed_device_memory: null endpoint");
     return endpoint_->control_committed_device_memory();
+}
+
+DeviceMemoryInfo WorkerThread::control_device_memory_info() {
+    if (!endpoint_) throw std::runtime_error("control_device_memory_info: null endpoint");
+    return endpoint_->control_device_memory_info();
 }
 
 void WorkerThread::control_prepare(const uint8_t *digest) {
@@ -1584,14 +1590,14 @@ void WorkerThread::control_free(uint64_t ptr) {
     endpoint_->control_free(ptr);
 }
 
-void WorkerThread::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void WorkerThread::control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
     if (!endpoint_) throw std::runtime_error("control_copy_to: null endpoint");
-    endpoint_->control_copy_to(dst, src, nbytes);
+    endpoint_->control_copy_to(dst, src, span);
 }
 
-void WorkerThread::control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) {
+void WorkerThread::control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) {
     if (!endpoint_) throw std::runtime_error("control_copy_from: null endpoint");
-    endpoint_->control_copy_from(dst, src, nbytes);
+    endpoint_->control_copy_from(dst, src, span);
 }
 
 void WorkerThread::control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) {
@@ -1607,16 +1613,6 @@ void WorkerThread::control_release_domain(const char *request_shm_name) {
 void WorkerThread::control_comm_init(const char *request_shm_name) {
     if (!endpoint_) throw std::runtime_error("control_comm_init: null endpoint");
     endpoint_->control_comm_init(request_shm_name);
-}
-
-void WorkerThread::control_region_allocate(const char *request_shm_name, const char *reply_shm_name) {
-    if (!endpoint_) throw std::runtime_error("control_region_allocate: null endpoint");
-    endpoint_->control_region_allocate(request_shm_name, reply_shm_name);
-}
-
-void WorkerThread::control_region_release(const char *request_shm_name, const char *reply_shm_name) {
-    if (!endpoint_) throw std::runtime_error("control_region_release: null endpoint");
-    endpoint_->control_region_release(request_shm_name, reply_shm_name);
 }
 
 bool WorkerManager::any_busy() const {
@@ -1759,22 +1755,6 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
         throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_comm_init(request_shm_name);
-}
-
-void WorkerManager::control_region_allocate(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
-    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
-    if (wt == nullptr) {
-        throw std::runtime_error("control_region_allocate: invalid worker_id " + std::to_string(worker_id));
-    }
-    wt->control_region_allocate(request_shm_name, reply_shm_name);
-}
-
-void WorkerManager::control_region_release(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
-    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
-    if (wt == nullptr) {
-        throw std::runtime_error("control_region_release: invalid worker_id " + std::to_string(worker_id));
-    }
-    wt->control_region_release(request_shm_name, reply_shm_name);
 }
 
 ControlResult WorkerManager::control_digest_only(

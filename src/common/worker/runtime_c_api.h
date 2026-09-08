@@ -22,15 +22,14 @@
  *                   simpler_init, finalize_device
  *   - sizing:       get_runtime_size, get_runtime_alignment
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
- *                   committed_device_memory_ctx,
+ *                   committed_device_memory_ctx, device_memory_info_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
  *   - prepared run: simpler_register_callable, simpler_prepare_run,
  *                   simpler_launch_run, simpler_poll_run, simpler_wait_run,
  *                   simpler_finalize_run, simpler_run,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
- *                   get_run_stream_set_create_count,
- *                   simpler_provision_dma_workspace
+ *                   get_run_stream_set_create_count
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
@@ -55,6 +54,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "device_memory_info.h"
 
 // simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
 // call_config.h). Forward-declared so this C-linkage header needn't pull the
@@ -249,6 +250,13 @@ void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
  */
 size_t committed_device_memory_ctx(DeviceContextHandle ctx);
 
+/**
+ * Query the target device's ACL_HBM_MEM free/total byte snapshot. The caller
+ * owns `info`; valid output is published only when the function returns 0.
+ * Unsupported backends return PTO_RUNTIME_ERR_UNSUPPORTED.
+ */
+int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info);
+
 /** Copy host memory to a device pointer within the given device context. */
 int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size);
 
@@ -280,19 +288,48 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      simpler_run invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
- *   4. When `prewarm_config` is non-null, build + upload + cache the prebuilt
+ *   4. Provision this device's async-DMA workspaces and latch their device
+ *      addresses into the resident AICPU globals, so every subsequent run
+ *      carries them (the scheduler prefills each core's GlobalContext from
+ *      there, and kernels read them through get_dma_workspace(args, kind); a
+ *      kind this device did not provision reads back 0). The addresses are
+ *      published by the same one-shot AICPU init launch that step 2's device
+ *      bring-up performs, so provisioning is ordered before it rather than
+ *      re-latching afterwards.
+ *
+ *      Every engine the platform supports is provisioned except SDMA, which is
+ *      provisioned only when `enable_sdma` is non-zero. SDMA is the one engine
+ *      a caller can decline, and the parameter is a flag rather than an engine
+ *      set for that reason: its workspace cannot be obtained without also
+ *      creating 48 CP-process STARS streams, and a Worker holding those gets a
+ *      single device-reset attempt after an AICore fault instead of three, so
+ *      defaulting it on would put every Worker in that population.
+ *      `enable_sdma` on a platform/runtime without SDMA support fails init, so
+ *      a Worker opting in on sim / a5 / hbg fails fast rather than reaching its
+ *      first run reading a zero workspace address.
+ *
+ *      `sdma_warmup_binary` / `sdma_warmup_size` carry the vector-only ELF that
+ *      walks the SDMA control path once per channel against the workspace just
+ *      provisioned, so the first TPREFETCH_ASYNC does not pay that cold start.
+ *      A null/empty buffer, or a warmup the platform cannot run, still
+ *      initializes successfully — the only cost is first-call latency. A warmup
+ *      whose device launch or sync fails does fail init, because that card is
+ *      then poisoned.
+ *
+ *   5. When `prewarm_config` is non-null, build + upload + cache the prebuilt
  *      runtime-arena for its `runtime_env` ring sizing (tensormap_and_ringbuffer;
  *      a no-op for runtimes without a prebuilt arena). The device is up by this
  *      point, so the first simpler_run with matching sizing skips the (~800ms)
  *      cold build. The sizing is fork-constant, so it rides init rather than a
  *      separate call. Only `prewarm_config->runtime_env` is read.
  *
- * Returns 0 on success, negative on attach or prewarm-build failure.
+ * Returns 0 on success, negative on attach, provisioning, or prewarm-build
+ * failure.
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
-    const CallConfig *prewarm_config
+    const CallConfig *prewarm_config, int enable_sdma, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
 );
 
 /**
@@ -359,7 +396,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * enables + output_prefix, and the per-task ring sizing overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a
  * per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT entries; 0 = unset,
- * precedence per ring: per-ring entry > PTO2_RING_* env var > compile-time
+ * precedence per ring: per-ring entry > compile-time
  * default). Ring overrides are consumed by tensormap_and_ringbuffer only; other
  * runtime variants accept and ignore them. Wire-compatible POD; prepare copies
  * it into the native-run context before returning.
@@ -485,25 +522,6 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
  * bootstrap pair.
  */
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
-
-/**
- * Provision the async-DMA workspaces named in `required_mask` (a bitmask of
- * DmaWorkspaceKind bits) once at Worker init, latching their device addresses
- * into the resident KernelArgs so every subsequent run carries them. Called only
- * for a Worker created with SDMA enabled. Bits unsupported by this
- * platform/runtime are rejected, so a Worker opting into SDMA on sim / a5 / hbg
- * fails fast. Returns 0 on success, negative on unsupported/failed provisioning.
- *
- * `sdma_warmup_binary` / `sdma_warmup_size` carry the vector-only ELF that walks
- * the SDMA control path once per channel against the workspace just provisioned,
- * so the first TPREFETCH_ASYNC does not pay that cold start. A null/empty buffer,
- * or a warmup the platform cannot run, skips it and still provisions
- * successfully — the only cost is first-call latency. A warmup whose device launch
- * or sync fails does fail provisioning, because that card is then poisoned.
- */
-int simpler_provision_dma_workspace(
-    DeviceContextHandle ctx, uint32_t required_mask, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
-);
 
 #ifdef __cplusplus
 }

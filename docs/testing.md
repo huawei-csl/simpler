@@ -110,6 +110,13 @@ multiply the number of active compilers within one process.
 simpler's two onboard CI jobs (a2a3, a5) explicitly use eight; the sim jobs have
 no warm-up step and use the same automatic token pool during cold pytest runs.
 
+The tool walks `SceneTestCase` classes, so it does not reach a standalone case
+that owns its own `Worker`. Such a case warms the same cache itself: the
+DeepSeek smokes and Qwen daily cases are compiled by their respective
+`examples/<arch>/<runtime>/<model>/main.py --compile-only` entry points. Those
+drivers call the same `scene_test.compile_chip_callable_spec` and take the same
+`--compile-workers` option.
+
 The persistent cache has two levels. An unchanged callable loads its complete
 `callable.bin` directly. When that entry misses, each incore kernel loads an
 independent artifact from `build/cache/kernels/incore/`; only missing or changed
@@ -706,6 +713,9 @@ Key fields:
 - The framework owns the `config` namespace. Its keys are
   `aicpu_thread_num`, `runtime_env`, `device_count`, and `num_sub_workers`;
   `runtime_env` accepts `ring_task_window`, `ring_heap`, and `ring_dep_pool`.
+  Which of those the runtime under test reads differs: `host_build_graph` reads
+  only `ring_task_window` and warns when `ring_heap` is set, since it commits its
+  graph heap to the size orchestration measured.
   Unknown keys fail when the `@scene_test` class is imported instead of being
   silently ignored. Case-level extension keys outside `config` remain allowed.
 
@@ -841,6 +851,28 @@ pytest --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
 ```
 
 `pytest-xdist` starts 4 workers (`gw0`..`gw3`). Each worker's `pytest_configure` slices `--device 8-11` down to a single id (`gw0` → `8`, `gw1` → `9`, ...), and `st_worker` is session-scoped, so the worker initializes exactly one `ChipWorker(device=N)` and reuses it for every L2 class routed to it. `--dist loadfile` keeps all cases from one test file on the same worker, amortizing any file-level setup cost.
+
+An explicit `-p no:xdist` or `-n 0` is authoritative for the L2 children
+inherited from the top-level invocation. The dispatcher does not append xdist
+options in either case, so each L2 runtime subprocess executes serially. `--pdb`
+reaches the same state, and reaches it on its own gate rather than through the
+worker count: xdist zeroes that count only for `-n auto` / `-n logical`, while
+a bare `--pdb` leaves it unset — and since the L2 child inherits `--pdb`, an
+appended `-n` would make xdist reject the child with
+`--pdb is incompatible with distributing tests`. An explicit top-level `--dist`
+(or its `-d` shortcut) is preserved too; the dispatcher adds only the options
+the invocation left unset.
+
+A top-level `-n N` with N > 0 is a different case: it puts xdist in
+distribution mode, whose `pytest_runtestloop` claims the session before this
+dispatcher's hook runs, so the phase split does not happen at all and every
+collected level runs in one flat xdist fanout. Size L2 parallelism with
+`--max-parallel`, not with a top-level `-n`.
+
+Resource-phase subprocess concurrency continues to follow `--max-parallel`
+because it does not use pytest-xdist. If plugin autoloading is disabled without
+blocking xdist explicitly, the dispatcher warns before falling back to serial
+L2 execution.
 
 ### L2 phase — standalone fanout
 

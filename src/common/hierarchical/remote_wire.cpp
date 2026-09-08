@@ -315,6 +315,9 @@ std::vector<uint8_t> encode_call_config(const CallConfig &config) {
     put_i32(out, config.enable_pmu);
     put_i32(out, config.enable_dep_gen);
     put_i32(out, config.enable_scope_stats);
+    // CallConfig::capture_clock_anchors is absent on purpose: every ChipWorker
+    // child decides it locally when it reads the config out of its mailbox, so a
+    // transported value would be overwritten before any runtime reads it.
     put_string(out, call_config_prefix(config), MAX_STRING_BYTES, "CallConfig.output_prefix");
     return out;
 }
@@ -342,16 +345,15 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 //
 // A remote TASK argument carries no local backing — the authoritative descriptor of its backing is
 // the per-argument RemoteTensorDesc sidecar — so the only backend this wire accepts is
-// REMOTE_SIDECAR, in both directions. That sidecar also carries where the view sits in the backing,
-// which is why the record's own `byte_offset` is zero: a non-zero one would name a second, weaker
-// origin for the same view. Both are rejected on encode and on decode.
+// REMOTE_SIDECAR, in both directions. The Tensor record still follows the ordinary local ABI:
+// descriptor.nbytes is the whole backing and byte_offset is the view origin. The sidecar carries
+// the transport locator for the same view and is checked against the decoded Tensor by the session.
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
     const BufferDescriptor &desc = tensor.buffer;
     ensure(
         desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
-    ensure(tensor.byte_offset == 0, "remote_wire: a remote TASK tensor must carry no byte_offset");
     ensure(
         tensor.ndims > 0 && tensor.ndims <= static_cast<uint32_t>(MAX_TENSOR_DIMS),
         "remote_wire: tensor ndims out of range"
@@ -404,7 +406,6 @@ Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset) {
     desc.body_len = static_cast<uint16_t>(body_len);
 
     tensor.byte_offset = get_u64(data, size, offset);
-    ensure(tensor.byte_offset == 0, "remote_wire: a remote TASK tensor must carry no byte_offset");
     uint32_t ndims = get_u32(data, size, offset);
     ensure(ndims > 0 && ndims <= static_cast<uint32_t>(MAX_TENSOR_DIMS), "remote_wire: tensor ndims out of range");
     tensor.ndims = ndims;

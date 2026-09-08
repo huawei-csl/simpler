@@ -9,33 +9,57 @@
 # host_build_graph Runtime build configuration
 # All paths are relative to this file's directory (src/runtime/host_build_graph/)
 #
-# This is the host-orchestration variant of tensormap_and_ringbuffer: it shares
-# the same scheduler, ring buffers, and shared-memory layout, differing only in
-# WHEN the orchestrator runs.
-# - Host runs the orchestrator to completion, populating SM + arena, then H2Ds
-#   the image to device (vs tensormap, where AICPU thread N-1 orchestrates on
-#   device concurrently with the scheduler threads)
-# - AICPU threads 0..N-1 all run schedulers (no on-device orchestrator thread)
-# - AICore executes tasks via an aligned PTO2DispatchPayload + pre-built dispatch_args
+# The host materializes the graph and uploads a read-only view. AICore workers
+# resolve dependencies and execute kernels. AICPU participates only in worker
+# initialization, run completion waiting, and teardown.
 #
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
-# by the ChipTensor constructor's validation logic).
-# "host_orchestration_support" is linked only into that host-loaded .so; its
-# recorder prewarm entry must not instantiate host threads in runtime targets.
+# by the ChipTensor constructor's validation logic). Nothing in it may create host
+# threads, because the aicore and aicpu targets compile it too: the Graph recorder pool
+# therefore lives in a "host" directory (common/host_build_graph/host/graph_recorder_pool.cpp),
+# which only the host target builds, and the orchestration .so reaches it through the
+# ops table.
+#
+# src/common/host_build_graph holds the sources shared with the other architecture.
+# Its .cpp files sit under a "host", "device" or "shared" subdirectory naming the
+# targets that compile them, because every source_dirs entry is collected by a
+# recursive glob: "host" code uses the STL containers the AICPU target forbids, so it
+# has to live outside any directory that target names. Headers stay flat there.
+#
+# That directory is also on every target's include path, which is what lets the
+# runtime-agnostic platform and worker sources reach this runtime's runtime.h and
+# types.h by bare name: they resolve here when compiled for host_build_graph and to
+# tensormap_and_ringbuffer's own copies when compiled for that runtime. "runtime"
+# precedes it, so an arch-local header still wins over a shared one of the same name.
+SHARED = "../../../common/host_build_graph"
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
+    "aicore": {
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": ["aicore", "orchestration"],
+    },
     "aicpu": {
-        "include_dirs": ["runtime", "common", ".."],
-        "source_dirs": ["aicpu", "runtime", "orchestration", "../../../common/host_build_graph"],
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": [
+            "aicpu",
+            "runtime",
+            "orchestration",
+            f"{SHARED}/device",
+            f"{SHARED}/shared",
+        ],
     },
     "host": {
-        "include_dirs": ["runtime", "common", ".."],
-        "source_dirs": ["host", "runtime/orchestrator_core", "runtime/shared", "orchestration"],
+        "include_dirs": ["runtime", "common", "..", SHARED],
+        "source_dirs": [
+            "host",
+            "orchestration",
+            f"{SHARED}/host",
+            f"{SHARED}/shared",
+        ],
     },
     "orchestration": {
-        "include_dirs": ["runtime", "orchestration", "common", ".."],
-        "source_dirs": ["orchestration", "host_orchestration_support"],
+        "include_dirs": ["runtime", "orchestration", "common", "..", SHARED],
+        "source_dirs": ["orchestration"],
     },
 }

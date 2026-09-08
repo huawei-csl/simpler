@@ -43,12 +43,6 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
-_A2A3_VECTOR_ADD = os.path.join(_PROJECT_ROOT, "examples", "workers", "l2", "vector_add")
-# a5's ccec/pto-isa needs the qualified `pto::Stride` spelling; the l2/vector_add
-# kernel above (a2a3-only example) uses unqualified `Stride` and does not compile
-# under the a5 AICore toolchain. Use the a5-native add kernel (same out=a+b Tensor*
-# ABI) on a5.
-_A5_VECTOR_ADD = os.path.join(_PROJECT_ROOT, "examples", "a5", "tensormap_and_ringbuffer", "vector_example")
 
 N_ROWS = 128
 N_COLS = 128
@@ -76,10 +70,11 @@ def _build_chip_callable(
 
     pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
-    if platform.startswith("a5"):
-        aiv_kernel = os.path.join(_A5_VECTOR_ADD, "kernels/aiv/kernel_add.cpp")
-    else:
-        aiv_kernel = os.path.join(_A2A3_VECTOR_ADD, "kernels/aiv/vector_add_kernel.cpp")
+    # The case owns its kernels: one names a single runtime's Tensor, and this helper
+    # is driven under both. They also differ by architecture — a5's ccec/pto-isa needs
+    # the qualified `pto::Stride` spelling, which the a2a3 copy does not use.
+    arch = "a5" if platform.startswith("a5") else "a2a3"
+    aiv_kernel = os.path.join(_HERE, "kernels", runtime, "aiv", f"vector_add_{arch}.cpp")
     kernel_bytes = kc.compile_incore(
         source_path=aiv_kernel,
         core_type="aiv",
@@ -93,7 +88,7 @@ def _build_chip_callable(
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
-        source_path=os.path.join(_HERE, "kernels/orchestration/task_timing_orch.cpp"),
+        source_path=os.path.join(_HERE, "kernels", runtime, "task_timing_orch.cpp"),
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
@@ -160,10 +155,10 @@ def _drive(
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
+def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drain_host_log):
     # Two-task chain: t0 -> slot 0, t1 -> slot 1. out = a + 2b.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2)
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     slot0 = _slot_spans(err, 0)
     slot1 = _slot_spans(err, 1)
@@ -181,7 +176,7 @@ def test_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
+def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_host_log):
     dev = int(st_device_ids[0])
 
     # A 3-task chain (t0 -> t1 -> t2) all tagged slot 0. out = a + 3b. The three
@@ -189,7 +184,7 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
     # (min dispatch .. max finish), not three separate markers, and no other slot
     # is touched.
     _drive(st_platform, dev, "task_timing_dup_orchestration", 3)
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     slot0 = _slot_spans(err, 0)
     assert len(slot0) == 1, f"expected exactly ONE merged task_slot_0 marker, got {len(slot0)}: {slot0}"
@@ -214,10 +209,10 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
+def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd, drain_host_log):
     # Same two-task chain as test_distinct_slots_emit_markers, on the hbg path.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2, runtime="host_build_graph")
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     slot0 = _slot_spans(err, 0)
     slot1 = _slot_spans(err, 1)
@@ -235,11 +230,11 @@ def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_hbg_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
+def test_hbg_duplicate_slot_merges_window(st_platform, st_device_ids, capfd, drain_host_log):
     # Same 3-task same-slot merge as test_duplicate_slot_merges_window, on the hbg
     # path: min(dispatch)/max(finish) must fold into a single slot-0 window.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_dup_orchestration", 3, runtime="host_build_graph")
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     slot0 = _slot_spans(err, 0)
     assert len(slot0) == 1, f"expected exactly ONE merged task_slot_0 marker, got {len(slot0)}: {slot0}"
@@ -283,7 +278,7 @@ def _build_mix_chip_callable(platform: str) -> ChipCallable:
     mul = CoreCallable.build(signature=sig9, binary=incore("aiv/kernel_mul.cpp", "aiv"))
 
     orch_bytes = kc.compile_orchestration(
-        runtime_name=runtime, source_path=os.path.join(_HERE, "kernels/orchestration/task_timing_orch.cpp")
+        runtime_name=runtime, source_path=os.path.join(_HERE, "kernels", runtime, "task_timing_orch.cpp")
     )
     return ChipCallable.build(
         signature=sig9,
@@ -298,7 +293,7 @@ def _build_mix_chip_callable(platform: str) -> ChipCallable:
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim"])
-def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
+def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd, drain_host_log):
     # One MIX task (AIC matmul + AIV0 add + AIV1 mul) tagged slot 0. All three
     # subtasks fold their dispatch/finish into slot 0 -> one complete window.
     import torch  # noqa: PLC0415
@@ -356,7 +351,7 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
     finally:
         worker.close()
 
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
     slot0 = _slot_spans(err, 0)
     assert len(slot0) == 1, f"expected exactly one task_slot_0 marker for the MIX task, got {slot0}"
     assert slot0[0][1] > 0, f"MIX task_slot_0 must be a complete window across its subtasks, got {slot0}"
@@ -366,11 +361,11 @@ def test_mix_task_aggregates_across_subtasks(st_platform, st_device_ids, capfd):
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
 @pytest.mark.manual(["a2a3sim", "a5sim"])
-def test_spmd_task_aggregates_across_threads(st_platform, st_device_ids, capfd):
+def test_spmd_task_aggregates_across_threads(st_platform, st_device_ids, capfd, drain_host_log):
     # One SPMD task (block_num=8) tagged slot 0; blocks dispatch across multiple
     # scheduler threads and must reduce to one complete slot. out = a + b.
     _drive(st_platform, int(st_device_ids[0]), "task_timing_spmd_orchestration", 1)
-    err = capfd.readouterr().err
+    err = drain_host_log(capfd)
 
     slot0 = _slot_spans(err, 0)
     assert len(slot0) == 1, f"expected exactly one task_slot_0 marker for the SPMD task, got {slot0}"

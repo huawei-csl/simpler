@@ -29,6 +29,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -50,8 +51,10 @@
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/dma_workspace.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "platform_comm/comm.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/host_phase_records.h"
@@ -194,7 +197,11 @@ public:
     int device_memset(void *dev_ptr, int value, size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
-    void *acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment);
+    int acquire_graph_definition_block(
+        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+    );
+    void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
+    int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -246,6 +253,12 @@ public:
         aicpu_so_binary_ = std::move(aicpu_so_binary);
         aicore_kernel_binary_ = std::move(aicore_kernel_binary);
     }
+
+    /**
+     * Record whether this Worker asked for an async-DMA workspace.
+     */
+    void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
+    int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
@@ -268,6 +281,11 @@ public:
         enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    bool
+    publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
+        return json_value != nullptr &&
+               chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
+    }
     HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
         host_phase_records_.finish(submitted_tasks, invocation_id);
@@ -275,6 +293,35 @@ public:
     const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane();
+    /**
+     * Publish arch-specific runtime metadata into the swimlane export, between
+     * the host-phase handoff and the export itself — the only point at which the
+     * collector holds this run's records but has not yet serialized them. a5
+     * overrides it; every other arch has nothing to add.
+     */
+    virtual void publish_chip_swimlane_runtime_extensions() {}
+    /**
+     * Start collector mgmt + poll threads for the four shared diagnostics
+     * collectors that are enabled. Mirrors the onboard base. Subclasses with
+     * arch-specific collectors (`dep_gen_collector_`) call this and then start
+     * their own.
+     */
+    void start_shared_collectors_for_run();
+    /** Write this pass's per-event host phase records, if it collected any. */
+    void write_host_phase_records_artifact();
+    /**
+     * Tear down the four shared diagnostics collectors after the launched
+     * kernels have synced, in the one order their couplings allow: the clock
+     * correlation session closes before the swimlane export reads it, and each
+     * collector drains before it reconciles before it exports.
+     *
+     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
+     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
+     * calling this helper, as on onboard.
+     */
+    void teardown_shared_collectors_after_run(bool device_execution_complete);
+    /** Start the level-4 Host/Device clock correlation once per run. */
+    void begin_clock_correlation_session_if_needed() noexcept;
     void finish_clock_correlation_session(bool capture_device_complete) noexcept;
     void set_dump_args_enabled(int level) {
         dump_args_level_ = static_cast<DumpArgsLevel>(level);
@@ -313,7 +360,10 @@ protected:
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
     void release_callable_state();
-    void release_graph_definition_buffers();
+    void release_graph_definition_blocks();
+
+    /** Drop every retained host SM mirror, returning its pages to the allocator. */
+    void release_sm_mirrors();
 
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
@@ -331,22 +381,50 @@ protected:
     std::vector<uint8_t> aicpu_so_binary_;
     std::vector<uint8_t> aicore_kernel_binary_;
 
+    bool sdma_requested_{false};
+    void *dma_workspace_handle_{nullptr};
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
+
     MemoryAllocator mem_alloc_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // One retained device block: the raw allocation plus the aligned address
-    // handed out. Backs the Graph Definition cache below.
-    struct RetainedGraphBuffer {
+    // Graph Definition storage, one retained block per pipeline slot — see
+    // HostApi acquire_graph_definition_block. `staging` is the host block the
+    // run's Definition objects are packed into and stays allocated across runs,
+    // so a bind neither acquires nor returns host memory for them; the device
+    // side is the raw allocation plus the aligned address handed out. One block
+    // per slot rather than one per Definition: every Definition of a run is
+    // packed end to end and shipped by a single H2D, and every submission
+    // references the device-resident copy of its own Definition.
+    struct RetainedGraphBlock {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};
         size_t capacity{0};
+        std::vector<std::byte> staging;
     };
-    // Graph Definition storage, one retained block per (pipeline slot,
-    // definition key) — see HostApi acquire_graph_definition_buffer.
-    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
-    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
+    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    // Host mirror of the runtime shared memory, one retained buffer per pipeline
+    // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
+    // whole shared-memory image here and the bind ships the live prefix, so the
+    // buffer is capacity-sized (tens of MB) and stays mapped across binds: one
+    // buffer per slot rather than one per bind, because two binds in different
+    // slots are in flight at once. `capacity` counts the raw block, which is over-allocated
+    // by the requested alignment so the aligned address handed out has the
+    // requested bytes behind it.
+    //
+    // The block is never value-initialized. The caller's layout is init-on-write
+    // and it ships only the prefixes it wrote, so the resident set is the pages a
+    // bind touches rather than the whole capacity — which is also why this is not a
+    // std::vector: `resize` would zero every page of a capacity the caller writes
+    // a fraction of, and would copy the old bytes on growth for a buffer whose
+    // contents mean nothing between binds.
+    struct RetainedSmMirror {
+        std::unique_ptr<std::byte[]> storage;
+        size_t capacity{0};
+    };
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
 
-    // Each arena bank backs the three pooled regions (PTO2 GM heap / PTO2
+    // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
     // are separate allocations because the combined size can exceed the device
     // allocator's largest contiguous block. Released explicitly in finalize()
@@ -472,6 +550,57 @@ protected:
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
+    /**
+     * The core and AICPU-thread counts a resident collector's pools were built
+     * for.
+     *
+     * Collector pool topology is derived from those counts: buffer seeding
+     * covers pools [0, aicpu_thread_num), and a core's recycled lane is
+     * `(core / PLATFORM_CORES_PER_BLOCKDIM) % aicpu_thread_num`. A collector
+     * that stays initialized across runs therefore holds pools shaped for the
+     * run that built them, so a later run with different counts must rebuild
+     * them rather than reuse pools whose lanes it maps differently.
+     */
+    struct CollectorShape {
+        bool latched{false};
+        int num_aicore{0};
+        int aicpu_thread_num{0};
+        int launch_aicpu_num{0};
+    };
+
+    /**
+     * True once collectors are built and this run's counts differ from theirs,
+     * i.e. their pools must be released and rebuilt before this run seeds them.
+     *
+     * The release frees device memory the collectors are holding, so it is only
+     * safe while no other run is executing against them. Nothing here enforces
+     * that. What guarantees it today is the diagnostics depth-1 gate: with any
+     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
+     * even reserve while a predecessor is in flight, and a stale shape is only
+     * ever seen between runs.
+     *
+     * **Whoever lifts that gate must move this rebuild inside the execution
+     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
+     * usable predicate at this point: onboard takes the claim in
+     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
+     * it is already true for the run being prepared and the check fires on its
+     * own run.
+     */
+    bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
+        return collector_shape_.latched &&
+               (collector_shape_.num_aicore != num_aicore || collector_shape_.aicpu_thread_num != aicpu_thread_num ||
+                collector_shape_.launch_aicpu_num != launch_aicpu_num);
+    }
+
+    void latch_collector_shape(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) {
+        collector_shape_ = CollectorShape{true, num_aicore, aicpu_thread_num, launch_aicpu_num};
+    }
+
+    /** Called by the subclass's finalize_collectors(): no pools are built now. */
+    void clear_collector_shape() { collector_shape_ = CollectorShape{}; }
+
+    CollectorShape collector_shape_{};
+
     // Enablement flags. Written before enqueue and read by execution helpers.
     bool enable_chip_swimlane_{false};
     bool enable_dump_args_{false};
@@ -480,6 +609,7 @@ protected:
     bool enable_scope_stats_{false};
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
+    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
 

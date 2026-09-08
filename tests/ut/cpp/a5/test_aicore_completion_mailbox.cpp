@@ -29,7 +29,10 @@
 
 namespace {
 
-TaskId make_token(uint32_t local) { return TaskId::make(/*ring=*/0, local); }
+// The mailbox stores a token and compares it for identity; it never decodes one,
+// and the encoding belongs to whichever runtime minted it, so any distinct 64-bit
+// value serves here.
+TaskId make_token(uint32_t local) { return TaskId{local}; }
 
 AICoreCompletionMailbox *fresh_mailbox() {
     void *raw = ::operator new(sizeof(AICoreCompletionMailbox));
@@ -161,7 +164,7 @@ TEST(A5AICoreCompletionMailbox, ConditionAttachesToExistingEntry) {
 }
 
 TEST(A5AICoreCompletionMailbox, SdmaPostDoneRecordUsesMonotonicPostId) {
-    alignas(PTO2_ALIGN_SIZE) uint64_t completed_post_id = (uint64_t{1} << 40) + 16;
+    alignas(CHIP_ALIGN_SIZE) uint64_t completed_post_id = (uint64_t{1} << 40) + 16;
     CompletionCondition cond{};
     cond.completion_type = COMPLETION_TYPE_SDMA_EVENT_RECORD;
     cond.addr = reinterpret_cast<uint64_t>(&completed_post_id);

@@ -15,6 +15,7 @@ import itertools
 import struct
 import weakref
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
 
 import pytest
 import simpler.task_interface as task_interface_module
@@ -27,6 +28,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     TaskArgs,
+    TaskHandle,
     TaskState,
     TensorArgType,
     arg_direction_name,
@@ -45,6 +47,9 @@ from simpler.buffer import (
     wrap_fork_inherited,
 )
 from simpler.task_interface import (
+    PROV_DESCRIPTOR_MISMATCH,
+    PROV_NOT_LIVE,
+    ProvenanceTable,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
@@ -69,12 +74,28 @@ def _dev_ref(addr, shapes, dtype, tag=None):
     )
 
 
+def _fork_ref(addr, shapes, dtype):
+    """A host-backed (FORK_SHM) ``Tensor``: names memory the owner allocation table does not hold."""
+    nbytes = get_element_size(dtype)
+    for s in shapes:
+        nbytes *= int(s)
+    return wrap_fork_inherited(
+        addr,
+        nbytes,
+        mint_owner_instance_id(),
+        next(_REF_BID),
+        "L2",
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.FORK_SHM,
+    ).tensor(tuple(shapes), int(dtype.value))
+
+
 def _ref_addr(ref: Tensor) -> int:
     """The device pointer carried in a DEVICE_MALLOC ref's backend body."""
     return int.from_bytes(bytes(ref.buffer.body)[:8], "little")
 
 
-def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generation=1):
+def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generation=1, byte_offset=0):
     """The per-argument record a remote L3 TASK carries: the submitter's REMOTE_SIDECAR placeholder."""
     return remote_sidecar_tensor(
         shapes=tuple(shapes),
@@ -84,6 +105,7 @@ def _remote_arg_tensor(shapes, nbytes, owner_worker_id=2, buffer_id=9, generatio
         buffer_id=buffer_id,
         generation=generation,
         address_space=AddressSpace.HOST,
+        byte_offset=int(byte_offset),
     )
 
 
@@ -472,6 +494,35 @@ class TestTaskArgs:
         args.add_tensor(_dev_ref(0xBEEF, (4, 8), DataType.FLOAT32), TensorArgType.OUTPUT)
         assert args.tag(0) == TensorArgType.OUTPUT
 
+    def test_identities_are_in_argument_order_and_keep_duplicates(self):
+        # The run's touched set is built from this; two views of one backing share an identity, and
+        # dropping the repeat here would make the list disagree with tensor_count().
+        one = _dev_ref(0x1, (4,), DataType.INT32)
+        args = TaskArgs()
+        args.add_tensor(one)
+        args.add_tensor(_dev_ref(0x2, (4,), DataType.INT32))
+        args.add_tensor(one)
+
+        identities = args.identities()
+        assert len(identities) == args.tensor_count() == 3
+        assert identities[0] == one.buffer.identity
+        assert identities[2] == one.buffer.identity
+        assert identities[1] != one.buffer.identity
+
+    def test_has_device_backed_tensor_sees_only_memory_behind_a_chip(self):
+        empty = TaskArgs()
+        assert not empty.has_device_backed_tensor()
+
+        host = TaskArgs()
+        host.add_tensor(_fork_ref(0x1000, (4,), DataType.INT32))
+        assert not host.has_device_backed_tensor()
+
+        # Any one device-backed arg is enough: the whole list then has to be authorized.
+        mixed = TaskArgs()
+        mixed.add_tensor(_fork_ref(0x2000, (4,), DataType.INT32))
+        mixed.add_tensor(_dev_ref(0x3, (4,), DataType.INT32))
+        assert mixed.has_device_backed_tensor()
+
     def test_multiple_refs_with_tags(self):
         args = TaskArgs()
         args.add_tensor(_dev_ref(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
@@ -499,6 +550,18 @@ class TestTaskArgs:
         assert args.scalar_count() == 1
         assert args.tensor_count() == 0
         assert len(args) == 1
+
+    def test_task_handle_is_opaque_and_dependency_methods_require_one(self):
+        with pytest.raises(TypeError):
+            TaskHandle()
+
+        args = TaskArgs()
+        for method_name in ("add_dep", "add_dep_wait"):
+            method = getattr(args, method_name)
+            with pytest.raises(ValueError, match="at least one"):
+                method()
+            with pytest.raises(TypeError):
+                method(object())
 
     def test_mixed_with_tags(self):
         args = TaskArgs()
@@ -579,12 +642,95 @@ class TestTaskArgs:
         assert args.scalar_count() == 200
 
 
+class TestProvenanceTable:
+    """The dispatch-path device-allocation table.
+
+    `Worker._child_prov_check_dispatch_locked` turns the reported failure into the ValueError a
+    caller sees; these cover what the table itself decides.
+    """
+
+    @staticmethod
+    def _registered(table, addr=0x1000, owner_worker_id=0):
+        buffer = wrap_device_malloc(addr, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        table.insert(buffer.to_descriptor(), owner_worker_id)
+        return buffer
+
+    def test_a_live_allocation_on_its_own_worker_passes(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=2)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 2) is None
+
+    def test_an_allocation_on_another_worker_is_not_live_here(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=0)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 1) == (0, PROV_NOT_LIVE)
+
+    def test_an_unregistered_identity_is_not_live(self):
+        table = ProvenanceTable()
+        stray = wrap_device_malloc(0x2000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+    def test_a_same_identity_descriptor_that_changed_is_rejected(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        # The identity still resolves; the extent reaching native does not match the registered one.
+        buffer.nbytes = 32
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((8,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_DESCRIPTOR_MISMATCH)
+
+    def test_the_first_failing_argument_is_the_one_reported(self):
+        table = ProvenanceTable()
+        good = self._registered(table)
+        stray = wrap_device_malloc(0x3000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(good.tensor((16,), int(DataType.FLOAT32.value)))
+        args.add_tensor(_fork_ref(0x4000, (4,), DataType.INT32))
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (2, PROV_NOT_LIVE)
+
+    def test_host_backed_args_name_nothing_the_table_holds(self):
+        table = ProvenanceTable()
+        args = TaskArgs()
+        args.add_tensor(_fork_ref(0x5000, (4,), DataType.INT32))
+
+        assert table.check_dispatch(args, 0) is None
+
+    def test_erase_revokes_and_clear_empties(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+        assert buffer.identity in table
+        assert len(table) == 1
+
+        table.erase(buffer.identity)
+        assert buffer.identity not in table
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+        table.erase(buffer.identity)  # revoking twice is not an error
+        self._registered(table)
+        table.clear()
+        assert len(table) == 0
+
+
 class TestRemoteTaskArgsSidecar:
     def test_remote_task_args_is_not_public_api(self):
         assert not hasattr(task_interface_module, "RemoteTaskArgs")
         assert "RemoteTaskArgs" not in task_interface_module.__all__
 
-    def test_remote_buffer_ref_adds_zero_metadata_and_sidecar(self):
+    def test_remote_buffer_ref_uses_whole_backing_and_sidecar_view(self):
         handle = RemoteBufferHandle._from_remote_allocation(
             worker_id=3,
             buffer_id=11,
@@ -603,6 +749,8 @@ class TestRemoteTaskArgsSidecar:
         assert args.tensor_count() == 1
         # An arg destined for a remote worker carries a REMOTE_SIDECAR placeholder ref (no local backing).
         assert args.tensor(0).buffer.backend_kind == BackendKind.REMOTE_SIDECAR
+        assert args.tensor(0).buffer.nbytes == 64
+        assert args.tensor(0).byte_offset == 8
         assert args.tag(0) == TensorArgType.OUTPUT
         assert args.scalar(0) == 9
 
@@ -620,6 +768,32 @@ class TestRemoteTaskArgsSidecar:
         assert desc.nbytes == 4
         assert desc.remote_addr == 0xCAFE
         assert desc.rkey_or_token == 0xBEEF
+
+    def test_local_tensor_after_remote_ref_keeps_sidecar_indices_aligned(self):
+        # A sidecar list is indexed by tensor position, so a local arg added after a remote one
+        # occupies a slot of its own. Without it, the trailing remote ref would be read as the
+        # descriptor for the local arg.
+        handle = RemoteBufferHandle._from_remote_allocation(
+            worker_id=3,
+            buffer_id=11,
+            generation=2,
+            address_space=RemoteAddressSpace.REMOTE_DEVICE,
+            nbytes=64,
+            remote_addr=0xCAFE,
+            rkey_or_token=0xBEEF,
+        )
+
+        args = TaskArgs()
+        args.add_tensor(_dev_ref(0x1000, (4,), DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(RemoteTensorRef(handle=handle, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(_dev_ref(0x2000, (4,), DataType.UINT8), TensorArgType.INPUT)
+
+        sidecar = _remote_sidecar_for(args)
+        assert sidecar is not None
+        assert len(sidecar.tensors) == args.tensor_count() == 3
+        assert sidecar.tensors[0] is None
+        assert sidecar.tensors[1] is not None and sidecar.tensors[1].present
+        assert sidecar.tensors[2] is None
 
     def test_remote_sidecar_storage_is_bound_to_task_args_lifetime(self):
         gc.collect()
@@ -757,6 +931,14 @@ class TestRemoteTaskArgsSidecar:
 
 
 class TestRemoteL3SessionTaskArgsMaterialization:
+    def test_tensor_extent_rejects_mismatched_shape_and_stride_counts(self):
+        from simpler.remote_l3_session import _tensor_extent_bytes
+
+        tensor = SimpleNamespace(shapes=(2, 2), strides=(2,), dtype=DataType.UINT8)
+
+        with pytest.raises(ValueError, match="shape and stride counts disagree"):
+            _tensor_extent_bytes(tensor)
+
     def test_task_payload_decode_preserves_scope_stats_config(self):
         from simpler.remote_l3_protocol import decode_task_payload
 
@@ -867,7 +1049,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         try:
             ctypes.memmove(backing.base, b"01234567", 8)
             entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)
-            tensor = _remote_arg_tensor((4,), nbytes=4)
+            tensor = _remote_arg_tensor((4,), nbytes=8, byte_offset=2)
             desc = RemoteTensorDesc(
                 address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
                 owner_worker_id=2,
@@ -928,9 +1110,10 @@ class TestRemoteL3SessionTaskArgsMaterialization:
                     flags=0,
                 )
 
-            tensor = _remote_arg_tensor((4,), nbytes=4)
+            tensor = _remote_arg_tensor((4,), nbytes=8)
+            tensor_second = _remote_arg_tensor((4,), nbytes=8, byte_offset=4)
             wire = RemoteTaskArgsWire(
-                (tensor, tensor),
+                (tensor, tensor_second),
                 (RemoteTensorSidecar(True, sub_range(0)), RemoteTensorSidecar(True, sub_range(4))),
                 (),
                 b"",
@@ -942,6 +1125,41 @@ class TestRemoteL3SessionTaskArgsMaterialization:
 
             assert args.tensor(0).buffer.identity == args.tensor(1).buffer.identity
             assert (args.tensor(0).byte_offset, args.tensor(1).byte_offset) == (0, 4)
+        finally:
+            backing.close()
+
+    def test_materialize_rejects_a_wire_offset_that_disagrees_with_the_sidecar(self):
+        from simpler.remote_l3_protocol import (
+            RemoteAddressSpace as WireRemoteAddressSpace,
+        )
+        from simpler.remote_l3_protocol import (
+            RemoteTaskArgsWire,
+            RemoteTensorDesc,
+            RemoteTensorSidecar,
+        )
+        from simpler.remote_l3_session import _materialize_task_args, _RemoteBufferEntry
+
+        backing = create_host_shared_buffer(8, mint_owner_instance_id(), buffer_id=9)
+        try:
+            entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)
+            tensor = _remote_arg_tensor((4,), nbytes=8, byte_offset=0)
+            desc = RemoteTensorDesc(
+                address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
+                owner_worker_id=2,
+                buffer_id=9,
+                offset=2,
+                nbytes=4,
+                remote_addr=entry.addr,
+                rkey_or_token=0,
+                generation=1,
+                inline_payload_offset=0,
+                inline_payload_len=0,
+                flags=0,
+            )
+            wire = RemoteTaskArgsWire((tensor,), (RemoteTensorSidecar(True, desc),), (), b"")
+
+            with pytest.raises(ValueError, match="byte_offset disagrees"):
+                _materialize_task_args(wire, {(9, 1): entry}, worker_id=2, mint_inline_buffer=_session_buffer_minter())
         finally:
             backing.close()
 
@@ -974,7 +1192,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
                 flags=0,
             )
             wire = RemoteTaskArgsWire(
-                (_remote_arg_tensor((4,), nbytes=4),), (RemoteTensorSidecar(True, desc),), (), b""
+                (_remote_arg_tensor((4,), nbytes=8),), (RemoteTensorSidecar(True, desc),), (), b""
             )
 
             args, _inline_backings = _materialize_task_args(

@@ -30,7 +30,7 @@ styles**. They measure different things; don't confuse them:
 
 - **Path 0 — in-repo example (simpler itself, NO cross-repo).** Start here
   if you just want qwen3 decode running on simpler. simpler ships a
-  self-contained SceneTestCase at
+  self-contained standalone driver with a thin manual pytest wrapper at
   `examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/` — **all 40**
   Qwen3-14B decode layers as one fused dispatch (harvested pypto codegen: 18
   AIC + 16 AIV + orchestration, plus the vendored CANN FusedInferAttentionScore
@@ -46,14 +46,14 @@ styles**. They measure different things; don't confuse them:
   task-submit --device auto --device-num 1 --run "\
     python -m pytest examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode \
       --platform a2a3 --device \$TASK_DEVICE --manual include"
-  # standalone: python .../qwen3_14b_decode/test_qwen3_14b_decode.py \
-  #   -p a2a3 -d \$TASK_DEVICE --manual include
+  # standalone driver (canonical direct entry; --rounds N --skip-golden to
+  # benchmark): python .../qwen3_14b_decode/main.py -p a2a3 -d \$TASK_DEVICE
   ```
 
   This is **not** a cross-repo path, so the rest of this skill (§1 setup,
-  §2–§6) does not apply to it — run it like any other example/scene test
-  (see the example's own `README.md`). It's listed here only so you know it
-  exists before reaching for the heavier cross-repo paths below.
+  §2–§6) does not apply to it — run it per the example's own `README.md`,
+  which owns both entry points' full recipes. It's listed here only so you
+  know it exists before reaching for the heavier cross-repo paths below.
 - **Path A — serving runner (pypto-serving).** Full engine: builds an
   `Engine` and runs `generate` over a prompt. Entry
   `examples/model/qwen3_14b/npu_generate.py`, flags `--model-dir --prompt
@@ -161,10 +161,15 @@ log to tell them apart**:
 1. **Heap-exhausted deadlock** (default 256 MB ring): the open prefill scope's
    live-set exceeds one ring → device log prints
    `FATAL: Task Allocator Deadlock - Heap Exhausted! ... Provable head-of-line`.
-   Fix: raise the ring. batch-1 needs just over 256 MB; batch-16 needs the
-   prefill config `PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072
-   PTO2_RING_DEP_POOL=131072` (heap, task-window, and dep-pool all scale with
-   batch; default `task_window=16384` also overflows at batch-16).
+   Fix: raise the ring. batch-1 needs just over 256 MB; batch-16 needs
+   `ring_heap=4294967296`, `ring_task_window=131072`, `ring_dep_pool=131072`
+   (heap, task-window, and dep-pool all scale with batch; the default
+   `task_window=16384` also overflows at batch-16). These are per-task values on
+   `CallConfig.runtime_env` — the runner has to pass them with the prefill call.
+   The `PTO2_RING_*` environment variables that used to carry them are no longer
+   read by simpler, and a stale export is silently ignored (simpler warns), so a
+   runner still exporting them runs on the 256 MB default and deadlocks exactly
+   as described above.
 2. **Op-execute timeout** (slow/contended prefill): device log prints
    `HandleTaskTimeout ... timeOut:<N>` and kills `aicpu-sd`. The compiled
    defaults (`PLATFORM_OP_EXECUTE_TIMEOUT_US`=45 s,

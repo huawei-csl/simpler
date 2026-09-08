@@ -14,7 +14,7 @@
  *
  * This module owns the host-side state and methods that are identical
  * between the two onboard arches today:
- *   - The `MemoryAllocator` and the three `DeviceArena`s (gm heap, PTO2
+ *   - The `MemoryAllocator` and the three `DeviceArena`s (gm heap, shared memory
  *     SM, runtime arena) backing the per-Worker pooled regions.
  *   - The trivial tensor-memory wrappers (`allocate_tensor`,
  *     `free_tensor`, `copy_*_device`).
@@ -144,8 +144,11 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
-    void *
-    acquire_graph_definition_buffer(uint32_t pipeline_slot, uint64_t key, std::size_t bytes, std::size_t alignment);
+    int acquire_graph_definition_block(
+        uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **staging_out
+    );
+    void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
+    int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     void clear_temporary_buffer();
     /**
      * Map a device buffer into the host address space and return a
@@ -165,7 +168,7 @@ public:
     virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     /**
-     * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
+     * Commit the three per-Worker pooled regions (GM heap, shared
      * shared memory, trb prebuilt runtime arena) as three independent
      * device allocations. Must be called before any `acquire_pooled_*`.
      * Idempotent on identical (or smaller) sizes; an equal-or-smaller
@@ -186,7 +189,7 @@ public:
     int setup_static_arena(uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
     /**
-     * Return the pooled GM heap / PTO2 SM / runtime arena base pointer of the
+     * Return the pooled GM heap / shared memory / runtime arena base pointer of the
      * selected arena bank. `setup_static_arena` (arch subclass) must have
      * already committed the relevant region on that bank; otherwise returns
      * nullptr. The runtime arena accessor is trb-only — hbg's
@@ -231,10 +234,17 @@ public:
      *      by the subclass `finalize()`).
      *   3. Bootstrap the dispatcher + register the inner AICPU SO via
      *      `ensure_binaries_loaded()`.
+     *   4. Provision the requested async-DMA workspaces via
+     *      `ensure_dma_workspace_provisioned()`.
+     *   5. Launch `simpler_aicpu_init` via `ensure_aicpu_init_launched()`,
+     *      which publishes step 4's addresses along with the other resident
+     *      invariants. Step 4 precedes it so that publication is one launch.
+     *   6. Warm the SDMA control path via `ensure_dma_workspace_warmed()`,
+     *      which needs both the live workspace and the AICore stream.
      *
-     * Called from `simpler_init` after executor + dispatcher bytes have
-     * been cached on the runner. Idempotent: subsequent calls
-     * short-circuit on `binaries_loaded_`.
+     * Called from `simpler_init` after executor + dispatcher bytes and the
+     * async-DMA request have been cached on the runner. Idempotent: each step
+     * short-circuits on its own guard.
      *
      * @return 0 on success, error code on failure.
      */
@@ -270,6 +280,27 @@ public:
      */
     void set_dispatcher_binary(std::vector<uint8_t> dispatcher_so_binary) {
         dispatcher_so_binary_ = std::move(dispatcher_so_binary);
+    }
+
+    /**
+     * Record this Worker's async-DMA request. Called by simpler_init before its
+     * `ensure_device_initialized()`, which is where the request is acted on —
+     * the workspace has to exist before the one-shot `simpler_aicpu_init` launch
+     * that publishes its addresses.
+     *
+     * `enable_sdma` opts into the SDMA workspace; every other engine
+     * `dma_workspace_supported_mask()` names is provisioned regardless. SDMA is
+     * declinable because its workspace cannot be obtained without also creating
+     * 48 CP-process STARS streams, which halves this Worker's post-fault reset
+     * budget. Opting in where SDMA is unsupported fails device init.
+     *
+     * `sdma_warmup_binary` is the vector-only ELF that walks the SDMA control
+     * path once per channel once the workspace is live. An empty buffer only
+     * costs first-call latency.
+     */
+    void set_dma_workspace_request(bool enable_sdma, std::vector<uint8_t> sdma_warmup_binary) {
+        sdma_requested_ = enable_sdma;
+        sdma_warmup_binary_ = std::move(sdma_warmup_binary);
     }
 
     /** The device id captured by simpler_init's `attach_current_thread` call. */
@@ -393,26 +424,6 @@ public:
     bool has_callable(int32_t callable_id) const;
 
     /**
-     * Provision the async-DMA workspaces named in `required_mask` once at Worker
-     * init and latch their device addresses into the resident KernelArgs so every
-     * subsequent run carries them (AICPU injects them into GlobalContext via
-     * get_dma_workspace). Called only for a Worker created with SDMA enabled;
-     * `required_mask` bits outside dma_workspace_supported_mask() are rejected, so
-     * a platform/runtime without SDMA fails fast. The provider handle is released
-     * by finalize_common().
-     *
-     * `sdma_warmup_binary` / `sdma_warmup_size`, when non-empty, are handed to
-     * launch_sdma_warmup_kernel() once the workspace is live. An absent or
-     * unrunnable warmup does NOT fail provisioning; a warmup whose device launch or
-     * sync fails does, and leaves the runner marked unusable.
-     *
-     * @return 0 on success, negative on unsupported/failed provisioning.
-     */
-    int provision_dma_workspace(
-        uint32_t required_mask, const void *sdma_warmup_binary = nullptr, size_t sdma_warmup_size = 0
-    );
-
-    /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
      * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
@@ -508,7 +519,7 @@ public:
 
     // ---- Virtual entry points called by the shared c_api ----------------
     //
-    // The shared `pto_runtime_c_api` glue (`src/common/platform/onboard/host/
+    // The shared `runtime_c_api` glue (`src/common/platform/onboard/host/
     // c_api_shared.cpp`) works through `DeviceRunnerBase *` and dispatches
     // through these virtuals. Each arch's `DeviceRunner` overrides the
     // enqueue/poll/drain lifecycle and `finalize`; a2a3 and a5 both override
@@ -680,8 +691,9 @@ public:
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
-     * of a run does not pay it. Called from provision_dma_workspace() once the
-     * workspace is live, on `stream_aicore_`, and synchronized before returning.
+     * of a run does not pay it. Called from ensure_dma_workspace_warmed() once
+     * the workspace is live, on `stream_aicore_`, and synchronized before
+     * returning.
      *
      * `binary` is a vector-only ELF, registered separately from the executor
      * (`RT_DEV_BINARY_MAGIC_ELF_AIVEC`, its own handle) because the executor is a
@@ -721,6 +733,11 @@ public:
         enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
     }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
+    bool
+    publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
+        return json_value != nullptr &&
+               chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
+    }
     HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
         host_phase_records_.finish(submitted_tasks, invocation_id);
@@ -728,6 +745,8 @@ public:
     const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane();
+    /** Start the level-4 Host/Device clock correlation once per run. */
+    void begin_clock_correlation_session_if_needed() noexcept;
     /**
      * Write this pass's per-event host phase records to `output_prefix_`.
      *
@@ -805,13 +824,37 @@ protected:
 
     /**
      * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
-     * device id, log config) into the resident AICPU SO globals. Idempotent via
-     * `aicpu_init_launched_`; called from
-     * `ensure_device_initialized()` after the binaries are loaded.
+     * device id, log config, provisioned async-DMA workspace addresses) into the
+     * resident AICPU SO globals. Idempotent via `aicpu_init_launched_`; called
+     * from `ensure_device_initialized()` after the binaries are loaded and the
+     * workspaces are provisioned, so one launch publishes everything.
      *
      * @return 0 on success, error code on failure.
      */
     int ensure_aicpu_init_launched();
+
+    /**
+     * Provision the async-DMA workspaces this Worker asked for (see
+     * `set_dma_workspace_request`) and record their device addresses in
+     * `dma_workspace_addr_`, ready for `ensure_aicpu_init_launched()` to
+     * publish. Idempotent: a runner that already holds a provider handle, and
+     * one whose request declined the only declinable engine on a device that
+     * supports nothing else, both no-op. The handle is released by
+     * `finalize_common()`, including on a later step's failure.
+     *
+     * @return 0 on success, negative on unsupported/failed provisioning.
+     */
+    int ensure_dma_workspace_provisioned();
+
+    /**
+     * Walk the SDMA control path once, after `ensure_aicpu_init_launched()` has
+     * published the workspace addresses. No-op without a provisioned workspace.
+     * One-shot via `sdma_warmed_`, which also releases the warmup ELF bytes.
+     *
+     * @return 0 on success or a skipped warmup, error code when the warmup
+     *         faulted the card.
+     */
+    int ensure_dma_workspace_warmed();
 
     /**
      * Query the maximum block_dim the stream can host.
@@ -923,8 +966,9 @@ protected:
      *
      * Each spawned thread is bound to `device_id_` via `create_thread`.
      *
-     * Subclasses with arch-specific collectors (a2a3's
-     * `dep_gen_collector_`) call this helper and then start their own.
+     * Subclasses with arch-specific collectors (`dep_gen_collector_`) call
+     * this helper and then start their own. The sim base carries the same
+     * split.
      */
     void start_shared_collectors_for_run();
 
@@ -937,11 +981,62 @@ protected:
      * writes dump files; `pmu` has no export step beyond reconcile;
      * `scope_stats` writes JSONL).
      *
-     * Subclasses with arch-specific collectors (a2a3's
-     * `dep_gen_collector_` + its `dep_gen_replay_emit_deps_json` export)
-     * inline their own teardown after calling this helper.
+     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
+     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
+     * calling this helper. The sim base carries the same split.
      */
     void teardown_shared_collectors_after_run(bool device_execution_complete);
+
+    /**
+     * The core and AICPU-thread counts a resident collector's pools were built
+     * for.
+     *
+     * Collector pool topology is derived from those counts: buffer seeding
+     * covers pools [0, aicpu_thread_num), and a core's recycled lane is
+     * `(core / PLATFORM_CORES_PER_BLOCKDIM) % aicpu_thread_num`. A collector
+     * that stays initialized across runs therefore holds pools shaped for the
+     * run that built them, so a later run with different counts must rebuild
+     * them rather than reuse pools whose lanes it maps differently.
+     */
+    struct CollectorShape {
+        bool latched{false};
+        int num_aicore{0};
+        int aicpu_thread_num{0};
+        int launch_aicpu_num{0};
+    };
+
+    /**
+     * True once collectors are built and this run's counts differ from theirs,
+     * i.e. their pools must be released and rebuilt before this run seeds them.
+     *
+     * The release frees device memory the collectors are holding, so it is only
+     * safe while no other run is executing against them. Nothing here enforces
+     * that. What guarantees it today is the diagnostics depth-1 gate: with any
+     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
+     * even reserve while a predecessor is in flight, and a stale shape is only
+     * ever seen between runs.
+     *
+     * **Whoever lifts that gate must move this rebuild inside the execution
+     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
+     * usable predicate at this point: onboard takes the claim in
+     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
+     * it is already true for the run being prepared and the check fires on its
+     * own run.
+     */
+    bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
+        return collector_shape_.latched &&
+               (collector_shape_.num_aicore != num_aicore || collector_shape_.aicpu_thread_num != aicpu_thread_num ||
+                collector_shape_.launch_aicpu_num != launch_aicpu_num);
+    }
+
+    void latch_collector_shape(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) {
+        collector_shape_ = CollectorShape{true, num_aicore, aicpu_thread_num, launch_aicpu_num};
+    }
+
+    /** Called by the subclass's finalize_collectors(): no pools are built now. */
+    void clear_collector_shape() { collector_shape_ = CollectorShape{}; }
+
+    CollectorShape collector_shape_{};
 
     /**
      * Shared body of `finalize()`. Each arch subclass's `finalize()`
@@ -968,16 +1063,19 @@ protected:
      * @return 0 on success, first nonzero rc encountered otherwise.
      */
     int finalize_common();
-    void release_graph_definition_buffers();
+    void release_graph_definition_blocks();
+
+    /** Drop every retained host SM mirror, returning its pages to the allocator. */
+    void release_sm_mirrors();
 
     /**
-     * Drop the retained graph-definition buffers without freeing them.
+     * Drop the retained graph-definition blocks without freeing the device side.
      *
-     * The fatal counterpart of release_graph_definition_buffers(): a force reset
-     * has already invalidated every allocation, so only the host-side map is
-     * cleared.
+     * The fatal counterpart of release_graph_definition_blocks(): a force reset
+     * has already invalidated every device allocation, so only the host-side
+     * bookkeeping and staging are dropped.
      */
-    void abandon_graph_definition_buffers();
+    void abandon_graph_definition_blocks();
 
     /**
      * Clear host-side ownership after a fatal device failure without issuing
@@ -1047,8 +1145,14 @@ protected:
     // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
     // so the resident AICPU SO latches them into g_dma_workspace_addr; the
     // scheduler prefills each core's GlobalContext from there. All-zero until a
-    // Worker opts into SDMA via provision_dma_workspace().
+    // Worker opts into SDMA via set_dma_workspace_request().
     uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
+    // This Worker's async-DMA request, recorded by set_dma_workspace_request()
+    // before device bring-up. `sdma_warmup_binary_` is released once
+    // ensure_dma_workspace_warmed() has consumed it.
+    bool sdma_requested_{false};
+    bool sdma_warmed_{false};
+    std::vector<uint8_t> sdma_warmup_binary_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of successful AICPU dlopens (incremented after prewarm
     // or first-run fallback succeeds; never decremented). Diverges from
@@ -1133,19 +1237,41 @@ protected:
     // the grow/pack logic lives in trb bind.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // One retained device block: the raw allocation plus the aligned address
-    // handed out. Backs the Graph Definition cache below.
-    struct RetainedGraphBuffer {
+    // Graph Definition storage, one retained block per pipeline slot — see
+    // HostApi acquire_graph_definition_block. `staging` is the host block the
+    // run's Definition objects are packed into and stays allocated across runs,
+    // so a bind neither acquires nor returns host memory for them; the device
+    // side is the raw allocation plus the aligned address handed out. One block
+    // per slot rather than one per Definition: every Definition of a run is
+    // packed end to end and shipped by a single H2D, and every submission
+    // references the device-resident copy of its own Definition.
+    struct RetainedGraphBlock {
         void *allocation{nullptr};
         void *aligned_addr{nullptr};
         std::size_t capacity{0};
+        std::vector<std::byte> staging;
     };
-    // Graph Definition storage, one retained block per (pipeline slot,
-    // definition key) — see HostApi acquire_graph_definition_buffer. Keyed by
-    // content identity rather than occurrence: every submission of one run
-    // references the same device-resident Definition.
-    using GraphDefinitionBufferMap = std::unordered_map<uint64_t, RetainedGraphBuffer>;
-    std::array<GraphDefinitionBufferMap, PTO_PIPELINE_MAX_DEPTH> graph_definition_buffers_{};
+    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    // Host mirror of the runtime shared memory, one retained buffer per pipeline
+    // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
+    // whole shared-memory image here and the bind ships the live prefix, so the
+    // buffer is capacity-sized (tens of MB) and stays mapped across binds: one
+    // buffer per slot rather than one per bind, because two binds in different
+    // slots are in flight at once. `capacity` counts the raw block, which is over-allocated
+    // by the requested alignment so the aligned address handed out has the
+    // requested bytes behind it.
+    //
+    // The block is never value-initialized. The caller's layout is init-on-write
+    // and it ships only the prefixes it wrote, so the resident set is the pages a
+    // bind touches rather than the whole capacity — which is also why this is not a
+    // std::vector: `resize` would zero every page of a capacity the caller writes
+    // a fraction of, and would copy the old bytes on growth for a buffer whose
+    // contents mean nothing between binds.
+    struct RetainedSmMirror {
+        std::unique_ptr<std::byte[]> storage;
+        std::size_t capacity{0};
+    };
+    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
@@ -1232,5 +1358,6 @@ protected:
     bool enable_scope_stats_{false};
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
+    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };

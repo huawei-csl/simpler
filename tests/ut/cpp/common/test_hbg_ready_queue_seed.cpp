@@ -21,11 +21,17 @@
 #include <cstring>
 #include <vector>
 
+#include "host_build_graph/ready_queue_sizing.h"
 #include "scheduler/scheduler.h"
 
 namespace {
 
 constexpr uint64_t CAPACITY = 8;
+
+// GraphExecutionBatch16Seq3500 in qwen3_14b_decode reaches 9400 AIC
+// tasks in one bind, so the supported ceiling must continue to cover it.
+constexpr uint64_t QWEN_AIC_REACHABLE_TASKS = 9400;
+static_assert(READY_QUEUE_CAPACITY_LIMIT >= QWEN_AIC_REACHABLE_TASKS);
 
 // A slots region under the test's control, filled with a pattern standing in for
 // unseeded device memory. 0 is deliberate for one case: zeroed memory is the
@@ -33,19 +39,19 @@ constexpr uint64_t CAPACITY = 8;
 class SlotsRegion {
 public:
     explicit SlotsRegion(uint8_t fill) :
-        storage_(CAPACITY * sizeof(PTO2ReadyQueueSlot)) {
+        storage_(CAPACITY * sizeof(ChipReadyQueueSlot)) {
         std::memset(storage_.data(), fill, storage_.size());
     }
 
-    PTO2ReadyQueueSlot *slots() { return reinterpret_cast<PTO2ReadyQueueSlot *>(storage_.data()); }
+    ChipReadyQueueSlot *slots() { return reinterpret_cast<ChipReadyQueueSlot *>(storage_.data()); }
 
 private:
     std::vector<std::byte> storage_;
 };
 
-// PTO2ReadyQueue holds atomics and so is neither copyable nor movable: the caller
+// ChipReadyQueue holds atomics and so is neither copyable nor movable: the caller
 // owns the storage and this only fills it, exactly as the arena path does.
-void make_queue(PTO2ReadyQueue *queue, SlotsRegion &region) {
+void make_queue(ChipReadyQueue *queue, SlotsRegion &region) {
     ready_queue_init_data_from_layout(queue, CAPACITY);
     queue->slots = region.slots();
 }
@@ -64,7 +70,7 @@ ChipTaskSlotState *fake_slot_state(size_t i) {
 // signal. One push then succeeds and the rest report full.
 TEST(HbgReadyQueueSeed, ZeroedSlotsReportFullAfterOnePush) {
     SlotsRegion region(0x00);
-    PTO2ReadyQueue queue{};
+    ChipReadyQueue queue{};
     make_queue(&queue, region);
 
     EXPECT_TRUE(queue.push(fake_slot_state(0)));
@@ -74,7 +80,7 @@ TEST(HbgReadyQueueSeed, ZeroedSlotsReportFullAfterOnePush) {
 
 TEST(HbgReadyQueueSeed, SeededSlotsAcceptCapacityPushes) {
     SlotsRegion region(0xAA);
-    PTO2ReadyQueue queue{};
+    ChipReadyQueue queue{};
     make_queue(&queue, region);
 
     queue.seed_slots();
@@ -96,7 +102,7 @@ TEST(HbgReadyQueueSeed, SeededSlotsAcceptCapacityPushes) {
 // work across laps with no re-seed.
 TEST(HbgReadyQueueSeed, DrainedQueueWrapsWithoutReseeding) {
     SlotsRegion region(0xAA);
-    PTO2ReadyQueue queue{};
+    ChipReadyQueue queue{};
     make_queue(&queue, region);
     queue.seed_slots();
 
@@ -116,7 +122,7 @@ TEST(HbgReadyQueueSeed, DrainedQueueWrapsWithoutReseeding) {
 // mid-lap by an earlier run rather than assuming a drained predecessor.
 TEST(HbgReadyQueueSeed, ReseedRecoversAPartiallyUsedRegion) {
     SlotsRegion region(0xAA);
-    PTO2ReadyQueue queue{};
+    ChipReadyQueue queue{};
     make_queue(&queue, region);
     queue.seed_slots();
     ASSERT_TRUE(queue.push(fake_slot_state(0)));
@@ -131,4 +137,90 @@ TEST(HbgReadyQueueSeed, ReseedRecoversAPartiallyUsedRegion) {
         EXPECT_TRUE(queue.push(fake_slot_state(i))) << "push " << i;
     }
     EXPECT_EQ(queue.pop(), fake_slot_state(0));
+}
+
+TEST(HbgReadyQueueSizing, DerivesCapacityForEachReachablePopulation) {
+    ReadyQueuePopulations populations{};
+    TaskAttrs sync_start;
+    sync_start.set_sync_start();
+    TaskAttrs predicate;
+    predicate.set_predicate();
+    TaskAttrs predicated_sync_start;
+    predicated_sync_start.set_predicate();
+    predicated_sync_start.set_sync_start();
+
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 9400);
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIV0), sync_start, TaskKind::KERNEL, 3);
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0), predicate, TaskKind::KERNEL, 5);
+    populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::DUMMY);
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIV1), predicated_sync_start, TaskKind::KERNEL, 3);
+    populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH, 7);
+
+    ReadyQueueCapacities capacities{};
+    ASSERT_TRUE(populations.derive_capacities(&capacities));
+    EXPECT_EQ(capacities.ready[static_cast<int32_t>(ResourceShape::AIC)], 16384);
+    EXPECT_EQ(capacities.ready[static_cast<int32_t>(ResourceShape::AIV)], 2);
+    EXPECT_EQ(capacities.ready[static_cast<int32_t>(ResourceShape::MIX)], 8);
+    EXPECT_EQ(capacities.ready_sync[static_cast<int32_t>(ResourceShape::AIV)], 8);
+    EXPECT_EQ(capacities.dummy, 16);
+    EXPECT_EQ(capacities.graph_ready, 8);
+    EXPECT_EQ(capacities.graph_prepare, 8);
+}
+
+TEST(HbgReadyQueueSizing, RejectsPopulationPastReservationLimit) {
+    ReadyQueuePopulations populations{};
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
+
+    ReadyQueueCapacities capacities{};
+    EXPECT_FALSE(populations.derive_capacities(&capacities));
+}
+
+TEST(HbgReadyQueueSizing, RejectsMergedPopulationPastReservationLimit) {
+    ReadyQueuePopulations first{};
+    ReadyQueuePopulations second{};
+    first.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 20000);
+    second.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 20000);
+
+    first.add(second);
+
+    ReadyQueueCapacities capacities{};
+    EXPECT_FALSE(first.derive_capacities(&capacities));
+}
+
+TEST(HbgReadyQueueSizing, BindRejectionReturnsReadyQueueOverflow) {
+    ReadyQueuePopulations populations{};
+    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
+    ReadyQueueCapacities capacities{};
+
+    const int32_t status = derive_ready_queue_capacities(populations, &capacities);
+
+    EXPECT_EQ(status, -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
+
+TEST(HbgReadyQueueSizing, InitializesEveryLogicalQueueCapacityFromLayout) {
+    DeviceArena scheduler_arena;
+    DeviceArena sm_arena;
+    SharedMemoryHandle *sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
+    ASSERT_NE(sm_handle, nullptr);
+    SchedulerLayout layout = SchedulerState::reserve_layout(scheduler_arena);
+    layout.capacities.ready[0] = 2;
+    layout.capacities.ready[1] = 4;
+    layout.capacities.ready[2] = 8;
+    layout.capacities.ready_sync[0] = 16;
+    layout.capacities.ready_sync[1] = 32;
+    layout.capacities.ready_sync[2] = 64;
+    layout.capacities.dummy = 128;
+    layout.capacities.graph_ready = 256;
+    layout.capacities.graph_prepare = 512;
+    SchedulerState scheduler{};
+
+    ASSERT_TRUE(scheduler.init_data_from_layout(layout, scheduler_arena, sm_handle->header));
+
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        EXPECT_EQ(scheduler.ready_queues[i].capacity, layout.capacities.ready[i]);
+        EXPECT_EQ(scheduler.ready_sync_queues[i].capacity, layout.capacities.ready_sync[i]);
+    }
+    EXPECT_EQ(scheduler.dummy_ready_queue.capacity, layout.capacities.dummy);
+    EXPECT_EQ(scheduler.graph_ready_queue.capacity, layout.capacities.graph_ready);
+    EXPECT_EQ(scheduler.graph_prepare_queue.capacity, layout.capacities.graph_prepare);
 }

@@ -16,18 +16,17 @@
  * only handles:
  * - Handshake buffers for AICPU-AICore communication
  * - Execution parameters (block_dim, aicpu_thread_num)
- * - ChipTensor pair management for host-device memory tracking
+ * - simpler::tmr::Tensor pair management for host-device memory tracking
  * - Device orchestration state (gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
+ * Task dispatch uses a per-core DispatchPayload written by the scheduler.
  * At dispatch time, build_payload() copies tensor pointers and scalars from
  * the task payload into the per-core args[], populates SPMD context, then
  * signals AICore via DATA_MAIN_BASE.
  */
 
-#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
-#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
+#pragma once
 
 #include <stddef.h>  // for offsetof
 #include <stdbool.h>
@@ -45,6 +44,8 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
 #include "task_args.h"
+#include "aicore_teardown.h"
+#include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
 
 // =============================================================================
 // Configuration Macros
@@ -73,7 +74,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * 2. AICPU publishes the task pointer and opens the register window with DATA_MAIN_BASE=IDLE
  * 3. AICore observes window-open, reports initial idle state, and reads the task pointer
  * 4. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
- * 5. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
+ * 5. Task Execution: AICore reads the cached DispatchPayload and executes
  * 6. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 7. Shutdown: AICPU writes the exit signal to DATA_MAIN_BASE; AICore exits
  *
@@ -99,10 +100,18 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 struct Handshake {
     volatile uint32_t aicpu_ready;  // Legacy layout field; unused by the current handshake
     volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // PTO2DispatchPayload* published before register window-open
+    volatile uint64_t task;         // DispatchPayload* published before register window-open
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
+
+// The AICore owns this line's writeback: it flushes the whole line with
+// dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
+// must publish independently cannot live here — a stale line writeback would
+// overwrite it. The post-close return gates live in
+// DeviceRuntimeLaunchDesc::teardown_gates, one isolated line each.
+static_assert(sizeof(Handshake) == 64);
+static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 
 enum class TensorReleaseKind {
     Free,
@@ -111,7 +120,7 @@ enum class TensorReleaseKind {
 };
 
 /**
- * ChipTensor lease for tracking host-device memory mappings and release ownership.
+ * simpler::tmr::Tensor lease for tracking host-device memory mappings and release ownership.
  */
 struct TensorLease {
     void *host_ptr;
@@ -127,7 +136,7 @@ struct TensorLease {
 /**
  * Task structure - Compatibility stub for platform layer
  *
- * RT2 uses PTO2DispatchPayload instead of Task for task dispatch.
+ * RT2 uses DispatchPayload instead of Task for task dispatch.
  * This stub exists only for API compatibility with device_runner.cpp.
  * Since get_task_count() returns 0, this struct is never actually used.
  */
@@ -159,7 +168,13 @@ struct Task {
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+    // Post-close return gates, one isolated cache line per worker. The AICPU
+    // stores here only after that worker's register window is closed; the
+    // AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -179,7 +194,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 
-    // PTO2 integration: kernel_id -> GM function_bin_addr mapping
+    // kernel binary resolution: kernel_id -> GM function_bin_addr mapping
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
     // TraCR data placeholder
@@ -193,8 +208,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
 
-    void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
-    ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
+    void *gm_sm_ptr_;                                   // GM pointer to shared memory (device)
+    simpler::tmr::EntryArgsStorage orch_args_storage_;  // Entry args, adopted on the host
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
     // Runtime to device; AICPU reads them in the boot path to skip
@@ -252,6 +267,7 @@ public:
     void *get_tracr_data_sizes() const { return dev.tracrDataSizes_; }
     void set_tracr_data_sizes(void *p) { dev.tracrDataSizes_ = p; }
     Handshake *get_workers() { return dev.workers; }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -270,7 +286,7 @@ public:
     // =========================================================================
 
     void *get_gm_sm_ptr() const;
-    const ChipStorageTaskArgs &get_orch_args() const;
+    const simpler::tmr::EntryArgsStorage &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
@@ -315,10 +331,10 @@ public:
     // Task graph is now managed by RuntimeContext, not Runtime
     // =========================================================================
 
-    /** @deprecated Task count is now in PTO2 shared memory */
+    /** @deprecated Task count is now in shared memory */
     int get_task_count() const { return 0; }
 
-    /** @deprecated RT2 uses PTO2DispatchPayload, not Task. Always returns nullptr. */
+    /** @deprecated RT2 uses DispatchPayload, not Task. Always returns nullptr. */
     Task *get_task(int) { return nullptr; }
 
     // =========================================================================
@@ -363,5 +379,3 @@ static_assert(
 // object). Defined per-runtime so the shared device_runner_helpers.cpp copy
 // path stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
-
-#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

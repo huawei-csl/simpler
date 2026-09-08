@@ -103,10 +103,17 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14;
 constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
 
 /**
- * Default onboard AICPU scheduler no-progress timeout (milliseconds).
- * Shared with host-side timeout ordering validation.
+ * Default AICPU scheduler no-progress timeout (milliseconds).
+ * One value for every platform variant: onboard and sim run the same
+ * no-progress watchdog, and a single constant keeps them from drifting.
+ * Must stay below PLATFORM_OP_EXECUTE_TIMEOUT_US so that onboard the AICPU
+ * declares the hang and flushes its diagnostics before STARS reaps the op.
+ * Sized to outlast a slow CPU-sim kernel on an oversubscribed host, where
+ * the AICPU scheduler threads share cores with the AICore threads.
+ * Shared with host-side timeout ordering validation. Overridden at runtime
+ * by SIMPLER_SCHEDULER_TIMEOUT_MS when that env var is valid.
  */
-constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 10000;
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 20000;
 
 /**
  * Default host-side stream synchronization timeout (milliseconds).
@@ -378,14 +385,14 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is 4672 B (16 ChipTensor blobs + small header). At 4×1024 =
+ * Each DepGenRecord is 4736 B (32 ChipTensor blobs + small header). At 4×1024 =
  * 4096 in-flight records (~19 MB), aligning dep_gen's in-flight count with the
  * scope_stats / l2 AicoreTask pools (also 4096) per the #977 cross-subsystem
  * review. History: original 32 (dropped 50% on unroll Case1) → #977 commit
  * overshot to 2048 → 1024 here (#977 Primary's actual proposal). Flood drops
  * are rate-bound, not capacity-bound — buffer sizing cannot fix them; real
  * dependency-paced workloads never drop. dep_gen is opt-in (--enable-dep-gen).
- * a5 record size (4672 B) and cohort (4096) are identical to a2a3, so the same
+ * a5 record size (4736 B) and cohort (4096) are identical to a2a3, so the same
  * 1024 applies; **a5-silicon validation still pending**. See
  * docs/dfx/dfx-buffer-capacity-audit.md.
  */

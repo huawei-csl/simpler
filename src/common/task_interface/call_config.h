@@ -55,14 +55,14 @@ inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT = RUNTIME_ENV_FIELD_GROUPS *
 
 #pragma pack(push, 1)
 // Per-task runtime-environment overrides — the programmatic equivalent of the
-// `PTO2_RING_*` env vars, grouped under their own sub-struct so they read as a
+// ring sizes, grouped under their own sub-struct so they read as a
 // distinct configuration tier from the top-level `aicpu_thread_num` knob.
 // Consumed by tensormap_and_ringbuffer only; other runtimes
 // ignore them.
 //
 // Each resource is a per-scope-depth-ring array (index 0..3). A 0 entry is
 // unset and falls through to the next precedence tier: per-ring entry >
-// PTO2_RING_* env var > compile-time default. ring_heap is bytes per ring.
+// compile-time default. ring_heap is bytes per ring.
 // The Python/scene-test layer accepts a scalar and broadcasts it to every ring
 // before populating these arrays, so a one-value "size all rings the same"
 // request arrives here as [v, v, v, v].
@@ -117,7 +117,12 @@ struct CallConfig {
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
-    RuntimeEnv runtime_env;          // per-task PTO2_RING_* overrides
+    // Anchor the Host and Device clocks for this capture even when no Host
+    // orchestration records exist, which is what places its device timestamps on
+    // an absolute Host timeline. Independent of why a caller wants that timeline:
+    // the runtime samples the anchors and never learns who consumes them.
+    int32_t capture_clock_anchors = 0;
+    RuntimeEnv runtime_env;  // per-task ring sizing
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {
@@ -145,6 +150,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

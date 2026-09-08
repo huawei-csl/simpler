@@ -21,8 +21,7 @@
 
 #include <atomic>
 #include <cstdarg>
-#include <cstdio>
-#include <mutex>
+#include <cstdint>
 
 #include <sys/types.h>
 
@@ -44,6 +43,11 @@ public:
     // Bind this module-local logger implementation to process-owned state.
     // Must happen during module init, before the module starts worker threads.
     int bind_state(SimplerHostLogState *state);
+    // Internal owner-side counterpart used when an embedding executable
+    // supplies storage instead of this module's default state. Cross-DSO
+    // loaders must use bind_state(), so a transient consumer cannot own the
+    // process writer across dlclose().
+    int adopt_state(SimplerHostLogState *state);
     SimplerHostLogState *state() const;
 
     void log(simpler::log::LogLevel level, const char *func, const char *fmt, ...);
@@ -52,7 +56,45 @@ public:
     // responsible for `va_start` / `va_end`.
     void vlog(simpler::log::LogLevel level, const char *func, const char *fmt, va_list args);
 
-    void set_level(simpler::log::LogLevel level);
+    // Owner initialization starts the bounded writer by default. Hierarchical
+    // workers defer it until their final local fork so no process forks with a
+    // C++ thread already running.
+    //
+    // Takes effect immediately for every host module in the process, since each
+    // reads the bound state's threshold per record — sim AICPU included, because
+    // it is one of them. It does NOT reach onboard AICPU, which latches
+    // InitArgs.log_level once in simpler_aicpu_init and keeps it for the
+    // Worker's life; that is deliberate, not missing (see docs/logging.md,
+    // "The threshold is live on the host and fixed on the device"). Recreate the
+    // Worker to change the device threshold.
+    void set_level(simpler::log::LogLevel level, bool defer_writer = false);
+    bool start_writer();
+
+    // A later hierarchical Worker may fork in the same process. Quiesce and
+    // join an earlier writer before that fork; fail boundedly if its output is
+    // pinned instead of forking while a C++ thread is alive.
+    bool prepare_to_fork(uint32_t timeout_ms = 1000);
+
+    // Drain records already accepted by this process owner. Producers must be
+    // quiescent if the caller needs a strict shutdown boundary.
+    bool flush(uint32_t timeout_ms = 1000);
+    uint64_t dropped_records() const;
+    // The same total, attributed. A caller sizing the queue or the claim budget
+    // needs to know which of them the losses came from; the total alone cannot
+    // distinguish "too small" from "too contended" from "destination broken".
+    uint64_t dropped_records(SimplerHostLogDropReason reason) const;
+    uint64_t pending_records() const;
+
+    // Write this process's records to `path`/host.<pid>.log instead of stderr.
+    // The caller is the one that knows where this run's artifacts go —
+    // CallConfig::output_prefix — so the logger never derives a path itself.
+    // The first non-empty path wins; a null or empty one leaves the logger on
+    // stderr. This is the logger's output, so it applies to every record: no
+    // caller declares anything and no record kind is treated specially.
+    void set_log_directory(const char *path);
+
+    // The bound output directory, or nullptr while this logger writes to stderr.
+    const char *log_directory() const;
 
     // Runtime modules read this from their bound process-owned state when
     // populating InitArgs.log_level at device init.
@@ -72,7 +114,7 @@ public:
 
 private:
     HostLogger();
-    ~HostLogger() = default;
+    ~HostLogger();
 
     HostLogger(const HostLogger &) = delete;
     HostLogger &operator=(const HostLogger &) = delete;
@@ -80,12 +122,20 @@ private:
     HostLogger &operator=(HostLogger &&) = delete;
 
     const char *level_name(simpler::log::LogLevel level) const;
-    bool emit(const char *level_tag, const char *func, const char *fmt, va_list args);
-    bool emit_ungated(const char *level_tag, const char *func, const char *fmt, ...);
+    bool emit(const char *level_tag, const char *func, const char *fmt, va_list args, int32_t anchor_pid = 0);
+    bool emit_ungated(int32_t anchor_pid, const char *level_tag, const char *func, const char *fmt, ...);
     void emit_clock_anchor_if_needed();
+    // Write the loss breakdown into the log itself when it has grown since the
+    // last report. The counters die with the process, so without this a reader
+    // holding only the log file cannot tell that records are missing.
+    void report_drops_if_grown();
 
     std::atomic<SimplerHostLogState *> state_;
-    std::mutex mutex_;
+    std::atomic<bool> state_owner_{true};
+    // The queue implementation is private to host_log.cpp. Keeping only an
+    // opaque pointer here prevents its C++ type and inline methods from becoming
+    // preemptible symbols in every DSO that compiles the host logger.
+    std::atomic<void *> sink_{nullptr};
 };
 
 #undef SIMPLER_HOST_LOG_LOCAL

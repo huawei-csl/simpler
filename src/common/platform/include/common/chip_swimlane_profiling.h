@@ -59,8 +59,9 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/dfx_backpressure_device.h"
+#include "common/host_phase_kind.h"
 #include "common/platform_config.h"
+#include "common/scheduler_profiling.h"
 
 // =============================================================================
 // chip swimlane_level — granularity ladder for the chip swimlane profiler.
@@ -77,11 +78,11 @@
 // enum is the canonical in-code type used for comparisons.
 // =============================================================================
 enum class ChipSwimlaneLevel : uint32_t {
-    DISABLED = 0,       // No collection at all
-    AICORE_TIMING = 1,  // AICore per-task start/end timestamps + task record buffer
-    AICPU_TIMING = 2,   // + AICPU dispatch/finish timestamps
-    SCHED_PHASES = 3,   // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
-    ORCH_PHASES = 4,    // + orchestrator phase records
+    DISABLED = 0,         // No collection at all
+    TASK_TIMING = 1,      // AICore per-task start/end timestamps + task record buffer
+    SCHEDULE_TIMING = 2,  // + Scheduler per-task dispatch/finish timestamps
+    SCHED_PHASES = 3,     // + scheduler main-loop phase records (SCHED_COMPLETE/DISPATCH/IDLE_WAIT)
+    ORCH_PHASES = 4,      // + orchestrator phase records
 };
 
 // =============================================================================
@@ -89,11 +90,12 @@ enum class ChipSwimlaneLevel : uint32_t {
 // =============================================================================
 
 /**
- * AICPU-side timing record. The minimal AICPU-only payload after the
+ * AICPU Scheduler timing record. The minimal AICPU-only payload after the
  * AICore-as-producer split: identity (task_token_raw, core_type) and
  * AICore-side timing (start/end) all live in ChipSwimlaneAicoreTaskRecord; the
- * AICPU record only carries the two timestamps the AICore side cannot
- * produce, plus the host-side join key against the AICore stream.
+ * AICPU record carries only the two timestamps the AICore side cannot produce
+ * (the scheduler's dispatch/finish), plus the host-side join key against the
+ * AICore stream.
  *
  *   - dispatch_time : AICPU timestamp when DATA_MAIN_BASE was written.
  *   - finish_time   : AICPU timestamp when AICPU observed FIN.
@@ -104,7 +106,7 @@ enum class ChipSwimlaneLevel : uint32_t {
  * the matched AICore record, derives core_type from the per-core static
  * table published via ChipSwimlaneCollector::set_core_types, and emits
  * func_id = -1 (resolved post-process by `swimlane_converter.py` from
- * deps.json's `kernel_ids[]`). Same path AICORE_TIMING (level=1) uses.
+ * deps.json's `kernel_ids[]`). Same path TASK_TIMING (level=1) uses.
  *
  * Fanout edges live in the static DAG (deps.json from dep_gen) — not in
  * this record. Keeping fanout out of the hot AICPU commit path avoids a
@@ -132,16 +134,17 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
 /**
  * Slim per-task record written by AICore directly into its own per-core
  * output buffer (no staging slot, no AICPU read). AICPU never touches this
- * record at AICORE_TIMING (level=1); at AICPU_TIMING+ the host joins it
- * against the AICPU record stream on `reg_task_id` (NOT `task_token_raw`).
+ * record at TASK_TIMING (level=1); at SCHEDULE_TIMING+ the host joins it
+ * against the active Scheduler producer's record stream on `reg_task_id`
+ * (NOT `task_token_raw`).
  *
  * Two identity fields with different roles:
  *
- * - `task_token_raw` — the PTO2 task identity `(ring_id << 32) | local_id`.
- *   Per-task unique. AICore reads it from
+ * - `task_token_raw` — the task identity, a `TaskId::raw` in whatever layout
+ *   the minting runtime uses. Per-task unique. AICore reads it from
  *   `LocalContext.async_ctx.task_token.raw` (already in the dispatch
  *   payload's cache line). The host pulls it from here as the canonical
- *   task id + ring decoder at ALL levels — the AICPU record carries no
+ *   task id at ALL levels — the AICPU record carries no
  *   identity after the slim-down (only dispatch/finish timestamps and the
  *   reg_task_id join key), so AICore is the single source of truth for
  *   task identity. NOT a join key on its own: SPMD `block_num > num_cores`,
@@ -419,7 +422,7 @@ struct ChipSwimlaneDataHeader {
 
     // Metadata (Host initializes, Device read-only)
     uint32_t num_cores;            // Actual number of cores launched
-    uint32_t chip_swimlane_level;  // 0=off, 1=AICore timing, 2=+dispatch/fanout,
+    uint32_t chip_swimlane_level;  // 0=off, 1=AICore timing, 2=+Scheduler task timing,
                                    // 3=+sched phases, 4=+orch phases. Host writes
                                    // at init; AICPU reads in chip_swimlane_aicpu_init.
 
@@ -435,9 +438,6 @@ struct ChipSwimlaneDataHeader {
     uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
-
-    // DFX backpressure coordination (unified across all DFX subsystems).
-    DfxBackpressureHeader backpressure;
 } __attribute__((aligned(64)));
 
 // ABI lock for the merged header. The phase metadata fields and the
@@ -481,123 +481,6 @@ static_assert(sizeof(ChipSwimlaneDataHeader) % 64 == 0, "ChipSwimlaneDataHeader 
 //   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
 //   the per-submit envelope answers "which submit was slow".
 
-/** Discriminator for the SCHED phase records (the orch side has no kind).
- *
- * Three role classes, but they share one enum so the on-device record carries
- * a single discriminator byte:
- *
- *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
- *     Complete, Dispatch, Release, Dummy, EarlyDispatch.
- *     Every iter is a sequence of zero-or-more outer bars + optional gap.
- *
- *   INNER (no anchor advance; Perfetto auto-nests by time containment):
- *     Resolve. Only parents are Complete and Dummy — those are the two
- *     FIN-observation sites that call on_task_complete.
- *
- *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
- *     DummyTask and PredicatedSkip. One zero-width marker per dependency-only
- *     completion keeps the DAG node visible on its handling AICPU's lane; the
- *     surrounding Dummy outer bar (sched lane) carries the actual drain time,
- *     and Resolve inside that bar carries the consumer-release work.
- */
-enum class ChipSwimlaneSchedPhaseKind : uint32_t {
-    // Outer
-    Complete = 0,       // check_running_cores_for_completion: observe FINs +
-                        // run on_task_complete inline. tasks_processed = FIN'd
-                        // subtasks + sub-block retires this iter.
-    Dispatch = 1,       // dispatch_ready_tasks: publish ready tasks to AICore.
-                        // tasks_processed = subtasks published this iter.
-    Release = 2,        // Deferred-release drain (on_task_release work).
-                        // tasks_processed = slots released this iter.
-    Dummy = 4,          // dummy_drain outer bar: covers explicit dummies and
-                        // false-predicate tasks popped this iter.
-                        // tasks_processed = dummy_got count.
-    EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
-                        // of a flagged producer's consumer's gated blocks.
-                        // tasks_processed = blocks staged this pass.
-    // Inner (parent: Complete | Dummy)
-    Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
-                  // push newly-ready successors, ring doorbells for
-                  // early-dispatch hits. tasks_processed = # consumers visited.
-    // Separate-lane (Worker View pid=4 AICPU_N)
-    DummyTask = 7,      // Per-dummy identity marker (zero-width). phase_data.dummy_task
-                        // carries the local/ring components of the full PTO2 identity.
-    Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
-                        // (ack barrier + availability + parallel stage + finalize).
-                        // One bar per dispatch-loop iteration that enters the drain,
-                        // so retries show as multiple bars. Otherwise this time is a
-                        // swimlane blind spot (the loop `continue`s past all records).
-    DrainPrepare = 9,   // inner: this thread's global sync_start staging prepare pass
-                        // (cluster scan + build_payload). tasks_processed = subtasks.
-    DrainPublish = 10,  // inner: this thread's global sync_start staging publish pass
-                        // (MMIO write_reg per subtask). tasks_processed = subtasks.
-    // Outer (sched lane): async-wait completion polling, split out of Complete
-    // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
-    // bar. tasks_processed = async subtasks completed this iter.
-    AsyncPoll = 11,
-    // Separate-lane (Worker View pid=4 AICPU_N)
-    PredicatedSkip = 12,  // Per-task marker for a real task retired inline because
-                          // its dispatch predicate evaluated false. Uses the same
-                          // phase_data.dummy_task identity payload as DummyTask.
-    // Outer (sched lane): one bounded Graph Definition materialization slice.
-    // phase_data.graph_task identifies the ring-0 outer Graph task and
-    // tasks_processed is the number of nodes patched in this slice.
-    GraphPrepare = 13,
-};
-
-/** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
- *  Must match PTO2ResourceShape's first three values (see submit_types.h).
- *  Hardcoded here rather than included to keep this header runtime-independent. */
-constexpr int CHIP_SWIMLANE_NUM_QUEUE_SHAPES = 3;
-
-/**
- * AICPU scheduler phase record (64 bytes).
- *
- * Position in the per-thread buffer is the identity — no thread_id field.
- *
- * phase_data is tagged by kind: Dispatch uses its ready-queue counters and
- * DummyTask and PredicatedSkip use the local/ring components of the full task
- * id. Other kinds store zero in the Dispatch view.
- *
- * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
- * queue occupancy at phase boundaries. They surface the dep-release-then-
- * discovery latency that head OH alone can't distinguish from register-write
- * latency. Filled with 0 below SCHED_PHASES.
- */
-struct ChipSwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;              // Phase start timestamp
-    uint64_t end_time;                // Phase end timestamp
-    uint32_t loop_iter;               // Scheduler-loop iteration number on this thread
-    ChipSwimlaneSchedPhaseKind kind;  // see enum above
-    uint32_t tasks_processed;         // Tasks processed in this phase batch
-    union {
-        struct {
-            uint32_t pop_hit;   // Ready-queue hit delta since the previous Dispatch emit
-            uint32_t pop_miss;  // Ready-queue miss delta since the previous Dispatch emit
-        } dispatch;
-        struct {
-            uint32_t local_id;  // task_id bits [31:0]
-            uint32_t ring_id;   // task_id bits [63:32]
-        } dummy_task;
-        struct {
-            uint32_t local_id;  // outer Graph task_id bits [31:0]
-            uint32_t ring_id;   // outer Graph task_id bits [63:32]
-        } graph_task;
-    } phase_data;
-    int16_t shared_depth_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
-    int16_t shared_depth_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
-    uint32_t _pad[4];  // 64B alignment padding
-};
-static_assert(
-    sizeof(decltype(ChipSwimlaneAicpuSchedPhaseRecord::phase_data)) == 8,
-    "ChipSwimlaneAicpuSchedPhaseRecord phase data must remain 8 bytes"
-);
-static_assert(
-    offsetof(ChipSwimlaneAicpuSchedPhaseRecord, phase_data) == 28,
-    "ChipSwimlaneAicpuSchedPhaseRecord phase data offset drift"
-);
-static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicpuSchedPhaseRecord layout drift");
-
 /**
  * AICPU orchestrator phase record (32 bytes).
  *
@@ -607,7 +490,7 @@ static_assert(sizeof(ChipSwimlaneAicpuSchedPhaseRecord) == 64, "ChipSwimlaneAicp
 struct ChipSwimlaneAicpuOrchPhaseRecord {
     uint64_t start_time;  // Submit start timestamp
     uint64_t end_time;    // Submit end timestamp
-    uint64_t task_id;     // Full PTO2 encoding (ring_id << 32) | local_id
+    uint64_t task_id;     // TaskId::raw, in the minting runtime's layout
     uint32_t submit_idx;  // Monotonic submit counter
     uint32_t _pad;        // 32B alignment padding
 };
@@ -624,7 +507,7 @@ static_assert(sizeof(ChipSwimlaneAicpuOrchPhaseRecord) == 32, "ChipSwimlaneAicpu
  *
  * `payload` is kind-discriminated: a task id for the kinds that submit a task
  * (see host_phase_kind_submits_task), otherwise a per-kind detail count such as
- * a byte or node count. Readers must consult `kind` before interpreting it.
+ * a byte or in-graph task count. Readers must consult `kind` before interpreting it.
  */
 struct HostPhaseRecord {
     uint64_t start_ns;
@@ -638,40 +521,11 @@ struct HostPhaseRecord {
 static_assert(sizeof(HostPhaseRecord) == 40, "HostPhaseRecord layout drift");
 
 /**
- * What one HostPhaseRecord measured.
- *
- * The bind kinds partition the bind stage: their durations sum to the
- * `chip.run.bind` span. The orchestrator kinds are nested inside BindHostOrch
- * and do not partition it — some are sub-operations of others.
+ * What one HostPhaseRecord measured — the kinds themselves live in
+ * common/host_phase_kind.h, so the AICPU build and the orchestration .so can name
+ * them without taking this header's dependencies. The predicates below are
+ * host-only and stay here.
  */
-enum class HostPhaseKind : uint32_t {
-    BindArgs = 0,
-    BindArenaBuild,
-    BindStaticArena,
-    BindGmHeap,
-    BindSharedMem,
-    BindRuntimeInit,
-    BindHostOrch,
-    BindGraphUpload,
-    BindRelocate,
-    BindSmH2d,
-    BindArenaH2d,
-    BindHostViewClose,
-    OrchSubmitTask,
-    OrchAllocTensors,
-    OrchRecordNode,
-    OrchGraphSubmit,
-    OrchBuildDefinition,
-    OrchGraphBegin,
-    OrchRecordingWait,
-    OrchGraphCommit,
-    OrchSubmitAdmit,
-    OrchRecordHandoff,
-    OrchGeneratedArgs,
-    Count
-};
-
-constexpr uint32_t kHostPhaseKindCount = static_cast<uint32_t>(HostPhaseKind::Count);
 
 /**
  * Whether this kind ends with a task submitted to the runtime, i.e. whether its
@@ -693,8 +547,20 @@ inline bool host_phase_kind_submits_task(HostPhaseKind kind) {
  * stage is host-only setup with no device counterpart.
  */
 inline bool host_phase_kind_is_device_upload(HostPhaseKind kind) {
-    return kind == HostPhaseKind::BindGraphUpload || kind == HostPhaseKind::BindSmH2d ||
-           kind == HostPhaseKind::BindArenaH2d;
+    return kind == HostPhaseKind::BindGraphUpload || kind == HostPhaseKind::BindArenaH2d;
+}
+
+/**
+ * Whether a kind's `detail` is a quantity, i.e. whether summing it across a bind
+ * means anything.
+ *
+ * Most kinds put in `detail` the identity of what their interval measured — a
+ * task id, a Graph key, the submission index — and a sum over identities is a
+ * number no reader can act on. Only the kinds that carry a count get the summed
+ * column in the breakdown; the rest print their count and total alone.
+ */
+inline bool host_phase_kind_detail_is_quantity(HostPhaseKind kind) {
+    return kind == HostPhaseKind::OrchBuildDefinition || kind == HostPhaseKind::OrchRecordingWait;
 }
 
 inline const char *host_phase_kind_name(HostPhaseKind kind) {
@@ -715,10 +581,6 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "host_orch";
     case HostPhaseKind::BindGraphUpload:
         return "graph_upload";
-    case HostPhaseKind::BindRelocate:
-        return "relocate";
-    case HostPhaseKind::BindSmH2d:
-        return "sm_h2d";
     case HostPhaseKind::BindArenaH2d:
         return "arena_h2d";
     case HostPhaseKind::BindHostViewClose:
@@ -727,8 +589,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:
         return "alloc_tensors";
-    case HostPhaseKind::OrchRecordNode:
-        return "record_node";
+    case HostPhaseKind::OrchRecordInGraphTask:
+        return "record_in_graph_task";
     case HostPhaseKind::OrchGraphSubmit:
         return "graph_submit";
     case HostPhaseKind::OrchBuildDefinition:
@@ -837,50 +699,54 @@ inline ChipSwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core
  *
  * Layout (after the fixed ChipSwimlaneDataHeader, which carries the phase
  * metadata fields):
- *   [ChipSwimlaneAicpuTaskPool       × num_cores]
- *   [ChipSwimlaneAicoreTaskPool      × num_cores]
+ *   [ChipSwimlaneAicpuTaskPool       × PLATFORM_MAX_CORES]
+ *   [ChipSwimlaneAicoreTaskPool      × PLATFORM_MAX_CORES]
  *   [ChipSwimlaneAicpuSchedPhasePool × PLATFORM_MAX_AICPU_THREADS]
- *   [ChipSwimlaneAicpuOrchPhasePool  × num_orch_phase_threads]
+ *   [ChipSwimlaneAicpuOrchPhasePool  × PLATFORM_MAX_AICPU_THREADS]
  *
- * @param num_cores               Number of AICore instances
- * @param num_sched_phase_threads Retained for API compatibility; scheduler allocation uses the platform maximum
- * @param num_orch_phase_threads  Number of orchestrator-phase pools
+ * Every array is dimensioned by a platform maximum, not by the run. The host
+ * and the AICPU both address this region, and each used to supply its own core
+ * count to locate the arrays — the host the run's, the device its worker_count.
+ * A single basis they cannot disagree about is the point: the pool *states* are
+ * a fixed grid, and only the record buffers hanging off them are allocated per
+ * run. header->num_cores therefore still means "cores this run uses" and is not
+ * an addressing input.
+ *
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t
-calc_perf_data_size_with_phases(int num_cores, int /*num_sched_phase_threads*/, int num_orch_phase_threads) {
-    return calc_perf_data_size(num_cores) + num_cores * sizeof(ChipSwimlaneAicoreTaskPool) +
+inline size_t calc_perf_data_size_with_phases() {
+    return calc_perf_data_size(PLATFORM_MAX_CORES) + PLATFORM_MAX_CORES * sizeof(ChipSwimlaneAicoreTaskPool) +
            PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuSchedPhasePool) +
-           num_orch_phase_threads * sizeof(ChipSwimlaneAicpuOrchPhasePool);
+           PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuOrchPhasePool);
 }
 
 /**
  * Get ChipSwimlaneAicoreTaskPool array start address (located immediately
  * after the ChipSwimlaneAicpuTaskPool array).
  */
-inline ChipSwimlaneAicoreTaskPool *get_aicore_buffer_states(void *base_ptr, int num_cores) {
+inline ChipSwimlaneAicoreTaskPool *get_aicore_buffer_states(void *base_ptr) {
     return reinterpret_cast<ChipSwimlaneAicoreTaskPool *>(
-        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores)
+        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(PLATFORM_MAX_CORES)
     );
 }
 
-inline ChipSwimlaneAicoreTaskPool *get_aicore_buffer_state(void *base_ptr, int num_cores, int core_index) {
-    return &get_aicore_buffer_states(base_ptr, num_cores)[core_index];
+inline ChipSwimlaneAicoreTaskPool *get_aicore_buffer_state(void *base_ptr, int core_index) {
+    return &get_aicore_buffer_states(base_ptr)[core_index];
 }
 
 /**
  * Get ChipSwimlaneAicpuSchedPhasePool array start address (located immediately
  * after the ChipSwimlaneAicoreTaskPool array).
  */
-inline ChipSwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_states(void *base_ptr, int num_cores) {
+inline ChipSwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_states(void *base_ptr) {
     return reinterpret_cast<ChipSwimlaneAicpuSchedPhasePool *>(
-        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores) +
-        num_cores * sizeof(ChipSwimlaneAicoreTaskPool)
+        reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(PLATFORM_MAX_CORES) +
+        PLATFORM_MAX_CORES * sizeof(ChipSwimlaneAicoreTaskPool)
     );
 }
 
-inline ChipSwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
-    return &get_sched_phase_buffer_states(base_ptr, num_cores)[thread_idx];
+inline ChipSwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_state(void *base_ptr, int thread_idx) {
+    return &get_sched_phase_buffer_states(base_ptr)[thread_idx];
 }
 
 /**
@@ -895,15 +761,15 @@ inline ChipSwimlaneAicpuSchedPhasePool *get_sched_phase_buffer_state(void *base_
  * AICPU's iteration count (actual) — otherwise AICPU reads the orch array
  * from inside the (still allocated) sched array tail, corrupting both.
  */
-inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_states(void *base_ptr, int num_cores) {
+inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_states(void *base_ptr) {
     return reinterpret_cast<ChipSwimlaneAicpuOrchPhasePool *>(
-        reinterpret_cast<char *>(get_sched_phase_buffer_states(base_ptr, num_cores)) +
+        reinterpret_cast<char *>(get_sched_phase_buffer_states(base_ptr)) +
         PLATFORM_MAX_AICPU_THREADS * sizeof(ChipSwimlaneAicpuSchedPhasePool)
     );
 }
 
-inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
-    return &get_orch_phase_buffer_states(base_ptr, num_cores)[thread_idx];
+inline ChipSwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr, int thread_idx) {
+    return &get_orch_phase_buffer_states(base_ptr)[thread_idx];
 }
 
 #ifdef __cplusplus

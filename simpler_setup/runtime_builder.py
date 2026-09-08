@@ -24,7 +24,7 @@ from .runtime_compiler import RuntimeCompiler
 logger = logging.getLogger(__name__)
 
 _GIT_COMMIT_FILE = ".git_commit"
-_DEFAULT_SIM_PROFILING_CONFIG = {
+_DEFAULT_PROFILING_CONFIG = {
     "SIMPLER_DFX": "1",
     "SIMPLER_ORCH_PROFILING": "0",
     "SIMPLER_SCHED_PROFILING": "0",
@@ -366,9 +366,12 @@ class RuntimeBuilder:
 
         build_pto_isa_commit = self._resolve_build_pto_isa_commit()
         cache_stamp = self._build_cache_stamp(build_pto_isa_commit)
-        effective_profiling_config = profiling_config
-        if variant == "sim" and effective_profiling_config is None:
-            effective_profiling_config = _DEFAULT_SIM_PROFILING_CONFIG
+        # Every build gets a fully specified configuration, so a value from an earlier
+        # profiling build cannot survive in the CMake cache as a default. Merged rather
+        # than substituted: cmake/profiling_config.cmake defaults only the variables
+        # that are *undefined*, and a name left out of a partial mapping is still
+        # defined in the target's cache from whatever configured it last.
+        effective_profiling_config = {**_DEFAULT_PROFILING_CONFIG, **(profiling_config or {})}
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
@@ -386,6 +389,11 @@ class RuntimeBuilder:
                     pto_root = ensure_pto_isa_root(verbose=True)
                 defines["PTO_ISA_ROOT"] = pto_root
             if target == "host":
+                # host_runtime.so is built once per runtime implementation, so
+                # bake that immutable artifact identity into the shared host
+                # platform code.  Runtime code must not grow a virtual/static
+                # API merely to report the directory it was compiled from.
+                defines["SIMPLER_RUNTIME_NAME"] = name
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
                 for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):

@@ -10,6 +10,50 @@ from grabbing the same device, keeps the `--list` queue accurate, and keeps
 local runs comparable to CI (CI always wraps pytest in `task-submit`, see
 `.github/workflows/ci.yml`).
 
+### Two separable things, and only one of them is about devices
+
+`task-submit` both **arbitrates devices** and **executes as root**. Everything
+below is about the first: a run that occupies a card must hold a lock, on any
+host where the tool exists.
+
+The second is why a *query* can need it too, and it is easy to reason past.
+`npu-smi` occupies no card, so the device-lock argument does not apply to it —
+yet some shared hosts grant DCMI only to root, and there a bare `npu-smi info`
+fails with `dcmi module initialize failed` rather than any device data. Which
+hosts do this is not a property to memorize; it is discovered by trying. **Run
+npu-smi bare, and on failure retry the same query through the queue:**
+
+```bash
+npu-smi info || task-submit --run "npu-smi info"
+```
+
+Three things make that one line safe to apply everywhere:
+
+- **Decide by exit status, never by output.** A DCMI refusal is written to
+  **stdout**, and on the retry path `task-submit` appends its own
+  `=== ... (exit=N) ===` banner there too. So a failed query is never empty
+  output, and `[ -z "$out" ]` is always the wrong test. Reading "no output" as
+  "no NPU" is the same misdiagnosis one layer up.
+- **The retry passes no `--device`,** so it allocates no card and waits behind
+  none. This is about privilege, never about the lock.
+- **It costs nothing where it is not needed.** An unrestricted host succeeds on
+  the bare call and never reaches the retry; a host with no `task-submit`
+  reports npu-smi's own error and status unchanged.
+
+Do not retry a `set`, `clear` or `upgrade` this way. Those modify device
+configuration, and re-running a denied mutation as root grants the caller
+privilege they did not have. The retry is for queries.
+
+### This is npu-smi-specific, not a pattern to copy
+
+`npu-smi` is the only tool here that reads the driver **without occupying a
+card**, which is exactly what puts it outside the device-lock rule while still
+needing privilege. Work that occupies a card is already covered by the explicit
+`task-submit --device … --run "…"` form below, and `msprof op simulator` runs on
+the host CPU and touches no driver at all. So there is no second case: if some
+other tool one day hits a permission wall, work out which of those two
+categories it is in rather than generalizing from this paragraph.
+
 ## Autonomous invocation — detect capability, then run without asking
 
 When a task needs the NPU, do **not** ask the user for permission to run it.
@@ -174,8 +218,8 @@ for the signature that actually fired:**
 | -------------------- | --------- | ---- |
 | `FATAL: Task Allocator Deadlock` / `FATAL: Dependency Pool Deadlock` / `FATAL: Fanin Spill Pool Deadlock` | an allocator or pool could not reclaim enough space | This header identifies the blocked resource, not the root cause. Classify it using the structural/timeout line that follows. |
 | `Provable head-of-line deadlock` | **proven open-scope structural deadlock** | TRB only: the reclaim head is the oldest task owned by an open scope on that ring. The blocked orchestrator cannot end that scope, so the head cannot become consumed. On A5, classification waits for at least 10 ms without reclaim progress and an exact-watermark publication acknowledgment. |
-| `No reclaim progress for ~500 ms` / `cannot reclaim space after ~500 ms` | allocator/pool **reclaim timeout** | TRB only — the 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`) lives in its reclaiming allocators. It proves prolonged lack of reclaim progress, not why progress stopped; check capacity, the dumped head, consumers and scheduler state. |
-| `Task Window Exhausted` / `Graph Heap Exhausted` / `Fanin Capacity Exhausted` / `TensorMap Entry Pool Exhausted` | **capacity**, HBG only | HBG is whole-graph-resident and reclaims nothing mid-run, so this is a sizing verdict reached immediately, not a stall. The line carries used/capacity and the requested amount; raise `PTO2_RING_TASK_WINDOW` / `PTO2_RING_HEAP` / `PTO2_TENSORMAP_POOL_SIZE` or shrink the graph. Inline fanin is hard-capped at `PTO2_MAX_FANIN=128`; HBG has no `PTO2_RING_DEP_POOL`. |
+| `No reclaim progress for ~500 ms` / `cannot reclaim space after ~500 ms` | allocator/pool **reclaim timeout** | TRB only — the 500ms backstop (`ALLOC_DEADLOCK_TIMEOUT_CYCLES`) lives in its reclaiming allocators. It proves prolonged lack of reclaim progress, not why progress stopped; check capacity, the dumped head, consumers and scheduler state. |
+| `Graph Too Large` / `Fanin Capacity Exhausted` / `TensorMap Entry Pool Exhausted` | **capacity**, HBG only | HBG is whole-graph-resident and reclaims nothing mid-run, so this is a sizing verdict reached immediately, not a stall. The line carries used/capacity and the requested amount; raise `runtime_env.ring_task_window` (any positive count — HBG indexes slots by task id and masks with nothing) / `CHIP_TENSORMAP_POOL_SIZE`, or shrink the graph. Inline fanin is hard-capped at `CHIP_MAX_FANIN=128`; HBG has no dependency spill pool. HBG's graph heap has no knob and cannot exhaust: it is committed after orchestration at the measured size, so a graph too large for the device fails host-side at that commit. |
 | `Timeout (N cycles): producer/consumers ...` | **SPIN** wait on a specific producer/consumer | `runtime_core.cpp`. |
 | `HandleTaskTimeout` / `kill aicpu-sd` | **OS op-execute timeout** | STARS/tsdaemon, default 45s (`PLATFORM_OP_EXECUTE_TIMEOUT_US`). **A 45s kill ≠ deadlock** — the op was merely long or stalled. Raise this constant to measure true on-device duration. |
 | `log_stall_diagnostics` (cores idle + tasks `state=WAIT fanin 0/N` + `completed` frozen) | **forward-progress stall** | No dedicated detector — intermittent races (often contention-triggered) land here and are reaped only by the op-timeout above. |
@@ -205,6 +249,13 @@ directly.
 - ❌ Bypassing `onboard-arch-precheck` — the `--platform` mismatch failure
   modes are silent (look like real bugs) and burn hours of investigation
   time. Always run the gate.
+- ❌ Reading a failed `npu-smi` as "this box has no NPU" and falling back to
+  sim. The device-lock argument genuinely does not cover npu-smi; host
+  privilege does. Retry the query through `task-submit --run` before
+  concluding anything about the silicon.
+- ❌ Deciding an npu-smi result by whether it printed anything. A DCMI refusal
+  goes to stdout, and the retry path adds a `task-submit` banner there, so a
+  failed query is never empty output. Read the exit status.
 - ❌ Fishing your run's device log out of the shared `~/ascend/log/debug/`
   by pid/timestamp guesswork. Set `ASCEND_PROCESS_LOG_PATH` to a per-run
   dir up front (see "Device logs" above) so the log is isolated and known.
@@ -219,6 +270,7 @@ directly.
 - **Wait for a submitted task** — `task-submit --wait <task-id>`
 - **Cancel pending** — `task-submit --cancel <task-id>`
 - **Per-die utilization + process table** — `npu-smi info`
+  (on failure: `task-submit --run "npu-smi info"`)
 - **Redirect device log to the run's output** —
   `mkdir -p <outdir>/ascend && export ASCEND_PROCESS_LOG_PATH=<outdir>/ascend`
   (== `task-submit --env ASCEND_PROCESS_LOG_PATH=...`; dir must pre-exist)

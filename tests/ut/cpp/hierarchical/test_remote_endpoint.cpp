@@ -26,6 +26,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -53,7 +54,8 @@ void count_sigpipe(int) { ++g_sigpipe_count; }
 // Declare before the transport so the transport is destroyed first.
 class ScopedServerThread {
 public:
-    ScopedServerThread() = default;
+    explicit ScopedServerThread(std::atomic<bool> *join_observed = nullptr) :
+        join_observed_(join_observed) {}
     ~ScopedServerThread() { stop_and_join(); }
 
     ScopedServerThread(const ScopedServerThread &) = delete;
@@ -66,12 +68,16 @@ public:
     // destructor then finds nothing joinable.
     void stop_and_join() {
         stop_.store(true, std::memory_order_release);
-        if (thread_.joinable()) thread_.join();
+        if (thread_.joinable()) {
+            thread_.join();
+            if (join_observed_ != nullptr) join_observed_->store(true, std::memory_order_release);
+        }
     }
 
 private:
     std::thread thread_;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> *join_observed_{nullptr};
 };
 
 class ScopedSigpipeCounter {
@@ -127,19 +133,20 @@ malloc_result(int32_t worker_id, uint64_t buffer_id, uint64_t generation, int32_
 // case when a transport constructor throws before or during connect — the
 // thread parks in accept() forever and stop_and_join() would hang. Polling in
 // short slices bounds that. A connection already pending always wins over
-// `stop`, because poll() runs before the flag is read: ClosedPeerWrite... calls
-// stop_and_join() immediately after a successful connect and still needs that
-// connection accepted and RST.
+// `stop`, because poll() runs before the flag is read, so teardown still reaps
+// a connection queued before the stop request.
 //
 // Returns the accepted fd, or -1 on stop / error / the hard cap.
+constexpr int SERVER_POLL_SLICE_MS = 20;
+constexpr int SERVER_MAX_SLICES = 500;
+constexpr auto SERVER_ACCEPT_TIMEOUT = std::chrono::milliseconds(SERVER_POLL_SLICE_MS * SERVER_MAX_SLICES);
+
 int accept_until_stop(int listener, std::atomic<bool> &stop) {
-    constexpr int POLL_SLICE_MS = 20;
-    constexpr int MAX_SLICES = 500;  // 10s cap, so a wedged test cannot hang the suite
-    for (int i = 0; i < MAX_SLICES; ++i) {
+    for (int i = 0; i < SERVER_MAX_SLICES; ++i) {
         struct pollfd pfd{};
         pfd.fd = listener;
         pfd.events = POLLIN;
-        int ready = ::poll(&pfd, 1, POLL_SLICE_MS);
+        int ready = ::poll(&pfd, 1, SERVER_POLL_SLICE_MS);
         if (ready > 0) return ::accept(listener, nullptr, nullptr);
         if (ready < 0 && errno != EINTR) return -1;
         if (stop.load(std::memory_order_acquire)) return -1;
@@ -147,7 +154,12 @@ int accept_until_stop(int listener, std::atomic<bool> &stop) {
     return -1;
 }
 
-uint16_t start_closing_server(std::thread &server_thread, std::atomic<bool> &stop) {
+// Accept one connection and keep it open until `close_now` requests an RST or
+// `stop` requests graceful teardown. `accepted` is the caller's barrier that
+// the server owns the connected socket.
+uint16_t start_closing_server(
+    std::thread &server_thread, std::atomic<bool> &stop, std::atomic<bool> &accepted, std::atomic<bool> &close_now
+) {
     int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
     int one = 1;
@@ -173,18 +185,36 @@ uint16_t start_closing_server(std::thread &server_thread, std::atomic<bool> &sto
         ::close(listener);
         throw std::runtime_error(std::string("getsockname failed: ") + std::strerror(err));
     }
-    server_thread = std::thread([listener, &stop]() {
+    server_thread = std::thread([listener, &stop, &accepted, &close_now]() {
         int fd = accept_until_stop(listener, stop);
         if (fd >= 0) {
-            struct linger rst{};
-            rst.l_onoff = 1;
-            rst.l_linger = 0;
-            (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
+            accepted.store(true, std::memory_order_release);
+            // The caller releases this gate only after its transport constructor
+            // returns. An earlier RST can become the nonblocking connect's
+            // SO_ERROR and bypass the error-path assertions that need a live
+            // transport.
+            while (!close_now.load(std::memory_order_acquire) && !stop.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (close_now.load(std::memory_order_acquire)) {
+                struct linger rst{};
+                rst.l_onoff = 1;
+                rst.l_linger = 0;
+                (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
+            }
             ::close(fd);
         }
         ::close(listener);
     });
     return ntohs(addr.sin_port);
+}
+
+bool wait_until_server_accepted(std::atomic<bool> &accepted) {
+    auto deadline = std::chrono::steady_clock::now() + SERVER_ACCEPT_TIMEOUT;
+    while (!accepted.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return accepted.load(std::memory_order_acquire);
 }
 
 int make_loopback_listener(uint16_t &port_out) {
@@ -258,6 +288,49 @@ start_delayed_reply_server(std::thread &server_thread, std::atomic<bool> &stop, 
                 off += static_cast<size_t>(n);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ::close(fd);
+        }
+        ::close(listener);
+    });
+    return port;
+}
+
+uint16_t start_gated_reply_server(
+    std::thread &server_thread, std::atomic<bool> &stop, std::atomic<bool> &request_received,
+    std::atomic<bool> &send_reply, uint64_t sequence
+) {
+    uint16_t port = 0;
+    int listener = make_loopback_listener(port);
+    server_thread = std::thread([listener, &stop, &request_received, &send_reply, sequence]() {
+        int fd = accept_until_stop(listener, stop);
+        if (fd >= 0) {
+            std::array<uint8_t, remote_l3::FRAME_HEADER_BYTES> request{};
+            size_t offset = 0;
+            while (offset < request.size()) {
+                ssize_t n = ::recv(fd, request.data() + offset, request.size() - offset, 0);
+                if (n <= 0) break;
+                offset += static_cast<size_t>(n);
+            }
+            if (offset == request.size()) {
+                request_received.store(true, std::memory_order_release);
+                while (!send_reply.load(std::memory_order_acquire) && !stop.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                if (!stop.load(std::memory_order_acquire)) {
+                    remote_l3::FrameHeader header;
+                    header.frame_type = remote_l3::FrameType::COMPLETION;
+                    header.session_id = 1;
+                    header.worker_id = 0;
+                    header.sequence = sequence;
+                    std::vector<uint8_t> frame = remote_l3::encode_frame(header, {});
+                    offset = 0;
+                    while (offset < frame.size()) {
+                        ssize_t n = ::send(fd, frame.data() + offset, frame.size() - offset, MSG_NOSIGNAL);
+                        if (n <= 0) break;
+                        offset += static_cast<size_t>(n);
+                    }
+                }
+            }
             ::close(fd);
         }
         ::close(listener);
@@ -602,12 +675,18 @@ TEST(RemoteEndpoint, RemoteBufferControlsRejectOutOfRangeSlices) {
 }
 
 TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
+    std::atomic<bool> accepted{false};
+    std::atomic<bool> close_now{false};
     ScopedServerThread server;
-    uint16_t port = start_closing_server(server.thread(), server.stop_flag());
+    uint16_t port = start_closing_server(server.thread(), server.stop_flag(), accepted, close_now);
     RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, 1.0, 1.0);
+    ASSERT_TRUE(wait_until_server_accepted(accepted));
+    close_now.store(true, std::memory_order_release);
     server.stop_and_join();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+    // Linux loopback delivers the SO_LINGER RST from close() synchronously, so
+    // joining the server puts the peer error on the client socket before this
+    // write.
     ScopedSigpipeCounter sigpipe_counter;
     std::vector<uint8_t> frame(4096, 0x5A);
     bool saw_error = false;
@@ -620,7 +699,7 @@ TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
         }
     }
 
-    EXPECT_TRUE(saw_error);
+    EXPECT_TRUE(saw_error) << "peer RST did not land before the write";
     EXPECT_EQ(g_sigpipe_count, 0);
     transport.shutdown();
 }
@@ -636,18 +715,16 @@ TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
 // accept() is still reapable — the join must not hang.
 TEST(RemoteSocketTransport, ServerThreadIsJoinedWhenTestBodyUnwinds) {
     bool caught = false;
-    auto t0 = std::chrono::steady_clock::now();
+    std::atomic<bool> join_observed{false};
     try {
-        ScopedServerThread server;
+        ScopedServerThread server(&join_observed);
         (void)start_stalling_server(server.thread(), server.stop_flag());
         throw std::runtime_error("stands in for a transport constructor timeout");
     } catch (const std::runtime_error &) {
         caught = true;
     }
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-
     EXPECT_TRUE(caught);
-    EXPECT_LT(elapsed, 5.0) << "destructor join should not wait out the server's own cap";
+    EXPECT_TRUE(join_observed.load(std::memory_order_acquire));
 }
 
 TEST(RemoteSocketTransport, CtorRejectsNonPositiveTimeouts) {
@@ -667,10 +744,8 @@ TEST(RemoteSocketTransport, HelloReadBoundedByAttachTimeout) {
     uint16_t port = start_stalling_server(server.thread(), server.stop_flag());
     RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 0.2, /*runtime*/ 5.0);
 
-    auto t0 = std::chrono::steady_clock::now();
     EXPECT_THROW(transport.expect_hello_ready(1, 0, "sim"), std::runtime_error);
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(elapsed, 1.0);
+    EXPECT_TRUE(transport.last_read_used_attach_deadline_for_test());
 
     transport.shutdown();
     server.stop_and_join();
@@ -697,8 +772,11 @@ TEST(RemoteSocketTransport, RuntimeReadSurvivesElapsedAttachDeadline) {
 }
 
 TEST(RemoteSocketTransport, ProgressPollDoesNotWaitForDelayedReply) {
+    std::atomic<bool> request_received{false};
+    std::atomic<bool> send_reply{false};
     ScopedServerThread server;
-    uint16_t port = start_delayed_reply_server(server.thread(), server.stop_flag(), /*delay_ms=*/500, /*sequence=*/1);
+    uint16_t port =
+        start_gated_reply_server(server.thread(), server.stop_flag(), request_received, send_reply, /*sequence=*/1);
     RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 1.0, /*runtime*/ 2.0);
 
     remote_l3::FrameHeader header;
@@ -709,14 +787,20 @@ TEST(RemoteSocketTransport, ProgressPollDoesNotWaitForDelayedReply) {
     transport.submit_progress_frame(remote_l3::encode_frame(header, {}));
 
     std::vector<uint8_t> reply;
-    auto t0 = std::chrono::steady_clock::now();
     EXPECT_FALSE(transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply));
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(elapsed, 0.2);
+    for (int i = 0; i < 30000 && !request_received.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(request_received.load(std::memory_order_acquire));
+    // The server has consumed the request and is held behind send_reply, so
+    // no response exists yet. This is an event/state assertion, independent
+    // of how quickly either thread was scheduled.
+    EXPECT_FALSE(transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply));
 
+    send_reply.store(true, std::memory_order_release);
     bool complete = false;
-    for (int i = 0; i < 100 && !complete; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    for (int i = 0; i < 30000 && !complete; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         complete = transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply);
     }
     EXPECT_TRUE(complete);
@@ -760,11 +844,14 @@ TEST(RemoteSocketTransport, ProgressPollResumesAfterPartialHeader) {
 }
 
 TEST(RemoteSocketTransport, ProgressErrorClearsActiveCommand) {
+    std::atomic<bool> accepted{false};
+    std::atomic<bool> close_now{false};
     ScopedServerThread server;
-    uint16_t port = start_closing_server(server.thread(), server.stop_flag());
+    uint16_t port = start_closing_server(server.thread(), server.stop_flag(), accepted, close_now);
     RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 1.0, /*runtime*/ 1.0);
+    ASSERT_TRUE(wait_until_server_accepted(accepted));
+    close_now.store(true, std::memory_order_release);
     server.stop_and_join();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     remote_l3::FrameHeader header;
     header.frame_type = remote_l3::FrameType::TASK;
@@ -776,14 +863,18 @@ TEST(RemoteSocketTransport, ProgressErrorClearsActiveCommand) {
 
     std::vector<uint8_t> reply;
     bool saw_error = false;
-    for (int i = 0; i < 3 && !saw_error; ++i) {
+    std::string error_message;
+    for (int i = 0; i < 2000 && !saw_error; ++i) {
         try {
-            (void)transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply);
-        } catch (const std::runtime_error &) {
+            if (transport.poll_progress_reply(remote_l3::FrameType::COMPLETION, 1, reply)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } catch (const std::runtime_error &error) {
             saw_error = true;
+            error_message = error.what();
         }
     }
-    ASSERT_TRUE(saw_error);
+    ASSERT_TRUE(saw_error) << "peer RST did not produce a progress I/O error";
+    EXPECT_EQ(error_message.find("timed out"), std::string::npos);
     EXPECT_NO_THROW(transport.submit_progress_frame(frame));
     transport.shutdown();
 }
@@ -797,10 +888,17 @@ TEST(RemoteSocketTransport, RuntimeWriteToStalledReaderTimesOut) {
     RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 1.0, /*runtime*/ 0.5);
 
     std::vector<uint8_t> big(16 * 1024 * 1024, 0x7E);
-    auto t0 = std::chrono::steady_clock::now();
-    EXPECT_THROW(transport.submit_frame(big), std::runtime_error);
-    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_LT(elapsed, 3.0);
+    EXPECT_THROW(
+        {
+            try {
+                transport.submit_frame(big);
+            } catch (const std::runtime_error &error) {
+                EXPECT_NE(std::string(error.what()).find("timed out writing frame"), std::string::npos);
+                throw;
+            }
+        },
+        std::runtime_error
+    );
 
     transport.shutdown();
     server.stop_and_join();
@@ -859,13 +957,11 @@ std::vector<uint8_t> ready_mpi_mailbox(int32_t world_size) {
     using namespace mpi_group_mailbox;
     std::vector<uint8_t> mailbox(MAILBOX_BYTES, 0);
     std::memcpy(mailbox.data() + OFF_MAGIC, MAGIC, sizeof(MAGIC));
-    const uint32_t version = PROTOCOL_VERSION;
     const uint32_t header_bytes = HEADER_BYTES;
     const uint64_t mailbox_bytes = MAILBOX_BYTES;
     const uint32_t size = static_cast<uint32_t>(world_size);
     const int32_t ready = static_cast<int32_t>(GroupState::READY);
     const int32_t idle = static_cast<int32_t>(RequestState::IDLE);
-    std::memcpy(mailbox.data() + OFF_PROTOCOL_VERSION, &version, sizeof(version));
     std::memcpy(mailbox.data() + OFF_HEADER_BYTES, &header_bytes, sizeof(header_bytes));
     std::memcpy(mailbox.data() + OFF_MAILBOX_BYTES, &mailbox_bytes, sizeof(mailbox_bytes));
     std::memcpy(mailbox.data() + OFF_WORLD_SIZE, &size, sizeof(size));

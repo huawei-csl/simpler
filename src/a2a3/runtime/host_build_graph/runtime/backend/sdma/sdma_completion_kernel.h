@@ -18,7 +18,7 @@
 
 #include "async_kernel_api.h"
 #include "aicore_completion_mailbox_types.h"
-#include "runtime_status.h"
+#include "host_build_graph/runtime_status.h"
 
 #ifndef __aicore__
 #define __aicore__
@@ -86,7 +86,7 @@ register_sdma_post_done_record(AsyncCtx &ctx, volatile __gm__ void *record_addr,
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ void
 register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
-    if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
+    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         (void)event.Wait(session);
         return;
     }

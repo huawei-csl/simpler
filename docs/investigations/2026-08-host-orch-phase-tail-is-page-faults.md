@@ -1,5 +1,12 @@
 # 2026-08 — The host-orchestration phase tail is page faults, not the code in the phase
 
+> **Phase and type names in this entry are the ones the tooling emitted at the
+> time.** The per-in-graph-task record phase was `record_node` and is now
+> `record_in_graph_task`; `GraphRecordedNode` is now `RecordedInGraphTask` and
+> `recording.nodes` is `recording.tasks`. The measurements and the archived run
+> directories below keep the old spellings because that is what the logs say, and
+> `strace_timing.py` still accepts `record_node` so those logs remain readable.
+
 ## Question
 
 `host_build_graph`'s host-side bind path shows two shapes on every swimlane of the
@@ -24,6 +31,16 @@ survive a bind: two consecutive `host_orch` records in one process both report
 again.
 
 ## Answer
+
+> **Two of this answer's three claims are superseded — read the last amendment
+> before acting on it.** What holds is the *exclusion*: a writer of `mmap_lock`
+> excludes every faulting thread in the address space, which is what makes a fault
+> here cost 14–33 µs against ~1.7 µs on an idle box. What does not hold is the
+> framing of the tail as *count × price* — two arms settle that in opposite
+> directions, one removing 86% of the faults for no time and one removing 6% for
+> 29–43% — nor `mmap`/`munmap` as the writer, which names what the off-tree
+> reproducer below used. **In tree that writer is `mprotect`**, from glibc opening a
+> non-main arena.
 
 **The tail is minor page faults on freshly allocated memory, and a fault here costs
 14–33 µs instead of the ~1.7 µs it costs on an idle box — because the process's own
@@ -85,7 +102,7 @@ where the fault landed. Over the 447 faulting calls above 10 µs (867 faults, 19
 leaves the per-node vector as the allocation: it is the single largest source.
 
 **But the structure that makes the others expensive is the hazard map.**
-`PTO2TensorMap::init` takes four `new[]` allocations per recording — 4096×8 buckets,
+`ChipTensorMap::init` takes four `new[]` allocations per recording — 4096×8 buckets,
 16384×128 entries, 16384×8 free list, 1024×8 task heads = **2.17 MB**, of which the 2 MB
 entry pool is one block — and they are freed when the recording is destroyed at the end
 of the orchestration. Only ~115 KB is ever touched (the buckets and task heads `init`
@@ -206,8 +223,11 @@ Two lessons, both already cost time here:
 
 ## Where a fix would go
 
-Not attempted here — this entry establishes the cause only. In order of the evidence
-behind them:
+**All four have shipped — see the amendments below before treating any of them as open
+work.** Items 1-3 landed as #1981 (the recorder thread owns its recording storage), item 4
+as #1988 and the retained SM mirror. What the list got right was the mechanism; what it
+got wrong is that none of it reached the ~1100 minor faults the submitting thread takes
+per bind, which is what is actually left. In order of the evidence behind them:
 
 1. **Stop returning the recording's memory to the kernel between orchestrations.** The 2.17 MB
    hazard-map arena and the per-node vectors are re-acquired every orchestration for a
@@ -230,6 +250,272 @@ behind them:
 Any of these must be measured by fault *count* first, and only then by duration, on the
 same rank and with `args` carried alongside as a load proxy — see
 `.claude/rules/discipline.md` §4 and the entries on this file's dead ends.
+
+**What the list missed.** #1981 removed every allocation items 1-3 name and reported that
+the submitting thread's ~1100 faults per bind *did not move*, so they were never the
+recording's. The retained mirror is the second independent measurement of the same thing.
+Attributing those ~1100 needs `mincore()` on a buffer's pages before the write that would
+fault them — the `page-faults` perf event carries no ADDR, which has been checked — not
+another guess at which allocation it is.
+
+## Amendment 2026-08-23 — the Definition image is not part of this tail
+
+Recording a Definition image no longer allocates: the images go straight into the
+retained upload staging. That removes a per-orchestration allocation the list above
+does not name — the `std::vector` each recording built its image into, 8 of them per
+dsv4 bind at ~126 KB each, acquired and returned every bind. Interleaved A/B on dsv4
+(`base, measure, base, measure`, six rounds each, 8 Definitions / 86 Graph
+submissions / 129 host tasks per bind on both arms), both arms taken at
+`3069f1aff`'s recording storage, i.e. **before** the per-recorder ownership of #1981:
+
+| per warm bind | base | measure |
+| ------------- | ---- | ------- |
+| `host_orch` minflt, min / median | 1100 / 1248, 1047 / 1138 | 1062 / 1107, 1082 / 1124 |
+| `graph_upload` minflt, min / median / max | 2 / 38 / 47, 34 / 43 / 133 | 0 / 1 / 3, 0 / 1 / 5 |
+| `graph_upload` dur min (ms) | 0.225, 0.282 | 0.141, 0.106 |
+| control plane, min of sums (ms) | 1.194, 1.365 | 1.549, 1.199 |
+
+**`host_orch`'s fault count did not move** — the two repetitions disagree in sign
+on both the min and the median, which is this file's own criterion for "not
+resolvable". Only `graph_upload` moved, consistently: the ~40 faults per bind it
+took allocating one staging vector per Definition are gone, and so is the copy.
+
+The reason is worth keeping: **a freed 126 KB block is reused from the heap without
+re-faulting**, so an allocation this size that is acquired and returned in the same
+orchestration was never a fault source, while the 2.17 MB hazard-map arena — far
+above glibc's mmap and trim thresholds — is. **Size against those thresholds, not
+byte count, decides what shows up in this tail**, which is why the entry's evidence
+points at the recording's own storage and not at the largest thing a bind allocates.
+
+The control-plane duration is **not** resolvable from this A/B either (+0.355 ms
+then −0.166 ms), which is the expected outcome of a change worth ~0.1 ms on a box
+whose load average sat between 40 and 66 throughout.
+
+## Amendment 2026-08-25 — retaining the SM mirror, and why a retained buffer must not be zeroed
+
+The host mirror of the runtime shared memory is now the platform runner's, one
+buffer per pipeline slot held across binds until Worker finalization, instead of a
+`new uint8_t[]` per bind. At dsv4's `ring_task_window` of 16384 that buffer is
+**82.46 MB**, so every bind used to be one `mmap` and one guaranteed `munmap` of
+that size — the mapping traffic this entry's off-tree reproduction prices at 10x
+on every other fault in the address space.
+
+Interleaved A/B on dsv4 (`base, retained, base, retained`, three rounds over two
+ranks, so six binds and four warm ones per arm), `mallinfo2` and `smaps_rollup`
+sampled at four points per bind. A **third** arm is included because the first
+implementation of the retained buffer was a `std::vector<std::byte>`, and it is
+the instructive one:
+
+| per process | base (one block per bind) | retained, `vector::resize` | retained, uninitialized block |
+| ----------- | ------------------------- | -------------------------- | ----------------------------- |
+| `hblkhd` at `bind_end`, 6 of 6 binds | 435.82 MB (falls back) | 518.28 MB (holds) | 518.28 MB (holds) |
+| `host_orch` minflt, the two **cold** binds | 1218 / 1022, 1164 / 1173 | **20194 / 21403, 21213 / 16107** | 1098 / 1130, 1059 / 1018 |
+| `host_orch` minflt, four warm binds (median) | 1197.5, 1204.5 | 1256.0, 1273.0 | 1229.5, **950.5** |
+| Rss at the last `bind_end` | 45.446 GB, 45.474 GB | 45.589 GB, 45.588 GB | 45.479 GB, 45.522 GB |
+
+**What resolves.** Two things, both counts, both agreeing on every bind of every
+run:
+
+- `hblkhd` stops returning to its pre-bind value. That is the mirror being mapped
+  and unmapped per bind, and then not.
+- **A retained buffer has to be handed over uninitialized.**
+  `std::vector::resize` value-initializes, so the first bind of each rank faulted
+  in the *whole* capacity — 82460928 / 4096 = 20132 pages, which is exactly the
+  ~20k excess above — and left all 82 MB resident for the rest of the run. The
+  owning-block version faults only the pages a bind writes, so its cold binds
+  match base and its Rss is within the run-to-run spread of it. A container was
+  the wrong reach here precisely because the layout is init-on-write: zeroing is
+  work whose result nothing reads.
+
+**What does not resolve.** `host_orch`'s own warm-bind fault count, in either
+direction. Base sits in [1160, 1256] across its eight warm binds; the retained
+block spans [181, 1268], with two binds well below anything base reached and a
+median that moves +32 on one repetition and −254 on the other. The mirror is
+~6 THP faults of a ~1200-fault bind (see the decomposition above), so this
+was never a signal this instrument could carry. Control-plane duration likewise:
+minimum-of-sums 1.724 → 1.795 ms then 1.532 → 1.010 ms, opposite signs.
+
+**One reading retracted.** An earlier pass over these logs attributed a
+sign-consistent +3-6% warm-minflt rise in the `vector` arm to glibc's dynamic
+`mmap`/`trim` thresholds no longer being raised by the freed 82 MB block, on the
+strength of `fordblks` at `bind_begin` reading 13.6 MB on base against 1.4 MB
+retained. That comparison is invalid: it pairs the *first* bind of each arm, whose
+heap state predates the mirror in both, and by the last bind both arms sit at
+~14.1 MB. The threshold mechanism is real in glibc, but nothing here measures it,
+and the retained-block arm reverses the sign it was invented to explain.
+
+**What is left, and what it is not.** Not the hazard-map arena: #1981 made the
+recorder thread own it, so it is stood up once per thread and `reset()` after
+that. Every item of "Where a fix would go" above is now implemented, and the
+~1100 faults the submitting thread takes per bind survived all of them — #1981
+reported them unmoved when the recording's allocations went away, and this arm
+says the same about the mirror's. Two things follow. The decomposition in this
+entry attributed those faults to allocations that no longer happen, so it no
+longer explains the steady state; and node/tensor storage is retained only at
+each thread's own high-water mark.
+
+## Amendment 2026-08-25 (later) — the high-water mark is not the steady state
+
+The paragraph above guessed that pre-sizing the recorder's node and tensor storage
+"would only move each thread's *first* recording off the growth path, not touch a
+warm bind". **That is wrong, and a counter proves it.** #1981's retention is
+per-thread, and which body a thread records is decided by the one FIFO all eight
+pool workers wait on, so a thread whose array is shorter than the body it is handed
+extends it — on whatever bind that happens to be. Counting slot creations per bind
+on dsv4, whose eight Definitions differ in size:
+
+| bind | 1 | 2 | 3 | 4 | 5 | 6 |
+| ---- | - | - | - | - | - | - |
+| node slots created | 365 | 1666 | **1336** | **401** | **219** | **56** |
+
+`standups=0` on binds 3-6 confirms the threads and their storage did survive; the
+slots are new all the same. So the growth is recurring, not amortized, and it is
+non-deterministic in which bind pays it — the shape this entry describes as a small
+median with a maximum two orders of magnitude above it.
+
+**And the obvious fix is a trap.** Reserving each node's own buffer to
+`CORE_MAX_TENSOR_ARGS` makes it 32 x 128 B = **exactly one page**, so a 1679-node
+body touches 1679 pages to hold ~210 KB of tensors. Measured against `a2ca70cff`,
+that took `host_orch`'s minflt from ~1070 to ~2540 and `record_node` from 4.4 ms to
+12-14 ms per bind, sign-consistent across two interleaved repetitions. Packing all
+of a body's tensors into one bump region — item 3's "flat array with a stable base",
+4 MB per thread, allocated once and never grown — is what actually helps: the same
+body touches ~53 pages, `record_node`'s warm minimum goes 1702/3423 -> 1239/1563 µs
+and the control plane's minimum of per-bind sums 837/1303 -> 719/943 µs.
+
+Two rules fall out, and both cost a wrong PR to learn:
+
+- **Retention is per thread, so a per-thread high-water mark is not the workload's.**
+  Where work is handed out by a shared queue, size the storage by the *contract*, not
+  by what this thread has seen.
+- **A reservation that is not packed can cost more than no reservation.** Per-object
+  buffers rounded up to a cap turn into a page each; the fault count follows the
+  number of *pages touched*, not the bytes reserved.
+
+## Amendment 2026-08-25 (last) — the count is not the lever; the price is
+
+Two arms measured after every item of "Where a fix would go" had shipped point in
+opposite directions, and together they refute the *count × price* framing above.
+
+| arm | faults | control-plane duration |
+| --- | ------ | ---------------------- |
+| glibc keeps freed memory (`MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` at 1 GiB, `MALLOC_TOP_PAD_` at 256 MiB; glibc 2.36) | 1019 → 140, **−86%** | **unchanged** |
+| #2015, one flat tensor region per recorder thread | median 1078 → 1010, **−6%** | median 1.157/1.454 → 0.824 ms, **−29…−43%** |
+
+An arm that removes 86% of the faults buys no time; an arm that removes 6% buys a
+third of the phase. **The fault count is not a lever. Only the price is** — which is
+the half of the Answer that survives.
+
+The tunable arm is not new evidence; it is the one already recorded under "Removing
+the return-to-kernel behaviour removes the faults". What was new was reading its flat
+duration as *"the tunables are not a fix"* instead of *"the count does not buy time"*.
+The datum sat here through three rounds of work with the wrong conclusion attached.
+
+### The in-tree `mmap_lock` writer is `mprotect`, and it was never traced
+
+glibc reserves a non-main arena with `mmap(PROT_NONE)` and opens it up with
+**`mprotect`** (`grow_heap`), so a recorder thread whose arrays grow issues one — and
+`mprotect` takes `mmap_lock` for write, excluding every faulting thread in the address
+space exactly as `munmap` does.
+
+Every strace in this investigation traced `madvise`, `mmap`, `munmap` and `brk`.
+**None traced `mprotect`.** One `strace -ff -e trace=mprotect,madvise,brk` over three
+rounds, in the non-main-arena band `0xfff0…0xfff4`:
+
+| syscall, in that band | over 6 binds |
+| --------------------- | ------------ |
+| `mprotect(PROT_READ\|PROT_WRITE)` | **157 calls — 26 per bind**, 85.2 MB |
+| `madvise(MADV_DONTNEED)` | **0** (3300 calls / 26 GB elsewhere, none of it arena) |
+
+Those arenas only grow; nothing shrinks them back. That is why #2015 — which sizes
+every recorder array from its contract at thread stand-up and never grows one again —
+removes the writer, and why it is the first change here to buy time.
+
+### The residual faults are a warm-up cost, and they end
+
+Every figure above this line calls its per-bind counts steady-state. **They are not.**
+Measured at `f40cacf30`, with #1988, #2013, #2015, #2019 and #2022 all in, `host_orch`'s
+`minflt` per bind in arrival order, on three runs at different round counts:
+
+| run | cold binds | then, bind by bind |
+| --- | ---------- | ------------------ |
+| `--rounds 2` (4 binds) | 992, 949 | 165, 130 |
+| `--rounds 5` (10 binds) | 989, 983 | 114, 173, 54, **3, 13, 13, 11, 8** |
+| `--rounds 8` (16 binds) | 931, 837 | 112, 216, 164, 10, 2, 1, 1, 8, 57, 10, 8, 11, **0, 0** |
+
+`args` follows the same curve (699310 on the cold bind, then 0–2) and so does
+`graph_upload` (246 cold, 0 after). So the tail **decays over roughly six binds and then
+reaches zero**; the ~1100 faults this entry chased for three rounds are a warm-up cost,
+not a per-bind one.
+
+**Which is why the per-bind counts here are wrong, all of them.** They came from runs of
+three to six rounds, divided by the bind count — so each one averages two cold binds and
+three or four still-decaying ones into a figure presented as steady state. The correction
+is not a smaller number; it is that the quantity being divided was never per-bind. See
+[`docs/dfx/hbg-bind-phases.md`](../dfx/hbg-bind-phases.md)'s trap on warm not meaning
+steady-state, which this measurement is what added.
+
+What still holds from the arms above: the tunable arm and #2015 do point in opposite
+directions, so within the warm-up window the count is not a lever and the price is. What
+does not hold is that anything "survived" the four changes — in the steady state there is
+nothing left to survive, and **the mechanism that went undetermined for three rounds
+turned out not to need determining.** Userspace tools were exhausted on it — `mincore`
+reports presence, not writability; pagemap's bit 56 is `mapcount == 1`, also not
+writability; no interface exposes a PTE's write bit — and none of that mattered.
+
+Where the control plane stands at `f40cacf30`, `--rounds 5`, the 8 warm binds: total
+0.529 ms min / 0.570 median, of which `host_orch` 0.341/0.364, `graph_upload`
+0.129/0.133, `arena_h2d` 0.056/0.058. Two of those 8 are still decaying (0.443 and 0.427
+against 0.341–0.397 for the rest), so even this is not a steady-state figure — it is the
+best available one, and it needs `--rounds 12` to become clean.
+
+### What the per-site attribution produced, and its shelf life
+
+`perf record -e page-faults -c 1 -k mono --call-graph fp`, filtered to the worker
+processes and to the `host_orch` windows, names every site. Per warm bind at
+`87deeab42`, before #2019:
+
+| site | per bind |
+| ---- | -------- |
+| `graph_end` → `memset(image, 0, total_bytes)` — **deleted by #2019** | 245 |
+| `_M_fill_assign` — the per-node tensor buffers, **replaced by #2015** | 199 |
+| `graph_record_submit_node` | 133 |
+| the two orchestration `.so`s | 79 |
+| flat arrays (`_M_default_append`) | 58 |
+| `ChipTensorMap::reset`, `operator new`, others | ~140 |
+| the SM mirror (`prepare_task` + `submit_task_common`, ~6 THP faults) | 6 |
+
+Two of the top three are gone, which is the point: **a per-site fault table dates
+quickly, and none of the entries it drove were worth what they measured.** Keep the
+method, not the numbers.
+
+Also refuted while attributing them, each with a direct measurement: `MADV_DONTNEED`
+(0 calls in that band), fork-COW (every `clone` carries `CLONE_VM`), KSM (`run=0`),
+AutoNUMA hinting (one rank's `total_numa_faults` never moves while its minflt stays
+~1000), THP (`PR_SET_THP_DISABLE` leaves the memset's faults at 0.97/page, unchanged),
+writing bytes never written before (per-slot high-water counter: 0 such assigns in the
+steady state), and the shape of the allocation (moving the Definition staging from a
+heap vector to its own anonymous mapping: 1960 → 1969 faults). The measurement itself
+was controlled with an empty `getrusage` window, which never counts a fault.
+
+Three traps in the tooling, each of which produced a wrong conclusion first:
+
+- **`perf record` without `-k mono`** stamps samples with a clock that is not the
+  `CLOCK_MONOTONIC` a phase window is expressed in. The offset is small enough that
+  "is `start_ns` between the first and last sample" still passes, and a
+  millisecond-wide window still lands on the wrong stretch: the first attempt put
+  99.9% of `host_orch`'s faults in `libtorch_cpu.so`, on a thread belonging to the
+  *parent* process, whose faults never enter a worker's `getrusage`.
+- **`--no-buildid-cache`** leaves the data depending on the `.so` at its recorded
+  path, so rebuilding it turns every symbol in an already-recorded run into `[unknown]`.
+- **Neither `mincore` nor pagemap reports write permission**, so neither can establish
+  that a page "was handed back". Both were used to argue exactly that.
+
+### What is closed
+
+"Where a fix would go" is fully implemented: items 1–3 by #1981, item 4 by #1988 plus
+ #2013, and the flat-region form of item 3 by #2015. No untried item remains, and the
+one that bought time did so by removing a **syscall**, not by removing allocations.
 
 ## References
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import logging
 import os
 import platform as host_platform
@@ -32,11 +33,12 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import IntEnum
+from functools import cache
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from .compile_pool import compile_slot, current_compile_workers
-from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, TIMING, configure_logging
 from .pto_isa import ensure_pto_isa_root
 from .scene_test_cache import (
     compile_artifact_key,
@@ -50,6 +52,8 @@ logger = logging.getLogger(__name__)
 _compile_cache: dict[tuple, object] = {}
 
 _CASE_CONFIG_KEYS = frozenset({"aicpu_thread_num", "runtime_env", "device_count", "num_sub_workers"})
+_TORCH_BACKEND_AUTOLOAD_ENV = "TORCH_DEVICE_BACKEND_AUTOLOAD"
+_TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT = 64
 _RUNTIME_ENV_KEYS = frozenset({"ring_task_window", "ring_heap", "ring_dep_pool"})
 
 
@@ -73,7 +77,7 @@ def _validate_diagnostic_flags(*, chip_swimlane: int, swimlane_overhead: bool) -
         raise ValueError("--enable-swimlane-overhead requires --enable-chip-swimlane")
 
 
-def _effective_diagnostic_options(
+def effective_diagnostic_options(
     rounds: int,
     *,
     chip_swimlane: int,
@@ -101,6 +105,55 @@ def _effective_diagnostic_options(
         if warn and enabled:
             logger.warning("%s disabled: --rounds > 1", name)
     return _DiagnosticOptions(0, 0, 0, False, False, False)
+
+
+@cache
+def _log_torch_backend_autoload_once() -> None:
+    """Record torch backend autoload configuration and module state once."""
+    raw_setting = os.environ.get(_TORCH_BACKEND_AUTOLOAD_ENV)
+    if raw_setting is None:
+        setting = "unset"
+    elif raw_setting in {"0", "1"}:
+        setting = raw_setting
+    else:
+        setting = "invalid"
+    raw_truncated = raw_setting is not None and len(raw_setting) > _TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT
+    raw_value = None if raw_setting is None else raw_setting[:_TORCH_BACKEND_AUTOLOAD_VALUE_LIMIT]
+    raw_json = json.dumps(raw_value, ensure_ascii=True)
+    # torch._is_device_backend_autoload_enabled() uses getenv(..., "1") == "1".
+    effective = "enabled" if (raw_setting is None or raw_setting == "1") else "disabled"
+
+    # SceneTest configures TIMING on "simpler"; the module logger filters this level.
+    logging.getLogger("simpler").log(
+        TIMING,
+        "torch_backend_autoload setting=%s raw=%s raw_truncated=%s effective=%s torch_imported=%s torch_npu_loaded=%s",
+        setting,
+        raw_json,
+        str(raw_truncated).lower(),
+        effective,
+        str("torch" in sys.modules).lower(),
+        str("torch_npu" in sys.modules).lower(),
+    )
+
+
+def log_torch_backend_autoload_once() -> None:
+    """Emit the shared autoload-state record from a standalone driver."""
+    _log_torch_backend_autoload_once()
+
+
+def standalone_pytest_options(request) -> dict:
+    """Forward the common scene-test CLI surface through a thin pytest wrapper."""
+    getoption = request.config.getoption
+    return {
+        "rounds": getoption("--rounds", default=1),
+        "skip_golden": getoption("--skip-golden", default=False),
+        "enable_chip_swimlane": getoption("--enable-chip-swimlane", default=0),
+        "dump_args": getoption("--dump-args", default=0),
+        "enable_pmu": getoption("--enable-pmu", default=0),
+        "enable_dep_gen": getoption("--enable-dep-gen", default=False),
+        "enable_scope_stats": getoption("--enable-scope-stats", default=False),
+        "enable_swimlane_overhead": getoption("--enable-swimlane-overhead", default=False),
+    }
 
 
 def _pto_isa_compile_cache_token() -> str:
@@ -963,7 +1016,7 @@ def _outputs_dir() -> Path:
     return _project_root() / "outputs"
 
 
-def _build_output_prefix(case_label: str) -> Path:
+def build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
@@ -989,6 +1042,10 @@ def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
     enable_overhead: bool = False,
+    *,
+    dispatch: str | None = None,
+    dispatch_id: str | None = None,
+    output_path: Path | None = None,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1010,6 +1067,12 @@ def _run_swimlane_converter(
         cmd.append(str(input_path))
     if func_names_path is not None:
         cmd += ["--func-names", str(func_names_path)]
+    if dispatch is not None:
+        cmd += ["--dispatch", dispatch]
+    if dispatch_id is not None:
+        cmd += ["--dispatch-id", dispatch_id]
+    if output_path is not None:
+        cmd += ["--output", str(output_path)]
     if enable_overhead:
         cmd.append("--overhead")
     try:
@@ -1029,6 +1092,111 @@ def _sanitize_for_filename(s: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in s)
 
 
+# Host/Device clock anchors — and therefore a common cross-Rank timeline — exist
+# only at this chip-swimlane level.
+_MULTI_RANK_SWIMLANE_LEVEL = 4
+
+
+def _rank_dirs(output_prefix: Path) -> list[Path]:
+    """Return the ``rankN`` roots below a case prefix, ordered by Rank."""
+    return sorted(
+        (path for path in output_prefix.glob("rank*") if path.is_dir() and path.name.removeprefix("rank").isdigit()),
+        key=lambda path: int(path.name.removeprefix("rank")),
+    )
+
+
+def _rank_capture_dirs(output_prefix: Path) -> list[Path]:
+    """Return deterministic ``rankN/dN`` capture roots below a case prefix."""
+    captures = []
+    for rank_dir in _rank_dirs(output_prefix):
+        captures.extend(
+            sorted(
+                (path for path in rank_dir.glob("d*") if path.is_dir() and path.name.removeprefix("d").isdigit()),
+                key=lambda path: int(path.name.removeprefix("d")),
+            )
+        )
+    return captures
+
+
+def _capture_swimlane_level(records_path: Path) -> int | None:
+    """Return one capture's ``chip_swimlane_level``, or None if it is unreadable."""
+    try:
+        with records_path.open() as file:
+            return int(json.load(file)["chip_swimlane_level"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _convert_rank_swimlanes(
+    case_label: str,
+    output_prefix: Path,
+    *,
+    callable_spec: dict | None,
+    enable_overhead: bool,
+    logger: logging.Logger,
+) -> None:
+    """Convert the ``rankN/dN`` captures below one L3 case prefix.
+
+    Cross-Rank merging is what puts every Rank on a common Host timeline, and
+    only level 4 carries the Host/Device clock anchors that make that possible.
+    A capture known to be below level 4 is therefore converted on its own Rank's
+    relative timeline instead. An unreadable level is left to the converter to
+    reject, so a malformed capture still fails loudly rather than downgrading.
+    """
+    from simpler_setup.tools.swimlane_converter import discover_l3_conversion_targets  # noqa: PLC0415
+
+    def dump_name_map(capture_dir: Path) -> Path | None:
+        if not callable_spec:
+            return None
+        safe_label = _sanitize_for_filename(case_label)
+        return _dump_name_map(_extract_name_map(callable_spec), capture_dir / f"name_map_{safe_label}.json")
+
+    captures = [path for path in _rank_capture_dirs(output_prefix) if (path / "chip_swimlane_records.json").is_file()]
+    if not captures:
+        logger.warning(f"[{case_label}] no Rank capture is present under {output_prefix}")
+        return
+
+    known_levels = {
+        level
+        for level in (_capture_swimlane_level(path / "chip_swimlane_records.json") for path in captures)
+        if level is not None
+    }
+    if known_levels - {_MULTI_RANK_SWIMLANE_LEVEL}:
+        logger.warning(
+            f"[{case_label}] cross-Rank merging needs --enable-chip-swimlane {_MULTI_RANK_SWIMLANE_LEVEL} on every "
+            f"Rank (found {sorted(known_levels)}); converting each Rank capture on its own timeline instead"
+        )
+        for capture_dir in captures:
+            _run_swimlane_converter(
+                input_path=capture_dir / "chip_swimlane_records.json",
+                func_names_path=dump_name_map(capture_dir),
+                enable_overhead=enable_overhead,
+            )
+        return
+
+    try:
+        targets = discover_l3_conversion_targets(output_prefix)
+    except ValueError as error:
+        logger.warning(f"[{case_label}] {error}")
+        return
+    if not targets:
+        logger.warning(f"[{case_label}] no complete Rank capture is present under {output_prefix}")
+        return
+
+    for target in targets:
+        # Directory mode auto-loads each Rank's own sibling name map, so these
+        # are dumped in place and never passed as a global override.
+        for capture_dir in target["capture_dirs"]:
+            dump_name_map(capture_dir)
+        _run_swimlane_converter(
+            input_path=output_prefix,
+            enable_overhead=enable_overhead,
+            dispatch=target["dispatch"],
+            dispatch_id=target["dispatch_id"],
+            output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
+        )
+
+
 def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
@@ -1038,10 +1206,23 @@ def _convert_case_swimlane(
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/chip_swimlane_records.json``. No diff/rename
     dance — the path is known a priori from CallConfig.output_prefix.
+
+    A run whose chips are forked ChipWorker children writes below ``rankN/dN``
+    instead, and its presence is what selects the multi-Rank postprocessor.
     """
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
+    if _rank_dirs(output_prefix):
+        _convert_rank_swimlanes(
+            case_label,
+            output_prefix,
+            callable_spec=callable_spec,
+            enable_overhead=enable_overhead,
+            logger=logger,
+        )
+        return
+
     perf_file = output_prefix / "chip_swimlane_records.json"
     if not perf_file.exists():
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
@@ -1140,6 +1321,64 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def finalize_diagnostic_outputs(
+    case_label: str,
+    output_prefix: str | Path,
+    *,
+    callable_spec: dict | None = None,
+    chip_swimlane: int = 0,
+    dep_gen: bool = False,
+    scope_stats: bool = False,
+    swimlane_overhead: bool = False,
+) -> None:
+    """Run the postprocessors shared by SceneTest and standalone drivers."""
+    prefix = Path(output_prefix)
+    rank_capture_dirs = _rank_capture_dirs(prefix)
+    if chip_swimlane:
+        _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec, enable_overhead=swimlane_overhead)
+    if dep_gen:
+        dep_targets = [path for path in rank_capture_dirs if (path / "deps.json").is_file()]
+        if dep_targets:
+            for target in dep_targets:
+                _graph_case_dep_gen(case_label, target, callable_spec=callable_spec)
+        else:
+            _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
+    if scope_stats:
+        scope_targets = [path for path in rank_capture_dirs if (path / "scope_stats" / "scope_stats.jsonl").is_file()]
+        if scope_targets:
+            for target in scope_targets:
+                _plot_case_scope_stats(case_label, target)
+        else:
+            _plot_case_scope_stats(case_label, prefix)
+
+
+def _name_failing_case(exc: BaseException, cls_name: str, case_name: str) -> None:
+    """Prefix `exc`'s message with the class and case that raised it, in place.
+
+    The exception object, its type, its traceback and its attributes all survive,
+    which two callers depend on:
+
+    - A negative scene test asserts on the exception its own orchestration raised
+      (`TestAllreduceIbingNranksError` expects `ValueError`). Re-raising a wrapper
+      of a fixed type makes such a test unable to pass however it is written.
+    - `conftest._requires_l2_worker_retirement` gates on
+      `issubclass(excinfo.type, RuntimeError)` before matching device-poison codes
+      in the message. Every code and marker it looks for comes out of the native
+      layer as a `RuntimeError`, so preserving the type keeps it classifiable.
+
+    `str(exc)` keeps the original text after the prefix, so both that classifier
+    and `pytest.raises(match=...)` still match on it.
+
+    Only `args[0]` is rewritten. An exception that renders itself from dedicated
+    attributes rather than from `args` (`OSError` and its errno/strerror) simply
+    does not gain the prefix; it is never left inconsistent. Python 3.11's
+    `BaseException.add_note` would express this directly, but `requires-python` is
+    `>=3.9`.
+    """
+    context = f"SceneTest case failed: {cls_name}::{case_name}"
+    exc.args = (f"{context}: {exc}", *exc.args[1:]) if exc.args else (context,)
+
+
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
     worker,
     cls_inst,
@@ -1179,7 +1418,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         # scope_stats writes below the per-case output prefix, so it uses the
         # same output-prefix allocation as the other diagnostics.
-        prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
+        prefix = build_output_prefix(case_label) if diagnostics_on else Path("")
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -1196,19 +1435,18 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 output_prefix=str(prefix) if diagnostics_on else "",
             )
         except Exception as exc:
-            raise RuntimeError(f"SceneTest case failed: {cls_name}::{case['name']}: {exc}") from exc
+            _name_failing_case(exc, cls_name, case["name"])
+            raise
         finally:
-            if enable_chip_swimlane:
-                _convert_case_swimlane(
-                    case_label,
-                    prefix,
-                    callable_spec=callable_spec,
-                    enable_overhead=enable_swimlane_overhead,
-                )
-            if enable_dep_gen:
-                _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
-            if enable_scope_stats:
-                _plot_case_scope_stats(case_label, prefix)
+            finalize_diagnostic_outputs(
+                case_label,
+                prefix,
+                callable_spec=callable_spec,
+                chip_swimlane=enable_chip_swimlane,
+                dep_gen=enable_dep_gen,
+                scope_stats=enable_scope_stats,
+                swimlane_overhead=enable_swimlane_overhead,
+            )
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -1223,8 +1461,15 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
             raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
 
 
-def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
-    """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``."""
+def compile_chip_callable_spec(spec, platform, runtime, cache_key):
+    """Compile a chip entry spec into a memory- and disk-cached ``ChipCallable``.
+
+    The one compile path for a `CALLABLE`-shaped spec dict, whoever owns the
+    Worker: the `SceneTestCase` classes below, the `st_worker` pytest fixture,
+    and standalone cases that drive an L3 Worker themselves. Key it through
+    ``l3_compile_cache_key`` so every path shares one cache entry per
+    orchestration.
+    """
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
@@ -1468,7 +1713,7 @@ class SceneTestCase:
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
         cache_key = (cls.__module__, cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
-        return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
+        return compile_chip_callable_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
     def _compile_l3_callables(cls, platform):
@@ -1478,7 +1723,7 @@ class SceneTestCase:
             if "orchestration" in entry:
                 name = entry["name"]
                 cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
+                chip = compile_chip_callable_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         return compiled
@@ -1541,8 +1786,8 @@ class SceneTestCase:
         # 0 = auto: DeviceRunner uses the architecture default.
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 0)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
-        # nested under the "runtime_env" key. Takes precedence over the
-        # PTO2_RING_* env vars / RUNTIME_ENV. Each value is either a scalar
+        # nested under the "runtime_env" key. This is the only way to size the
+        # rings -- there is no process-wide env. Each value is either a scalar
         # (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
         # (per-ring); the binding accepts both forms.
         runtime_env = config_dict.get("runtime_env", {})
@@ -1556,7 +1801,7 @@ class SceneTestCase:
         config.enable_scope_stats = enable_scope_stats
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
-        # directory built by _build_output_prefix().
+        # directory built by build_output_prefix().
         if output_prefix:
             config.output_prefix = str(output_prefix)
         return config
@@ -1660,6 +1905,8 @@ class SceneTestCase:
             with _golden_thread_cap():
                 self.compute_golden(golden_args, params)
 
+        _log_torch_backend_autoload_once()
+
         # Save initial output tensor values for reset between rounds
         initial_outputs = {}
         if rounds > 1:
@@ -1678,7 +1925,7 @@ class SceneTestCase:
                     getattr(test_args, name).copy_(initial)
 
             # Every diagnostic reaching this loop is already multi-round-safe:
-            # _effective_diagnostic_options zeroes all of them when rounds > 1,
+            # effective_diagnostic_options zeroes all of them when rounds > 1,
             # so no per-round masking belongs here.
             config = self._build_config(
                 config_dict,
@@ -1711,18 +1958,6 @@ class SceneTestCase:
         enable_scope_stats=False,
         output_prefix="",
     ):
-        # Defensive belt-and-braces: the pytest dispatcher and run_module both
-        # block --enable-chip-swimlane for L3 at the CLI boundary. Catch any code
-        # path that reaches here with the flag on anyway (direct API use,
-        # future refactors) so we fail loud rather than produce garbage perf
-        # files. Lift once the runtime embeds device_id in the perf filename.
-        if enable_chip_swimlane:
-            raise NotImplementedError(
-                "L3 profiling is not supported yet (multi-chip-process perf "
-                "filename collision). Gate at the CLI level in "
-                "conftest.pytest_collection_modifyitems / scene_test.run_module."
-            )
-
         params = case.get("params", {})
         config_dict = case.get("config", {})
         skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
@@ -1743,6 +1978,8 @@ class SceneTestCase:
         # reset, dispatch, and compare below all operate on the rehosted views.
         rehosted = _RehostedTaskArgs(worker, test_args)
         try:
+            _log_torch_backend_autoload_once()
+
             # Save initial tensor values for reset between rounds
             all_tensor_names = test_args.tensor_names()
             initial_tensors = {}
@@ -1796,13 +2033,27 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _effective_enable_chip_swimlane(request) -> int:
+        """Return the multi-round-safe chip-swimlane level for extension hooks."""
+        return effective_diagnostic_options(
+            request.config.getoption("--rounds", default=1),
+            chip_swimlane=request.config.getoption("--enable-chip-swimlane", default=0),
+            dump_args=0,
+            pmu=0,
+            dep_gen=False,
+            scope_stats=False,
+            swimlane_overhead=False,
+            warn=False,
+        ).chip_swimlane
+
+    @staticmethod
     def _effective_enable_dep_gen(request) -> bool:
         """Return the multi-round-safe dep-gen setting for extension hooks.
 
         Subclass hooks use the same effective-value rule as the main run path
         without emitting an additional user-facing warning.
         """
-        return _effective_diagnostic_options(
+        return effective_diagnostic_options(
             request.config.getoption("--rounds", default=1),
             chip_swimlane=0,
             dump_args=0,
@@ -1832,7 +2083,7 @@ class SceneTestCase:
         enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
         enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
-        diagnostics = _effective_diagnostic_options(
+        diagnostics = effective_diagnostic_options(
             rounds,
             chip_swimlane=enable_chip_swimlane,
             dump_args=enable_dump_args,
@@ -2001,6 +2252,11 @@ class SceneTestCase:
         parser.add_argument(
             "--level",
             type=int,
+            # SceneTestCase reaches level 2 and 3 only: build_callable rejects
+            # anything else, and the NETWORK1 scene tests are plain pytest
+            # functions rather than classes. Should a class ever reach L4,
+            # mirror the pytest-side multi-Rank swimlane guard here first —
+            # rankN numbering is per L3 Worker and collides above it.
             choices=[2, 3],
             default=None,
             help="Only run classes with this _st_level (child-mode marker when combined with --runtime)",
@@ -2052,7 +2308,7 @@ class SceneTestCase:
         # Resolved before the eager PTO-ISA checkout below so a rejected flag
         # combination costs no clone.
         try:
-            diagnostics = _effective_diagnostic_options(
+            diagnostics = effective_diagnostic_options(
                 args.rounds,
                 chip_swimlane=args.enable_chip_swimlane,
                 dump_args=args.dump_args,
@@ -2087,17 +2343,17 @@ class SceneTestCase:
         # slot but the dispatcher doesn't actually run tests here.
         args.device = device_ids[0]
 
-        # Resolve -j (max parallel) — 'auto' is CPU-aware on sim, device-count on hardware.
+        # Resolve --max-parallel; 'auto' is CPU-aware on sim and device-count on hardware.
         if args.max_parallel in (None, "", "auto"):
             args.max_parallel = default_max_parallel(args.platform, device_ids)
         else:
             try:
                 args.max_parallel = int(args.max_parallel)
             except (TypeError, ValueError):
-                print(f"ERROR: -j must be 'auto' or an integer, got {args.max_parallel!r}", file=sys.stderr)
+                print(f"ERROR: --max-parallel must be 'auto' or an integer, got {args.max_parallel!r}", file=sys.stderr)
                 sys.exit(2)
             if args.max_parallel < 1:
-                print(f"ERROR: -j must be >= 1, got {args.max_parallel}", file=sys.stderr)
+                print(f"ERROR: --max-parallel must be >= 1, got {args.max_parallel}", file=sys.stderr)
                 sys.exit(2)
         # Profiling + parallelism is safe: each test case sets its own
         # `output_prefix` on CallConfig (see run_class_cases) so diagnostic
@@ -2129,20 +2385,6 @@ class SceneTestCase:
         selected_by_cls: dict[type, list[dict]] = {}
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
-
-        # L3 profiling not supported yet (multi-chip-process filename collision).
-        # Mirror the pytest-side guard so standalone users get the same early-fail.
-        if args.enable_chip_swimlane:
-            l3_classes = sorted(cls.__name__ for cls in selected_by_cls if cls._st_level == 3)
-            if l3_classes:
-                print(
-                    f"ERROR: --enable-chip-swimlane is not supported for L3 tests yet — "
-                    f"multi-chip-process filename collision unresolved. "
-                    f"L3 classes selected: {', '.join(l3_classes)}. "
-                    f"Either drop --enable-chip-swimlane or scope to L2 with --level 2.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
 
         # Child mode: both --runtime and --level set. Run inline without
         # spawning further subprocesses; this is the path dispatcher
@@ -2324,9 +2566,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
     l2_failed = False
     for rt in sorted(l2_by_runtime):
         classes = l2_by_runtime[rt]
-        # Chunk count = min(-j, number of classes). We intentionally do NOT
+        # Chunk count = min(--max-parallel, number of classes). We intentionally do NOT
         # include len(device_ids) here: each chunk uses 1 device and at most
-        # max_parallel chunks run concurrently, so a pool bigger than -j just
+        # max_parallel chunks run concurrently, so a larger device pool just
         # leaves unused ids. Fewer, larger chunks also amortize ChipWorker
         # init (layer-4 reuse) over more cases.
         n = min(args.max_parallel, len(classes))
@@ -2473,7 +2715,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
             elif "orchestration" in entry:
                 name = entry["name"]
                 cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, args.platform, cls._st_runtime)
-                chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
+                chip = compile_chip_callable_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle
                 cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])

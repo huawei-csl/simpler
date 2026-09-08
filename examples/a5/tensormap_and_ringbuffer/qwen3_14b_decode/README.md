@@ -8,7 +8,7 @@
 > `pipe_barrier` pipes and the core-count accessor differently, and the a2a3
 > `__DAV_C220_*` guards name a macro ccec does not predefine on a5.
 
-Self-contained SceneTestCase port of pypto-lib
+Self-contained standalone-driver port of pypto-lib
 `models/qwen3/14b/decode_fwd.py` entry `decode_fwd_layers` with
 `_CHUNK_NLAYERS == 40`: **the whole Qwen3-14B decode stack as one fused
 dispatch** (hidden → hidden, no LM head), with the FP32 inter-layer residual
@@ -159,8 +159,9 @@ The Left-tile fractal and the `fai_body.hpp` edits (include order, soft Mix
 
 One deliberate deviation from `kernel_config.py`: `decode_fwd_layers` declares
 `k_cache` / `v_cache` as plain inputs, but the extern writes the current token's
-KV into them. The `CALLABLE` marks them `INOUT` so simpler copies the pools back
-and the golden can verify all 40 layers' KV writes, not just the hidden output.
+KV into them. The callable marks them `INOUT`; correctness runs explicitly copy
+the pools back so the golden can verify all 40 layers' KV writes, not just the
+hidden output.
 
 ## Running
 
@@ -169,20 +170,27 @@ and the golden can verify all 40 layers' KV writes, not just the hidden output.
 pytest examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode \
     --platform a5 --device ${DEVICE} --manual include
 
-# standalone
-python examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode/test_qwen3_14b_decode.py \
-    -p a5 -d ${DEVICE} --manual include
+# standalone correctness
+python examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode/main.py \
+    -p a5 -d ${DEVICE}
+
+# benchmark: one fixture upload, then device-only parameter reuse across rounds
+python examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode/main.py \
+    -p a5 -d ${DEVICE} --rounds 100 --skip-golden
 ```
 
-DFX is opt-in via the existing flags — no kernel changes needed:
+DFX is opt-in on the standalone driver — no kernel changes needed:
 
 ```bash
-pytest .../qwen3_14b_decode --platform a5 --device ${DEVICE} \
-    --manual include --enable-chip-swimlane 1 --enable-dep-gen
+python .../qwen3_14b_decode/main.py -p a5 -d ${DEVICE} \
+    --enable-dep-gen
+
+python .../qwen3_14b_decode/main.py -p a5 -d ${DEVICE} \
+    --enable-chip-swimlane 1
 ```
 
-Note that `--enable-dep-gen` / `--enable-chip-swimlane` on the full 40-layer graph
-can overflow the per-run SHM record buffer ("records dropped"); pypto-lib warns
+Note that dependency generation or chip swimlane on the full 40-layer graph can
+overflow the per-run SHM record buffer ("records dropped"); pypto-lib warns
 about the same thing for `decode_fwd.py --fwd-layers`. Capture on a smaller
 harvest if you need a clean trace.
 
@@ -193,11 +201,24 @@ Passes on a5 silicon against the same torch reference as the a2a3 source, at
 match, with every element inside tolerance (worst element `out` 0.0625,
 `k_cache` / `v_cache` 0.03125 — one bf16 quantum at those magnitudes).
 
-## Cost
+## Memory and round behavior
 
-This A5 case runs in the daily full scene-test sweep and is excluded from
-per-PR CI. The measured breakdown below comes from the a2a3 source on one
-device:
+All 20 entry tensors are allocated once with `Worker.malloc`. In
+`--skip-golden` benchmark mode, the 19 inputs are generated and uploaded one at
+a time, so the host never retains the complete 38 GiB fixture. The flag still
+uploads valid model weights, KV cache, and paging metadata; it skips only the
+torch reference and explicit D2H comparison. Every round reuses the same device
+addresses and does no automatic parameter staging or copy-back.
+
+Correctness mode materializes the host fixture once, uploads that same fixture,
+computes the torch golden in place, then reads back `out`, `k_cache`, and
+`v_cache` one at a time after the last round. The freshly allocated `out` buffer
+is not uploaded because the final `copy_out` task overwrites every element.
+
+## Historical cost
+
+Before the device-resident migration, the measured breakdown below came from
+the a2a3 source on one device:
 
 | Phase | Wall |
 | ----- | ---- |
@@ -227,7 +248,7 @@ so a refresh is still "re-harvest a2a3, then re-apply this table".
 
 | Delta | Where | Why a5 needs it |
 | ----- | ----- | --------------- |
-| `set_block_num` → `set_core_num` (×18) | orchestration | a5 tmr `PTO2LaunchSpec` names the accessor `set_core_num` (hbg still has `set_block_num`) |
+| `set_block_num` → `set_core_num` (×18) | orchestration | a5 tmr `LaunchSpec` names the accessor `set_core_num` (hbg still has `set_block_num`) |
 | Left(A) tile `BLayout::RowMajor` → `ColMajor` (×288) | AIC kernels | a5 cube takes L0A in the ColMajor fractal: pto-isa's own `TileLeft` alias is `BLayout::ColMajor` off a2a3, and `CheckMadValid` asserts `!TileLeft::isRowMajor`. SFractal stays `RowMajor`, and the L1 `Mat` tiles the `TEXTRACT` reads from are unchanged |
 | drop `pipe_barrier(PIPE_V)` (×135), `pipe_barrier(PIPE_MTE1)` (×32), `pipe_barrier(PIPE_FIX)` (×3) | AIV + AIC kernels | a5 `pipe_barrier` accepts only `MTE3` / `M` / `ALL`; anything else is a compile error. Nothing is lost: a5's own `pto::Event` emits no barrier for a same-pipe V event either, and every cross-pipe order here is already carried by a `set_flag` / `wait_flag` pair |
 | `__DAV_C220_{VEC,CUBE}__` → `__DAV_{VEC,CUBE}__` (3 files) | attention extern | `__DAV_C220_*` is the a2a3 (`dav-c220`) ccec predefine. a5 builds as `dav-c310`, so on a5 those guards silently compiled out the whole RoPE/QK-norm/KV-write phase **and** the vendor FAI's cube and vector bodies — the task ran to completion writing nothing. `__DAV_VEC__` / `__DAV_CUBE__` are predefined on both arches and are what every other kernel here already uses |

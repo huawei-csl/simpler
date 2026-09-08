@@ -28,12 +28,12 @@ end-to-end runtime numbers. Two cases dominate the profiler diet:
   pinpoints the fix.
 
 chip swimlane profiling captures both: per-task `(start, end,
-dispatch, finish)` records on the AICore side, plus per-iteration
-phase records on the AICPU scheduler side and per-submit orchestrator
+dispatch, finish)` records, plus per-iteration phase records from the active
+AICPU or AICore scheduler producer and per-submit orchestrator
 envelopes. The host writes a Chrome Trace Event JSON
-that loads directly in Perfetto, and the same file feeds a
-scheduler-overhead deep-dive report when a device log is
-available.
+that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
+`deps.json` separately and invoke `sched_overhead_analysis` explicitly; see its
+[tool documentation](../../simpler_setup/tools/README.md#sched_overhead_analysis).
 
 ## 2. Overview
 
@@ -45,12 +45,17 @@ available.
   `chip_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep-gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into seven
-  mutually time-exclusive **outer** phases (`complete` / `async_poll`
-  / `dispatch` / `release` / `dummy` / `early_dispatch` / `drain`), plus
-  `resolve`, `drain_prepare`, and `drain_publish` **inner** phases. `resolve`
-  is rendered on a sibling scheduler sub-lane with the same `Sched_N` label,
-  while the drain sub-phases are nested within their `drain` bar,
+- **Scheduler phases** — producer-specific per-iteration breakdown. AICPU uses mutually
+  time-exclusive **outer** phases (`complete` / `async_poll` / `dispatch` /
+  `release` / `dummy` / `early_dispatch` / `drain` / `graph_prepare`), plus
+  nested phases.
+  In `tensormap_and_ringbuffer`, `resolve` is nested within `complete` or
+  `dummy`; in `host_build_graph`, `resolve_standalone`, `async_poll`, and
+  `dummy` are standalone, mutually exclusive phases on the dedicated P
+  thread. The converter renders `resolve_standalone` as `resolve` on that P
+  thread's main scheduler lane; TMR's nested `resolve` uses a sibling
+  scheduler sub-lane. The drain sub-phases are nested within
+  their `drain` bar,
   and two **separate-lane**
   phases (`dummy_task` and `predicated_skip`, sampled immediately before
   `on_task_complete()` begins dependency resolution and rendered as synthetic
@@ -101,9 +106,9 @@ backward-compatible with the old boolean behavior).
 | Level | Collects | Notes |
 | ----- | -------- | ----- |
 | 0 | Nothing (disabled) | Default when flag is absent |
-| 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No AICPU timestamps |
-| 2 | + dispatch_time_us, finish_time_us | Full per-task AICPU record |
-| 3 | + scheduler phases (`aicpu_scheduler_phases[]`) | Skips orchestrator phases |
+| 1 | AICore timing only (start_time_us/end_time_us/task_id/func_id/core_type) | No Scheduler timestamps |
+| 2 | + Scheduler per-task dispatch_time_us, finish_time_us | Producer is identified as `aicpu` or `aicore` |
+| 3 | + scheduler phases (`scheduler_records`) | Skips orchestrator phases |
 | 4 | + orchestrator phases (`aicpu_orchestrator_phases[]`) | Full collection |
 
 Dependency arrows are not produced by any swimlane level — see
@@ -130,13 +135,13 @@ The flag sets `CallConfig::enable_chip_swimlane` to the chosen
 level. The host then allocates the per-core / per-thread shared
 region and publishes its base address through
 `kernel_args.chip_swimlane_data_base`. AICore writes timing into
-per-task WIP slots; AICPU commits the records on FIN. Per-task
-dispatch/finish timestamps are recorded only at level >= 2,
+per-task WIP slots; the active Scheduler records dispatch/finish timestamps.
+Per-task Scheduler timestamps are recorded only at level >= 2,
 scheduler phase records only at level >= 3, and orchestrator phase
 records only at level >= 4.
 
 The JSON output `"chip_swimlane_level"` field is the captured perf_level:
-`1` = AICore timing only, `2` = +AICPU dispatch/finish,
+`1` = AICore timing only, `2` = +Scheduler per-task dispatch/finish,
 `3` = +scheduler phases, `4` = +orchestrator phases.
 
 Chip-swimlane collection is disabled when `--rounds > 1` so benchmark
@@ -159,6 +164,43 @@ runs):
 
 Filenames are fixed (no per-file timestamp) — the directory is the
 per-task uniqueness boundary.
+
+For L3 runs, each forked ChipWorker writes below its own `rankN/dN` directory.
+The filenames above are fixed, so N children sharing one `output_prefix` would
+overwrite each other — the separation therefore covers **every** diagnostic that
+writes below `output_prefix`, not just the swimlane:
+
+```text
+<output_prefix>/
+├── rank0/d0/
+│   ├── chip_swimlane_records.json    # --enable-chip-swimlane
+│   ├── dispatch_identity.json        # always, whenever any diagnostic is on
+│   ├── deps.json                     # --enable-dep-gen
+│   └── scope_stats/                  # --enable-scope-stats
+├── rank1/d0/
+│   └── ...
+└── l3_swimlane.json                  # cross-Rank trace (added by converter)
+```
+
+Here `rankN` is the logical ChipWorker index and `dN` is that worker's local
+capture index. It is a storage-order suffix, not a globally comparable dispatch
+ID. `dispatch_identity.json` records the parent scheduler identity: `run_id`,
+`task_slot`, `group_index`, and `group_size`, plus the endpoint-local dispatch
+and pipeline diagnostics. All members submitted through one
+`submit_next_level_group` share `(run_id, task_slot)` and have distinct
+`group_index` values. Individually submitted tasks do not share that identity;
+the current postprocessor therefore retains local-capture-index pairing for
+them and requires symmetric `dN` sets.
+
+Automatic merging is limited to one same-host L3 Worker. NETWORK1/L4 is
+rejected until the layout also carries a node namespace. Every Rank must expose
+the same complete set of local capture indexes; the postprocessor refuses
+asymmetric sets instead of guessing pairings.
+
+Cross-Rank merging needs `--enable-chip-swimlane 4` on every Rank, because the
+Host/Device clock anchors that level 4 collects are what put the Ranks on a
+common timeline. A lower level still captures per Rank; the postprocessor then
+converts each `rankN/dN` capture on its own relative timeline and says so.
 
 `chip_swimlane_records.json` carries the raw records. **There are two
 layers to be aware of:**
@@ -189,31 +231,51 @@ layers to be aware of:**
     "core_to_thread": [<int>, ...]     // optional; level >= 3 only
   },
 
-  // Bulk task streams — flat array of tuples. Column order is fixed.
+  // Bulk task streams. Tuple column order is fixed.
   //   aicore_tasks: [core_id, task_token_raw, reg_task_id,
   //                  start_cycles, end_cycles]
-  //   aicpu_tasks:  [core_id, reg_task_id,
-  //                  dispatch_cycles, finish_cycles]
+  //   scheduler_tasks.records: [core_id, reg_task_id,
+  //                             dispatch_cycles, finish_cycles]
   "aicore_tasks": [[...], ...],
-  "aicpu_tasks":  [[...], ...],
+  "scheduler_tasks": {
+    "schema_version": 1,
+    "producer": "<aicpu|aicore>",
+    "records": [[...], ...]
+  },
 
-  // Per-scheduler-thread arrays of objects (level >= 3 only).
-  //   sched record: {kind, start_cycles, end_cycles, loop_iter,
-  //                  tasks_processed, [pop_hit, pop_miss]}
+  // Producer-neutral per-Scheduler streams (level >= 3 only).
+  "scheduler_records": {
+    "schema_version": 1,
+    "streams": [{
+      "platform": "<a2a3|a5>",
+      "runtime": "<host_build_graph|tensormap_and_ringbuffer>",
+      "producer": "<aicpu|aicore>",
+      "scheduler_id": <int>,
+      "worker_id": <int>,
+      "core_type": "<aicpu|aic|aiv>",
+      "physical_core_id": "<int|null>",
+      "capture": {"committed": <int>, "dropped": <int>, "truncated": <bool>},
+      "records": [{"start_cycles": <int>, "end_cycles": <int>,
+                   "loop_iter": <int>, "kind": <str>,
+                   "tasks_processed": <int>, "task_id": "<int|null>"}],
+      "metrics": [{"record_index": <int>, ...}]
+    }]
+  },
+
+  // Orchestrator records (level >= 4 only).
   //   orch record:  {submit_idx, task_id, start_cycles, end_cycles}
-  // pop_hit / pop_miss are present only on Dispatch records.
-  "aicpu_scheduler_phases":    [ [ {...}, ... ], ... ],
   "aicpu_orchestrator_phases": [ [ {...}, ... ], ... ]   // level >= 4 only
 }
 ```
 
 All timestamps on disk are raw `get_sys_cnt` cycles (uint64). The
-join key between `aicore_tasks` and `aicpu_tasks` is
+join key between `aicore_tasks` and `scheduler_tasks.records` is
 `(core_id, reg_task_id)` — *not* `task_token_raw`, because SPMD
 `block_num > num_cores` and MIX cluster spread can dispatch the same
 `task_token_raw` to the same core multiple times. AICore is the
-canonical producer of `task_token_raw`; AICPU only stamps the
-dispatch / finish timestamps and the per-core join token.
+canonical producer of `task_token_raw`; the Scheduler producer stamps the
+dispatch / finish timestamps and the per-core join token. Archived raw files
+with the former `aicpu_tasks` array remain readable as `producer: "aicpu"`.
 
 #### Reader output (µs domain)
 
@@ -222,19 +284,20 @@ microseconds, downstream code sees:
 
 | Field | Meaning |
 | ----- | ------- |
-| `task_id` | Runtime task id (`(ring_id << 32) \| local_id`); also exposed split as`ring_id` |
+| `task_id` | Runtime task id (`TaskId::raw`); its high 32 bits are also exposed split off as `ring_id`, which is a ring index under `tensormap_and_ringbuffer` and an id space under `host_build_graph` |
 | `func_id` | Kernel function id. Always `-1` on disk; resolved post-process from `deps.json::tasks[].kernel_ids[3]` (see `swimlane_converter.resolve_func_id_from_kernel_map`) |
 | `core_id` / `core_type` | Physical core index and `"aic"` / `"aiv"` string |
 | `start_time_us` / `end_time_us` / `duration_us` | AICore execution window in microseconds |
-| `dispatch_time_us` | AICPU timestamp when this task was dispatched (filled at level >= 2; `0.0` at level 1) |
-| `finish_time_us` | AICPU timestamp when AICPU observed FIN (filled at level >= 2; `0.0` at level 1) |
+| `dispatch_time_us` | Scheduler timestamp when dispatch publication completed (filled at level >= 2) |
+| `finish_time_us` | Scheduler timestamp when completion processing began (filled at level >= 2) |
 
 Note: per-task records carry **no** fanout edges. Dependency arrows
 come from a separate `deps.json` (dep_gen) joined at convert time —
 see [§3.5](#35-dependency-arrows-from-dep_gen).
 
-Phase records (per scheduler thread, level >= 3 for
-`aicpu_scheduler_phases[]` and level >= 4 for
+Phase records (per Scheduler stream, level >= 3 in raw
+`scheduler_records`—also exposed through the legacy reader alias
+`aicpu_scheduler_phases`—and level >= 4 for
 `aicpu_orchestrator_phases[]`):
 
 | Field | Meaning |
@@ -257,13 +320,15 @@ field but render differently in Perfetto:
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
-| `async_poll` | outer | sched | async-wait (SDMA/RoCE/URMA/CCU) subtasks completed this iter; split from `complete` |
+| `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `drain` | outer | sched | blocks staged by this thread's global sync-start drain pass |
-| `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
+| `graph_prepare` | outer | sched | Graph Definition nodes expanded this pass |
+| `resolve` | inner (TMR) | TMR sched sub-lane | consumers visited in `on_task_complete` |
+| `resolve_standalone` | P-thread outer (HBG); rendered as `resolve` | HBG P sched lane | completed SPSC slots |
 | `drain_prepare` | inner | sched, nested in `drain` | subtasks prepared for global sync-start publication |
 | `drain_publish` | inner | sched, nested in `drain` | subtasks published during global sync-start staging |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | one dummy entering `on_task_complete()`; full identity is in `task_id` |
@@ -274,13 +339,31 @@ orchestrator submit path, so it has no swimlane lane. Read its cost
 from `g_orch_fanin_cycle` in the device-log orch breakdown (the
 `fanin` line) instead.
 
-Outer phases are mutually time-exclusive within an iter. The converter renders
-`resolve` on a sibling `Sched_N` tid so flow arrows attach to the outer
-`complete`/`dummy` lane; `drain_prepare` and `drain_publish` remain on the
-scheduler lane and are time-contained by `drain`. Separate-lane phases are
-routed to a different lane by the converter
+Outer phases are mutually time-exclusive within an iter. In
+`tensormap_and_ringbuffer`, the converter renders `resolve` on a sibling
+`Sched_N` tid because it is time-contained by the outer `complete`/`dummy`
+lane. In `host_build_graph`, standalone `resolve` stays beside `async_poll` and
+`dummy` on the P thread's main scheduler lane. `drain_prepare` and
+`drain_publish` remain on the scheduler lane and are time-contained by `drain`.
+Separate-lane phases are routed to a different lane by the converter
 (Worker View AICPU_N), so they never overlap visually with the sched lane
 bars even when their timestamps fall inside an outer span.
+
+On the HBG P thread, consecutive empty async-wait polls are compacted into one
+`async_poll(0)` record. Its duration is the exact sum of time spent inside the
+poll calls, anchored at the point where the aggregate is flushed; it is not a
+wall-clock envelope over the intervening loop bookkeeping. The aggregate is
+flushed before `resolve` or `dummy`, when a poll resolves work or reports an
+error, and when P exits. This keeps polling cost visible without exporting one
+record per spin. A non-zero `tasks_processed` counts every resolved async-wait
+entry, including internal Graph nodes, rather than only host-submitted stream
+tasks. The compacted record's `shared_at_start` snapshot comes from the first
+poll in the aggregate, while `loop_iter` names the iteration that flushes the
+aggregate. Because the displayed start timestamp is synthesized from summed
+poll CPU time, neither field identifies one wall-clock iteration boundary.
+The converter still emits the record's real `shared_at_end` snapshot on the
+global ready-queue counter track; only the aggregate's start-side metadata has
+the synthesized-timestamp caveat.
 
 Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
 are still parsed for old captures but current a2a3/a5 builds no
@@ -313,20 +396,84 @@ python -m simpler_setup.tools.swimlane_converter \
 # Custom output path
 python -m simpler_setup.tools.swimlane_converter \
     outputs/<case>_<ts>/chip_swimlane_records.json -o my_trace.json
+
+# Same-host L3: merge rankN/d0 captures onto one CLOCK_MONOTONIC timeline
+python -m simpler_setup.tools.swimlane_converter \
+    build_output/<case>/dfx_outputs --dispatch d0
+
+# Prefer the parent group identity when Rank-local dN suffixes differ
+python -m simpler_setup.tools.swimlane_converter \
+    build_output/<case>/dfx_outputs --dispatch-id 17:5
 ```
 
-The output is `outputs/<case>_<ts>/merged_swimlane.json` (or your
-`-o` override). Open <https://ui.perfetto.dev/> and drag the file
-in. The trace contains:
+For directory input, the default output is `dfx_outputs/l3_swimlane.json`.
+Every Rank must be a level-4 capture under
+`rankN/<dispatch>/`, with successful clock anchors and the same
+`metadata.host_clock_domain_id`. The converter preserves real Rank start skew,
+adds Rank-specific PID/name/flow namespaces, and reports clock uncertainty and
+anchor-group observer overhead in trace metadata.
+
+For new group captures, `--dispatch-id RUN_ID:TASK_SLOT` selects the common
+parent DAG node and resolves each Rank's actual `dN` path through
+`dispatch_identity.json`. SceneTest does this automatically. `--dispatch dN`
+remains the compatibility selector for old captures and for independently
+submitted per-Rank tasks; it fails if available sidecars show that the selected
+paths belong to different parent groups.
+
+Host-orchestrated level-4 runs retain their existing clock anchors. For
+Device/AICPU orchestration, anchors are additionally enabled only when the
+ChipWorker marks the capture with `CallConfig.capture_clock_anchors`, which it
+does for an L3 chip-swimlane capture, at the common launch boundary before
+collectors and kernels start. Both modes sample again after AICPU/AICore
+execution completes. Existing single-card Device/AICPU level-4 captures
+therefore keep their prior relative timeline and do not pay the new anchor cost.
+
+`capture_clock_anchors` says only *what the runtime does* — sample the two
+clocks — never why. Rank, group and merge are concepts of the layer above: the
+platform runner that reads this flag has no notion of a Rank, and no runtime or
+platform code parses the `rankN/dN` path. The two are deliberately separate
+switches, because the directory is artifact separation that every diagnostic
+needs while the anchors are consumed only by the swimlane reader. An L3 run with
+`--enable-dep-gen` alone therefore gets its own `rankN/dN` directory and pays no
+anchor cost.
+
+**The opening anchor sits at a different point in each runtime**, because each
+takes it at the earliest point preceding every device timestamp it records:
+
+| Runtime | Opening anchor | Calibrated interval covers |
+| ------- | -------------- | -------------------------- |
+| `host_build_graph` | before Host orchestration (`host_phase_pool_arm`) | bind, H2D, and execution |
+| `tensormap_and_ringbuffer` | before kernel launch (`start_shared_collectors_for_run`) | execution only |
+
+Both close on `post_device_execution`. So the two runtimes' calibrated intervals
+are not comparable in length, and a `host_build_graph` interpolation spans work
+a `tensormap_and_ringbuffer` one does not. This does not affect
+`max_uncertainty_ns`, which depends only on each anchor group's own sampling
+RTT. The serialized position name `pre_host_orchestration` predates the
+Device/AICPU case — read it as "start of the calibrated interval", not as a
+claim about Host orchestration.
+
+The default output depends on which input form was used, and `-o` overrides
+either:
+
+| Input | Default output |
+| ----- | -------------- |
+| a records file | `outputs/<case>_<ts>/merged_swimlane.json` |
+| a `dfx_outputs` directory | `<dfx_outputs>/l3_swimlane.json` |
+
+Open <https://ui.perfetto.dev/> and drag the file in. Both forms produce the
+same lane structure — the directory form repeats it once per Rank under the
+`rankN / <view>` process names. The trace contains:
 
 - **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
   blocks (level >= 4).
-- **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
+- **Scheduler** (pid=2) — per-iteration scheduler phase
   blocks coloured by `phase` (level >= 3). Outer phases appear as sibling bars
-  on each scheduler thread's first `Sched_N` lane. `resolve` appears on an
-  adjacent `Sched_N` sub-lane, while `drain_prepare` and `drain_publish` nest
-  within `drain`.
-- **Scheduler View** (pid=3) — task-execution overlay using AICPU
+  on each scheduler thread's first `Sched_N` lane. TMR's nested `resolve`
+  appears on an adjacent `Sched_N` sub-lane; HBG's standalone `resolve` stays
+  on the P thread's first lane. `drain_prepare` and `drain_publish` nest within
+  `drain`.
+- **Scheduler View** (pid=3) — task-execution overlay using Scheduler
   dispatch/finish timestamps (level >= 2), with the same labels
   as Worker View.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
@@ -370,12 +517,15 @@ whether a `deps.json` is present** (see
   prints a one-line hint). Re-run with `--enable-dep-gen` (or join an
   existing `deps.json`) to recover names and arrows.
 
-When the run also emitted a device log (`device-*` file under
-`outputs/`), `swimlane_converter` resolves the nearest log by
-mtime and runs `sched_overhead_analysis` automatically. The
-report is printed to stdout; it correlates AICPU phase records
-with the device log to attribute each scheduler iteration to a
-specific overhead source.
+`swimlane_converter` does not run the scheduler-overhead deep-dive. Capture
+`deps.json` and `chip_swimlane_records.json` in separate runs, then invoke
+`sched_overhead_analysis` explicitly as described in the
+[tool documentation](../../simpler_setup/tools/README.md#sched_overhead_analysis).
+
+The scheduler-budget parser counts every mutually exclusive outer phase and
+standalone HBG P-thread `resolve` bars. It excludes only `resolve` records whose
+timestamps are contained by a TMR `complete` or `dummy` parent, preventing the
+nested TMR work from being counted twice.
 
 ### 3.4 Adding human-readable names
 
@@ -433,7 +583,7 @@ Two artifacts, one join:
 | `chip_swimlane_records.json` | `--enable-chip-swimlane` | Per-task / per-phase timing for one run |
 | `merged_swimlane.json` | `swimlane_converter` | Perfetto trace = timing joined to the graph |
 
-**Default workflow (paired flags, recommended for most runs):**
+**Co-capture workflow (functional debugging and CI smoke):**
 
 ```bash
 python test_my_case.py --platform a2a3 \
@@ -442,10 +592,11 @@ python test_my_case.py --platform a2a3 \
 
 Both artifacts land under the same `<output_prefix>/`; the
 converter auto-detects `deps.json` and emits flow arrows. This is the
-right default for CI smoke, single debugging runs, and small/medium
-workloads.
+convenient path for CI smoke and one-off functional debugging. Do not use
+co-captured timing for strict scheduler-overhead measurement because dep_gen
+adds per-submit work to the measured run.
 
-**Split workflow (two launches, recommended for strict perf
+**Split workflow (two launches, required for strict scheduler-overhead
 measurement):**
 
 ```bash
@@ -463,9 +614,8 @@ python -m simpler_setup.tools.swimlane_converter \
 
 Use this when:
 
-- You're measuring overhead at the µs level and want each profiler in
-  isolation (combined per-round overhead is still well under 10 µs on
-  measured workloads, but if you need certainty, split).
+- You're measuring scheduler overhead and need the swimlane timing run free
+  from dep_gen instrumentation.
 - The same topology is being measured under several configurations
   (one `dep_gen` capture amortizes across N swimlane runs).
 - A workload is so large that the dep_gen replay validation gate
@@ -616,9 +766,8 @@ ChipSwimlaneDataHeader                               (host init, device R/W)
 ├── queue_heads / queue_tails  (per-thread)
 ├── num_cores / chip_swimlane_level                   (host writes at init)
 ├── num_sched_phase_threads / num_orch_phase_threads  (AICPU writes at phase
-├── num_phase_cores / core_to_thread[]                 init; host gates on
-│                                                      the two counts)
-└── backpressure                (DfxBackpressureHeader)
+└── num_phase_cores / core_to_thread[]                 init; host gates on
+                                                       the two counts)
 
 Every pool below is the same 192B shape — one ChipSwimlaneActiveHead (64B)
 plus one ChipSwimlaneFreeQueue (128B). Only the buffer payload type differs,
@@ -677,10 +826,11 @@ Both architectures use split phase streams:
 
 - `ChipSwimlaneAicpuSchedPhaseRecord` (64 B) — one record per **emitted
   phase**, not per scheduler iteration: a single iteration routinely emits
-  several (e.g. Complete, AsyncPoll, Dispatch, Release, plus the Resolve
-  inner phase). `ChipSwimlaneSchedPhaseKind` spans the outer phases
+  several (e.g. Complete, AsyncPoll, Dispatch, Release, plus Resolve).
+  `ChipSwimlaneSchedPhaseKind` spans the outer phases
   (Complete, Dispatch, Release, Dummy, EarlyDispatch, AsyncPoll, Drain,
-  GraphPrepare), the inner ones (Resolve, DrainPrepare, DrainPublish) and
+  GraphPrepare, ResolveStandalone), TMR's inner Resolve, the inner drain phases
+  (DrainPrepare, DrainPublish), and
   the separate-lane markers (DummyTask, PredicatedSkip) — see §3.2 for how
   each is rendered. Carries loop_iter + tasks_processed + pop_hit /
   pop_miss deltas and queue-depth snapshots.
@@ -1119,11 +1269,9 @@ overwrites `task_id` with the full encoding on FIN
 wrote the WIP slot but AICPU never committed.
 
 **Scheduler-overhead deep-dive missing from converter output.**
-The converter runs `sched_overhead_analysis` only when a device
-log is resolvable. Pass `-d <device-id>` or place a `device-*`
-log under `outputs/` close in time to the `chip_swimlane_records.json`
-mtime; see `simpler_setup/tools/README.md` for the resolver
-rules.
+This is expected: the converter does not run `sched_overhead_analysis`.
+Capture `deps.json` and `chip_swimlane_records.json` in separate runs, then
+pass both paths to the analysis CLI; see `simpler_setup/tools/README.md`.
 
 ## 9. Related docs
 

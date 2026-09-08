@@ -28,13 +28,13 @@ extern "C" void framework_bind_runtime(RuntimeContext *rt) { g_bound_runtime = r
 
 struct FakeRuntime {
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode = PTO2ScopeMode::AUTO;
+    ScopeMode pending_scope_mode = ScopeMode::AUTO;
     bool fatal = false;
     int submit_calls = 0;
     int alloc_calls = 0;
     int scope_begin_calls = 0;
     int scope_end_calls = 0;
-    PTO2ScopeMode last_scope_mode = PTO2ScopeMode::AUTO;
+    ScopeMode last_scope_mode = ScopeMode::AUTO;
     int get_calls = 0;
     int set_calls = 0;
     int report_fatal_calls = 0;
@@ -83,12 +83,12 @@ void fake_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func,
 
 void fake_log(const char *, const char *, ...) {}
 
-uint64_t fake_get_tensor_data(RuntimeContext *rt, const ChipTensor &, uint32_t, const uint32_t[]) {
+uint64_t fake_get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[]) {
     as_fake(rt)->get_calls++;
     return 0x1234ULL;
 }
 
-void fake_set_tensor_data(RuntimeContext *rt, const ChipTensor &, uint32_t, const uint32_t[], uint64_t) {
+void fake_set_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], uint64_t) {
     as_fake(rt)->set_calls++;
 }
 
@@ -141,7 +141,7 @@ TEST(A5Fatal, ApiShortCircuitsAfterFatal) {
     CoreTaskArgs args;
     uint32_t indices[1] = {0};
     uint32_t shape[1] = {1};
-    ChipTensor tensor = make_tensor_external(reinterpret_cast<void *>(0x1), shape, 1);
+    simpler::tmr::Tensor tensor = simpler::tmr::make_tensor_external(reinterpret_cast<void *>(0x1), shape, 1);
 
     EXPECT_TRUE(rt_submit_task(mixed, args).empty());
     EXPECT_TRUE(alloc_tensors(args).empty());
@@ -187,22 +187,22 @@ TEST(A5Fatal, ScopeGuardForwardsModeUntilLexicalScopeExit) {
     runtime.ops = &kFakeOps;
     RuntimeBindingGuard bind(reinterpret_cast<RuntimeContext *>(&runtime));
 
-    runtime.pending_scope_mode = PTO2ScopeMode::MANUAL;
+    runtime.pending_scope_mode = ScopeMode::MANUAL;
 
     {
         SIMPLER_SCOPE_GUARD();
         EXPECT_EQ(runtime.scope_begin_calls, 1);
         EXPECT_EQ(runtime.scope_end_calls, 0);
-        EXPECT_EQ(runtime.last_scope_mode, PTO2ScopeMode::AUTO);
+        EXPECT_EQ(runtime.last_scope_mode, ScopeMode::AUTO);
     }
 
     EXPECT_EQ(runtime.scope_end_calls, 1);
 
     {
-        SIMPLER_SCOPE_GUARD(PTO2ScopeMode::MANUAL);
+        SIMPLER_SCOPE_GUARD(ScopeMode::MANUAL);
         EXPECT_EQ(runtime.scope_begin_calls, 2);
         EXPECT_EQ(runtime.scope_end_calls, 1);
-        EXPECT_EQ(runtime.last_scope_mode, PTO2ScopeMode::MANUAL);
+        EXPECT_EQ(runtime.last_scope_mode, ScopeMode::MANUAL);
     }
 
     EXPECT_EQ(runtime.scope_end_calls, 2);

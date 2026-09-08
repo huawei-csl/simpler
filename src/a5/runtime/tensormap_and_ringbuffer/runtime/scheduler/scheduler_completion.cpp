@@ -36,7 +36,7 @@
 // =============================================================================
 
 namespace {
-inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+inline constexpr int32_t DEFERRED_RELEASE_CAP = 256;
 }
 
 // Pure function: read register result -> SlotTransition (no side effects).
@@ -79,7 +79,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
-    ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
+    ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
     [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if SIMPLER_DFX
@@ -164,10 +164,11 @@ void SchedulerContext::complete_slot_task(
     if (task_complete && !defer_completion_to_consumer) {
 #if SIMPLER_DFX
         if (is_dump_args_enabled()) {
-            dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, slot_state, ArgsDumpStage::AFTER_COMPLETION,
+            dump_args_for_task<SUBTASK_SLOT_COUNT>(
+                thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
+                ArgsDumpStage::AFTER_COMPLETION,
                 [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                    return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
                 },
                 [this](int32_t func_id) {
                     return get_function_bin_addr(func_id);
@@ -201,28 +202,32 @@ void SchedulerContext::complete_slot_task(
         }
         chip_swimlane.phase_complete_count++;
 #endif
-        if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
-            deferred_release_slot_states[deferred_release_count++] = &slot_state;
-        } else {
-            while (deferred_release_count > 0) {
+        // At capacity, elide deferred releases (including the overflowing slot)
+        // when orchestration is done; otherwise drain then push.
+        bool release_elided = false;
+        if (deferred_release_count >= DEFERRED_RELEASE_CAP) {
+            release_elided = orchestrator_done_.load(std::memory_order_acquire);
+            drain_or_elide_deferred_releases(
+                sched_, deferred_release_slot_states, deferred_release_count, release_elided
 #if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                ,
+                thread_idx
 #endif
-            }
+            );
+        }
+        if (!release_elided) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         }
         completed_this_turn++;
     }
 
 #if SIMPLER_DFX
-    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
     // {start, end, task_token_raw}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
-    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task.
-    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
@@ -245,8 +250,8 @@ void SchedulerContext::complete_slot_task(
     if (is_pmu_enabled()) {
         // Slot key must be the 32-bit register token AICore wrote into
         // dual_issue_slots[task_id & 1].task_id (= DATA_MAIN_BASE value).
-        // task_id.raw is the full PTO2 (ring_id<<32|local_id) encoding —
-        // matching on that would never hit. Pass the PTO2 id separately
+        // task_id.raw is the full (ring_id<<32|local_id) encoding —
+        // matching on that would never hit. Pass the task identity separately
         // for the PmuRecord.
         pmu_aicpu_complete_record(
             core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
@@ -292,7 +297,7 @@ void SchedulerContext::check_running_cores_for_completion(
         {
             ChipTaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
+                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == EARLY_DISPATCH_STAGING) {
                 continue;
             }
         }
@@ -323,12 +328,11 @@ void SchedulerContext::check_running_cores_for_completion(
         uint8_t pending_ss =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr) ?
                 core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) :
-                static_cast<uint8_t>(PTO2_EARLY_DISPATCH_NONE);
+                static_cast<uint8_t>(EARLY_DISPATCH_NONE);
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             (pending_ss == PTO2_EARLY_DISPATCH_STAGING ||
-              (pending_ss == PTO2_EARLY_DISPATCH_DISPATCHED &&
-               core.pending_slot_state->task_attrs.requires_sync_start())));
+             (pending_ss == EARLY_DISPATCH_STAGING ||
+              (pending_ss == EARLY_DISPATCH_DISPATCHED && core.pending_slot_state->task_attrs.requires_sync_start())));
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
@@ -346,7 +350,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // BEFORE any fanin / deferred-release work. Anything later would
         // charge AICPU completion-processing cost to (end → finish).
         uint64_t finish_ts = 0;
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
             finish_ts = get_sys_cnt_aicpu();
         }
 #endif
@@ -407,7 +411,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 promote_pending_to_running(core);
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    if (sched_->maybe_rendezvous_ring(*promoted)) {
+                    if (sched_->try_launch_sync_start_cohort(*promoted)) {
                         sched_->propagate_dispatch_fanin(*promoted);
                     }
                 }
@@ -475,7 +479,7 @@ bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending) {
+int32_t SchedulerContext::count_global_available(ResourceShape shape, uint8_t core_mask, bool include_pending) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
         total += core_trackers_[t].count_available_blocks(shape, core_mask, include_pending);
@@ -493,9 +497,9 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
     [[maybe_unused]] bool record_drain_phases
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    ResourceShape shape = slot_state->active_mask.to_shape();
     uint8_t core_mask = slot_state->active_mask.core_mask();
-    bool mix_split = gated && shape == PTO2ResourceShape::MIX;
+    bool mix_split = gated && shape == ResourceShape::MIX;
     SyncStartStageResult result;
 
     auto stage = [&](CoreTracker::BitStates valid, bool to_pending) {
@@ -516,7 +520,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 claimed[b] = valid.pop_first();
             for (int32_t b = 0; b < claim; b++) {
                 auto core_offset = claimed[b];
-                if (shape == PTO2ResourceShape::MIX) {
+                if (shape == ResourceShape::MIX) {
                     result.running_cores += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
                 }
                 handle_count += prepare_block_for_dispatch(
@@ -534,11 +538,11 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
             }
 #endif
-            uint64_t my_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
+            uint64_t my_mask[EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
             for (int i = 0; i < handle_count; i++) {
                 publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
                 if (gated) {
@@ -549,7 +553,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 }
             }
             if (gated) {
-                for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
                     if (my_mask[w] != 0) {
                         slot_state->payload->staged_core_mask[w].fetch_or(my_mask[w], std::memory_order_seq_cst);
                     }
@@ -564,15 +568,15 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             }
 #endif
             sched_->record_published_blocks(*slot_state, claim);
-            if (gated && shape != PTO2ResourceShape::MIX && !to_pending) result.running_cores += handle_count;
+            if (gated && shape != ResourceShape::MIX && !to_pending) result.running_cores += handle_count;
         }
     };
 
     if (mix_split) {
         stage(tracker.get_mix_split_cluster_offset_states(core_mask), /*to_pending=*/true);
     } else {
-        auto idle = (shape == PTO2ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(core_mask) :
-                                                        tracker.get_idle_core_offset_states(shape);
+        auto idle = (shape == ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(core_mask) :
+                                                    tracker.get_idle_core_offset_states(shape);
         stage(idle, /*to_pending=*/false);
         if (gated) {
             stage(tracker.get_pending_core_offset_states(shape), /*to_pending=*/true);
@@ -622,10 +626,10 @@ void SchedulerContext::handle_drain_mode(
     bool coordinator = thread_idx == 0;
 
     ChipTaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    bool gated = slot_state->payload != nullptr && PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
+    bool gated = slot_state->payload != nullptr && SchedulerState::owns_early_sync_drain(*slot_state->payload);
 
     if (coordinator) {
-        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        ResourceShape shape = slot_state->active_mask.to_shape();
         int32_t available =
             count_global_available(shape, slot_state->active_mask.core_mask(), /*include_pending=*/gated);
         if (available < block_num) {
@@ -685,5 +689,5 @@ void SchedulerContext::handle_drain_mode(
     } else {
         sched_->propagate_dispatch_fanin(*slot_state);
     }
-    PTO2SchedulerState::finish_early_sync_drain(*slot_state->payload);
+    SchedulerState::finish_early_sync_drain(*slot_state->payload);
 }

@@ -65,12 +65,6 @@ def _profiling_config(values: dict[str, Optional[int]]) -> Optional[dict[str, st
     return {name: str(value) for name, value in config.items()}
 
 
-def _validate_profiling_platforms(platforms: list[str], config: Optional[dict[str, str]]) -> None:
-    """Reject generated profiling configurations for unsupported targets."""
-    if config and any(parse_platform(platform)[1] != "sim" for platform in platforms):
-        raise ValueError("generated profiling configurations currently support sim platforms only")
-
-
 def detect_buildable_platforms() -> list:
     """Detect which platforms can be built with available toolchains.
 
@@ -85,8 +79,8 @@ def detect_buildable_platforms() -> list:
         platforms.extend(["a2a3sim", "a5sim"])
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
-    # a2a3 and a5 use the same toolchain and produce identical artifacts;
-    # the difference is runtime-only, so always build both.
+    # a2a3 and a5 share toolchain prerequisites but build separate artifacts
+    # with architecture-specific AICore targets (dav-c220 and dav-c310).
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
@@ -138,8 +132,6 @@ def build_all(
     if not platforms:
         logger.warning("No buildable platforms detected (missing gcc/g++?)")
         return
-
-    _validate_profiling_platforms(platforms, profiling_config)
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
     pto_isa_root_for_metadata: Optional[str] = None

@@ -500,14 +500,15 @@ def pytest_configure(config):
         "fixtures and standalone runners build its Worker with enable_sdma=True "
         "unless worker_workspace=False selects a platform-provisioned "
         "communication-domain workspace. "
-        "Worker-global provisioning creates 48 "
+        "On onboard a2a3, worker-global provisioning creates 48 "
         "device-only STARS streams that sit in the device fault domain, which "
         "makes a later AICore fault on that device cost minutes instead of "
         "~0.3 s (#1425). Two consequences follow from the one marker: such a "
         "test never shares an L2 Worker (the pool key carries the flag) and it "
         "sorts after every ordinary test, so fault-injection cases run on a "
         "device that has never provisioned. The a2a3 CI additionally runs them "
-        "in a step of their own via -m sdma until #1425 is fixed",
+        "in a step of their own via -m sdma until #1425 is fixed. On sim platforms, "
+        "the workspace is inert scratch and no hardware streams are created.",
     )
     config.addinivalue_line(
         "markers",
@@ -722,24 +723,22 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
     items.sort(key=sort_key)
 
-    # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
-    # that all write chip_swimlane_records_<ts>.json to the same directory with
-    # second-precision timestamps, so they trample each other. Block the
-    # combination up front; waiting for a proper device-id-in-filename fix.
+    # The automatic rankN/dN layout is scoped to one same-host L3 Worker. Every
+    # level above NODE owns several L3 Workers, each of which numbers its local
+    # chips from zero, so accepting one would reintroduce directory collisions.
     if config.getoption("--enable-chip-swimlane", default=0) and config.getoption("--rounds", default=1) <= 1:
-        l3_items = [
-            i
-            for i in items
-            if _item_scene_level(i) == SceneTestLevel.NODE and not any(m.name == "skip" for m in i.iter_markers())
+        multi_node_items = [
+            item
+            for item in items
+            if (_item_scene_level(item) or SceneTestLevel.CHIP) > SceneTestLevel.NODE
+            and not any(marker.name == "skip" for marker in item.iter_markers())
         ]
-        if l3_items:
-            sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
-            more = "" if len(l3_items) <= 3 else f" (+{len(l3_items) - 3} more)"
+        if multi_node_items:
+            sample = ", ".join(sorted({item.nodeid for item in multi_node_items})[:3])
+            more = "" if len(multi_node_items) <= 3 else f" (+{len(multi_node_items) - 3} more)"
             raise pytest.UsageError(
-                f"--enable-chip-swimlane is not supported for L3 tests yet — "
-                f"multi-chip-process filename collision unresolved. "
-                f"L3 items in this session: {sample}{more}. "
-                f"Either drop --enable-chip-swimlane or scope to L2 with --level 2."
+                "--enable-chip-swimlane supports automatic multi-Rank merging only for same-host L3 tests; "
+                f"NETWORK1/L4 needs a node namespace before it is safe. Items: {sample}{more}."
             )
 
 
@@ -872,7 +871,45 @@ def _strip_value_options(args, options):
     return stripped
 
 
-def _resource_child_command(spec, device_ids, platform, manual_mode):
+# Options that change what a case does rather than which case runs. The
+# resource child's argv is built from scratch so it can be narrowed to one
+# nodeid (see _build in the dispatcher), which means nothing reaches it that is
+# not listed here — a diagnostic the parent asked for is silently dropped
+# otherwise, and the run passes while producing no artifact at all.
+#
+# The options that select which case runs — --manual and --case — are forwarded
+# by _resource_child_command alongside the nodeid they refine, because a nodeid
+# names a whole SceneTestCase class: `--case` filters inside its single
+# `test_run` item at run time, so a child that does not receive it runs every
+# case of the class the parent narrowed to one.
+_RESOURCE_CHILD_VALUE_OPTIONS = (
+    ("--rounds", 1),
+    ("--enable-chip-swimlane", 0),
+    ("--dump-args", 0),
+    ("--enable-pmu", 0),
+)
+_RESOURCE_CHILD_FLAG_OPTIONS = (
+    "--skip-golden",
+    "--enable-dep-gen",
+    "--enable-scope-stats",
+    "--enable-swimlane-overhead",
+)
+
+
+def _resource_child_diagnostic_argv(cfg):
+    """Forward the parent's diagnostic and round selection to a resource child."""
+    argv = []
+    for option, unset in _RESOURCE_CHILD_VALUE_OPTIONS:
+        value = cfg.getoption(option, default=unset)
+        if value != unset:
+            argv.extend([option, str(value)])
+    for option in _RESOURCE_CHILD_FLAG_OPTIONS:
+        if cfg.getoption(option, default=False):
+            argv.append(option)
+    return argv
+
+
+def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
     command = [
         sys.executable,
         "-m",
@@ -888,6 +925,9 @@ def _resource_child_command(spec, device_ids, platform, manual_mode):
     if platform:
         command.extend(["--platform", platform])
     command.extend(["--manual", manual_mode])
+    for selector in cfg.getoption("--case", default=None) or []:
+        command.extend(["--case", str(selector)])
+    command.extend(_resource_child_diagnostic_argv(cfg))
     return command
 
 
@@ -901,7 +941,7 @@ def _base_pytest_argv(session, *, strip_options=()):
 
 
 def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
-    """Parse the -j/--max-parallel CLI value; 'auto' → platform-aware default."""
+    """Parse --max-parallel; 'auto' selects a platform-aware default."""
     raw = cfg.getoption("--max-parallel", default="auto")
     if raw in (None, "", "auto"):
         return _ps.default_max_parallel(platform or "", device_ids)
@@ -912,6 +952,56 @@ def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
     if val < 1:
         raise pytest.UsageError(f"--max-parallel must be >= 1, got {val}")
     return val
+
+
+def _invocation_has_option(cfg, options):
+    """Return whether the original command line contains one of ``options``."""
+    for arg in cfg.invocation_params.args:
+        text = str(arg)
+        if text in options or any(text.startswith(f"{option}=") for option in options):
+            return True
+    return False
+
+
+def _l2_xdist_options(cfg, max_parallel: int):
+    """Return whether L2 uses xdist, child defaults, and the worker label.
+
+    ``numprocesses`` arrives here as ``None`` or ``0``. A top-level ``-n N``
+    with N > 0 puts xdist in distribution mode, and its ``pytest_runtestloop``
+    runs the whole session before this dispatcher's own hook is reached, so a
+    positive worker count is only ever seen from a direct caller.
+
+    ``--pdb`` is serial whatever ``numprocesses`` says: xdist zeroes the worker
+    count only for ``-n auto`` / ``-n logical``, so a bare ``--pdb`` arrives
+    with it unset — and the L2 child inherits ``--pdb``, which xdist rejects
+    with a usage error as soon as ``-n`` puts the child in distribution mode.
+    """
+    plugin_active = cfg.pluginmanager.hasplugin("xdist")
+    if not plugin_active or cfg.getoption("usepdb", default=False):
+        return False, [], None
+
+    requested_workers = cfg.getoption("numprocesses", default=None)
+    if requested_workers == 0:
+        return False, [], None
+
+    if requested_workers is None and max_parallel <= 1:
+        return False, [], None
+
+    options = []
+    if requested_workers is None:
+        options.extend(["-n", str(max_parallel)])
+    # xdist rewrites its effective default from ``no`` to ``load`` as soon as
+    # ``-n`` is active. Inspect the original command line so that derived
+    # ``load`` does not masquerade as an explicit user choice. ``-d`` is
+    # xdist's shortcut for ``--dist=load`` and overrides a ``--dist`` passed
+    # alongside it, so it is an explicit choice too. The scan sees the
+    # invocation argv only: a ``--dist`` coming from ini ``addopts`` reads as
+    # unset here, and ``addopts`` is prepended to the child's argv, so the
+    # appended default wins over it.
+    if not _invocation_has_option(cfg, {"--dist", "-d"}):
+        options.extend(["--dist", "loadfile"])
+    worker_label = requested_workers if requested_workers is not None else max_parallel
+    return True, options, worker_label
 
 
 def _emit_group(header: str, body: str) -> None:
@@ -1000,7 +1090,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                 # this job in the same subprocess, which has only this job's
                 # allocated devices — e.g. TestL3Group (needs 2) would fail
                 # inside TestL3ChildMemory's 1-device subprocess.
-                return _resource_child_command(_spec, ids, platform, manual_mode)
+                return _resource_child_command(_spec, ids, platform, manual_mode, session.config)
 
             jobs.append(
                 _ps.Job(
@@ -1057,27 +1147,21 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     # ----- Phase 2: L2 per-runtime subprocess -----
     l2_runtimes = _collect_st_runtimes(session.items, level=2)
     l2_failed = False
-    # When we have more than one device, enable pytest-xdist so the L2 phase
-    # spreads classes across devices. Each xdist worker slices --device 0-7
-    # down to one id in its own pytest_configure (above) and the st_worker
-    # fixture is session-scoped inside the worker — one ChipWorker per (runtime,
-    # device), reused across every class assigned to that worker.
-    xdist_available = False
-    if max_parallel > 1:
-        try:
-            import xdist  # noqa: F401,PLC0415
-
-            xdist_available = True
-        except ImportError:
-            print(
-                "\n[warning] -j > 1 but pytest-xdist not installed; "
-                "falling back to serial L2 phase. pip install pytest-xdist to enable.\n",
-                flush=True,
-            )
+    # An active pytest-xdist plugin spreads L2 classes across devices. Each
+    # worker slices --device 0-7 down to one id in pytest_configure (above),
+    # and the session-scoped st_worker fixture reuses one ChipWorker per
+    # (runtime, device).
+    xdist_active, xdist_options, xdist_workers = _l2_xdist_options(cfg, max_parallel)
+    if max_parallel > 1 and not cfg.pluginmanager.hasplugin("xdist") and not cfg.pluginmanager.is_blocked("xdist"):
+        print(
+            "\n[warning] --max-parallel > 1 but the pytest-xdist plugin is not active; "
+            "falling back to serial L2 phase. Install or enable pytest-xdist to use L2 parallelism.\n",
+            flush=True,
+        )
     for rt in l2_runtimes:
         cmd = base_args + ["--runtime", rt, "--level", "2"]
-        if xdist_available:
-            cmd += ["-n", str(max_parallel), "--dist", "loadfile"]
+        if xdist_active:
+            cmd += xdist_options
         # Per-runtime sink for the in-process poison guards (issue #1110). Each
         # xdist worker appends the classes it poison-skips; we re-run them in a
         # fresh subprocess after this one exits so they don't silently lose
@@ -1091,7 +1175,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
         # need to buffer their stdout — we can stream it directly through
         # the group markers. ``::group::`` on its own line before the run
         # opens the fold; ``::endgroup::`` after closes it.
-        label = f"L2 {rt}" + (f" [-n {max_parallel}]" if xdist_available else "")
+        label = f"L2 {rt}" + (f" [-n {xdist_workers}]" if xdist_active else "")
         start = time.monotonic()
         print(f"::group::{label}", flush=True)
         result = subprocess.run(cmd, check=False, cwd=cwd, env=run_env)
@@ -1701,13 +1785,13 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 from simpler_setup.scene_test import (  # noqa: PLC0415
-                    _compile_chip_callable_from_spec,
+                    compile_chip_callable_spec,
                     l3_compile_cache_key,
                 )
 
                 name = entry["name"]
                 cache_key = l3_compile_cache_key(cls.__module__, cls.__qualname__, name, st_platform, runtime)
-                chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
+                chip = compile_chip_callable_spec(entry, st_platform, runtime, cache_key)
                 handle = w.register(chip)
                 chip_handles[name] = handle
                 chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])

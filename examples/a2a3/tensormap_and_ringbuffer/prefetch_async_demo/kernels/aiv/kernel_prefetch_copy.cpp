@@ -42,8 +42,8 @@ using namespace pto;
 #include "pipe_sync.h"
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ ChipTensor *in_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[0]);
-    __gm__ ChipTensor *out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
+    __gm__ Tensor *in_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
 
     __gm__ float *in = reinterpret_cast<__gm__ float *>(in_tensor->buffer.addr) + in_tensor->start_offset;
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
@@ -62,8 +62,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     GlobalData in_global(in);
     GlobalData out_global(out);
 
-    // Runtime-injected SDMA workspace -- no user arg. The host refuses this
-    // marked callable unless SDMA is supported and provisioning succeeded.
+    // Runtime-injected SDMA workspace -- no user arg. On supported platforms
+    // (including sim, which provides inert scratch), get_dma_workspace returns
+    // a non-null address when the Worker requested SDMA; nullptr means injection failed.
     __gm__ uint8_t *sdma_workspace = get_dma_workspace(args, DMA_WORKSPACE_SDMA);
     if (sdma_workspace == nullptr) {
         pipe_barrier(PIPE_ALL);

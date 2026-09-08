@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <new>
 
 #include "callable.h"
 #include "callable_protocol.h"
@@ -48,7 +50,7 @@
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
-#include "task_args.h"
+#include "task_args_wire.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
@@ -65,7 +67,7 @@ namespace {
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
-        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
+        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS
     };
     RuntimeTimeoutParseStatus parse_status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
@@ -107,7 +109,7 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
                                      0;
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
-            "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
+            "Ignoring timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
@@ -173,52 +175,103 @@ void DeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *ad
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-void *DeviceRunnerBase::acquire_graph_definition_buffer(
-    uint32_t pipeline_slot, uint64_t key, size_t bytes, size_t alignment
+int DeviceRunnerBase::acquire_graph_definition_block(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
 ) {
-    if (pipeline_slot >= graph_definition_buffers_.size() || bytes == 0 || alignment == 0 ||
+    if (device_out == nullptr || staging_out == nullptr) return -1;
+    *device_out = nullptr;
+    *staging_out = nullptr;
+    if (pipeline_slot >= graph_definition_blocks_.size() || bytes == 0 || alignment == 0 ||
         (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
-        return nullptr;
+        return -1;
     }
-    RetainedGraphBuffer &buffer = graph_definition_buffers_[pipeline_slot][key];
-    if (buffer.aligned_addr != nullptr && buffer.capacity >= bytes &&
-        reinterpret_cast<uintptr_t>(buffer.aligned_addr) % alignment == 0) {
-        return buffer.aligned_addr;
-    }
-
-    const size_t allocation_bytes = bytes + alignment - 1;
-    void *allocation = mem_alloc_.alloc(allocation_bytes);
-    if (allocation == nullptr) return nullptr;
-    const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-    if (raw > UINTPTR_MAX - (alignment - 1)) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-    if (device_memset(aligned_addr, 0, bytes) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    if (buffer.allocation != nullptr && mem_alloc_.free(buffer.allocation) != 0) {
-        mem_alloc_.free(allocation);
-        return nullptr;
-    }
-    buffer = RetainedGraphBuffer{allocation, aligned_addr, bytes};
-    return aligned_addr;
-}
-
-void DeviceRunnerBase::release_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        for (auto &entry : by_key) {
-            if (entry.second.allocation != nullptr) mem_alloc_.free(entry.second.allocation);
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.aligned_addr == nullptr || block.capacity < bytes ||
+        reinterpret_cast<uintptr_t>(block.aligned_addr) % alignment != 0) {
+        const size_t allocation_bytes = bytes + alignment - 1;
+        void *allocation = mem_alloc_.alloc(allocation_bytes);
+        if (allocation == nullptr) return -1;
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
+        if (raw > UINTPTR_MAX - (alignment - 1)) {
+            mem_alloc_.free(allocation);
+            return -1;
         }
-        by_key.clear();
+        void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
+        if (device_memset(aligned_addr, 0, bytes) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        if (block.allocation != nullptr && mem_alloc_.free(block.allocation) != 0) {
+            mem_alloc_.free(allocation);
+            return -1;
+        }
+        block.allocation = allocation;
+        block.aligned_addr = aligned_addr;
+        block.capacity = bytes;
+    }
+    // Grow-only and never shrunk, so a steady-state bind assembles its objects
+    // in host memory it neither acquires nor returns.
+    if (block.staging.size() < bytes) block.staging.resize(bytes);
+    *device_out = block.aligned_addr;
+    *staging_out = block.staging.data();
+    return 0;
+}
+
+void DeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (addr != nullptr) *addr = nullptr;
+    if (size != nullptr) *size = 0;
+    if (pipeline_slot >= graph_definition_blocks_.size()) return;
+    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
+    if (block.staging.empty()) return;
+    if (addr != nullptr) *addr = block.staging.data();
+    if (size != nullptr) *size = block.staging.size();
+}
+
+int DeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= sm_mirrors_.size() || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+        bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &mirror = sm_mirrors_[pipeline_slot];
+    // Grow-only and never shrunk: the task capacity is fixed for a given run
+    // configuration, so past the first bind the image is written into host pages
+    // that are already mapped, and each page of it faults once per process rather
+    // than once per bind.
+    const size_t needed = bytes + alignment - 1;
+    if (mirror.capacity < needed) {
+        // `new[]` on a trivially-typed array default-initializes, so the block
+        // costs no page until a bind writes one; make_unique would zero it. The
+        // outgoing block's bytes are not carried over, because nothing reads a byte
+        // this bind did not write.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        mirror.storage = std::move(storage);
+        mirror.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(mirror.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void DeviceRunnerBase::release_sm_mirrors() {
+    for (RetainedSmMirror &mirror : sm_mirrors_) {
+        mirror.storage.reset();
+        mirror.capacity = 0;
     }
 }
 
-void DeviceRunnerBase::abandon_graph_definition_buffers() {
-    for (GraphDefinitionBufferMap &by_key : graph_definition_buffers_) {
-        by_key.clear();
+void DeviceRunnerBase::release_graph_definition_blocks() {
+    for (RetainedGraphBlock &block : graph_definition_blocks_) {
+        if (block.allocation != nullptr) mem_alloc_.free(block.allocation);
+        block = RetainedGraphBlock{};
+    }
+}
+
+void DeviceRunnerBase::abandon_graph_definition_blocks() {
+    for (RetainedGraphBlock &block : graph_definition_blocks_) {
+        block = RetainedGraphBlock{};
     }
 }
 
@@ -307,7 +360,7 @@ int DeviceRunnerBase::setup_static_arena(
         LOG_ERROR("arena bank %u is outside [0, %zu)", arena_bank, arena_banks_.size());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
+    // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
     // block. Each arena commits exactly one region, so its base() is the
@@ -496,7 +549,15 @@ int DeviceRunnerBase::ensure_device_initialized() {
     rc = ensure_binaries_loaded();
     if (rc != 0) return rc;
 
-    return ensure_aicpu_init_launched();
+    // Before the AICPU init launch: that launch is what publishes the workspace
+    // addresses, and it happens once.
+    rc = ensure_dma_workspace_provisioned();
+    if (rc != 0) return rc;
+
+    rc = ensure_aicpu_init_launched();
+    if (rc != 0) return rc;
+
+    return ensure_dma_workspace_warmed();
 }
 
 int DeviceRunnerBase::ensure_aicpu_init_launched() {
@@ -506,14 +567,18 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
 
     InitArgs init_args{};
     init_args.device_id = static_cast<uint32_t>(device_id_);
+    // The device threshold is set here and never again: this entry launches once
+    // per Worker, so a later host-side set_level does not reach the AICPU. That is
+    // the intended contract, not a missing refresh — recreate the Worker to change
+    // it. docs/logging.md records why.
     init_args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
-    // Publish the provisioned async-DMA workspace addresses (all-zero until a
-    // Worker opts into SDMA). provision_dma_workspace() re-launches this entry to
-    // re-latch them; the AICPU SO stays resident, so the latest values survive
-    // every subsequent per-task launch.
+    // Publish the provisioned async-DMA workspace addresses (all-zero unless the
+    // Worker opted into SDMA). ensure_dma_workspace_provisioned() runs first, so
+    // this single launch carries them; the AICPU SO stays resident, and the
+    // values survive every subsequent per-task launch.
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
         init_args.dma_workspace_addr[kind] = dma_workspace_addr_[kind];
     }
@@ -929,17 +994,41 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-int DeviceRunnerBase::provision_dma_workspace(
-    uint32_t required_mask, const void *sdma_warmup_binary, size_t sdma_warmup_size
-) {
+int DeviceRunnerBase::ensure_dma_workspace_provisioned() {
+    if (dma_workspace_handle_ != nullptr) {
+        return 0;
+    }
     const uint32_t supported = dma_workspace_supported_mask();
-    if ((required_mask & ~supported) != 0) {
-        LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
+    constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
+    // Opting in on a device that cannot provide SDMA is a caller error, not a
+    // silent no-op: a Worker built for TPREFETCH_ASYNC must not reach its first
+    // run reading a zero workspace address.
+    if (sdma_requested_ && (supported & kSdmaBit) == 0) {
+        LOG_ERROR("dma workspace: SDMA requested where unsupported (supported=0x%x)", supported);
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
-    if (dma_workspace_handle_ != nullptr) {
-        LOG_ERROR("provision_dma_workspace: workspace already provisioned");
-        return PTO_RUNTIME_ERR_INTERNAL;
+    // Everything this device supports, minus what the caller declined. SDMA is
+    // the only declinable engine: its workspace cannot be obtained without also
+    // creating 48 CP-process STARS streams, which halves this Worker's
+    // post-fault reset budget, so a Worker that did not ask for it must not end
+    // up holding them. Every other supported engine carries no such cost and is
+    // provisioned unconditionally.
+    const uint32_t required_mask = sdma_requested_ ? supported : (supported & ~kSdmaBit);
+    if (required_mask == 0) {
+        return 0;
+    }
+    // Dormant while one engine is supported, since required_mask is a subset of
+    // supported. It arms itself on the day dma_workspace_supported_mask() widens,
+    // which is the day the single-handle contract breaks — dma_workspace_release()
+    // casts the opaque handle back to the one provider type it can be, so a second
+    // engine would be released as the type of the first. A rejection here beats
+    // that silent type confusion.
+    if ((required_mask & (required_mask - 1)) != 0) {
+        LOG_ERROR(
+            "dma workspace: mask=0x%x names %d engines; one handle owns one provider", required_mask,
+            __builtin_popcount(required_mask)
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     }
 
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
@@ -949,41 +1038,34 @@ int DeviceRunnerBase::provision_dma_workspace(
     int rc =
         dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
     if (rc != 0) {
-        LOG_ERROR("provision_dma_workspace: mask=0x%x failed: %d", required_mask, rc);
+        LOG_ERROR("dma workspace: mask=0x%x failed: %d", required_mask, rc);
         for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
             dma_workspace_addr_[kind] = 0;
         dma_workspace_handle_ = nullptr;
         return rc;
     }
+    return 0;
+}
 
-    // Re-latch the resident AICPU globals: simpler_aicpu_init publishes the
-    // provisioned addresses into g_dma_workspace_addr, which the scheduler
-    // prefills into every core's GlobalContext (get_dma_workspace). The AICPU SO
-    // stays dlopen'd, so the values survive every subsequent per-task launch.
-    aicpu_init_launched_ = false;
-    rc = ensure_aicpu_init_launched();
+int DeviceRunnerBase::ensure_dma_workspace_warmed() {
+    if (dma_workspace_handle_ == nullptr || sdma_warmed_) {
+        return 0;
+    }
+    // An unavailable warmup leaves init successful, because the only cost is
+    // first-call latency. A device error does not: the card the warmup just
+    // faulted on would otherwise reach the first run. No dma_workspace_release()
+    // on that path — launch_sdma_warmup_kernel() has marked the runner unusable,
+    // and per-resource release on a faulted card is exactly what finalize()'s
+    // fatal path exists to avoid. The workspace handle stays set so that path
+    // still sees an SDMA generation and applies its handoff delay.
+    const int rc = launch_sdma_warmup_kernel(sdma_warmup_binary_.data(), sdma_warmup_binary_.size());
     if (rc != 0) {
-        LOG_ERROR("provision_dma_workspace: re-latch of simpler_aicpu_init failed: %d", rc);
-        dma_workspace_release(dma_workspace_handle_);
-        dma_workspace_handle_ = nullptr;
-        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
-            dma_workspace_addr_[kind] = 0;
+        LOG_ERROR("dma workspace: sdma warmup left the device unusable: %d", rc);
         return rc;
     }
-
-    // Deliberately after the re-latch: warming needs the live workspace. An
-    // unavailable warmup leaves provisioning successful, because the only cost is
-    // first-call latency. A device error does not: the card the warmup just faulted
-    // on would otherwise reach the first run. No dma_workspace_release() on that
-    // path — launch_sdma_warmup_kernel() has marked the runner unusable, and
-    // per-resource release on a faulted card is exactly what finalize()'s fatal
-    // path exists to avoid. The workspace handle stays set so that path still sees
-    // an SDMA generation and applies its handoff delay.
-    rc = launch_sdma_warmup_kernel(sdma_warmup_binary, sdma_warmup_size);
-    if (rc != 0) {
-        LOG_ERROR("provision_dma_workspace: sdma warmup left the device unusable: %d", rc);
-        return rc;
-    }
+    sdma_warmed_ = true;
+    sdma_warmup_binary_.clear();
+    sdma_warmup_binary_.shrink_to_fit();
     return 0;
 }
 
@@ -1199,6 +1281,7 @@ void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
     // without dep_gen falls through to the base no-op.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_scope_stats_enabled(config.enable_scope_stats != 0);
+    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
@@ -1221,8 +1304,14 @@ HostPhaseRecordPool *DeviceRunnerBase::host_phase_pool_arm(bool producer_wants_r
     }
     if (!swimlane_wants_records) return pool;
 
-    // Only the chip-swimlane reader places these records against device
-    // timestamps, so only it needs the two clocks anchored.
+    begin_clock_correlation_session_if_needed();
+    return pool;
+}
+
+void DeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
+    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
+        return;
+    }
     try {
         clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
         chip_swimlane_collector_.begin_clock_correlation_session(
@@ -1243,7 +1332,6 @@ HostPhaseRecordPool *DeviceRunnerBase::host_phase_pool_arm(bool producer_wants_r
             chip_swimlane_collector_.finish_clock_correlation_session();
         }
     }
-    return pool;
 }
 
 void DeviceRunnerBase::publish_host_phase_records_to_swimlane() {
@@ -1383,6 +1471,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // the SDMA warmup ELF's separate handle.
     aicore_bin_handle_ = nullptr;
     sdma_warmup_bin_handle_ = nullptr;
+    sdma_warmed_ = false;
     binaries_loaded_ = false;
     // The inner AICPU SO is unloaded with the binaries above, so its latched
     // globals are gone too — clear the one-shot guard so a reused runner
@@ -1415,7 +1504,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     aicpu_seen_callable_ids_.clear();
     aicpu_dlopen_total_ = 0;
 
-    // Release the three per-Worker pooled arenas (GM heap, PTO2 SM, optional
+    // Release the three per-Worker pooled arenas (GM heap, shared memory, optional
     // trb prebuilt runtime arena — each its own device_malloc). Must precede
     // mem_alloc_.finalize() so the arenas free through the still-live
     // allocator, not after it.
@@ -1438,13 +1527,16 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     prebuilt_runtime_arena_cache_image_.clear();
 
     if (abandon_device_resources) {
-        abandon_graph_definition_buffers();
+        abandon_graph_definition_blocks();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
     } else {
-        release_graph_definition_buffers();
+        release_graph_definition_blocks();
         clear_temporary_buffer();
     }
+    // Pure host memory, so it is returned on both paths — a force reset
+    // invalidated device allocations, not these pages.
+    release_sm_mirrors();
 
     // Free the device-phase/task-timing buffer (allocated lazily in run()) while
     // mem_alloc_ and the device context are still live. free_tensor() routes
@@ -1810,6 +1902,7 @@ void DeviceRunnerBase::start_shared_collectors_for_run() {
         return create_thread(std::move(fn));
     };
     if (enable_chip_swimlane_) {
+        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
         chip_swimlane_collector_.start(thread_factory);
     }
     if (enable_dump_args_) {
@@ -1844,7 +1937,7 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
     // set on CallConfig (CallConfig::validate() enforces non-empty upstream).
     finish_clock_correlation_session(device_execution_complete, !can_accept_run());
     if (enable_chip_swimlane_) {
-        chip_swimlane_collector_.stop();
+        chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
         publish_host_phase_records_to_swimlane();
@@ -1854,18 +1947,18 @@ void DeviceRunnerBase::teardown_shared_collectors_after_run(bool device_executio
     write_host_phase_records_artifact();
 
     if (enable_dump_args_) {
-        dump_collector_.stop();
+        dump_collector_.quiesce();
         dump_collector_.reconcile_counters();
         dump_collector_.export_dump_files();
     }
 
     if (enable_pmu_) {
-        pmu_collector_.stop();
+        pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();
     }
 
     if (enable_scope_stats_) {
-        scope_stats_collector_.stop();
+        scope_stats_collector_.quiesce();
         scope_stats_collector_.reconcile_counters();
         scope_stats_collector_.write_jsonl(output_prefix_);
     }

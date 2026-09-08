@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <algorithm>
 #include <cerrno>
+#include <fstream>
 #include <sstream>
 #include <set>
 #include <string>
@@ -51,10 +52,7 @@ struct CannLogLevelCall {
 
 CannLogLevelCall g_cann_log_level_call{};
 SimplerHostLogState g_shared_log_state{
-    SIMPLER_HOST_LOG_STATE_ABI_VERSION,
-    sizeof(SimplerHostLogState),
-    static_cast<int32_t>(LogLevel::TIMING),
-    0,
+    static_cast<int32_t>(LogLevel::TIMING), 0, 0, {}, 0, 0, nullptr, nullptr, 0, 0, 0, {}, 0,
 };
 
 int capture_cann_log_level(int module_id, int level, int enable_event) {
@@ -79,6 +77,7 @@ CapturedStdio run_with_config(LogLevel level, Fn &&fn) {
     HostLogger::get_instance().set_level(level);
 
     fn();
+    EXPECT_TRUE(HostLogger::get_instance().flush());
 
     fflush(stdout);
     fflush(stderr);
@@ -103,15 +102,8 @@ CapturedStdio run_with_config(LogLevel level, Fn &&fn) {
 
 }  // namespace
 
-TEST(HostLogTest, SharedStateBindingValidatesAbiAndOwnsThreshold) {
-    SimplerHostLogState bad_version = g_shared_log_state;
-    bad_version.abi_version++;
+TEST(HostLogTest, SharedStateBindingValidatesThresholdAndOwnsIt) {
     EXPECT_NE(simpler_host_log_bind_state(nullptr), 0);
-    EXPECT_NE(simpler_host_log_bind_state(&bad_version), 0);
-
-    SimplerHostLogState bad_size = g_shared_log_state;
-    bad_size.struct_size = sizeof(SimplerHostLogState) - 1;
-    EXPECT_NE(simpler_host_log_bind_state(&bad_size), 0);
 
     SimplerHostLogState bad_threshold = g_shared_log_state;
     bad_threshold.threshold = 26;
@@ -120,6 +112,9 @@ TEST(HostLogTest, SharedStateBindingValidatesAbiAndOwnsThreshold) {
     g_shared_log_state.threshold = static_cast<int32_t>(LogLevel::ERROR);
     g_shared_log_state.clock_anchor_pid = 0;
     ASSERT_EQ(simpler_host_log_bind_state(&g_shared_log_state), 0);
+    // This executable supplies the process-owned storage; production consumers
+    // only take the exported bind path and therefore cannot create its writer.
+    ASSERT_EQ(HostLogger::get_instance().adopt_state(&g_shared_log_state), 0);
     EXPECT_EQ(HostLogger::get_instance().state(), &g_shared_log_state);
     EXPECT_EQ(HostLogger::get_instance().level(), static_cast<int>(LogLevel::ERROR));
     EXPECT_FALSE(HostLogger::get_instance().is_enabled(LogLevel::WARN));
@@ -153,6 +148,7 @@ TEST(HostLogTest, HostSpanEnabledFollowsTimingVisibility) {
         EXPECT_EQ(unified_log_host_span_enabled(), expected);
     }
     HostLogger::get_instance().set_level(LogLevel::TIMING);
+    EXPECT_TRUE(HostLogger::get_instance().flush());
 }
 
 TEST(HostLogTest, ErrorLevelEmitsErrorOnly) {
@@ -247,6 +243,7 @@ TEST(HostLogTest, EmitPrefixHasMonotonicNanosecondsAndTid) {
 }
 
 TEST(HostLogTest, TimingStartupEmitsOneClockAnchorPerProcess) {
+    ASSERT_TRUE(HostLogger::get_instance().prepare_to_fork());
     int log_pipe[2];
     ASSERT_EQ(pipe(log_pipe), 0);
 
@@ -260,6 +257,7 @@ TEST(HostLogTest, TimingStartupEmitsOneClockAnchorPerProcess) {
         HostLogger::get_instance().set_level(LogLevel::TIMING);
         HostLogger::get_instance().log(LogLevel::TIMING, "child", "first-record");
         HostLogger::get_instance().log(LogLevel::TIMING, "child", "second-record");
+        if (!HostLogger::get_instance().flush()) _exit(3);
         _exit(0);
     }
 
@@ -276,6 +274,7 @@ TEST(HostLogTest, TimingStartupEmitsOneClockAnchorPerProcess) {
     ASSERT_EQ(waitpid(child, &status, 0), child);
     ASSERT_TRUE(WIFEXITED(status));
     ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(HostLogger::get_instance().start_writer());
 
     const size_t anchor_pos = captured.find("[CLOCK_ANCHOR]");
     ASSERT_NE(anchor_pos, std::string::npos);
@@ -322,19 +321,23 @@ TEST(HostLogTest, AllOutputGoesToStderr) {
     EXPECT_NE(captured.err.find("debug-output-marker"), std::string::npos);
 }
 
+TEST(HostLogTest, LongHumanRecordFitsPortableAtomicWriteBound) {
+    const std::string payload(4096, 'x');
+    auto captured = run_with_config(LogLevel::ERROR, [&] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "long_record", "%s", payload.c_str());
+    });
+
+    EXPECT_EQ(captured.out, "");
+    ASSERT_EQ(captured.err.size(), static_cast<size_t>(_POSIX_PIPE_BUF));
+    EXPECT_EQ(std::count(captured.err.begin(), captured.err.end(), '\n'), 1);
+    EXPECT_EQ(captured.err[captured.err.size() - 2], '~');
+    EXPECT_EQ(captured.err.back(), '\n');
+}
+
 TEST(HostLogTest, HostSpanEscapesDelimitersAndFitsAtomicPipeRecord) {
     const std::string name = "bad name\n[STRACE]=x";
     const std::string attributes = "run_id=7 role=worker\n[STRACE] injected=1 " + std::string(4096, 'x');
-    const SimplerHostSpan span{SIMPLER_HOST_SPAN_ABI_VERSION,
-                               sizeof(SimplerHostSpan),
-                               7,
-                               0x1234,
-                               0,
-                               0,
-                               100,
-                               25,
-                               name.c_str(),
-                               attributes.c_str()};
+    const SimplerHostSpan span{7, 0x1234, 0, 0, 100, 25, name.c_str(), attributes.c_str()};
 
     auto captured = run_with_config(LogLevel::TIMING, [&] {
         unified_log_host_span(&span);
@@ -352,11 +355,157 @@ TEST(HostLogTest, HostSpanEscapesDelimitersAndFitsAtomicPipeRecord) {
     EXPECT_EQ(record[record.size() - 2], '~');
 }
 
+// The output directory is frozen on the first non-empty value, so a test that
+// needs its own clears the binding first — the same shape as this file's
+// existing `clock_anchor_pid` resets. Restoring it on scope exit is what keeps
+// one directory test from redirecting every later test's records away from
+// stderr, including when an ASSERT leaves the test early.
+class ScopedLogDirectory {
+public:
+    explicit ScopedLogDirectory(const char *directory) {
+        unbind();
+        HostLogger::get_instance().set_log_directory(directory);
+    }
+
+    ~ScopedLogDirectory() { unbind(); }
+
+    ScopedLogDirectory(const ScopedLogDirectory &) = delete;
+    ScopedLogDirectory &operator=(const ScopedLogDirectory &) = delete;
+
+private:
+    static void unbind() {
+        g_shared_log_state.log_directory_bound = 0;
+        g_shared_log_state.log_directory[0] = '\0';
+    }
+};
+
+std::string read_log_file(const char *directory, pid_t pid) {
+    const std::string path = std::string(directory) + "/host." + std::to_string(static_cast<int>(pid)) + ".log";
+    std::ifstream input(path);
+    if (!input.good()) return "";
+    return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+}
+
+TEST(HostLogTest, LogDirectorySendsEveryRecordToOneAsyncFilePerProcess) {
+    char directory_template[] = "/tmp/simpler-host-strace-XXXXXX";
+    char *directory = mkdtemp(directory_template);
+    ASSERT_NE(directory, nullptr);
+    ScopedLogDirectory scoped_log_directory(directory);
+    ASSERT_STREQ(HostLogger::get_instance().log_directory(), directory);
+
+    const SimplerHostSpan nested{7, 0x1234, 1, 0, 100, 25, "chip.run.bind", "run_id=7"};
+    const SimplerHostSpan root{7, 0x1234, 0, 0, 90, 50, "chip.run", "run_id=7"};
+    g_shared_log_state.clock_anchor_pid = 0;
+    const auto captured = run_with_config(LogLevel::TIMING, [&] {
+        unified_log_host_span(&nested);
+        unified_log_host_span(&root);
+    });
+    // The destination belongs to the logger, so nothing is left behind on
+    // stderr — not the spans and not the anchor they are unreadable without.
+    EXPECT_EQ(captured.err, "");
+
+    const std::string contents = read_log_file(directory, getpid());
+    std::istringstream records(contents);
+    std::string anchor_record;
+    std::string nested_record;
+    std::string root_record;
+    ASSERT_TRUE(static_cast<bool>(std::getline(records, anchor_record)));
+    ASSERT_TRUE(static_cast<bool>(std::getline(records, nested_record)));
+    ASSERT_TRUE(static_cast<bool>(std::getline(records, root_record)));
+    EXPECT_NE(anchor_record.find("[CLOCK_ANCHOR] v=1"), std::string::npos);
+    // Field sequence, not just the name: `name=chip.run` is a prefix of
+    // `name=chip.run.bind`, so a name alone cannot tell the root record from the
+    // nested one.
+    EXPECT_NE(nested_record.find("depth=1 name=chip.run.bind ts=100 dur=25"), std::string::npos) << nested_record;
+    EXPECT_NE(root_record.find("depth=0 name=chip.run ts=90 dur=50"), std::string::npos) << root_record;
+    std::string extra_record;
+    EXPECT_FALSE(static_cast<bool>(std::getline(records, extra_record)));
+
+    // Every line went through the same envelope, which is what lets one reader
+    // parse the anchor and the spans out of this one file.
+    for (const std::string &record : {anchor_record, nested_record, root_record}) {
+        EXPECT_EQ(record.find("[mono_ns="), 0u) << record;
+    }
+
+    const std::string path = std::string(directory) + "/host." + std::to_string(static_cast<int>(getpid())) + ".log";
+    EXPECT_EQ(unlink(path.c_str()), 0);
+    EXPECT_EQ(rmdir(directory), 0);
+}
+
+TEST(HostLogTest, ExplicitDrainMakesAllAcceptedFileRecordsVisible) {
+    char directory_template[] = "/tmp/simpler-host-log-ordinary-XXXXXX";
+    char *directory = mkdtemp(directory_template);
+    ASSERT_NE(directory, nullptr);
+    ScopedLogDirectory scoped_log_directory(directory);
+
+    g_shared_log_state.clock_anchor_pid = 0;
+    const auto captured = run_with_config(LogLevel::TIMING, [] {
+        HostLogger::get_instance().log(LogLevel::ERROR, "fn", "disk-please");
+        HostLogger::get_instance().log(LogLevel::TIMING, "fn", "queued-please");
+    });
+    EXPECT_EQ(captured.err, "");
+
+    // run_with_config performs the explicit shutdown/test drain. Severity no
+    // longer selects a producer-side flush path: both records use one queue.
+    const std::string contents = read_log_file(directory, getpid());
+    EXPECT_NE(contents.find("disk-please"), std::string::npos);
+    EXPECT_NE(contents.find("queued-please"), std::string::npos);
+
+    const std::string path = std::string(directory) + "/host." + std::to_string(static_cast<int>(getpid())) + ".log";
+    EXPECT_EQ(unlink(path.c_str()), 0);
+    EXPECT_EQ(rmdir(directory), 0);
+}
+
+TEST(HostLogTest, ForkBoundaryDrainsParentAndChildOpensItsOwnFile) {
+    char directory_template[] = "/tmp/simpler-host-strace-fork-XXXXXX";
+    char *directory = mkdtemp(directory_template);
+    ASSERT_NE(directory, nullptr);
+    ScopedLogDirectory scoped_log_directory(directory);
+    // Emission is gated on the live threshold, and an unbound module defaults to
+    // NUL, so this test sets the level rather than inheriting whatever an earlier
+    // test in this binary left behind.
+    HostLogger::get_instance().set_level(LogLevel::TIMING);
+
+    const SimplerHostSpan parent_span{8, 0x1234, 1, 0, 100, 25, "parent.span", ""};
+    unified_log_host_span(&parent_span);
+    // Production uses this same quiescent boundary before a hierarchical
+    // Worker forks: accepted parent records are drained and the thread joined.
+    ASSERT_TRUE(HostLogger::get_instance().prepare_to_fork());
+
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        const SimplerHostSpan child_span{9, 0x1234, 0, 0, 200, 25, "child.span", ""};
+        HostLogger::get_instance().set_level(LogLevel::TIMING);
+        unified_log_host_span(&child_span);
+        if (!HostLogger::get_instance().flush()) _exit(3);
+        _exit(0);
+    }
+    ASSERT_TRUE(HostLogger::get_instance().start_writer());
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    const std::string parent_path =
+        std::string(directory) + "/host." + std::to_string(static_cast<int>(getpid())) + ".log";
+    const std::string child_path = std::string(directory) + "/host." + std::to_string(static_cast<int>(child)) + ".log";
+    std::ifstream child_input(child_path);
+    ASSERT_TRUE(child_input.good());
+    const std::string child_contents((std::istreambuf_iterator<char>(child_input)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(child_contents.find("name=parent.span"), std::string::npos);
+    EXPECT_NE(child_contents.find("name=child.span"), std::string::npos);
+    std::ifstream parent_input(parent_path);
+    const std::string parent_contents((std::istreambuf_iterator<char>(parent_input)), std::istreambuf_iterator<char>());
+    EXPECT_NE(parent_contents.find("name=parent.span"), std::string::npos);
+    EXPECT_EQ(parent_contents.find("name=child.span"), std::string::npos);
+    EXPECT_EQ(unlink(parent_path.c_str()), 0);
+    EXPECT_EQ(unlink(child_path.c_str()), 0);
+    EXPECT_EQ(rmdir(directory), 0);
+}
+
 TEST(HostLogTest, DisabledHostSpanProducesNoRecord) {
-    const SimplerHostSpan span{
-        SIMPLER_HOST_SPAN_ABI_VERSION, sizeof(SimplerHostSpan), 7, 0x1234, 0, 0, 100, 25, "host.dispatch",
-        "run_id=7 role=scheduler"
-    };
+    const SimplerHostSpan span{7, 0x1234, 0, 0, 100, 25, "node.dispatch", "run_id=7 role=scheduler"};
 
     auto captured = run_with_config(LogLevel::WARN, [&] {
         unified_log_host_span(&span);
@@ -375,16 +524,7 @@ TEST(HostLogTest, AllHostSpanEmitPathsPreserve64BitInvocationIds) {
         { simpler::strace::StraceScope scope("scope_path"); }
         simpler::strace::emit_host_span_at("explicit_path", 100, 25, 0);
 
-        const SimplerHostSpan span{SIMPLER_HOST_SPAN_ABI_VERSION,
-                                   sizeof(SimplerHostSpan),
-                                   invocation_id,
-                                   callable_hash,
-                                   0,
-                                   0,
-                                   200,
-                                   30,
-                                   "c_abi_path",
-                                   ""};
+        const SimplerHostSpan span{invocation_id, callable_hash, 0, 0, 200, 30, "c_abi_path", ""};
         unified_log_host_span(&span);
     });
 
@@ -406,16 +546,7 @@ TEST(HostLogTest, HostSpanTruncationDropsAWholeEscapeRatherThanItsLastByte) {
     // 3 (leading escape) + 186 + 3 (trailing escape) is exactly the 192-byte
     // attribute budget, so the next byte truncates on an escape boundary.
     const std::string attributes = "\n" + std::string(186, 'x') + "\ny";
-    const SimplerHostSpan span{SIMPLER_HOST_SPAN_ABI_VERSION,
-                               sizeof(SimplerHostSpan),
-                               7,
-                               0x1234,
-                               0,
-                               0,
-                               100,
-                               25,
-                               "node.dispatch",
-                               attributes.c_str()};
+    const SimplerHostSpan span{7, 0x1234, 0, 0, 100, 25, "node.dispatch", attributes.c_str()};
 
     auto captured = run_with_config(LogLevel::TIMING, [&] {
         unified_log_host_span(&span);
@@ -430,6 +561,7 @@ TEST(HostLogTest, HostSpanTruncationDropsAWholeEscapeRatherThanItsLastByte) {
 }
 
 TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
+    ASSERT_TRUE(HostLogger::get_instance().prepare_to_fork());
     int log_pipe[2];
     int start_pipe[2];
     ASSERT_EQ(pipe(log_pipe), 0);
@@ -437,7 +569,7 @@ TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
 
     const long pipe_buf = fpathconf(log_pipe[1], _PC_PIPE_BUF);
     ASSERT_GT(pipe_buf, 256);
-    const size_t payload_size = static_cast<size_t>(std::min<long>(pipe_buf - 256, 2048));
+    constexpr size_t payload_size = 128;
     constexpr int child_count = 16;
     constexpr int records_per_child = 128;
 
@@ -462,6 +594,7 @@ TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
                     LogLevel::ERROR, "fork_writer", "child=%d seq=%d payload=%s", child, seq, payload.c_str()
                 );
             }
+            if (!HostLogger::get_instance().flush(5000)) _exit(3);
             _exit(0);
         }
         children.push_back(pid);
@@ -501,6 +634,7 @@ TEST(HostLogTest, ForkedProcessesEmitWholePipeRecords) {
         }
     }
     reader.join();
+    ASSERT_TRUE(HostLogger::get_instance().start_writer());
 
     std::vector<std::vector<bool>> seen(child_count, std::vector<bool>(records_per_child, false));
     std::set<int> anchor_pids;

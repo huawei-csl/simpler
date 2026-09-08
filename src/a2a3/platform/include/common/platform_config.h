@@ -77,10 +77,17 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
 
 /**
- * Default onboard AICPU scheduler no-progress timeout (milliseconds).
- * Shared with host-side timeout ordering validation.
+ * Default AICPU scheduler no-progress timeout (milliseconds).
+ * One value for every platform variant: onboard and sim run the same
+ * no-progress watchdog, and a single constant keeps them from drifting.
+ * Must stay below PLATFORM_OP_EXECUTE_TIMEOUT_US so that onboard the AICPU
+ * declares the hang and flushes its diagnostics before STARS reaps the op.
+ * Sized to outlast a slow CPU-sim kernel on an oversubscribed host, where
+ * the AICPU scheduler threads share cores with the AICore threads.
+ * Shared with host-side timeout ordering validation. Overridden at runtime
+ * by SIMPLER_SCHEDULER_TIMEOUT_MS when that env var is valid.
  */
-constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 10000;
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 20000;
 
 /**
  * Default host-side stream synchronization timeout (milliseconds).
@@ -337,14 +344,14 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is 4672 B (16 ChipTensor blobs + small header), so a buffer
+ * Each DepGenRecord is 4736 B (32 ChipTensor blobs + small header), so a buffer
  * of 1024 records is ~4.6 MB; draining one copies that over SVM.
  * Guaranteed one-shot capacity = BUFFERS_PER_INSTANCE × RECORDS_PER_BUFFER
  * records — the size of a back-to-back submit flood the pool absorbs even if
  * the host never drains. At 4×1024 that is 4096 submits, which aligns
  * dep_gen's in-flight record count with the scope_stats / l2 AicoreTask pools
  * (also 4096) per the #977 cross-subsystem review. By in-flight BYTES dep_gen
- * cannot align (its 4672 B record is 70–90× the others); that tension is
+ * cannot align (its 4736 B record is 70–90× the others); that tension is
  * inherent — see docs/dfx/dfx-buffer-capacity-audit.md.
  * History: original 32 (commit 77ef83c0) → #977 commit 3f977e54 overshot to
  * 2048 → 1024 here (#977 Primary's actual proposal; the 2× was no gain).

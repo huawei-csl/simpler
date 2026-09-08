@@ -216,7 +216,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | n/a | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA as an opt-in alternative |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA as an opt-in alternative |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -237,6 +237,19 @@ the resident `KernelArgs`, and injects it into every run's kernel
 SDMA streams and its kernels read a zero workspace address. The workspace is
 released at Worker finalize by ordinary stream/manager teardown.
 
+**`enable_sdma` is a defect quarantine, not a capability switch, and it has an
+exit condition.** Selecting an engine already belongs to the kernel, which reads
+whichever addresses were injected; the runtime would otherwise provision every
+engine the platform supports. SDMA is the exception because
+`SdmaWorkspaceManager::Init()` is indivisible — the 16 KB workspace *is* the
+descriptor table for 48 CP-process STARS streams, so there is no way to have the
+address without holding the streams — and a Worker holding those streams gets a
+single device-reset attempt instead of three after an AICore fault. Defaulting it
+on would therefore put every ordinary Worker in that population, which is exactly
+the regression [the investigation](investigations/2026-07-a2a3-sdma-fault-teardown.md)
+records. The flag disappears once CANN bounds the final CP-process stream release,
+or once pto-isa offers an `Init()` that separates the workspace from the streams.
+
 Provisioning also warms the SDMA control path once, in the same call: a
 vector-only AICore ELF (`sdma_warmup_kernel.o`, staged per arch under
 `build/lib/<arch>/sdma_warmup/`) walks every channel so the first
@@ -256,11 +269,14 @@ streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
 so ordinary workloads are unaffected — see
 [docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
-and issue #1425. `enable_sdma` is currently honored only by the a2a3 onboard
-`tensormap_and_ringbuffer` runtime; host-build-graph, simulation, a5, and
-provider-disabled builds fail Worker init fast when it is set. A5 provisions
+and issue #1425. `enable_sdma` is honored by **both** a2a3 onboard runtimes: the
+PTO-SDMA provider is compiled into every a2a3 onboard `host_runtime.so`, so the
+gate is the platform, not the runtime. Only `tensormap_and_ringbuffer` is
+exercised with it, so host-build-graph's path from a provisioned address to a
+kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
+and provider-disabled builds fail Worker init fast when it is set. A5 provisions
 its communication-context SDMA workspace by default; this is separate from
-the callable-declared workspace mechanism controlled by `enable_sdma`.
+the Worker-level workspace mechanism controlled by `enable_sdma`.
 
 ---
 

@@ -43,6 +43,7 @@
 
 #include "../task_interface/buffer.h"
 #include "../task_interface/call_config.h"
+#include "../worker/device_memory_info.h"
 #include "remote_wire.h"
 #include "types.h"
 
@@ -98,7 +99,7 @@ static constexpr size_t MAILBOX_TASK_FRAME_COUNT = 2;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
 static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 3;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 4;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -148,13 +149,19 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_RUN_ID = MAILBOX_OFF_ACCEPTED - 32;
 static constexpr ptrdiff_t MAILBOX_OFF_FRAME_SLOT_ID = MAILBOX_OFF_ACCEPTED - 24;
 static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GENERATION = MAILBOX_OFF_ACCEPTED - 16;
 static constexpr ptrdiff_t MAILBOX_OFF_FRAME_DISPATCH_ID = MAILBOX_OFF_ACCEPTED - 8;
+// Parent-DAG identity shared by every member of one NEXT_LEVEL group. Unlike
+// dispatch_id (which is local to one WorkerThread), task_slot is comparable
+// across the group's Rank endpoints within run_id.
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_TASK_SLOT = MAILBOX_OFF_ACCEPTED - 48;
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_INDEX = MAILBOX_OFF_ACCEPTED - 56;
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_SIZE = MAILBOX_OFF_ACCEPTED - 64;
 // Termination is a sticky one-way word on the control frame, not a MailboxState:
 // MAILBOX_OFF_STATE has three writers (the parent's CONTROL_REQUEST, the child's
 // CONTROL_DONE, and this endpoint's return-to-IDLE), any of which overwrites a
 // SHUTDOWN store. Only a terminating parent writes this word, 0 -> 1, and
 // nothing ever clears it, so a child that observes it exits its serve loop no
 // matter what state word a concurrent control command leaves behind.
-static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_FRAME_PROTOCOL - 8;
+static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ACCEPTED - 72;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
@@ -212,11 +219,17 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
-static constexpr uint64_t CTRL_REGION_ALLOCATE = 16;
-static constexpr uint64_t CTRL_REGION_RELEASE = 17;
+// 16 and 17 are unused retired control-command numbers and must not be reassigned.
 // Query a chip child's MemoryAllocator-committed HBM (bytes). The child writes
-// the value to CTRL_OFF_RESULT; the parent sums across children for L3.
+// the selected chip's value to CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_COMMITTED_DEVICE_MEMORY = 18;
+// 19..24 are reserved by the Python Global CommDomain chip controls and its
+// L4-to-local-L3 envelope. Query a chip child's device-wide ACL_HBM_MEM
+// snapshot; the child writes one DeviceMemoryInfo at CTRL_OFF_RESULT.
+static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
+// 26 is reserved by the Python delegated-region control. It carries the DRCT
+// envelope on control_payload at every hop of the recursive single-owner
+// region protocol, so no C++ endpoint method claims it.
 
 // Control args occupy the base frame's config-sized region:
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free)
@@ -230,15 +243,26 @@ static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 // Fixed-width so the wire layout stays simple; well above the encoded length
 // of "simpler-cb-<pid>-<counter>" with pid < 32-bit max.
 
+// The byte range a control-plane copy touches: `nbytes` starting at `dst_offset` into the
+// destination backing and at `src_offset` into the source. One contiguous run at each end -- the
+// underlying ChipWorker::copy_to takes a single length and a single address per side, so a strided
+// or otherwise non-contiguous view has no representation here. The three travel together so a call
+// site cannot pair a length with the wrong offsets.
+struct CopySpan {
+    uint64_t nbytes;
+    uint64_t dst_offset;
+    uint64_t src_offset;
+};
+
 // CTRL_COPY_TO / CTRL_COPY_FROM payload, written at MAILBOX_OFF_ARGS on the control frame. `dst`
 // and `src` are in the direction the sub-command names, matching ChipWorker::copy_to /
 // copy_from(dst, src, nbytes); which of the two is the device end follows from the sub-command.
-// `nbytes` travels with the pair it bounds, so the length can never be read from a slot a different
-// sub-command last wrote.
+// `span` travels with the pair it bounds, so neither the length nor an offset can be read from a
+// slot a different sub-command last wrote.
 struct ControlCopyRequest {
     BufferDescriptor dst;
     BufferDescriptor src;
-    uint64_t nbytes;
+    CopySpan span;
 };
 
 static_assert(std::is_trivially_copyable_v<ControlCopyRequest> && std::is_standard_layout_v<ControlCopyRequest>);
@@ -248,20 +272,39 @@ static_assert(
 );
 
 inline void write_control_copy_request(
-    char *mbox, uint64_t sub_cmd, const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes
+    char *mbox, uint64_t sub_cmd, const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::memcpy(mbox + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
-    ControlCopyRequest request{dst, src, nbytes};
+    ControlCopyRequest request{dst, src, span};
     std::memcpy(mbox + MAILBOX_OFF_ARGS, &request, sizeof(request));
 }
 
 // Both descriptors pass `validate_buffer_descriptor` before the child can act on them, so a
-// malformed or over-long backend body is refused at the same gate a task-args decode uses.
+// malformed or over-long backend body is refused at the same gate a task-args decode uses. The two
+// spans are bounded against the descriptors they arrived with, so an offset can only ever name a
+// byte inside the backing that came with it -- the same receive-side gate `validate_tensor` applies
+// to a view, applied here to a copy range. Subtraction, never `offset + nbytes`, so an addition
+// cannot wrap a span back inside the backing.
+inline void validate_control_copy_request(const ControlCopyRequest &request) {
+    auto reject = [](const char *what) {
+        throw std::invalid_argument(what);
+    };
+    validate_buffer_descriptor(request.dst);
+    validate_buffer_descriptor(request.src);
+    if (request.span.dst_offset > request.dst.nbytes ||
+        request.span.nbytes > request.dst.nbytes - request.span.dst_offset) {
+        reject("invalid ControlCopyRequest: dst range extends past the destination backing");
+    }
+    if (request.span.src_offset > request.src.nbytes ||
+        request.span.nbytes > request.src.nbytes - request.span.src_offset) {
+        reject("invalid ControlCopyRequest: src range extends past the source backing");
+    }
+}
+
 inline ControlCopyRequest read_control_copy_request(const char *mbox) {
     ControlCopyRequest request{};
     std::memcpy(&request, mbox + MAILBOX_OFF_ARGS, sizeof(request));
-    validate_buffer_descriptor(request.dst);
-    validate_buffer_descriptor(request.src);
+    validate_control_copy_request(request);
     return request;
 }
 
@@ -343,9 +386,10 @@ public:
     virtual void shutdown_child() {}
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();
+    virtual DeviceMemoryInfo control_device_memory_info();
     virtual void control_free(uint64_t ptr);
-    virtual void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes);
-    virtual void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes);
+    virtual void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
+    virtual void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
     virtual void control_prepare(const uint8_t *digest);
     virtual void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
     virtual void control_unregister(const uint8_t *digest);
@@ -384,8 +428,6 @@ public:
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
-    virtual void control_region_allocate(const char *request_shm_name, const char *reply_shm_name);
-    virtual void control_region_release(const char *request_shm_name, const char *reply_shm_name);
 };
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
@@ -407,9 +449,10 @@ public:
     void shutdown_child() override;
     uint64_t control_malloc(size_t size) override;
     uint64_t control_committed_device_memory() override;
+    DeviceMemoryInfo control_device_memory_info() override;
     void control_free(uint64_t ptr) override;
-    void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) override;
-    void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes) override;
+    void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
+    void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
     void control_prepare(const uint8_t *digest) override;
     void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) override;
     void control_unregister(const uint8_t *digest) override;
@@ -445,8 +488,6 @@ public:
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
-    void control_region_allocate(const char *request_shm_name, const char *reply_shm_name) override;
-    void control_region_release(const char *request_shm_name, const char *reply_shm_name) override;
 
 private:
     WorkerEndpointCaps caps_;
@@ -487,6 +528,7 @@ private:
         RunId run_id{INVALID_RUN_ID};
         uint64_t slot_id{0};
         uint64_t generation{0};
+        uint64_t group_size{0};
     };
     std::array<FrameRecord, MAILBOX_TASK_FRAME_COUNT> frames_{};
 
@@ -561,9 +603,10 @@ public:
     // child progress owner may observe a control request while a task is active.
     uint64_t control_malloc(size_t size);
     uint64_t control_committed_device_memory();
+    DeviceMemoryInfo control_device_memory_info();
     void control_free(uint64_t ptr);
-    void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes);
-    void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, uint64_t nbytes);
+    void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
+    void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
 
     // Pre-warm a chip child by triggering simpler_register_callable for the digest's
     // target-local slot via CTRL_PREPARE.
@@ -621,8 +664,6 @@ public:
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
     // Caller dispatches in parallel to every chip; child runs cw.comm_init.
     void control_comm_init(const char *request_shm_name);
-    void control_region_allocate(const char *request_shm_name, const char *reply_shm_name);
-    void control_region_release(const char *request_shm_name, const char *reply_shm_name);
 
 private:
     enum class SubmitDispatchResult : uint8_t {
@@ -721,8 +762,6 @@ public:
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
-    void control_region_allocate(int worker_id, const char *request_shm_name, const char *reply_shm_name);
-    void control_region_release(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
     std::vector<uint8_t> control_payload(

@@ -11,13 +11,16 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <cstdint>
 #include <mutex>
 #include <set>
 #include <thread>
 
+#include "host_build_graph/graph_recorder_pool.h"
 #include "orchestration_api.h"
 
 namespace {
@@ -35,7 +38,7 @@ extern "C" void framework_bind_runtime(RuntimeContext *rt) { g_bound_runtime = r
 
 struct FakeRuntime {
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode{PTO2ScopeMode::AUTO};
+    ScopeMode pending_scope_mode{ScopeMode::AUTO};
     std::mutex mutex;
     std::condition_variable cv;
     bool record_entered{false};
@@ -48,7 +51,17 @@ struct FakeRuntime {
     int begin_calls{0};
     int prepare_calls{0};
     int end_calls{0};
-    int commit_calls{0};
+    // A recorded body reports a fatal on the recorder thread while the bind thread
+    // reads it, which is what the runtime's own fatal_code is atomic for.
+    std::atomic<bool> fatal{false};
+    // graph_end's view of the fatal at the moment it ran, so a test can tell "end
+    // was reached after the body latched" from "end was reached at all".
+    bool end_saw_fatal{false};
+    std::atomic<int> abort_calls{0};
+    const void *abort_handle{nullptr};
+    // Written from a recorder worker (the recorded body calls rt_graph_commit) and from
+    // the main thread, so it cannot be a plain int.
+    std::atomic<int> commit_calls{0};
     int scope_begin_calls{0};
     int scope_end_calls{0};
     std::thread::id record_thread;
@@ -75,7 +88,7 @@ static_assert(offsetof(FakeRuntime, pending_scope_mode) == offsetof(RuntimeConte
 
 FakeRuntime *as_fake(RuntimeContext *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
-bool fake_is_fatal(RuntimeContext *) { return false; }
+bool fake_is_fatal(RuntimeContext *rt) { return as_fake(rt)->fatal.load(std::memory_order_acquire); }
 
 GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &) {
     FakeRuntime &fake = *as_fake(rt);
@@ -104,7 +117,7 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
     fake.recorded_scalar_count = args.scalar_count();
     fake.recorded_args_object = &args;
     if (args.tensor_count() > 0) {
-        const ChipTensor &tensor = args.tensor(0).ref();
+        const simpler::hbg::Tensor &tensor = args.tensor(0).ref();
         fake.recorded_tensor_addr = tensor.buffer.addr;
         fake.recorded_tensor_size = tensor.buffer.size;
         fake.recorded_ndims = tensor.ndims;
@@ -132,14 +145,21 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
     return true;
 }
 
-void fake_graph_abort(RuntimeContext *, void *) {}
+void fake_graph_abort(RuntimeContext *rt, void *recording_handle) {
+    FakeRuntime &fake = *as_fake(rt);
+    fake.abort_handle = recording_handle;
+    fake.abort_calls.fetch_add(1, std::memory_order_acq_rel);
+}
 
 bool fake_graph_end(RuntimeContext *rt) {
     FakeRuntime &fake = *as_fake(rt);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.end_calls++;
     fake.submit_thread = std::this_thread::get_id();
-    return true;
+    // Mirrors the real graph_end's contract: on a fatal it retires the entry itself
+    // and reports that no Definition was published.
+    fake.end_saw_fatal = fake.fatal.load(std::memory_order_acquire);
+    return !fake.end_saw_fatal;
 }
 
 void fake_graph_commit(RuntimeContext *rt) { as_fake(rt)->commit_calls++; }
@@ -147,6 +167,26 @@ void fake_graph_commit(RuntimeContext *rt) { as_fake(rt)->commit_calls++; }
 void fake_scope_begin(RuntimeContext *rt) { as_fake(rt)->scope_begin_calls++; }
 
 void fake_scope_end(RuntimeContext *rt) { as_fake(rt)->scope_end_calls++; }
+
+// The pool is the runtime's now, so rt_graph_submit reaches it through these two rather
+// than through a static in the orchestration header. Wiring them to the same process-wide
+// pool the runtime uses is what keeps this test exercising the asynchronous path -- with
+// them null, rt_graph_submit correctly falls back to recording inline and the test would
+// be asserting the fallback instead.
+// This test's own pool, not the runtime's: the point is the pool's behaviour, and a
+// file-local instance keeps the test from linking the runtime translation unit that owns
+// the process-wide one.
+GraphAsyncRecordingState &test_pool() {
+    static GraphAsyncRecordingState pool;
+    return pool;
+}
+
+bool fake_graph_record_start(RuntimeContext *, const GraphTaskArgs &args, void *job) {
+    auto *record = static_cast<std::function<void(GraphTaskArgs &)> *>(job);
+    return test_pool().start(args, std::move(*record));
+}
+
+void fake_graph_record_wait(RuntimeContext *) { test_pool().wait(); }
 
 const RuntimeOps kFakeOps = {
     .scope_begin = fake_scope_begin,
@@ -157,6 +197,8 @@ const RuntimeOps kFakeOps = {
     .graph_abort = fake_graph_abort,
     .graph_end = fake_graph_end,
     .graph_commit = fake_graph_commit,
+    .graph_record_start = fake_graph_record_start,
+    .graph_record_wait = fake_graph_record_wait,
 };
 
 }  // namespace
@@ -211,7 +253,7 @@ TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit
 
     uint32_t storage[4]{};
     uint32_t shape[] = {4};
-    ChipTensor boundary = make_tensor_external(storage, shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
     GraphTaskArgs args;
     args.add_input(boundary);
 
@@ -242,7 +284,7 @@ TEST(HbgGraphAsyncSubmit, WorkerRecordsWhileMainSubmitsLaterGraphs) {
 
     uint32_t storage[4]{};
     uint32_t shape[] = {4};
-    ChipTensor boundary = make_tensor_external(storage, shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
     GraphTaskArgs args;
     args.add_input(boundary);
 
@@ -334,7 +376,7 @@ TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
 
     uint32_t storage[8]{};
     uint32_t shape[] = {8};
-    ChipTensor boundary = make_tensor_external(storage, shape, 1);
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
     constexpr uint64_t kScalar = 0x5eed1715ULL;
     GraphTaskArgs args;
     args.add_input(boundary);
@@ -366,5 +408,56 @@ TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
 
     EXPECT_NE(fake.recorded_args_object, caller_args_object) << "the worker must not read the caller's GraphTaskArgs";
     EXPECT_NE(fake.recorded_tensor_storage, caller_tensor_storage)
-        << "the worker must not read ChipTensor storage the caller owns";
+        << "the worker must not read simpler::hbg::Tensor storage the caller owns";
+}
+
+// A fatal reported inside a recorded body has to reach graph_end. graph_end is the
+// only thing that transitions the in-flight entry out of RECORDING, and
+// graph_commit's drain blocks on recording_cv until every entry has — with no
+// timeout, on the bind thread. rt_graph_end used to short-circuit on is_fatal() and
+// report success, which skipped the retire and hung that drain.
+//
+// The same case pins the other half: the wrapper must NOT follow a declined end with
+// an abort. graph_end retires the entry it bound on every path that has one, so a
+// caller-side abort is always a second one — and graph_commit frees a drained entry
+// after releasing recording_mutex, so the second abort has nothing left to
+// synchronize against and writes to freed memory.
+//
+// Neither half is reachable from a test that calls OrchestratorState::graph_end()
+// directly: both live in the wrapper, which is why this case is here and not with the
+// orchestrator's own graph tests.
+TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothing) {
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+
+    uint32_t storage[4]{};
+    uint32_t shape[] = {4};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+
+    // No later submission to overlap with, so release the handshake gate rather than
+    // letting fake_graph_prepare sit out a timeout nothing will satisfy.
+    fake.later_submit_entered = true;
+
+    int body_calls = 0;
+    {
+        ScopeGuard scope;
+        (void)rt_submit_graph_impl(0x1722, args, [&](const GraphTaskArgs &) {
+            body_calls++;
+            // Stands in for the body's own rt_report_fatal: from the wrapper's side a
+            // fatal is just is_fatal() turning true partway through the pass.
+            fake.fatal.store(true, std::memory_order_release);
+        });
+    }
+    // Drains the recorder pool through the ops table, as orchestration completion does.
+    rt_graph_commit();
+    framework_bind_runtime(nullptr);
+
+    EXPECT_EQ(body_calls, 1);
+    EXPECT_EQ(fake.end_calls, 1) << "a fatal must not stop the recording pass from reaching graph_end";
+    EXPECT_TRUE(fake.end_saw_fatal) << "graph_end has to observe the fatal — it is the retire point";
+    EXPECT_EQ(fake.abort_calls.load(std::memory_order_acquire), 0)
+        << "graph_end retires its own entry, so a caller-side abort would be a second one racing graph_commit's free";
 }

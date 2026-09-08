@@ -31,6 +31,7 @@ simpler_setup/            ← test framework + build/runtime assembly (simpler_s
     paged_attention.py    attention reference (used by multiple paged_attention tests)
   _assets/                (wheel-only, populated by CMake install)
     src/                  source tree mirror
+    cmake/                the includes a runtime configure needs, via SIMPLER_CMAKE_DIR
     build/lib/            pre-built per-arch/platform/runtime .so/.o
 
 _task_interface.*.so      nanobind extension at site-packages root
@@ -40,12 +41,21 @@ _task_interface.*.so      nanobind extension at site-packages root
 
 | Concern | `simpler` | `simpler_setup` |
 | ------- | --------- | --------------- |
-| What it is | Stable user-facing runtime API | Test/build infrastructure |
-| Imported by user code? | Yes — `from simpler.worker import Worker` | Sometimes — test framework uses it |
-| Imported by other packages? | Yes — `simpler_setup` imports `simpler.env_manager` | No — leaf consumer |
-| Lifecycle | Slow-changing public API | Fast-changing internal helpers |
+| What it is | Runtime API | Kernel compilation, runtime assembly, scene tests, and analysis tools |
+| Imported by user code? | Yes — `from simpler.worker import Worker` | Yes — for example, `KernelCompiler`, `TensorArg`, and `SceneTestCase` |
+| Imported by the other package? | `simpler_setup` uses `simpler.env_manager` and task types | `Worker` lazily imports `RuntimeBuilder` during chip setup |
 
-Internal coupling: `simpler_setup.toolchain`, `simpler_setup.kernel_compiler`, and `simpler_setup.runtime_compiler` import `simpler.env_manager`. This is the only direction allowed (`simpler_setup → simpler`); never the reverse. `simpler` must not depend on `simpler_setup`.
+The packages ship together. `simpler_setup.toolchain`, `kernel_compiler`, and
+`runtime_compiler` import `simpler.env_manager`. In the other direction,
+`Worker._init_level2` and hierarchical chip-child setup lazily import
+`simpler_setup.runtime_builder.RuntimeBuilder` to resolve runtime binaries.
+Keep that runtime-assembly dependency lazy: importing `simpler` alone does not
+load the native extension or initialize a worker.
+
+The transitional `kernel_compiler`, `runtime_compiler`, `toolchain`, and
+`elf_parser` modules under `python/simpler/` also ship in the wheel. New
+callers should use their authoritative `simpler_setup` equivalents;
+`wheel.packages` includes both packages without excluding those modules.
 
 ### Dependencies
 
@@ -69,10 +79,10 @@ NPU hardware (`a2a3`/`a5` with CANN toolkit).
 
 `simpler_setup.environment.PROJECT_ROOT` auto-detects between:
 
-- **Wheel install**: `simpler_setup/_assets/` exists → `PROJECT_ROOT = .../site-packages/simpler_setup/_assets`. The wheel's bundled `_assets/src/` and `_assets/build/lib/` provide everything needed at runtime.
-- **Source tree / editable install**: `_assets/` doesn't exist → `PROJECT_ROOT = repo root`. Live `src/` and `build/lib/` are used.
+- **Wheel install**: `simpler_setup/_assets/` exists → `PROJECT_ROOT = .../site-packages/simpler_setup/_assets`. Everything the runtime reads at that root has to be installed there: `_assets/src/`, `_assets/build/lib/`, and `_assets/cmake/`, which is where `SIMPLER_CMAKE_DIR` lands and therefore what the platform `CMakeLists.txt` include. An asset directory the install block forgets fails only at use — a runtime configure dies on `include could not find requested file` — so `tools/verify_packaging.sh` asserts the set exists in every mode.
+- **Source tree / editable install**: `_assets/` doesn't exist → `PROJECT_ROOT = repo root`. Live `src/`, `cmake/` and `build/lib/` are used.
 
-Anything that needs to find `src/`, `build/lib/`, or `build/cache/` MUST go through `simpler_setup.environment.PROJECT_ROOT` — never `Path(__file__).parent.parent...`.
+Anything that needs to find `src/`, `cmake/`, `build/lib/`, or `build/cache/` MUST go through `simpler_setup.environment.PROJECT_ROOT` — never `Path(__file__).parent.parent...`.
 
 ## Import rules
 

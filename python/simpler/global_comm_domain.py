@@ -16,7 +16,31 @@ from dataclasses import dataclass
 
 from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
 
-from .comm_endpoints import AdapterKind, AdapterProfile, AttachmentRole
+from .comm_endpoints import (
+    _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
+    _ADAPTER_PROFILE_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
+    AdapterKind,
+    AdapterProfile,
+    AttachmentRole,
+    BufferAccessQuery,
+    EndpointDeployment,
+    EndpointIdentity,
+    EndpointRecord,
+    _backend_kind_for_provider,
+    buffer_adapter_candidates,
+)
+from .comm_endpoints import (
+    _adapter_kind_from_id as _neutral_adapter_kind_from_id,
+)
+from .comm_endpoints import (
+    _adapter_kind_id as _neutral_adapter_kind_id,
+)
+from .comm_endpoints import (
+    _adapter_profile_from_id as _neutral_adapter_profile_from_id,
+)
+from .comm_endpoints import (
+    _adapter_profile_id as _neutral_adapter_profile_id,
+)
 
 #: Descriptor layout. Paired with ``COMM_GLOBAL_DOMAIN_VERSION`` in
 #: ``src/common/platform_comm/comm.h``: the platform backend stamps this number into every
@@ -24,9 +48,6 @@ from .comm_endpoints import AdapterKind, AdapterProfile, AttachmentRole
 #: without the other fails every allocation at PREPARE. The ``LOCAL_*`` L3->L2 mailbox structs
 #: in ``worker.py`` also carry it; producer and consumer there are the same build.
 GLOBAL_DOMAIN_VERSION = 2
-#: L4<->L3 control-command layout: COMM_INIT, ALLOC_DOMAIN, RELEASE and COPY. Python owns both
-#: ends, so this advances on its own -- a command-layout change needs no C++ rebuild.
-GLOBAL_DOMAIN_COMMAND_VERSION = 2
 GLOBAL_DOMAIN_MAX_RANKS = 64
 GLOBAL_DOMAIN_MAX_BUFFERS = 64
 GLOBAL_DOMAIN_MAX_ATTACHMENT_ROWS = GLOBAL_DOMAIN_MAX_RANKS
@@ -317,34 +338,59 @@ def validate_member_table(members: tuple[GlobalDomainMember, ...]) -> None:
         raise ValueError("global domain members require unique non-negative global device ranks")
 
 
-# Wire ids for the three ``comm_endpoints`` enums this command carries. They are string enums, so
-# the wire needs its own numbering, and these numbers are part of the version-2 command format: a
-# value's id is fixed for the life of the version, and 0 is reserved for "no adapter". Adding an
-# enumerator means adding an id here; renaming or renumbering one is a wire break. Encoding and
-# decoding both reject an id this table does not name, so an enumerator that is added upstream and
-# not mirrored here fails closed rather than travelling as a wrong value.
+# AttachmentRole remains a Global CommDomain-only wire id. Adapter kind/profile numeric
+# authority lives in comm_endpoints; this module only wraps those helpers with domain-local
+# error text. 0 stays reserved for "no adapter".
 _ATTACHMENT_ROLE_IDS = {
     AttachmentRole.PROVIDER: 1,
     AttachmentRole.CONSUMER: 2,
 }
 _ATTACHMENT_ROLE_BY_ID = {value: key for key, value in _ATTACHMENT_ROLE_IDS.items()}
-_ADAPTER_KIND_IDS = {
-    AdapterKind.DIRECT_MAP: 1,
-    AdapterKind.DEVICE_PEER: 2,
-    AdapterKind.OWNER_DELEGATED_COPY: 3,
-    AdapterKind.EXPLICIT_TRANSFER: 4,
-    AdapterKind.COLLECTIVE: 5,
-}
-_ADAPTER_KIND_BY_ID = {value: key for key, value in _ADAPTER_KIND_IDS.items()}
-_ADAPTER_PROFILE_IDS = {
-    AdapterProfile.HOST_SVM_MAP: 1,
-    AdapterProfile.HOST_VMM_COPY: 2,
-    AdapterProfile.DEVICE_VMM_PEER_IMPORT: 3,
-    AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT: 4,
-    AdapterProfile.HOST_SHM_MAP: 5,
-    AdapterProfile.REMOTE_COPY: 6,
-}
-_ADAPTER_PROFILE_BY_ID = {value: key for key, value in _ADAPTER_PROFILE_IDS.items()}
+
+
+def _assert_every_plannable_profile_is_numbered() -> None:
+    """Fail import if region planning can name an ``AdapterProfile`` this wire cannot encode.
+
+    ``AdapterProfile`` is deliberately wider than this table: the Buffer access judgment is shared
+    with the per-Tensor path, which reaches mechanisms (``FORK_INHERITED_VA``, ``DEVICE_LOCAL``,
+    ``OWNER_DEVICE_COPY``) that no region plan can produce and that therefore never travel in a
+    ``GlobalDomainCommand``. That is a fact about ``buffer_adapter_candidates`` and
+    ``_backend_kind_for_provider``, not a property either declaration states, so nothing but this
+    check ties the two together — and the failure it prevents surfaces as a ``ValueError`` at
+    allocation time, from a planner that had already accepted the plan.
+    """
+
+    # Drives the real `_backend_kind_for_provider` rather than restating which backends a provider
+    # can name; only the deployment is read, so the rest of the record is filler.
+    def _provider(deployment: EndpointDeployment) -> EndpointRecord:
+        return EndpointRecord(
+            identity=EndpointIdentity(session_instance_id=b"", registry_epoch=0, endpoint_id=0),
+            path="L0",
+            deployment=deployment,
+            node_scope_id=0,
+        )
+
+    plannable = {
+        candidate.profile
+        for backend_kind in {_backend_kind_for_provider(_provider(deployment)) for deployment in EndpointDeployment}
+        for deployment in EndpointDeployment
+        for same_node in (True, False)
+        # Region planning attaches consumers, never the provider itself, so the Buffer is never
+        # already local to the endpoint being planned for.
+        for candidate in buffer_adapter_candidates(
+            BufferAccessQuery(backend_kind, deployment, same_node, same_endpoint=False)
+        )
+    }
+    missing = sorted(profile.value for profile in plannable if profile not in _ADAPTER_PROFILE_IDS)
+    if missing:
+        raise AssertionError(
+            f"region planning can produce adapter profiles the global-domain wire cannot number: "
+            f"{missing}; add them to _ADAPTER_PROFILE_IDS (and to COMM_GLOBAL_DOMAIN_VERSION's "
+            f"contract) or keep them out of buffer_adapter_candidates for a planner backend"
+        )
+
+
+_assert_every_plannable_profile_is_numbered()
 
 
 def _attachment_role_id(role: AttachmentRole) -> int:
@@ -362,38 +408,30 @@ def _attachment_role_from_id(value: int) -> AttachmentRole:
 
 
 def _adapter_kind_id(kind: AdapterKind | None) -> int:
-    if kind is None:
-        return 0
     try:
-        return _ADAPTER_KIND_IDS[AdapterKind(kind)]
-    except (KeyError, ValueError) as exc:
+        return _neutral_adapter_kind_id(kind)
+    except ValueError as exc:
         raise ValueError(f"global domain attachment adapter_kind is unknown: {kind!r}") from exc
 
 
 def _adapter_kind_from_id(value: int) -> AdapterKind | None:
-    if value == 0:
-        return None
     try:
-        return _ADAPTER_KIND_BY_ID[int(value)]
-    except KeyError as exc:
+        return _neutral_adapter_kind_from_id(value)
+    except ValueError as exc:
         raise ValueError(f"global domain attachment adapter_kind id is unknown: {value}") from exc
 
 
 def _adapter_profile_id(profile: AdapterProfile | None) -> int:
-    if profile is None:
-        return 0
     try:
-        return _ADAPTER_PROFILE_IDS[AdapterProfile(profile)]
-    except (KeyError, ValueError) as exc:
+        return _neutral_adapter_profile_id(profile)
+    except ValueError as exc:
         raise ValueError(f"global domain attachment adapter_profile is unknown: {profile!r}") from exc
 
 
 def _adapter_profile_from_id(value: int) -> AdapterProfile | None:
-    if value == 0:
-        return None
     try:
-        return _ADAPTER_PROFILE_BY_ID[int(value)]
-    except KeyError as exc:
+        return _neutral_adapter_profile_from_id(value)
+    except ValueError as exc:
         raise ValueError(f"global domain attachment adapter_profile id is unknown: {value}") from exc
 
 
@@ -540,7 +578,7 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
         raise ValueError(f"unsupported global domain profile {command.profile!r}")
     if command.node_rank < 0 or command.node_count <= 0 or command.node_rank >= command.node_count:
         raise ValueError("global comm init node identity is invalid")
-    out = bytearray(struct.pack("<III", GLOBAL_DOMAIN_COMMAND_VERSION, command.node_rank, command.node_count))
+    out = bytearray(struct.pack("<II", command.node_rank, command.node_count))
     _put_string(out, command.cluster_id, "cluster_id")
     _put_string(out, command.topology_hash, "topology_hash")
     _put_string(out, command.profile, "profile")
@@ -552,9 +590,6 @@ def encode_comm_init(command: GlobalCommInitCommand) -> bytes:
 
 def decode_comm_init(data: bytes) -> GlobalCommInitCommand:
     reader = _Reader(data)
-    version = reader.u32()
-    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
-        raise ValueError("global comm init version mismatch")
     node_rank = reader.u32()
     node_count = reader.u32()
     cluster_id = reader.string("cluster_id")
@@ -636,8 +671,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
 
     out = bytearray(
         struct.pack(
-            "<IIQQQ",
-            GLOBAL_DOMAIN_COMMAND_VERSION,
+            "<IQQQ",
             int(command.phase),
             int(command.domain_id),
             int(command.generation),
@@ -664,9 +698,6 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
 
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
-    version = reader.u32()
-    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
-        raise ValueError("global domain command version mismatch")
     try:
         phase = GlobalDomainPhase(reader.u32())
     except ValueError as exc:
@@ -733,15 +764,15 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:
     if command.domain_id == 0 or command.generation == 0:
         raise ValueError("global domain release identity must be positive")
-    return struct.pack("<IQQ", GLOBAL_DOMAIN_COMMAND_VERSION, int(command.domain_id), int(command.generation))
+    return struct.pack("<QQ", int(command.domain_id), int(command.generation))
 
 
 def decode_release_command(data: bytes) -> GlobalDomainReleaseCommand:
-    if len(data) != struct.calcsize("<IQQ"):
+    if len(data) != struct.calcsize("<QQ"):
         raise ValueError("global domain release size mismatch")
-    version, domain_id, generation = struct.unpack("<IQQ", data)
-    if version != GLOBAL_DOMAIN_COMMAND_VERSION or domain_id == 0 or generation == 0:
-        raise ValueError("global domain release identity or version is invalid")
+    domain_id, generation = struct.unpack("<QQ", data)
+    if domain_id == 0 or generation == 0:
+        raise ValueError("global domain release identity is invalid")
     return GlobalDomainReleaseCommand(int(domain_id), int(generation))
 
 
@@ -761,8 +792,7 @@ def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool)
         raise ValueError("global domain copy-from request must not contain data")
     out = bytearray(
         struct.pack(
-            "<IQQIQQ",
-            GLOBAL_DOMAIN_COMMAND_VERSION,
+            "<QQIQQ",
             int(command.domain_id),
             int(command.generation),
             int(command.domain_rank),
@@ -776,10 +806,10 @@ def encode_copy_command(command: GlobalDomainCopyCommand, *, include_data: bool)
 
 
 def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyCommand:
-    header_size = struct.calcsize("<IQQIQQ")
+    header_size = struct.calcsize("<QQIQQ")
     if len(data) < header_size:
         raise ValueError("global domain copy request is truncated")
-    version, domain_id, generation, domain_rank, offset, nbytes = struct.unpack_from("<IQQIQQ", data)
+    domain_id, generation, domain_rank, offset, nbytes = struct.unpack_from("<QQIQQ", data)
     payload = data[header_size:]
     command = GlobalDomainCopyCommand(
         domain_id=int(domain_id),
@@ -789,8 +819,6 @@ def decode_copy_command(data: bytes, *, include_data: bool) -> GlobalDomainCopyC
         nbytes=int(nbytes),
         data=bytes(payload),
     )
-    if version != GLOBAL_DOMAIN_COMMAND_VERSION:
-        raise ValueError("global domain copy version mismatch")
     encode_copy_command(command, include_data=include_data)
     return command
 

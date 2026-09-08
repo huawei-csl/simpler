@@ -43,9 +43,10 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
-#include "../task_interface/task_args.h"
+#include "../task_interface/task_args_wire.h"
 #include "../task_interface/tensor.h"
 #include "../worker/pipeline_slot_pool.h"
+#include "../worker/device_memory_info.h"
 #include "ring.h"
 #include "scope.h"
 #include "tensormap.h"
@@ -54,17 +55,16 @@
 class WorkerManager;
 
 // ---------------------------------------------------------------------------
-// SubmitResult — C++ internal slot id
+// TaskHandle — run-scoped producer handle
 // ---------------------------------------------------------------------------
 //
 // Downstream consumers reference outputs by their own tensor pointers (the
 // tensors live in the HeapRing allocated by the Worker), and tensormap.lookup
 // finds the producer slot from the data pointer. No outputs[] field needed.
-// This is intentionally not exposed through the Python facade.
+// The Python facade exposes this as an opaque handle for TaskArgs.add_dep()
+// and TaskArgs.add_dep_wait().
 
-struct SubmitResult {
-    TaskSlot task_slot{INVALID_SLOT};
-};
+using SubmitResult = TaskHandle;
 
 // Deterministic seams for exception-safety unit tests. Production workers
 // leave the callback unset.
@@ -108,6 +108,7 @@ public:
     // allocator. Thread-safe: can be called from the orch thread while the
     // target worker is running a task (MemoryAllocator is mutex-protected).
     uint64_t committed_device_memory(int worker_id);
+    DeviceMemoryInfo device_memory_info(int worker_id);
 
     // Submit a NEXT_LEVEL task. `callable` is the stable identity returned
     // by Worker.register(); the child resolves its digest to a private slot.
@@ -178,7 +179,7 @@ public:
     // Non-blocking: `scope_end` walks the scope's tasks and releases one
     // ref per task, returning immediately. Actual CONSUMED transitions
     // happen asynchronously as each task's consumer count reaches
-    // threshold (mirrors L2's `pto2_scope_end`). The owning run fence
+    // threshold (mirrors the chip runtime's `rt_scope_end`). The owning run fence
     // provides the synchronous completion boundary.
     void scope_begin();
     void scope_end();
@@ -208,6 +209,11 @@ public:
 
     void set_test_hook(std::function<void(OrchestratorTestPoint)> hook) { test_hook_ = std::move(hook); }
 
+    // Deterministic observation seam for tests that must issue another submit
+    // only after an asynchronous task failure has reached the current run.
+    bool current_building_run_failed_for_test() const;
+    size_t begin_run_waiter_count_for_test() const;
+
 private:
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
@@ -227,6 +233,7 @@ private:
     RunId next_run_id_{1};
     RunId building_run_id_{INVALID_RUN_ID};
     RunId active_run_id_{INVALID_RUN_ID};
+    size_t begin_run_waiters_{0};
 
     // Scheduler's loop mutex (not owned). Held across optional quiescent
     // compaction so the scheduler cannot retain a slot pointer being removed.
@@ -281,16 +288,23 @@ private:
         std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
     );
 
+    struct ProducerDependency {
+        TaskSlot slot{INVALID_SLOT};
+        bool retain{false};
+    };
+
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
-    // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
-    // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
+    // edges (explicit wait/retain deps plus retained INPUT/INOUT deps) and
+    // registering outputs in the tensormap (for
+    // OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
     // `target_worker_ids` maps NEXT_LEVEL args_list[i] to its exact worker for
     // TensorKey construction. It is empty for SUB tasks.
     void infer_deps(
         TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &target_worker_ids,
-        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
+        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<ProducerDependency> &producers,
         std::vector<TensorKey> &output_keys
     );
+    void validate_explicit_deps(RunId run_id, const std::vector<TaskArgs> &args_list) const;
     void validate_worker_eligibility(
         WorkerType worker_type, size_t args_count, const std::vector<int32_t> &target_worker_ids,
         const std::vector<std::vector<int32_t>> &eligible_worker_ids

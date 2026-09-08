@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,13 +23,135 @@ from simpler_setup import parallel_scheduler
 from simpler_setup.scene_test import (
     SceneTestCase,
     _dispatch_test_phases_standalone,
-    _effective_diagnostic_options,
+    effective_diagnostic_options,
     run_class_cases,
+    standalone_pytest_options,
 )
 
 
+def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    for rank in (0, 1):
+        for dispatch in ("d0", "d1"):
+            records = tmp_path / f"rank{rank}" / dispatch / "chip_swimlane_records.json"
+            records.parent.mkdir(parents=True)
+            records.write_text("{}")
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [call["dispatch"] for call in calls] == ["d0", "d1"]
+    assert [call["output_path"] for call in calls] == [
+        Path(tmp_path) / "l3_swimlane_d0.json",
+        Path(tmp_path) / "l3_swimlane_d1.json",
+    ]
+
+
+def test_l3_swimlane_postprocess_falls_back_per_rank_below_level_four(tmp_path, monkeypatch, caplog) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    for rank in (0, 1):
+        records = tmp_path / f"rank{rank}" / "d0" / "chip_swimlane_records.json"
+        records.parent.mkdir(parents=True)
+        records.write_text(json.dumps({"chip_swimlane_level": 3}))
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    # No cross-Rank merge without clock anchors — one single-file conversion per Rank.
+    assert [call["input_path"] for call in calls] == [
+        tmp_path / "rank0" / "d0" / "chip_swimlane_records.json",
+        tmp_path / "rank1" / "d0" / "chip_swimlane_records.json",
+    ]
+    assert all("dispatch" not in call for call in calls)
+    assert "cross-Rank merging needs --enable-chip-swimlane 4" in caplog.text
+
+
+def test_l3_swimlane_postprocess_refuses_asymmetric_local_capture_indexes(tmp_path, monkeypatch, caplog) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    for rank, dispatches in ((0, ("d0", "d1")), (1, ("d0",))):
+        for dispatch in dispatches:
+            records = tmp_path / f"rank{rank}" / dispatch / "chip_swimlane_records.json"
+            records.parent.mkdir(parents=True)
+            records.write_text("{}")
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert calls == []
+    assert "refusing to pair asymmetric local capture indexes" in caplog.text
+
+
+def test_l3_swimlane_postprocess_uses_parent_identity_when_rank_d_paths_are_reordered(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    captures = {
+        (0, "d0"): (5, 0),
+        (0, "d1"): (6, 0),
+        (1, "d0"): (6, 1),
+        (1, "d1"): (5, 1),
+    }
+    for (rank, dispatch), (task_slot, group_index) in captures.items():
+        capture = tmp_path / f"rank{rank}" / dispatch
+        capture.mkdir(parents=True)
+        (capture / "chip_swimlane_records.json").write_text("{}")
+        (capture / "dispatch_identity.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": 17,
+                    "task_slot": task_slot,
+                    "group_index": group_index,
+                    "group_size": 2,
+                    "chip_rank": rank,
+                    "local_capture_index": int(dispatch.removeprefix("d")),
+                    "endpoint_dispatch_id": int(dispatch.removeprefix("d")) + 1,
+                    "pipeline_slot": 0,
+                    "pipeline_generation": 1,
+                    "callable_digest": "ab" * 32,
+                }
+            )
+        )
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [(call["dispatch"], call["dispatch_id"]) for call in calls] == [(None, "17:5"), (None, "17:6")]
+    assert [call["output_path"].name for call in calls] == [
+        "l3_swimlane_run17_task5.json",
+        "l3_swimlane_run17_task6.json",
+    ]
+
+
+def test_rank_local_dep_and_scope_postprocessors_follow_swimlane_output_prefix(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    captures = [tmp_path / f"rank{rank}" / "d0" for rank in (0, 1)]
+    for capture in captures:
+        (capture / "scope_stats").mkdir(parents=True)
+        (capture / "deps.json").write_text("{}")
+        (capture / "scope_stats" / "scope_stats.jsonl").write_text("")
+
+    dep_calls = []
+    scope_calls = []
+    monkeypatch.setattr(
+        scene_test_module, "_graph_case_dep_gen", lambda _label, path, **_kwargs: dep_calls.append(path)
+    )
+    monkeypatch.setattr(scene_test_module, "_plot_case_scope_stats", lambda _label, path: scope_calls.append(path))
+
+    scene_test_module.finalize_diagnostic_outputs("case", tmp_path, dep_gen=True, scope_stats=True)
+
+    assert dep_calls == captures
+    assert scope_calls == captures
+
+
 def test_multi_rounds_disable_every_diagnostic() -> None:
-    options = _effective_diagnostic_options(
+    options = effective_diagnostic_options(
         2,
         chip_swimlane=4,
         dump_args=3,
@@ -42,7 +166,7 @@ def test_multi_rounds_disable_every_diagnostic() -> None:
 
 def test_swimlane_overhead_requires_chip_swimlane() -> None:
     with pytest.raises(ValueError, match="requires --enable-chip-swimlane"):
-        _effective_diagnostic_options(
+        effective_diagnostic_options(
             1,
             chip_swimlane=0,
             dump_args=0,
@@ -69,6 +193,39 @@ def test_dep_gen_extension_hook_uses_the_shared_multi_round_gate() -> None:
     assert not SceneTestCase._effective_enable_dep_gen(request)
 
 
+def test_thin_pytest_wrapper_forwards_the_shared_cli_contract() -> None:
+    options = {
+        "--rounds": 7,
+        "--skip-golden": True,
+        "--enable-chip-swimlane": 3,
+        "--dump-args": 2,
+        "--enable-pmu": 4,
+        "--enable-dep-gen": True,
+        "--enable-scope-stats": True,
+        "--enable-swimlane-overhead": True,
+    }
+    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name, default=None: options.get(name, default)))
+
+    assert standalone_pytest_options(request) == {
+        "rounds": 7,
+        "skip_golden": True,
+        "enable_chip_swimlane": 3,
+        "dump_args": 2,
+        "enable_pmu": 4,
+        "enable_dep_gen": True,
+        "enable_scope_stats": True,
+        "enable_swimlane_overhead": True,
+    }
+
+
+@pytest.mark.parametrize(("rounds", "expected"), [(1, 3), (2, 0)])
+def test_chip_swimlane_extension_hook_uses_the_shared_multi_round_gate(rounds, expected) -> None:
+    options = {"--rounds": rounds, "--enable-chip-swimlane": 3}
+    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name, default=None: options.get(name, default)))
+
+    assert SceneTestCase._effective_enable_chip_swimlane(request) == expected
+
+
 def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> None:
     scene_test_module = importlib.import_module("simpler_setup.scene_test")
     output_prefix = scene_test_module.Path("diagnostic-output")
@@ -78,7 +235,7 @@ def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> 
         def _run_and_validate(self, *_args, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(scene_test_module, "_build_output_prefix", lambda _case_label: output_prefix)
+    monkeypatch.setattr(scene_test_module, "build_output_prefix", lambda _case_label: output_prefix)
 
     run_class_cases(
         object(),
@@ -106,8 +263,10 @@ def test_run_class_cases_reports_the_failing_case_name() -> None:
 
     case = {"name": "large_bf16", "params": {"batch": 64, "dtype": "bfloat16"}}
 
+    # The scene's own exception type reaches the caller: a negative scene test
+    # asserts on it, so a fixed-type wrapper would make such a test unable to pass.
     with pytest.raises(
-        RuntimeError,
+        ValueError,
         match=r"SceneTest case failed: FailingScene::large_bf16: device run failed$",
     ) as failure:
         run_class_cases(
@@ -125,8 +284,36 @@ def test_run_class_cases_reports_the_failing_case_name() -> None:
             enable_scope_stats=False,
         )
 
-    assert isinstance(failure.value.__cause__, ValueError)
-    assert str(failure.value.__cause__) == "device run failed"
+    # Annotated in place, so there is no wrapper to unwrap and the traceback still
+    # points at the scene that raised.
+    assert failure.value.__cause__ is None
+    assert failure.value.args[0] == "SceneTest case failed: FailingScene::large_bf16: device run failed"
+
+
+def test_run_class_cases_names_the_case_without_args() -> None:
+    """An exception carrying no message still gets the case name, not `'…: '`."""
+
+    class FailingScene:
+        def _run_and_validate(self, *_args, **_kwargs):
+            raise ValueError
+
+    with pytest.raises(ValueError) as failure:
+        run_class_cases(
+            object(),
+            FailingScene(),
+            [{"name": "empty_args"}],
+            callable_obj=object(),
+            sub_handles={},
+            rounds=1,
+            skip_golden=False,
+            enable_chip_swimlane=0,
+            enable_dump_args=0,
+            enable_pmu=0,
+            enable_dep_gen=False,
+            enable_scope_stats=False,
+        )
+
+    assert str(failure.value) == "SceneTest case failed: FailingScene::empty_args"
 
 
 def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:

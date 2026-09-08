@@ -19,7 +19,7 @@ over-provisioned pools frees **~66 MB, zero ABI**.
 | **pmu** | over, free margin 75%, L≈1 | `BUFFERS_PER_CORE` **4→2** | 9.2 → **4.6 MB** |
 | **scope_stats** | over, free margin 87.5%, L≈1 | `BUFFERS_PER_INSTANCE` **8→4** | 0.21 → **0.11 MB** |
 | **dep_gen** | drops are **rate-limited, not capacity** | `RECORDS_PER_BUFFER` → **1024** (corrects a 2048 overshoot) | frees ~17.5 MB |
-| **args_dump** | adequate (0 overwrite across 6 cases) | **unchanged** | — |
+| **args_dump** | adequate (historical `ovf` counter stayed 0 across 6 cases) | **unchanged** | — |
 
 **Two counterintuitive findings** (argued in §6): ① drops are set by the
 **dispatch pattern (burst intensity)**, not submit count; ② dep_gen drops are
@@ -81,7 +81,7 @@ drains" — **independent of how many buffers you preallocate.** Hence
 | scope_stats | low (per scope enter/exit) | small (52B) | **≈1** | 8 | 8× |
 | l2 task | high (one per task, flood is huge) | small (32B) | **≈4** | 4/8 | 1–2× |
 | l2 phase | high | small W **but buffer is huge (16384)** | T_fill ≫ W → **≪16** | 16 | several× |
-| dep_gen | high (per submit, AICPU at full speed) | **large** (4672B record) | **explodes** under flood | 4 | far short |
+| dep_gen | high (per submit, AICPU at full speed) | **large** (4736B current record) | **explodes** under flood | 4 | far short |
 
 Reasoning per row:
 
@@ -95,7 +95,7 @@ Reasoning per row:
 - **l2 phase**: viewed differently — the per-buffer capacity 16384 is enormous, so
   filling one takes `T_fill = 16384/λ`, far larger than W (recycle latency). So the
   number of phase buffers simultaneously in flight is ≪ 16. Configured 16 is over.
-- **dep_gen**: λ high × W **large** (4672B record drains slowly) → under flood L
+- **dep_gen**: λ high × W **large** (4736B current record drains slowly) → under flood L
   exceeds any realistic config → **sizing can't fix it** (proven via the dynamic
   form `drop ∝ (λ−µ)T` in §5.2).
 
@@ -103,8 +103,9 @@ Reasoning per row:
 
 ### 4.1 Cross-example matrix + margin stats
 
-Format `lowest-free / peak-ready-backlog` (raw counts); `dropN`; `ovf` = tensor
-overwrite count.
+Format `lowest-free / peak-ready-backlog` (raw counts); `dropN` = dropped
+record count; historical `ovf` = the then-current tensor-overwrite counter,
+which #1698 later removed.
 
 | Example | dep_gen | l2_swim | pmu | scope | dump |
 | ------- | ------- | ------- | --- | ----- | ---- |
@@ -137,7 +138,7 @@ verdict reads the weaker dimension):
 | scope_stats | 7/8 → **87.5%** | 87% | **over** |
 | chip_swimlane | **0/4 → 0%** | 95% | **at edge** (free bottomed, but zero-drop) → §4.2 |
 | dep_gen | 3/4 → 75% | 50% | **rate-limited**: both have room yet it still drops (§5.2) |
-| args_dump | 3/4 → 75% | 92% | **adequate** (no overwrite) |
+| args_dump | 3/4 → 75% | 92% | **adequate** (historical `ovf=0`) |
 
 ### 4.2 chip_swimlane: the four pools in detail
 
@@ -234,8 +235,9 @@ drop ≈ (P − R) × T − N × S      P=produce rate, R=host drain rate, N×S=
   | 8×2048 SLOT8 | 16384 | 73 MB | 24576 |
   | batch=16 (4096 submits/burst) | — | — | **0** |
 
-- **The only variable is R** (host drain rate), pinned by record size (4672B) +
-  bandwidth.
+- **The only variable is R** (host drain rate), pinned by record size + bandwidth.
+  These measurements used the then-current 4672B record; the current 4736B
+  dep/kind wire record is 1.37% larger, which does not change the sizing conclusion.
 - **Corollary**: a real layer-serial decoder (qwen3: 40 residual layers, layer
   N+1 waits on N) has `P<R` and is already zero-drop → **dep_gen needs no
   enlargement.** Surviving a 65536 flood would need ≥146 MB in flight, paid for a
@@ -261,9 +263,10 @@ drop ≈ (P − R) × T − N × S      P=produce rate, R=host drain rate, N×S=
 
 ### 5.4 args_dump: adequate, leave
 
-All 6 examples (including the bare flood) show `ovf=0` (no arena overwrite) and a
-steady free of 3/4. The old "arena overwrite under-provisioned" claim is refuted by
-the new data. Re-evaluate if a genuinely large-dump workload appears.
+All 6 examples (including the bare flood) reported `ovf=0` under the overwrite
+detector that existed when this audit was recorded, and show a steady free depth
+of 3/4. The old arena under-provisioning claim is refuted by the data. Re-evaluate
+if a genuinely large-dump workload appears.
 
 ## 6. Cross-cutting mechanisms
 
@@ -317,7 +320,7 @@ separate fix (fewer threads / merged mgmt / scheduling priority).
 | l2 AicoreTask | `AICORE_BUFFER_SIZE` (1024) | `AICORE_BUFFERS_PER_CORE` (4) | 32B | per-core |
 | l2 phase | `PHASE_RECORDS_PER_THREAD` (16384) | `PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD` (6/8) | 64/32B | per-thread |
 | pmu | `PMU_RECORDS_PER_BUFFER` (512) | `PMU_BUFFERS_PER_CORE` (2) | 64B | per-core |
-| dep_gen | `DEP_GEN_RECORDS_PER_BUFFER` (1024) | `DEP_GEN_BUFFERS_PER_INSTANCE` (4) | 4672B | per-instance |
+| dep_gen | `DEP_GEN_RECORDS_PER_BUFFER` (1024) | `DEP_GEN_BUFFERS_PER_INSTANCE` (4) | 4736B | per-instance |
 | scope_stats | `SCOPE_STATS_RECORDS_PER_BUFFER` (512) | `SCOPE_STATS_BUFFERS_PER_INSTANCE` (4) | 52B | per-instance |
 | args_dump | `PLATFORM_DUMP_RECORDS_PER_BUFFER` (256) + arena | `PLATFORM_DUMP_BUFFERS_PER_THREAD` (8) | 128B+tensor | per-thread |
 
