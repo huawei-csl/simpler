@@ -10,14 +10,16 @@
 
 from __future__ import annotations
 
-import time
+import json
 
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
-from simpler_setup.tools.swimlane_converter import read_perf_data
+
+FANOUT_WIDTH = 32
+EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1 + 1  # root + children + final + terminal dummy
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -26,14 +28,20 @@ class TestSchedulerPhases(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/scheduler_phases_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN],
+            "signature": [D.INOUT],
         },
         "incores": [
             {
                 "func_id": 0,
                 "source": "kernels/aiv/kernel_noop.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN],
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "source": "kernels/aiv/kernel_empty.cpp",
+                "core_type": "aiv",
+                "signature": [],
             },
         ],
     }
@@ -53,45 +61,62 @@ class TestSchedulerPhases(SceneTestCase):
         )
 
     def compute_golden(self, args, params):
-        pass
+        args.input[0] = 1
 
     def test_run(self, st_platform, st_worker, request):
-        run_marker = int(time.time())
+        outputs_dir = _outputs_dir()
+        previous_outputs = (
+            {path: path.stat().st_mtime_ns for path in outputs_dir.iterdir()} if outputs_dir.exists() else {}
+        )
         super().test_run(st_platform, st_worker, request)
-        if self._effective_enable_chip_swimlane(request) < 3:
+        level = self._effective_enable_chip_swimlane(request)
+        if level == 0:
             return
 
         for case in self._matching_cases(st_platform, request):
             case_label = _sanitize_for_filename(f"TestSchedulerPhases_{case['name']}")
-            matches = [p for p in _outputs_dir().glob(f"{case_label}_*") if p.stat().st_mtime >= run_marker]
-            assert matches, f"no output directory created for {case_label}"
-            perf_path = max(matches, key=lambda p: p.stat().st_mtime) / "chip_swimlane_records.json"
-            assert perf_path.exists(), f"missing chip swimlane artifact: {perf_path}"
-
-            data = read_perf_data(perf_path)
-            phase_threads = data.get("aicpu_scheduler_phases")
-            assert phase_threads, "scheduler phase records are missing"
-            assigned_threads = {thread_idx for thread_idx in data.get("core_to_thread", []) if thread_idx >= 0}
-            resolution_threads = [
-                records
-                for thread_idx, records in enumerate(phase_threads)
-                if records and thread_idx not in assigned_threads
+            matches = [
+                path
+                for path in outputs_dir.glob(f"{case_label}_*")
+                if path not in previous_outputs or path.stat().st_mtime_ns > previous_outputs[path]
             ]
-            assert len(resolution_threads) == 1, f"expected one core-less P thread, found {len(resolution_threads)}"
-            resolution_thread = resolution_threads[0]
-            required = {"resolve_standalone", "dummy"}
-            emitted = {record.get("phase") for record in resolution_thread}
-            assert required <= emitted, f"missing P-thread phases: {sorted(required - emitted)}"
+            assert matches, f"no output directory created for {case_label}"
+            output_prefix = max(matches, key=lambda path: path.stat().st_mtime_ns)
+            raw = json.loads((output_prefix / "chip_swimlane_records.json").read_text())
+            aicore_rows = raw["aicore_tasks"]
+            assert len(aicore_rows) == EXPECTED_PROFILED_TASKS, (
+                f"task timing covers {len(aicore_rows)} tasks, expected {EXPECTED_PROFILED_TASKS} "
+                "for the fanout/fanin DAG and terminal dummy"
+            )
 
-            records = [record for record in resolution_thread if record.get("phase") in required]
-            assert all(record["loop_iter"] > 0 for record in records)
-            assert all(record["end_time_us"] >= record["start_time_us"] for record in records)
-            assert sum(record["tasks_processed"] for record in records if record["phase"] == "resolve_standalone") >= 1
-            assert sum(record["tasks_processed"] for record in records if record["phase"] == "dummy") == 1
-            assert len(resolution_thread) < 64, "P-thread phase aggregation produced excessive records"
+            if level >= 2:
+                scheduler_tasks = raw["scheduler_tasks"]
+                assert scheduler_tasks["schema_version"] == 1
+                assert scheduler_tasks["producer"] == "aicore"
+                scheduler_rows = scheduler_tasks["records"]
+                assert len(scheduler_rows) == len(aicore_rows)
+                aicore_by_key = {(int(row[0]), int(row[2])): row for row in aicore_rows}
+                assert {(int(row[0]), int(row[1])) for row in scheduler_rows} == set(aicore_by_key)
+                for core_id, reg_task_id, dispatch_cycles, finish_cycles in scheduler_rows:
+                    aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
+                    assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
+                assert raw["aicpu_lifecycle_records"], "AICPU lifecycle records are missing"
+            else:
+                assert "scheduler_tasks" not in raw
+                assert "aicpu_lifecycle_records" not in raw
 
-            ordered = sorted(records, key=lambda record: (record["start_time_us"], record["end_time_us"]))
-            assert all(left["end_time_us"] <= right["start_time_us"] for left, right in zip(ordered, ordered[1:]))
+            if level >= 3:
+                streams = raw["scheduler_records"]["streams"]
+                assert streams, "A5 HBG AICore Scheduler records are missing"
+                assert all(stream["producer"] == "aicore" for stream in streams)
+                assert all(stream["capture"]["dropped"] == 0 for stream in streams)
+                emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
+                required_kinds = {"bootstrap", "fanin", "dispatch", "complete", "resolve", "idle"}
+                assert required_kinds <= emitted_kinds, (
+                    f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
+                )
+            else:
+                assert "scheduler_records" not in raw
 
 
 if __name__ == "__main__":

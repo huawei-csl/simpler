@@ -250,14 +250,14 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if SIMPLER_DFX
-    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
     // {start, end, task_token_raw}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
-    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task. Bypassing here saves the per-completion
     // hot-path cost (counter inc + ring lookup + record store + wmb + buffer
     // rotation bookkeeping) for runs that only want AICore timing.
-    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
@@ -394,7 +394,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // charge AICPU completion-processing cost to the (end → finish)
         // span, masking the actual FIN-delivery latency.
         uint64_t finish_ts = 0;
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
             finish_ts = get_sys_cnt_aicpu();
         }
 #endif
@@ -459,7 +459,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    if (sched_->maybe_rendezvous_ring(*promoted)) {
+                    if (sched_->try_launch_sync_start_cohort(*promoted)) {
                         sched_->propagate_dispatch_fanin(*promoted);
                     }
                 }
@@ -609,7 +609,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
             }
 #endif
@@ -797,7 +797,7 @@ void SchedulerContext::handle_drain_mode(
     }
     if (gated) {
         // Seed the rendezvous with the running-slot cores staged across all threads; pending
-        // cores advance it as they promote. maybe_rendezvous_ring (producer release) rings iff
+        // cores advance it as they promote. try_launch_sync_start_cohort (producer release) rings iff
         // this already equals popcount(staged_core_mask) — i.e. no pending spill.
         slot_state->payload->running_slot_count.store(
             static_cast<int16_t>(drain_state_.drain_running_staged.load(std::memory_order_acquire)),

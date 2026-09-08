@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -20,11 +21,65 @@
 #include <vector>
 
 #include "host_build_graph/runtime_types.h"
+#include "aicore_scheduler_error.h"
+#include "aicore_scheduler_state.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_watchdog.h"
 
 namespace {
+
+TEST(AicoreSchedulerError, MapsInternalFailureToExistingHostStatus) {
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(0), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(1), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(
+        aicore_scheduler_runtime_error_code(static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)),
+        SIMPLER_ERROR_SCHEDULER_TIMEOUT
+    );
+    EXPECT_EQ(aicore_scheduler_runtime_error_code(UINT64_MAX), SIMPLER_ERROR_INVALID_ARGS);
+}
+
+TEST(AicoreSchedulerError, LatchesFirstHostVisibleFailure) {
+    std::atomic<int32_t> status{SIMPLER_ERROR_NONE};
+    EXPECT_FALSE(latch_aicore_scheduler_runtime_error(&status, 0));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_NONE);
+
+    EXPECT_TRUE(latch_aicore_scheduler_runtime_error(&status, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+
+    status.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW, std::memory_order_relaxed);
+    EXPECT_FALSE(latch_aicore_scheduler_runtime_error(&status, 2));
+    EXPECT_EQ(status.load(std::memory_order_relaxed), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+}
+
+TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(0));
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
+
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(0));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
+    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
+}
+
+TEST(AicoreSchedulerState, ResidentV0AcceptsOnlySingleLaneSingleBlockTasks) {
+    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(2, 1, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
+    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+}
+
+TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
+    EXPECT_FALSE(scheduler_watchdog_expired(100, UINT64_MAX, 0));
+    EXPECT_FALSE(scheduler_watchdog_expired(100, 199, 100));
+    EXPECT_TRUE(scheduler_watchdog_expired(100, 200, 100));
+    EXPECT_TRUE(scheduler_watchdog_expired(UINT64_MAX - 10, 4, 15));
+}
 
 class SchedulerStateBuffer {
 public:
@@ -153,16 +208,29 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(alignof(SchedulerDispatchSlot), 128u);
     EXPECT_EQ(alignof(SchedulerRunControl), 128u);
     EXPECT_EQ(alignof(SchedulerWorkerContext), 128u);
+    EXPECT_EQ(alignof(SchedulerTaskTrace), 128u);
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerDispatchSlot, 2> dispatch_slots{};
     std::array<SchedulerWorkerContext, 2> contexts{};
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&dispatch_slots[1]) - reinterpret_cast<uintptr_t>(&dispatch_slots[0]), 128u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&dispatch_slots[1]) - reinterpret_cast<uintptr_t>(&dispatch_slots[0]), 256u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
     EXPECT_NE(offsetof(SchedulerDispatchSlot, task_id) / 64, offsetof(SchedulerDispatchSlot, publication) / 64);
+    EXPECT_EQ(offsetof(SchedulerDispatchSlot, executor_trace), 128u);
+    EXPECT_EQ(
+        offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
+    );
+    EXPECT_NE(
+        offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64,
+        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
+    );
+    EXPECT_NE(
+        offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) / 64,
+        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
+    );
 }
 
 TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics) {
@@ -299,7 +367,7 @@ TEST(SchedulerDispatchPayload, DisablesDeferredCompletionWithoutASlab) {
     ASSERT_EQ(
         scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
     );
-    EXPECT_TRUE(payload.local_context.async_ctx.task_token.is_invalid());
+    EXPECT_FALSE(payload.local_context.async_ctx.task_token.is_valid());
     EXPECT_EQ(payload.global_context.sub_block_id, 0);
 
     task.subtask_slot = 2;

@@ -26,6 +26,7 @@
 #include "callable.h"
 #include "call_config.h"
 #include "device_runner_base.h"
+#include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "prepare_callable_common.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
@@ -49,6 +50,37 @@ using SimNativeRunContext = NativeRunContext<SimDeviceRunnerBase>;
 // Phase entry points validate raw caller storage before beginning object
 // lifetime, so the on-storage magic must remain the leading bytes.
 static_assert(__builtin_offsetof(SimNativeRunContext, magic) == 0, "native-run magic must lead runtime storage");
+
+// Forward-declared rather than including the host_build_graph header, whose
+// types belong to that runtime .so. Each platform .so carries weak `false` /
+// `-1` fallbacks for the runtimes that capture on the device instead — see each
+// arch's device_runner.cpp.
+extern "C" bool dep_gen_host_graph_active();
+extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
+
+/**
+ * Write a host-orchestrated run's dependency graph, at the point its capture
+ * window closes.
+ *
+ * The graph is complete when bind returns — host_build_graph runs its
+ * orchestrator there — and it lives in state private to the thread that ran it.
+ * Writing it here keeps the write on that thread and ahead of any later capture,
+ * which is what the alternative (writing at drain) cannot promise: a drain may
+ * land on another thread, and a successor's bind resets the capture state.
+ *
+ * The destination comes from this run's own config rather than the runner's.
+ *
+ * A no-op for runtimes that capture on the device: their `dep_gen_host_graph_active`
+ * is the weak `false`, and their graph is emitted from the collector at drain.
+ */
+static void emit_host_dep_gen_graph(const CallConfig &config, const char *trace_attrs) {
+    if (config.enable_dep_gen == 0 || !dep_gen_host_graph_active()) return;
+    const std::string deps_path = make_deps_json_path(config.output_prefix);
+    const int emit_rc = dep_gen_host_graph_emit(deps_path.c_str());
+    if (emit_rc != 0) {
+        LOG_ERROR("dep_gen host graph emit failed (%d) — deps.json not produced (%s)", emit_rc, trace_attrs);
+    }
+}
 
 extern "C" {
 
@@ -190,6 +222,13 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static bool publish_chip_swimlane_extension(
+    void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+) {
+    return runner_ctx != nullptr && static_cast<SimDeviceRunnerBase *>(runner_ctx)
+                                        ->publish_chip_swimlane_extension(section, json_value, json_size);
+}
+
 static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
@@ -302,6 +341,7 @@ static const HostApiOps g_host_api_ops = {
     .get_chip_swimlane_level = get_chip_swimlane_level,
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
+    .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
 };
 
 /* ===========================================================================
@@ -377,7 +417,7 @@ int finalize_device(DeviceContextHandle ctx) {
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
-    const CallConfig *prewarm_config
+    const CallConfig *prewarm_config, int enable_sdma, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
 ) {
     // Sim has no AICPU dispatcher (the simulator runs AICPU in-process). Accept
     // the parameters for ABI parity with the onboard implementation and ignore
@@ -385,14 +425,30 @@ int simpler_init(
     // and the dispatcher / preinstall load path on sim isn't taken anyway.
     (void)dispatcher_binary;
     (void)dispatcher_size;
+    // Simulation drives no SDMA control path, so the warmup ELF has nothing to
+    // walk.
+    (void)sdma_warmup_binary;
+    (void)sdma_warmup_size;
 
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
 
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
+    runner->set_dma_workspace_request(enable_sdma != 0);
 
     int rc;
     try {
         rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) return rc;
+
+    // Provisioning follows the attach because the release path depends on it:
+    // finalize() returns early on a runner that never attached, and its
+    // dma_workspace_release() sits past that guard, so a block acquired before
+    // the attach would outlive the runner.
+    try {
+        rc = runner->ensure_dma_workspace_provisioned();
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -702,6 +758,7 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        emit_host_dep_gen_graph(state->config, state->trace_attrs);
         rc = runner->prepare_execution(
             state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
             &state->prepared_execution
@@ -953,18 +1010,6 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
 int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
     if (ctx == NULL || info == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     return PTO_RUNTIME_ERR_UNSUPPORTED;
-}
-
-int simpler_provision_dma_workspace(
-    DeviceContextHandle ctx, uint32_t required_mask, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
-) {
-    // Simulation provides no async-DMA workspaces; a non-empty request fails
-    // fast so an SDMA-enabled Worker cannot come up on sim. With no workspace
-    // there is likewise nothing for the warmup ELF to warm.
-    (void)ctx;
-    (void)sdma_warmup_binary;
-    (void)sdma_warmup_size;
-    return required_mask == 0 ? 0 : PTO_RUNTIME_ERR_UNSUPPORTED;
 }
 
 }  // extern "C"

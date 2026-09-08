@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#include "intrinsic.h"
+#include "tensor.h"
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -20,4 +23,10 @@
 #define __aicore__ [aicore]
 #endif
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { (void)args; }
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ int32_t *output = reinterpret_cast<__gm__ int32_t *>(tensor->buffer.addr) + tensor->start_offset;
+    output[0] = 1;
+    dcci(&output[0], cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+}

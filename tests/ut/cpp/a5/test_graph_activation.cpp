@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "utils/device_arena.h"
+#include "scheduler/scheduler.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 
@@ -61,7 +62,7 @@ protected:
     static void init_in_graph_task(ChipTaskStorage &task, int32_t task_index, ChipTaskState state) {
         memset(&task, 0, sizeof(ChipTaskStorage));
         task.slot.task_state.store(state);
-        task.slot.in_graph_task_index = task_index;
+        task.slot.in_graph_local_id = task_index;
         task.slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
         task.slot.task_kind = TaskKind::KERNEL;
         task.slot.total_required_subtasks = 1;
@@ -78,7 +79,7 @@ TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegiste
     init_in_graph_task(tasks[1], 1, CHIP_TASK_PENDING);      // consumer of task 0
     tasks[0].slot.wake_list_head.store(WAKE_LIST_SENTINEL);  // its wake list already drained
 
-    std::vector<uint32_t> fanin_offsets{0, 0, 1};  // task 0 is a root; task 1 <- {0}
+    std::vector<int32_t> fanin_offsets{0, 0, 1};  // task 0 is a root; task 1 <- {0}
     std::vector<uint16_t> fanin_indices{0};
     GraphExecution exec{};
     exec.tasks = exec.task_storage = tasks.get();
@@ -103,7 +104,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     init_in_graph_task(tasks[2], 2, CHIP_TASK_PENDING);    // consumer of task 0 (completed)
     init_in_graph_task(tasks[3], 3, CHIP_TASK_PENDING);    // consumer of task 1 (pending)
 
-    std::vector<uint32_t> fanin_offsets{0, 0, 0, 1, 2};  // task 2 <- {0}, task 3 <- {1}
+    std::vector<int32_t> fanin_offsets{0, 0, 0, 1, 2};  // task 2 <- {0}, task 3 <- {1}
     std::vector<uint16_t> fanin_indices{0, 1};
     GraphExecution exec{};
     exec.tasks = exec.task_storage = tasks.get();
@@ -134,7 +135,7 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
     auto complete_in_state = [&](GraphExecutionState state) {
         auto task = std::make_unique<ChipTaskStorage[]>(1);
         memset(task.get(), 0, sizeof(ChipTaskStorage));
-        task[0].slot.in_graph_task_index = 0;
+        task[0].slot.in_graph_local_id = 0;
         task[0].slot.total_required_subtasks = 1;
 
         GraphExecution exec{};
@@ -171,7 +172,7 @@ TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask
     // A whole storage entry, not a bare slot state: a slot reaches its descriptor by
     // ChipTaskStorage's layout, so one on its own would resolve outside itself.
     ChipTaskStorage outer{};
-    outer.task.task_id = simpler::hbg::make_global_task(0);
+    outer.task.task_id = TaskId::make_global(0);
 
     ChipTaskSlotState &slot = outer.slot;
     slot.task_kind = TaskKind::GRAPH;

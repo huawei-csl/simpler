@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "assert_compat.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
@@ -19,7 +20,6 @@
 
 #include "scheduler/scheduler.h"
 
-#include "aicore_completion_mailbox.h"
 #include "dispatch_payload.h"
 
 // runtime.h cannot be included here — it pulls in Handshake, which this header
@@ -142,7 +142,7 @@ public:
 
     // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
     // per-S CompletedTaskQueues and runs on_task_complete for each finished task
-    // (completion_flags publish + wake-list drain + watermark advance), making P
+    // (task_states publish + wake-list drain), making P
     // the sole producer of the ready queues. Owns completed_tasks_ / termination.
     int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
 
@@ -150,10 +150,10 @@ public:
     // host_build_graph always reserves it (aicpu_thread_num >= 2 is required).
     int32_t p_thread_idx() const { return p_thread_idx_; }
 
-    // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
-    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
-    int32_t shutdown(int32_t thread_idx);
+    // Retire the cores this thread owns, on its way out of resolve_and_dispatch.
+    // Threads that own none no-op. Runs before the completion latch, so no
+    // run() exit path can leave a worker blocked on its gate.
+    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
 
     // Run all post-attach scheduler bookkeeping, once, on the boot leader:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -224,6 +224,10 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     std::atomic<bool> completed_{false};
+    // Per-core retirement claim. The winner owns that core's register window
+    // and return gate for the rest of the run; every other path leaves both
+    // alone. Indexed by core id, reset in pre_handshake_init.
+    std::atomic<bool> core_retired_[PLATFORM_MAX_CORES];
     uint64_t *func_id_to_addr_{nullptr};
 
     // --- Thread/core configuration ---
@@ -276,6 +280,10 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
+    // Claim and retire the named cores. Cores already claimed elsewhere are
+    // skipped, so callers may name overlapping sets.
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    int32_t retire_all_cores(Runtime *runtime);
 
     __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
 
@@ -316,7 +324,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below SCHEDULE_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;

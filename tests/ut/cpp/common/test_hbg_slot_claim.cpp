@@ -24,10 +24,11 @@
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
+#include "scheduler/scheduler.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
-#include "host_build_graph/task_id_encoding.h"
+#include "host_build_graph/task_id.h"
 
 class HbgSlotClaimTest : public ::testing::Test {
 protected:
@@ -56,7 +57,7 @@ protected:
 
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS, &sched));
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
         GraphDefinitionArena arena{};
@@ -88,8 +89,8 @@ protected:
         state.any_subtask_deferred.store(true, std::memory_order_relaxed);
         state.completed_subtasks.store(7, std::memory_order_relaxed);
         state.next_block_idx.store(3, std::memory_order_relaxed);
-        state.in_graph_task_index = 11;
-        sm_handle->header->tasks.completion_flags[slot].store(1, std::memory_order_relaxed);
+        state.in_graph_local_id = 11;
+        sm_handle->header->tasks.store_completed(slot);
     }
 
     void expect_slot_pristine(int32_t slot) {
@@ -100,8 +101,8 @@ protected:
         EXPECT_FALSE(state.has_any_subtask_deferred());
         EXPECT_EQ(state.completed_subtasks.load(std::memory_order_relaxed), 0);
         EXPECT_EQ(state.next_block_idx.load(std::memory_order_relaxed), 0);
-        EXPECT_EQ(sm_handle->header->tasks.completion_flags[slot].load(std::memory_order_relaxed), 0)
-            << "a stale completion flag reports this task done before it has run";
+        EXPECT_EQ(sm_handle->header->tasks.task_states[slot].load(std::memory_order_relaxed), CHIP_TASK_PENDING)
+            << "a stale progress state reports this task done before it has run";
     }
 };
 
@@ -178,7 +179,7 @@ TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     poison_slot(1);
     const GraphScopeResult replay = orch.graph_begin(0x51ADC1A2, boundary_args, 0x1736);
     ASSERT_TRUE(replay.task_id.is_valid());
-    ASSERT_EQ(simpler::hbg::task_local_id(replay.task_id), 1u);
+    ASSERT_EQ(replay.task_id.local_id(), 1);
 
     expect_slot_pristine(1);
 }

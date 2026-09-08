@@ -6,6 +6,11 @@ This document describes the profiling macro hierarchy and logging control in the
 
 The runtime uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_chip_swimlane` runtime flag (integer perf_level 0–4) controls data collection granularity (performance buffers, shared memory writes) but does NOT control log output.
 
+> **A5 HBG scheduler selection.** Diagnostic flags never select the scheduler.
+> Ordinary DAGs remain on the A5 HBG AICore Scheduler, while Graph replay
+> remains on its explicit AICPU compatibility path. Both producers export the
+> same `scheduler_records` schema; stream metadata identifies `producer` so
+> tools never apply AICPU scheduling assumptions to AICore intervals.
 > **host_build_graph (host-orch) note.** The profiling **macros** below
 > (`SIMPLER_DFX`, `SIMPLER_ORCH_PROFILING`, …) are shared with
 > `tensormap_and_ringbuffer`. But the orchestrator-timing **device-log lines**
@@ -166,7 +171,7 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in `aicpu_scheduler_phases[]` (in `chip_swimlane_records.json`
+stats live in `scheduler_records.streams[]` (in `chip_swimlane_records.json`
 captured at chip_swimlane_level >= 3) and `deps.json`; consume them via
 `simpler_setup/tools/sched_overhead_analysis.py`.
 
@@ -240,12 +245,12 @@ appear.
 
 ### What is recorded
 
-Sixteen kinds, all on the host monotonic clock the `[STRACE]` host spans use,
+Twenty-one kinds, all on the host monotonic clock the `[STRACE]` host spans use,
 so records and spans read against each other with no alignment step.
 
 | Group | Kinds |
 | ----- | ----- |
-| Bind segments (partition the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `sm_h2d`, `arena_h2d`, `host_view_close` |
+| Bind segments (one interval each, inside the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `arena_h2d`, `host_view_close` |
 | Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_in_graph_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
 
 Three of the orchestrator kinds end with a task submitted — `submit_task`,
@@ -270,7 +275,11 @@ the wrong one produces a number that reads as data and is not:
   count). That is the whole contract.
 - **A quantity about a segment is an attribute** — `bytes=`, `heap_used=`,
   `spilled=`, `minflt=`, `nvcsw=`. It goes in the segment's attribute string,
-  which is what the `bind phase=` line prints.
+  which is what the segment's span carries. That string is capped at the span
+  attribute field's width (`SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY`), and the
+  kernel counters are formatted first, so an overlong one loses a caller quantity
+  the artifact's `detail` can still supply rather than a counter nothing else
+  carries.
 
 So: **a new interval to name earns a new kind; a new quantity about an interval
 that already exists is an attribute on it.** Adding a kind to carry a statistic
@@ -286,7 +295,7 @@ printed as `detail_sum` for as long as the column was unconditional.
 
 | Switch | Turns on |
 | ------ | -------- |
-| `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` (env, off unless it starts with `1`, `t` or `T`) | the `LOG_TIMING` breakdown; needs no records, no rebuild, and works at any `--rounds` |
+| `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` (env, off unless it starts with `1`, `t` or `T`) | the breakdown in the log — segment spans plus the `host-orch` cost-share lines; needs no records, no rebuild, and works at any `--rounds` |
 | `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE` (env, same spelling) | per-event collection into the pool, which reaches `host_phase_records.jsonl` when the run has an output directory |
 | `--enable-chip-swimlane 4` (CallConfig `chip_swimlane_level`) | per-event collection *and* the host lane in `chip_swimlane_records.json`, with its records clock-aligned against the device timeline |
 
@@ -319,11 +328,15 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
 
 ### The three views
 
-- **`LOG_TIMING` lines**, at the default log threshold, gated by
-  `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE`. One `bind phase=<p> start_ns=<n>
-  dur_ns=<n> <attrs>` line per segment, plus one `host-orch phase=<p>
-  total_ns=<n> count=<k> detail_sum=<n> dropped=<n>` line per orchestrator kind.
-  They come from per-kind counters, not from the record pool. The counters use
+- **The log**, at the default threshold, gated by
+  `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE`. Two shapes, because a segment and a cost
+  share are different things: one `[STRACE]` span named
+  `chip.run.bind.<segment>` per segment, carrying `ts` / `dur` / `<attrs>` at
+  depth 2 inside the `chip.run.bind` span; and one `host-orch phase=<p>
+  total_ns=<n> count=<k> detail_sum=<n> dropped=<n>` `LOG_TIMING` line per
+  orchestrator kind, which stays a line because those kinds nest inside each
+  other and a total over them is not an interval.
+  Both come from per-kind counters, not from the record pool. The counters use
   lock-free atomic additions across the main and recording-worker lanes, with
   every phase isolated on its own cache line so concurrent `graph_submit` and
   `record_in_graph_task` updates do not false-share. The per-event pool is armed when the
@@ -334,9 +347,11 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   makes this the channel for steady state, where `--rounds > 1` switches every
   artifact collector off.
 
-  Every line is written at the end of the bind, keeping the log write off the path
-  being measured. The line therefore carries its own `start_ns`; the log prefix
-  timestamps the write, not the segment.
+  Both are written at the end of the bind, keeping the write off the path being
+  measured. The span therefore carries its own `ts`, taken when the segment
+  opened, rather than leaving its start to be inferred from when the record was
+  written — `STRACE_HOST_SPAN_AT_A` exists for that, and `chip.run` itself is
+  emitted the same way.
 
 - **`host_phase_records.jsonl`** in the per-case output directory, when a
   collecting bind has one. One JSON Lines object per bind carrying `pid` / `inv`
@@ -355,7 +370,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   | Key | Kinds | Rendered as |
   | --- | ----- | ----------- |
   | `host_orchestrator_phases` | the task-submitting kinds | `Host Orchestrator` process |
-  | `host_device_uploads` | `graph_upload`, `sm_h2d`, `arena_h2d`, with byte counts | `Host Prepare` / `H2D` lane |
+  | `host_device_uploads` | `graph_upload`, `arena_h2d`, with byte counts | `Host Prepare` / `H2D` lane |
 
   The upload lane is the one place the whole question — orchestration plus H2D
   inside a millisecond — is visible against the device execution it precedes; the
@@ -365,13 +380,15 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   against `recorded_records` (the submit projection), plus `pool_records` for the
   whole population — a pool count above the projection is normal, not incomplete.
 
-The stage's *duration* is already published as the `chip.run.bind` `[STRACE]`
-marker, so the marker and this breakdown are a total and its parts rather than two
-spellings of one number. The parts are not markers themselves: the marker grammar
-is the platform's public per-run-stage contract (see `runtime_c_api.h` and
-[docs/dfx/host-trace.md](../../../../../docs/dfx/host-trace.md)), whose consumers
-key off a fixed stage set, and a runtime's internal breakdown of one stage does
-not belong in it.
+The stage's *duration* is the `chip.run.bind` `[STRACE]` span, and its segments
+are `[STRACE]` spans one level below it, so the two are a stage and its parts in
+one format. A runtime subdividing a stage it owns is ordinary: the tensormap
+runtime's `chip.run.bind.args` and `chip.run.bind.prebuilt` do it, and the device
+sub-phases are that runtime's own AICPU breakdown, read back from a cycle buffer
+and re-emitted as spans (see `runtime_c_api.h` and
+[docs/dfx/host-trace.md](../../../../../docs/dfx/host-trace.md)). What is *not*
+a span is a summed cost share over kinds that nest inside each other — those have
+no honest position on a timeline, and they are the `host-orch phase=` lines.
 
 ### Cost and capacity
 
@@ -396,13 +413,16 @@ mirrors the PMU pattern — two independent channels (one binary, one int):
 
 - **Binary on/off** — `KernelArgs::enable_profiling_flag` bit1
   (`SIMPLER_DFX_FLAG_CHIP_SWIMLANE`). Set by the host whenever level > 0; read
-  by AICore (which only needs on/off to decide whether to write timing) and
-  by AICPU kernel entry via `set_chip_swimlane_enabled(bool)`.
+  by AICore for the initial profiler activation and by AICPU kernel entry via
+  `set_chip_swimlane_enabled(bool)`.
 - **Granular level (0–4)** — `ChipSwimlaneDataHeader::chip_swimlane_level`
   (shared memory). Host writes it in `ChipSwimlaneCollector::initialize`; AICPU
   promotes it from the header in `chip_swimlane_aicpu_init` and exposes it via
   `get_chip_swimlane_level()` (typed `ChipSwimlaneLevel`) for
-  `>= AICPU_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
+  `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates. The A5 HBG host also
+  copies the level into `SchedulerRunControl`, where the AICore Scheduler reads
+  it once and gates task timing, per-task scheduling timing, and phase timing
+  independently.
 
 On sim, the binary on/off travels via the dlsym'd `set_chip_swimlane_enabled`
 entry point; the granular level still goes through the shared-memory
@@ -412,12 +432,29 @@ header just like on onboard.
 | ----- | -------- |
 | 0 | Nothing (disabled) |
 | 1 | AICore timing only (start/end/task_token_raw) — AICPU `complete_task` is bypassed |
-| 2 | + AICPU dispatch_time, finish_time |
+| 2 | + Scheduler per-task dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
 
+The A5 HBG AICore Scheduler records the same per-task timing contract as the
+AICPU Scheduler: `dispatch_time` is the end of dispatch publication and
+`finish_time` is when the Scheduler starts processing the completion. The raw
+`scheduler_tasks.producer` field identifies which Scheduler produced these
+timestamps. At level 2 and above, A5 HBG also exports AICPU lifecycle timestamps
+for handshake, topology/configuration, context publication, bootstrap wait,
+register release, and exit; these are supplemental control-plane records.
+
+At level 3 and above, A5 HBG AICore Scheduler task intervals reuse the per-task
+trace. Consecutive taskless scheduler-loop iterations are coalesced into one
+`idle` interval and stored in one fixed-capacity, no-wrap buffer per Scheduler;
+overflow increments `capture.dropped` and sets `capture.truncated`. Coalescing
+keeps capture size dependent on idle-to-active transitions instead of Host CPU
+speed in simulation. The buffer is not allocated below level 3. Interval
+endpoints are captured at operation entry and exit; no interval is synthesized
+from aggregate durations.
+
 At level 1 the AICore record carries the full `task_token_raw`
-(a `TaskId::raw`; see `src/common/host_build_graph/task_id_encoding.h`), read straight from
+(a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from
 `LocalContext.async_ctx.task_token.raw` inside the AICore helper —
 already in cache from the dispatch payload, so no extra GM load.
 Identity fields the AICPU side used to write at level 1 (`func_id`,
@@ -458,10 +495,11 @@ content it depends on instead of relying on magic numbers:
 // Cheap binary check, available immediately after kernel entry.
 if (is_chip_swimlane_enabled()) { ... }
 
-// AICPU dispatch/finish timestamps.
+// On the AICPU compatibility path, gate its Scheduler task-timing producer.
+// The A5 HBG AICore Scheduler applies the same enum contract host-side.
 // Granular checks below require chip_swimlane_aicpu_init to have already run
 // (so the level has been promoted from the shared-memory header).
-if (get_chip_swimlane_level() >= ChipSwimlaneLevel::AICPU_TIMING) { ... }
+if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING) { ... }
 
 // Scheduler main-loop phase records (SCHED_*)
 if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHED_PHASES) { ... }
@@ -477,8 +515,8 @@ shared-memory field and mirrors `PmuEventType : uint32_t`):
 | Enumerator | Underlying value |
 | ---------- | ---------------- |
 | `DISABLED` | 0 |
-| `AICORE_TIMING` | 1 |
-| `AICPU_TIMING` | 2 |
+| `TASK_TIMING` | 1 |
+| `SCHEDULE_TIMING` | 2 |
 | `SCHED_PHASES` | 3 |
 | `ORCH_PHASES` | 4 |
 

@@ -103,10 +103,12 @@ public:
     // `DeviceRunnerBase`.
 
     /**
-     * a5 `dep_gen` enablement setter, overriding the base no-op. Captures
-     * orchestrator submit_task inputs for offline replay into deps.json.
+     * a5 `dep_gen` enablement setter, overriding the base no-op. Also arms the
+     * loaded runtime's host-side graph capture, which a host-orch runtime uses
+     * instead of the device collector. Defined in the .cpp so this header stays
+     * free of the runtime-provided capture symbols.
      */
-    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
+    void set_dep_gen_enabled(bool enable) override;
 
     /**
      * Cleanup all resources
@@ -251,7 +253,10 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args);
+    int init_chip_swimlane(
+        int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+        const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
+    );
 
     /**
      * Initialize args dump device buffers.
@@ -261,7 +266,10 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args);
+    int init_args_dump(
+        Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
+        DumpArgsLevel dump_args_level
+    );
 
     /**
      * Initialize PMU profiling device buffers.

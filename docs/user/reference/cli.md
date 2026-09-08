@@ -41,7 +41,7 @@ rounds stay uninstrumented. The harness warns for each one it switches off.
 
 | Flag | Meaning |
 | ---- | ------- |
-| `--enable-chip-swimlane` | Per-task timing. Bare flag = level 4 (full); `1` AICore timing, `2` + dispatch/fanout, `3` + scheduler phases, `4` + orchestration. **L2 only** |
+| `--enable-chip-swimlane` | Per-task timing. Bare flag = level 4 (full); `1` AICore timing, `2` + dispatch/fanout, `3` + scheduler phases, `4` + orchestration. **L2 and same-host L3**; cross-rank merging requires level `4` |
 | `--enable-swimlane-overhead` | Adds the 8 Overhead Analysis counter tracks. Requires `--enable-chip-swimlane` **and** a `deps.json` — add `--enable-dep-gen` if absent |
 | `--enable-pmu` | AICore hardware counters. Bare flag = `PIPE_UTILIZATION` (2); pass an event type to override, e.g. `--enable-pmu 4` |
 | `--dump-args` | Capture per-task arguments. `0` off; `1` partial; `2` full; `3` hybrid (all metadata plus payload selected via `Arg::dump(...)`) |
@@ -78,7 +78,7 @@ python -m simpler_setup.tools.swimlane_converter <chip_swimlane_records_*.json>
 | -------- | ------ |
 | `SIMPLER_OP_EXECUTE_TIMEOUT_US` | Overrides the op-execute timeout (default 45 s) |
 | `SIMPLER_STREAM_SYNC_TIMEOUT_MS` | Overrides the stream-sync timeout (default 50 s) |
-| `SIMPLER_SCHEDULER_TIMEOUT_MS` | Overrides the scheduler timeout (default 10 s) |
+| `SIMPLER_SCHEDULER_TIMEOUT_MS` | Overrides the scheduler timeout (default 20 s) |
 | `ASCEND_PROCESS_LOG_PATH` | Redirects the device log into a directory you own; the directory must already exist |
 | `ASCEND_HOME_PATH` | CANN toolkit location; required for hardware platforms |
 

@@ -12,14 +12,13 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
 #include <cstdint>
 
-#include "aicpu/platform_regs.h"
 #include "backend/sdma/sdma_completion_scheduler.h"
-#include "intrinsic.h"
 #include "aicore_completion_mailbox.h"
+#include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/completion_token.h"
+#include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 
 struct SchedulerState;
@@ -153,6 +152,17 @@ struct AsyncWaitList {
     // non-zero value means consumers are too slow or the ring is undersized.
     // Read by scheduler shutdown / l2 perf summary; not on the hot path.
     std::atomic<uint64_t> mpsc_skipped_count{0};
+
+    // Empty state of a wait list sitting on the arena's device-only zone, whose
+    // bytes are whatever the pooled allocation last held. `count` bounds every
+    // read of entries[], and a drain assigns an entry in full before raising the
+    // count that admits it, so clearing the three scalars is the whole reset —
+    // the 190 KB entries[] region needs no per-bind sweep.
+    void reset_for_reuse() {
+        busy.store(0, std::memory_order_relaxed);
+        count = 0;
+        mpsc_skipped_count.store(0, std::memory_order_relaxed);
+    }
 
     bool try_lock() {
         int32_t expected = 0;

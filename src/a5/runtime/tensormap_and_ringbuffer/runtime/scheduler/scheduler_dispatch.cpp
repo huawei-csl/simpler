@@ -204,7 +204,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     uint64_t *dispatch_timestamp_slot = nullptr;
 #if SIMPLER_DFX
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         dispatch_timestamp_slot =
             to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
     }
@@ -354,7 +354,7 @@ void SchedulerContext::dispatch_shape(
             wmb();
             uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = get_sys_cnt_aicpu();
             }
 #endif
@@ -538,19 +538,26 @@ void SchedulerContext::dispatch_ready_tasks(
     // (sync_start > MIX > C/V within the normal source). Same order and machinery,
     // fed from ready_sync_queues; an oversized cohort arms the stop-the-world drain
     // (entered_drain), which also short-circuits the regular tier below.
-    run_staging_order(
-        thread_idx, pmu_active,
-        [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            dispatch_shape(
-                thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
-            );
-            return entered_drain;
-        },
-        [&] {
-            return has_residual_sync_mix();
-        }
-    );
-    if (entered_drain) return;
+    // Skip Tier-0 entirely until the orchestrator has submitted a sync_start
+    // task. Without one the staging order below can only probe six empty queues
+    // per iteration. The acquire pairs with the release in prepare_task(), so
+    // observing the latch set also makes that task's submission visible.
+    if (sched_->sync_task_seen.load(std::memory_order_acquire) != 0) {
+        run_staging_order(
+            thread_idx, pmu_active,
+            [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+                dispatch_shape(
+                    thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress,
+                    try_pushed
+                );
+                return entered_drain;
+            },
+            [&] {
+                return has_residual_sync_mix();
+            }
+        );
+        if (entered_drain) return;
+    }
 
     // Tier 1: regular ready work.
     run_staging_order(
@@ -1202,19 +1209,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
-                // beyond their own producers; release self-reference so the slot can
-                // reach CONSUMED once all consumers drain.
+                // beyond their own producers. While lifecycle reclamation is active,
+                // release their self-reference so the slot can reach CONSUMED.
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= DEFERRED_RELEASE_CAP) {
-                    while (deferred_release_count > 0) {
+                    bool release_elided = orchestrator_done_.load(std::memory_order_acquire);
+                    drain_or_elide_deferred_releases(
+                        sched_, deferred_release_slot_states, deferred_release_count, release_elided
 #if SIMPLER_SCHED_PROFILING
-                        (void)sched_->on_task_release(
-                            *deferred_release_slot_states[--deferred_release_count], thread_idx
-                        );
-#else
-                        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                        ,
+                        thread_idx
 #endif
-                    }
+                    );
                 }
                 int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
                 last_progress_count = prev + 1;
@@ -1328,17 +1334,21 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     0;
             uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
-            while (deferred_release_count > 0) {
+            // Elide remaining deferred releases when orchestration is done;
+            // otherwise drain via on_task_release.
+            bool release_elided = deferred_release_count > 0 && orchestrator_done_.load(std::memory_order_acquire);
+            if (deferred_release_count > 0 && !release_elided) {
                 INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
-
-#if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
             }
+            drain_or_elide_deferred_releases(
+                sched_, deferred_release_slot_states, deferred_release_count, release_elided
+#if SIMPLER_SCHED_PROFILING
+                ,
+                thread_idx
+#endif
+            );
 #if SIMPLER_DFX
-            if (release_t0 != 0) {
+            if (release_t0 != 0 && !release_elided) {
                 chip_swimlane_aicpu_record_sched_phase(
                     thread_idx, ChipSwimlaneSchedPhaseKind::Release, release_t0, get_sys_cnt_aicpu(),
                     chip_swimlane.sched_loop_count, released_count
@@ -1416,18 +1426,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
-    // Drain any entries left in the deferred-release batch. The in-loop flush
-    // only fires on idle iterations and on buffer-full; a loop exit while the
-    // last iteration made progress can leave entries un-released. Drop them
-    // here so every consumed producer slot completes its on_task_release
-    // regardless of which loop-exit path fired.
-    while (deferred_release_count > 0) {
+    // Exact release on every exit while orchestration is still running.
+    // After orchestrator_done_, drop remaining deferred releases — the next
+    // run memset+reinit clears SM, and reused slots self-clean on submit.
+    bool release_elided = deferred_release_count > 0 && orchestrator_done_.load(std::memory_order_acquire);
+    drain_or_elide_deferred_releases(
+        sched_, deferred_release_slot_states, deferred_release_count, release_elided
 #if SIMPLER_SCHED_PROFILING
-        (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-        sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+        ,
+        thread_idx
 #endif
-    }
+    );
 
 #if SIMPLER_DFX
     // Final-drain: emit any pop_hit / pop_miss accrued since the last

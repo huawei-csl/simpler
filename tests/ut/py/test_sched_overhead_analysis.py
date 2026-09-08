@@ -8,10 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for sched_overhead_analysis: overhead model, aicore switch, Head/Tail OH."""
 
+import os
+
 from simpler_setup.tools.sched_overhead_analysis import (
     _scheduler_phases_for_report,
     _summarize_scheduler_loops,
     aicore_switch_stats,
+    auto_select_chip_swimlane_records_json,
     build_task_graph,
     compute_critical_path,
     compute_head_tail,
@@ -19,6 +22,7 @@ from simpler_setup.tools.sched_overhead_analysis import (
     parse_scheduler_from_json_phases,
     per_id_timing,
     print_distribution,
+    run_analysis,
 )
 
 
@@ -32,6 +36,71 @@ def _task(core_id, dispatch, start, end, finish, core_type="aic"):
         "finish_time_us": float(finish),
         "duration_us": float(end - start),
     }
+
+
+def test_aicore_scheduler_runs_common_analysis_and_own_phase_breakdown(tmp_path, capsys):
+    perf_path = tmp_path / "chip_swimlane_records.json"
+    perf_path.write_text("{}")
+    deps_path = tmp_path / "deps.json"
+    deps_path.write_text('{"edges": []}')
+    task = _task(0, 1, 2, 4, 5)
+    task["task_id"] = 1
+    data = {
+        "tasks": [task],
+        "scheduler_task_producer": "aicore",
+        "scheduler_records": [[{"phase": "ready_claim", "start_time_us": 1.0, "end_time_us": 1.5}]],
+        "scheduler_streams": [{"producer": "aicore", "capture": {"committed": 1, "dropped": 0, "truncated": False}}],
+    }
+
+    assert run_analysis(perf_path, print_sources=False, perf_data=data, deps_json_path=deps_path) == 0
+    output = capsys.readouterr().out
+    assert "Part 1: Overhead verdict" in output
+    assert "Part 3: Head OH" in output
+    assert "Part 4: Tail OH" in output
+    assert "Part 5: AICore scheduler phase breakdown" in output
+    assert "ready_claim" in output
+    assert "Part 6: Critical-path latency attribution" in output
+    assert "AICPU scheduler loop breakdown" not in output
+
+
+def test_level_two_aicore_runs_common_analysis_without_phase_records(tmp_path, capsys):
+    perf_path = tmp_path / "chip_swimlane_records.json"
+    perf_path.write_text("{}")
+    deps_path = tmp_path / "deps.json"
+    deps_path.write_text('{"edges": []}')
+    task = _task(0, 1, 2, 4, 5)
+    task["task_id"] = 1
+    data = {
+        "tasks": [task],
+        "scheduler_task_producer": "aicore",
+    }
+
+    assert run_analysis(perf_path, print_sources=False, perf_data=data, deps_json_path=deps_path) == 0
+    output = capsys.readouterr().out
+    assert "Part 1: Overhead verdict" in output
+    assert "Part 5: AICore scheduler phase breakdown" in output
+    assert "phase records unavailable at chip-swimlane Level 2" in output
+    assert "Part 6: Critical-path latency attribution" in output
+
+
+def test_level_two_aicpu_runs_common_analysis_without_phase_records(tmp_path, capsys):
+    perf_path = tmp_path / "chip_swimlane_records.json"
+    perf_path.write_text("{}")
+    deps_path = tmp_path / "deps.json"
+    deps_path.write_text('{"edges": []}')
+    task = _task(0, 1, 2, 4, 5)
+    task["task_id"] = 1
+    data = {
+        "tasks": [task],
+        "scheduler_task_producer": "aicpu",
+    }
+
+    assert run_analysis(perf_path, print_sources=False, perf_data=data, deps_json_path=deps_path) == 0
+    output = capsys.readouterr().out
+    assert "Part 1: Overhead verdict" in output
+    assert "Part 5: AICPU scheduler loop breakdown" in output
+    assert "phase records unavailable at chip-swimlane Level 2" in output
+    assert "Part 6: Critical-path latency attribution" in output
 
 
 def test_head_first_task_uses_start_minus_dispatch():
@@ -137,6 +206,17 @@ def test_critical_path_splits_exec_vs_scheduler():
     assert cp["hops"] == 1
     assert abs(cp["exec"] - 10.0) < 1e-6  # A 5 + B 5
     assert abs(cp["sched"] - 2.0) < 1e-6  # B.start - A.end
+    assert cp["sched"] + cp["exec"] <= cp["span"]
+
+
+def test_critical_path_span_includes_root_dispatch_head():
+    tasks = [_gtask(1, 0, 1, 3, 8, 9)]
+    _ready, _gating, end_by_id, *_ = build_task_graph(tasks, {"edges": []}, 3.0)
+    dispatch, start, _end, finish = per_id_timing(tasks)
+
+    cp = compute_critical_path({}, end_by_id, finish, start, dispatch, 3.0)
+
+    assert cp == {"hops": 0, "span": 8.0, "sched": 2.0, "exec": 5.0}
 
 
 def test_print_distribution(capsys):
@@ -244,6 +324,29 @@ def test_parse_scheduler_counts_hbg_p_thread_standalone_phases():
     assert threads[0]["loops"] == 9
     assert threads[0]["role"] == "resolution"
     assert threads[0]["phases_seen"] == {"resolve", "async_poll", "dummy", "idle"}
+
+
+def test_parse_scheduler_classifies_release_as_scheduler_work():
+    data = {
+        "aicpu_scheduler_phases": [
+            [
+                {
+                    "phase": "release",
+                    "start_time_us": 1.0,
+                    "end_time_us": 2.0,
+                    "loop_iter": 7,
+                    "tasks_processed": 5,
+                },
+                {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 8},
+            ]
+        ]
+    }
+
+    threads = parse_scheduler_from_json_phases(data)
+
+    assert threads[0]["role"] == "scheduler"
+    assert threads[0]["release_us"] == 1.0
+    assert threads[0]["phases_seen"] == {"release", "resolve"}
 
 
 def test_parse_scheduler_uses_explicit_hbg_resolve_discriminator_at_parent_boundary():
@@ -375,3 +478,23 @@ def test_scheduler_phase_report_suppresses_absent_runtime_phases():
     }
 
     assert _scheduler_phases_for_report(threads) == ["complete", "async_poll", "dispatch", "resolve", "idle"]
+
+
+def test_auto_select_reaches_both_the_l2_and_the_l3_capture_depths(tmp_path, monkeypatch):
+    # An L2 case writes its records at outputs/<case>/, an L3 case writes one
+    # per chip below outputs/<case>/rankN/dN/ — two levels deeper. A depth-fixed
+    # glob resolves only one of them and calls the other run "no records".
+    outputs = tmp_path / "outputs"
+    l2_records = outputs / "case_l2" / "chip_swimlane_records.json"
+    l3_records = outputs / "case_l3" / "rank1" / "d0" / "chip_swimlane_records.json"
+    for path in (l2_records, l3_records):
+        path.parent.mkdir(parents=True)
+        path.write_text("{}")
+    monkeypatch.chdir(tmp_path)
+
+    os.utime(l2_records, (1_000, 1_000))
+    os.utime(l3_records, (2_000, 2_000))
+    assert auto_select_chip_swimlane_records_json() == l3_records
+
+    os.utime(l2_records, (3_000, 3_000))
+    assert auto_select_chip_swimlane_records_json() == l2_records

@@ -28,10 +28,11 @@
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
+#include "scheduler/scheduler.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
-#include "host_build_graph/task_id_encoding.h"
+#include "host_build_graph/task_id.h"
 
 class HbgGraphRecordingBoundsTest : public ::testing::Test {
 protected:
@@ -58,7 +59,7 @@ protected:
 
         ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
         sched.wire_arena_pointers(sched_layout, runtime_arena);
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS, &sched));
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
         GraphDefinitionArena arena{};
@@ -96,7 +97,7 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
         filler.add_input(boundary);
         ASSERT_TRUE(orch.submit_dummy_task(filler).task_id().is_valid()) << "filler task " << i;
     }
-    ASSERT_EQ(orch.task_allocator.active_count(), static_cast<int32_t>(MAX_IN_GRAPH_TASKS));
+    ASSERT_EQ(orch.task_allocator.active_count(), MAX_IN_GRAPH_TASKS);
 
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
@@ -111,13 +112,13 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
     task_args.add_inout(boundary);
     const TaskId in_graph_task_id = orch.submit_dummy_task(task_args).task_id();
     ASSERT_TRUE(in_graph_task_id.is_valid());
-    EXPECT_EQ(simpler::hbg::task_id_space(in_graph_task_id), simpler::hbg::TaskIdSpace::IN_GRAPH)
+    EXPECT_EQ(in_graph_task_id.space(), TaskId::Space::IN_GRAPH)
         << "a recorded task must not take a GLOBAL id: nothing resolves it against the task table, and its low "
            "field is what keys the recording's hazard map";
-    EXPECT_EQ(simpler::hbg::task_local_id(in_graph_task_id), 0u)
+    EXPECT_EQ(in_graph_task_id.local_id(), 0)
         << "the first recorded task's low field is task index 0, independent of how many tasks the run has "
            "already allocated";
-    EXPECT_LT(simpler::hbg::task_local_id(in_graph_task_id), MAX_IN_GRAPH_TASKS);
+    EXPECT_LT(in_graph_task_id.local_id(), MAX_IN_GRAPH_TASKS);
 
     ASSERT_TRUE(orch.graph_end());
 }

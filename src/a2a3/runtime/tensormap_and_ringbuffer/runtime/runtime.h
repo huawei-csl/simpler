@@ -26,8 +26,7 @@
  * signals AICore via DATA_MAIN_BASE.
  */
 
-#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
-#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
+#pragma once
 
 #include <stddef.h>  // for offsetof
 #include <stdbool.h>
@@ -45,6 +44,7 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
 #include "task_args.h"
+#include "aicore_teardown.h"
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
 
 // =============================================================================
@@ -105,6 +105,14 @@ struct Handshake {
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
 
+// The AICore owns this line's writeback: it flushes the whole line with
+// dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
+// must publish independently cannot live here — a stale line writeback would
+// overwrite it. The post-close return gates live in
+// DeviceRuntimeLaunchDesc::teardown_gates, one isolated line each.
+static_assert(sizeof(Handshake) == 64);
+static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
+
 enum class TensorReleaseKind {
     Free,
     BufferNoop,
@@ -160,7 +168,13 @@ struct Task {
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+    // Post-close return gates, one isolated cache line per worker. The AICPU
+    // stores here only after that worker's register window is closed; the
+    // AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -253,6 +267,7 @@ public:
     void *get_tracr_data_sizes() const { return dev.tracrDataSizes_; }
     void set_tracr_data_sizes(void *p) { dev.tracrDataSizes_ = p; }
     Handshake *get_workers() { return dev.workers; }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -364,5 +379,3 @@ static_assert(
 // object). Defined per-runtime so the shared device_runner_helpers.cpp copy
 // path stays runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
-
-#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

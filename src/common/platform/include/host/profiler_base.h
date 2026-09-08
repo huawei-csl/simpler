@@ -98,7 +98,11 @@
  *
  *   process_entry          replenishes the originating free_queue from the
  *                          current drain shard's local recycled pool. It does
- *                          not allocate on the runtime hot path.
+ *                          not allocate on the runtime hot path. When that pool
+ *                          is dry it reports the site back, and the drain loop
+ *                          retries it after every sweep — the only way a lane
+ *                          with no buffer left to publish can recover, since
+ *                          this top-up is otherwise entry-driven.
  *   proactive_replenish    fills to kSlotCount across all instances before
  *                          drain/collector threads start. If recycled is dry,
  *                          it allocates one registered block and carves it
@@ -109,7 +113,8 @@
  *                          max(kSlotCount, gap). It never writes device
  *                          free_queues, so the drain hot path remains
  *                          allocation-free and owns all runtime free_queue
- *                          publication.
+ *                          publication — which makes every free_queue
+ *                          single-writer by structure, not by timing.
  *
  * The above two algorithms live in ProfilerAlgorithms<Module>; Module only
  * supplies the data-access traits above. Implementors must NOT zero `count`
@@ -129,12 +134,17 @@
  *   3. ... device execution ...
  *   4. stop() — atomically:
  *        a) flips mgmt_running_, joins the mgmt thread(s); the drain thread's
- *           final-drain pass pushes the last L1→L2 entries before exiting.
+ *           final-drain pass pushes the last device-ring entries into the host
+ *           ready queue shard(s) before exiting.
  *        b) execution_complete_ is set; each collector loop sees it on its
  *           next idle tick, drains its host ready queue shard, and exits.
  *        c) collector thread(s) joined.
- *      Caller is then guaranteed L1 and L2 are both empty and all collected
- *      data has been delivered to Derived::on_buffer_collected.
+ *      Caller is then guaranteed the device-side ring and the host ready queue
+ *      shard(s) are both empty and all collected data has been delivered to
+ *      Derived::on_buffer_collected.
+ *
+ *      quiesce() gives that same guarantee without (a)'s and (c)'s joins, so
+ *      the threads survive it — see its own comment.
  *
  * SVM vs host-shadow paths (chosen at runtime by the collector's MemoryOps)
  * -------------------------------------------------------------------------
@@ -330,6 +340,13 @@ struct EntrySite {
     typename Module::ReadyBufferInfo info;
 };
 
+// Outcome of one free_queue top-up. `filled` is false when the recycled lane
+// ran dry before the queue reached capacity, i.e. the site needs revisiting.
+struct TopUpResult {
+    uint64_t pushed;
+    bool filled;
+};
+
 // Unified mgmt-loop algorithms parameterized on Module's data-access traits.
 // Module supplies the layout (constants + types + resolve_entry +
 // for_each_instance); ProfilerAlgorithms supplies the control flow that used
@@ -415,11 +432,18 @@ struct ProfilerAlgorithms {
     // Refill the originating pool's free_queue from this drain shard's local
     // recycled pool before handing the full buffer to the collector.
     //
+    // `short_site_out`, when non-null, receives this entry's site if the top-up
+    // could not fill the queue (the shard's recycled lane ran dry). The caller
+    // retries those sites once per sweep — see mgmt_drain_loop. Without that a
+    // starved lane could never recover, because this top-up is entry-driven and
+    // a lane with no buffer has nothing left to publish.
+    //
     // a5 specifics: after resolving the popped buffer's host shadow, copy
     // the buffer contents from device to host before delivery. The host
     // shadow seen by the collector then matches what the device wrote.
     template <typename Mgr>
-    static void process_entry(Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry) {
+    static void
+    process_entry(Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out) {
         auto site_opt = Module::resolve_entry(mgr.shared_mem_host(), header, q, entry);
         if (!site_opt.has_value()) return;
         auto &site = *site_opt;
@@ -438,19 +462,13 @@ struct ProfilerAlgorithms {
             return;
         }
 
-        // Drain-driven free_queue top-up, suppressed while EITHER freeze is open so
-        // the mgmt replenish thread (conjunction release) is the sole free_queue
-        // writer. This drain read is not synchronized against the mgmt write, and
-        // try_pop advances queue_heads before it — so mgmt can observe RQ-empty and
-        // start its own top_up while a drain thread is here. The two writers stay
-        // apart by timing, not structure: the freeze_active=1 store precedes the
-        // whole RQ-drain window, so it is visible here well before the last drained
-        // entry. The fields stay plain volatile (they are also host→device shared,
-        // so cannot become std::atomic); a stale read only defers this top_up, or
-        // in the vanishing open-edge overlap duplicates a free_queue slot —
-        // bounding the worst case to DFX diagnostic loss, never compute data.
-        if (header->backpressure.rq_freeze_active == 0 && header->backpressure.fq_freeze_active == 0) {
-            (void)top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, q);
+        // Drain-driven free_queue top-up. The drain shard that serves ready queue
+        // q is the sole runtime writer of every free_queue that q's entries
+        // resolve to, so this needs no coordination with the replenish thread —
+        // that thread only writes host-side recycled lanes at runtime.
+        if (!top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, q).filled &&
+            short_site_out != nullptr) {
+            *short_site_out = site;
         }
 
         // The device ready entry was already acknowledged by
@@ -469,12 +487,17 @@ struct ProfilerAlgorithms {
         return pushed;
     }
 
+    // Fill every (kind, instance) free_queue from any recycled lane, allocating
+    // when they are dry. Startup only: `shard_index=-1` lets obtain_buffer
+    // allocate and lets pop_recycled_for_startup consume from every shard, both
+    // of which are safe only before the drain threads exist. At runtime the
+    // owning drain shard is the sole free_queue writer.
     template <typename Mgr>
     static uint64_t replenish_free_queues(Mgr &mgr, DataHeader *header) {
         uint64_t pushed = 0;
         refresh_replenish_metadata(mgr, header, 0);
         Module::for_each_instance(mgr.shared_mem_host(), header, [&](int kind, FreeQueue *fq, size_t buf_size) {
-            pushed += top_up_free_queue(mgr, kind, *fq, buf_size, /*shard_index=*/-1);
+            pushed += top_up_free_queue(mgr, kind, *fq, buf_size, /*shard_index=*/-1).pushed;
         });
         return pushed;
     }
@@ -513,118 +536,17 @@ struct ProfilerAlgorithms {
         return pushed;
     }
 
-    // DFX backpressure global-sync freeze state machine (host-owned). Runs each
-    // mgmt tick for every DFX subsystem; idle at zero cost until a lane raises
-    // contention. Two per-gate freezes, one per gate class (#997 "a thread blocks
-    // only at its buffer-switch gate"):
-    //   rq_freeze (push gate): opened on rq_contended (ready-queue-full); every
-    //     lane parks at its push gate.
-    //   fq_freeze (pop gate): opened on fq_contended (free-queue-empty); every
-    //     lane parks at its pop gate.
-    // Each freeze is opened independently by its leader, but BOTH release together
-    // on the conjunction #997 "block until RQ fully drained AND FQ fully refilled"
-    // — resuming into RQ-empty + FQ-at-limit is one clean common-mode gap.
-    // Deadlock-free at any pool size: RQ-drain is host-driven and independent of
-    // any held buffer, and FQ "refilled" is the attainable initial limit (pushed
-    // ==0), not the unreachable exact-kSlotCount fill.
+    // Retry the free_queue top-up for sites whose recycled lane ran dry, so a
+    // starved lane recovers locally. Called once per drain sweep, over only the
+    // sites that actually came up short — empty in the normal case, so this path
+    // costs nothing until a lane runs dry.
     //
-    // *_freeze_active are host→device, *_contended / queue_tails are device→host.
-    // Host writes go through write_range_to_device and device→host reads through
-    // read_range_from_device so a5 (non-SVM) sees them; a2a3 (SVM) short-circuits
-    // both to no-ops since the header already lives in shared device memory.
-    // extra_release_ready is the per-subsystem release predicate
-    // (Derived::backpressure_release_ready(), default true). The caller
-    // (mgmt_replenish_loop) evaluates it because this static has no Derived.
-    // args_dump uses it to hold the release until its collector has pulled all
-    // arena bytes (RQ-empty alone does not imply that — see buffer_pool_manager).
+    // Runs on the owning drain shard, which is the sole runtime writer of these
+    // queues; `shard_index` is the ready queue the site was observed on and
+    // BufferPoolManager folds it onto that shard's recycled lane.
     template <typename Mgr>
-    static void update_backpressure_freeze(Mgr &mgr, DataHeader *header, bool extra_release_ready = true) {
-        // --- Open each per-gate freeze on its own contention ---
-        // A thread blocks only at its own buffer-switch gate (#997 "same gate
-        // class"): push lanes park on rq_freeze (ready-queue-full), pop lanes on
-        // fq_freeze (free-queue-empty). Each is opened independently by its leader.
-        if (header->backpressure.rq_freeze_active == 0 &&
-            mgr.read_range_from_device(&header->backpressure.rq_contended, sizeof(header->backpressure.rq_contended)) ==
-                0 &&
-            header->backpressure.rq_contended != 0) {
-            header->backpressure.rq_freeze_active = 1;
-            wmb();
-            mgr.write_range_to_device(
-                &header->backpressure.rq_freeze_active, sizeof(header->backpressure.rq_freeze_active)
-            );
-            header->backpressure.rq_contended = 0;
-            mgr.write_range_to_device(&header->backpressure.rq_contended, sizeof(header->backpressure.rq_contended));
-            LOG_WARN(
-                "%s DFX backpressure TRIGGERED: ready-queue-full, push-gate freeze OPENED — all AICPU lanes parked at "
-                "their push gate",
-                Module::kSubsystemName
-            );
-        }
-        if (header->backpressure.fq_freeze_active == 0 &&
-            mgr.read_range_from_device(&header->backpressure.fq_contended, sizeof(header->backpressure.fq_contended)) ==
-                0 &&
-            header->backpressure.fq_contended != 0) {
-            // Open fq_freeze BEFORE consuming fq_contended so the disjunction
-            // (fq_contended || fq_freeze_active) that wait_for_release() spins on
-            // stays continuously true — no (0,0) escape window.
-            header->backpressure.fq_freeze_active = 1;
-            wmb();
-            mgr.write_range_to_device(
-                &header->backpressure.fq_freeze_active, sizeof(header->backpressure.fq_freeze_active)
-            );
-            header->backpressure.fq_contended = 0;
-            mgr.write_range_to_device(&header->backpressure.fq_contended, sizeof(header->backpressure.fq_contended));
-            LOG_WARN(
-                "%s DFX backpressure TRIGGERED: free-queue-empty, pop-gate freeze OPENED — lanes park as they "
-                "reach an empty free queue",
-                Module::kSubsystemName
-            );
-        }
-
-        // --- Conjunction release (#997 "block until RQ fully drained AND FQ fully
-        //     refilled") ---
-        // While either freeze is open, release BOTH only once RQ is drained AND
-        // the free queues are refilled to their initial upper limit. Resuming into
-        // RQ-empty + FQ-at-limit is one clean common-mode gap (no immediate
-        // re-stall). Deadlock-free regardless of pool size: RQ-drain is
-        // host-driven and independent of any buffer held at a push gate, and FQ
-        // "refilled" is pushed==0 (the attainable initial limit min(kSlotCount,
-        // BUFFERS)), not the unreachable exact-kSlotCount fill. Order matters: wait
-        // RQ-empty FIRST — once RQ is empty the drain threads are idle, so it is
-        // safe for THIS thread to top up the free queues (drain-driven top_up is
-        // suppressed while either freeze is open).
-        if (header->backpressure.rq_freeze_active == 0 && header->backpressure.fq_freeze_active == 0) {
-            return;
-        }
-        if (mgr.read_range_from_device(&header->queue_tails[0], sizeof(header->queue_tails)) != 0) {
-            return;
-        }
-        for (int q = 0; q < PLATFORM_MAX_AICPU_THREADS; q++) {
-            if (header->queue_heads[q] != header->queue_tails[q]) return;  // RQ not drained
-        }
-        uint64_t pushed = replenish_free_queues(mgr, header);
-        if (pushed != 0 || !extra_release_ready) {
-            return;  // FQ not yet refilled to its attainable initial limit
-        }
-        // Both conjuncts met → release both freezes together.
-        if (header->backpressure.rq_freeze_active != 0) {
-            header->backpressure.rq_freeze_active = 0;
-            wmb();
-            mgr.write_range_to_device(
-                &header->backpressure.rq_freeze_active, sizeof(header->backpressure.rq_freeze_active)
-            );
-        }
-        if (header->backpressure.fq_freeze_active != 0) {
-            header->backpressure.fq_freeze_active = 0;
-            wmb();
-            mgr.write_range_to_device(
-                &header->backpressure.fq_freeze_active, sizeof(header->backpressure.fq_freeze_active)
-            );
-        }
-        LOG_WARN(
-            "%s DFX backpressure RELEASED: ready-queue drained AND free-queues refilled — AICPU lanes resume",
-            Module::kSubsystemName
-        );
+    static bool retry_short_site(Mgr &mgr, const EntrySite<Module> &site, int shard_index) {
+        return top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, shard_index).filled;
     }
 
 private:
@@ -712,34 +634,48 @@ private:
         return true;
     }
 
+    // Unknown means the device head could not be refreshed, so whether the queue
+    // has room is not established. It is deliberately distinct from Full: a
+    // caller that treated it as Full would stop retrying a lane that may still be
+    // starved.
+    enum class QueueSpace { Available, Full, Unknown };
+
     template <typename Mgr>
-    static bool free_queue_has_space(Mgr &mgr, FreeQueue &fq) {
+    static QueueSpace free_queue_space(Mgr &mgr, FreeQueue &fq) {
         if (mgr.read_range_from_device(&fq.head, sizeof(fq.head)) != 0) {
             LOG_ERROR("%s: failed to refresh free_queue head", Module::kSubsystemName);
-            return false;
+            return QueueSpace::Unknown;
         }
         rmb();
-        return fq.tail - fq.head < Module::kSlotCount;
+        return fq.tail - fq.head < Module::kSlotCount ? QueueSpace::Available : QueueSpace::Full;
     }
 
     // Fill one (kind, instance) free_queue to kSlotCount. Startup uses any
     // recycled lane and may batch-allocate; runtime uses only the drain
     // shard's local recycled lane and returns when it is dry.
+    //
+    // `filled` distinguishes "the queue is at capacity" from "the recycled lane
+    // ran dry first", which is what tells a drain shard it must come back to this
+    // site. `pushed` alone cannot: a top-up that pushed nothing may equally mean
+    // the queue was already full.
     template <typename Mgr>
-    static uint64_t top_up_free_queue(Mgr &mgr, int kind, FreeQueue &fq, size_t buf_size, int shard_index = 0) {
+    static TopUpResult top_up_free_queue(Mgr &mgr, int kind, FreeQueue &fq, size_t buf_size, int shard_index = 0) {
         uint64_t pushed = 0;
 
-        while (free_queue_has_space(mgr, fq)) {
+        for (;;) {
+            QueueSpace space = free_queue_space(mgr, fq);
+            if (space == QueueSpace::Full) return {pushed, true};
+            if (space == QueueSpace::Unknown) return {pushed, false};
+
             void *new_dev = obtain_buffer(mgr, kind, buf_size, shard_index);
-            if (new_dev == nullptr) return pushed;
+            if (new_dev == nullptr) return {pushed, false};
             if (!try_push_to_free_queue(mgr, fq, new_dev)) {
                 (void)mgr.retire_unqueued_buffer(kind, new_dev, shard_index);
                 LOG_ERROR("%s: failed to return recycled buffer to free_queue", Module::kSubsystemName);
-                return pushed;
+                return {pushed, false};
             }
             pushed++;
         }
-        return pushed;
     }
 };
 
@@ -754,16 +690,13 @@ public:
     ProfilerBase(const ProfilerBase &) = delete;
     ProfilerBase &operator=(const ProfilerBase &) = delete;
 
-    // DFX backpressure per-subsystem release predicate (CRTP hook). Default:
-    // the freeze may release as soon as the framework's RQ-empty + FQ-full hold.
-    // A subsystem whose collector owns a separate reusable region (only
-    // args_dump today: the payload arena) MUST override this to return false
-    // until its collector has drained that region, else the device can reuse
-    // bytes the host has not pulled. Called once per mgmt tick
-    // before the state-machine update. The idle path must use only local state;
-    // an active-freeze check may refresh device state but must return without
-    // waiting for asynchronous work.
-    bool backpressure_release_ready() const { return true; }
+    // Per-subsystem arena acknowledgement (CRTP hook). Default: nothing to do.
+    // A subsystem whose collector owns a separate reusable region (only args_dump
+    // today: the per-thread payload arena) overrides this to publish, per lane,
+    // how much of that region the host has consumed — the device blocks on that
+    // watermark before overwriting arena bytes. Called once per replenish tick,
+    // so it must be cheap and must not wait for asynchronous work.
+    void publish_arena_acks() {}
 
 private:
     friend Derived;
@@ -854,8 +787,8 @@ public:
      * init() aborted before set_memory_context, or finalize() has cleared
      * the context) this is a no-op.
      *
-     * Order matters: mgmt is started before collectors because mgmt is the
-     * only writer to L2 (the ready queues) and collectors are the consumers. The
+     * Order matters: mgmt is started before collectors because mgmt is the only
+     * writer to the host ready queue shards and collectors are the consumers. The
      * register slot defaults to identity on the SVM path (copy_to_device_
      * is null) or to a host-shadow malloc lambda on the non-SVM path
      * (copy_to_device_ installed) — so BufferPoolManager always has a
@@ -865,6 +798,11 @@ public:
      */
     void start(const ThreadFactory &thread_factory) {
         if (shm_host_ == nullptr) return;
+        // Idempotent, like Derived::init(): the collector is resident across
+        // runs, so every run's arming reaches this and only the first should
+        // spawn. Without the guard each run would append another full set of
+        // threads to the same collector.
+        if (!collector_threads_.empty()) return;
 
         if (!thread_num_set_) {
             LOG_WARN(
@@ -925,6 +863,16 @@ public:
         manager_.set_memory_context(std::move(ops), shm_dev_, shm_host_, shm_size_, device_id_);
 
         execution_complete_.store(false, std::memory_order_release);
+        // Reset the quiescence handshake so a restarted collector cannot see a
+        // previous run's acks. Safe to do unsynchronized: the std::thread
+        // constructors below are the synchronization point for the workers that
+        // read these.
+        drain_quiesce_epoch_.store(0, std::memory_order_relaxed);
+        collect_quiesce_epoch_.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < Manager::kMaxCollectorShards; i++) {
+            drain_acked_[i].store(0, std::memory_order_relaxed);
+            collect_acked_[i].store(0, std::memory_order_relaxed);
+        }
         {
             DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
             (void)ProfilerAlgorithms<Module>::proactive_replenish(manager_, header);
@@ -967,16 +915,45 @@ public:
     }
 
     /**
+     * Drain to a quiescent point without retiring the threads. On return the
+     * device-side ring and the host ready queue shard(s) are empty and
+     * Derived::on_buffer_collected has been called for every entry that was in
+     * either — the same guarantee stop() gives, minus the thread teardown.
+     *
+     * Precondition: the device-side producers have stopped. A drain worker
+     * reports its shard quiescent after one full sweep that found nothing, so a
+     * producer still writing could push a record in behind that report.
+     * Callers already satisfy this — the run is drained before teardown.
+     *
+     * Idempotent, and a no-op before start() or after stop(). Like stop(), it
+     * waits without a deadline: a wedged worker hangs the caller here exactly
+     * as it would hang the join in stop().
+     */
+    void quiesce() {
+        if (collector_threads_.empty()) return;
+        const int n = shard_count_;
+
+        // Phase one: mgmt sweeps the device-side ring into the host shards.
+        const uint64_t epoch = drain_quiesce_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        wait_for_epoch(drain_acked_, n, epoch);
+
+        // Phase two: only now can a collector's "my shard is empty" mean the
+        // pipeline is empty rather than that mgmt has not pushed yet.
+        collect_quiesce_epoch_.store(epoch, std::memory_order_release);
+        wait_for_epoch(collect_acked_, n, epoch);
+    }
+
+    /**
      * Stop the drain/replenish mgmt threads, drain whatever the drain side
      * pushes during its final pass, and join the collector. Idempotent. Caller
-     * is guaranteed on return that mgmt's L1 ringbuffer and the host-side
-     * ready queue shard(s) are empty and Derived::on_buffer_collected has been
-     * called for every entry that was in either queue. Framework-owned buffers
-     * are NOT freed here — Derived's finalize() must do that.
+     * is guaranteed on return that mgmt's device-side ringbuffer and the
+     * host-side ready queue shard(s) are empty and Derived::on_buffer_collected
+     * has been called for every entry that was in either queue. Framework-owned
+     * buffers are NOT freed here — Derived's finalize() must do that.
      *
      * Order matters: stop+join mgmt first so its final-drain pass is fully
-     * landed in L2 BEFORE we tell poll to exit. Otherwise mgmt's last batch
-     * has no consumer.
+     * landed in the host shards BEFORE we tell poll to exit. Otherwise mgmt's
+     * last batch has no consumer.
      */
     void stop() {
         mgmt_running_.store(false, std::memory_order_release);
@@ -1121,23 +1098,62 @@ protected:
     }
 
 private:
+    // Teardown-path wait, so a sleep is permitted here: no task's latency
+    // passes through it (codestyle.md rule 5 exempts teardown).
+    template <typename Acks>
+    static void wait_for_epoch(const Acks &acks, int n, uint64_t epoch) {
+        for (int i = 0; i < n; i++) {
+            while (acks[i].load(std::memory_order_acquire) != epoch) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+        }
+    }
+
     void mgmt_drain_loop(int queue_start, int queue_stride) {
         DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
         using Alg = ProfilerAlgorithms<Module>;
         constexpr int kIdleBusyPollLoops = 64;
         int idle_busy_polls = 0;
 
+        // Sites whose last top-up ran out of recycled buffers, keyed by the ready
+        // queue they were seen on. Thread-local to this shard: every site here
+        // resolved from an entry on one of this shard's queues, and each queue is
+        // served by exactly one shard, so this shard is their sole writer.
+        std::vector<std::pair<int, EntrySite<Module>>> short_sites;
+
         while (mgmt_running_.load(std::memory_order_relaxed)) {
             bool found_any = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
                 ReadyEntry entry;
                 while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
-                    Alg::process_entry(manager_, header, q, entry);
+                    // A null free_queue is the "nothing to retry" sentinel;
+                    // process_entry only writes this on a short top-up.
+                    EntrySite<Module> short_site{};
+                    Alg::process_entry(manager_, header, q, entry, &short_site);
+                    if (short_site.free_queue != nullptr) {
+                        record_short_site(short_sites, q, short_site);
+                    }
                     found_any = true;
                 }
             }
             if (found_any) {
                 idle_busy_polls = 0;
+            }
+
+            // Retry after every sweep, not only on an idle one: a lane that has
+            // run dry has nothing left to publish, so it would otherwise wait
+            // behind a busy sibling on this same shard indefinitely.
+            retry_short_sites(short_sites);
+
+            // A full sweep that found nothing means this worker's slice of the
+            // device-side queues is empty. With producers stopped (quiesce()'s
+            // precondition) nothing can arrive behind this report, so it is the
+            // quiescent condition for phase one.
+            if (!found_any) {
+                const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
+                if (drain_acked_[queue_start].load(std::memory_order_relaxed) != requested) {
+                    drain_acked_[queue_start].store(requested, std::memory_order_release);
+                }
             }
 
             if (!found_any) {
@@ -1152,7 +1168,31 @@ private:
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
             ReadyEntry entry;
             while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
-                Alg::process_entry(manager_, header, q, entry);
+                Alg::process_entry(manager_, header, q, entry, nullptr);
+            }
+        }
+    }
+
+    // Append a site unless this shard is already tracking that free_queue. The
+    // list is bounded by the shard's instance count, so a linear scan is cheaper
+    // than any keyed container at these sizes.
+    static void record_short_site(
+        std::vector<std::pair<int, EntrySite<Module>>> &short_sites, int q, const EntrySite<Module> &site
+    ) {
+        for (const auto &tracked : short_sites) {
+            if (tracked.second.free_queue == site.free_queue) return;
+        }
+        short_sites.emplace_back(q, site);
+    }
+
+    void retry_short_sites(std::vector<std::pair<int, EntrySite<Module>>> &short_sites) {
+        using Alg = ProfilerAlgorithms<Module>;
+        for (size_t i = 0; i < short_sites.size();) {
+            if (Alg::retry_short_site(manager_, short_sites[i].second, short_sites[i].first)) {
+                short_sites[i] = short_sites.back();
+                short_sites.pop_back();
+            } else {
+                i++;
             }
         }
     }
@@ -1164,17 +1204,13 @@ private:
             size_t drained = manager_.drain_done_into_recycled();
             uint64_t replenished = Alg::replenish_recycled_pools(manager_, header);
 
-            // DFX backpressure global-sync freeze state machine. Runs on this
-            // single replenish thread — the state machine must be single-writer
-            // for freeze_active. Always active (block-on-contention is the only
-            // behavior); idle at zero cost until a lane raises `contended`.
-            // Per-subsystem release predicate (CRTP): default true, only
-            // args_dump overrides it (gate release on collector-quiesce);
-            // evaluated here because update_backpressure_freeze is a static with
-            // no Derived. Its idle path must be local; an active-freeze check
-            // returns false rather than waiting for collector work.
-            const bool extra_release_ready = static_cast<const Derived *>(this)->backpressure_release_ready();
-            Alg::update_backpressure_freeze(manager_, header, extra_release_ready);
+            // This thread's only runtime writes are to host-side recycled lanes:
+            // the owning drain shard publishes into device free_queues. Keeping
+            // that split is what makes each free_queue single-writer by structure.
+            //
+            // The arena acknowledgement (CRTP): a no-op for every subsystem but
+            // args_dump, which publishes its per-lane payload watermark here.
+            static_cast<Derived *>(this)->publish_arena_acks();
 
             if (drained == 0 && replenished == 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
@@ -1216,6 +1252,22 @@ private:
                 }
                 break;
             }
+            // Phase two of the quiescence handshake. wait_pop_ready timed out,
+            // so this shard is empty; mgmt has already reported its own sweep
+            // done for this epoch, so nothing further can arrive. Placed above
+            // the has_seen_buffer guard below: a shard that never received a
+            // buffer is a valid run shape and still has to report, or quiesce()
+            // would wait on it forever.
+            {
+                const uint64_t requested = collect_quiesce_epoch_.load(std::memory_order_acquire);
+                if (collect_acked_[shard_index].load(std::memory_order_relaxed) != requested) {
+                    while (manager_.try_pop_ready(info, shard_index)) {
+                        consume(info, shard_index);
+                        has_seen_buffer = true;
+                    }
+                    collect_acked_[shard_index].store(requested, std::memory_order_release);
+                }
+            }
             // A shard that has never seen a buffer is a valid run shape at any
             // shard count — a subsystem can legitimately emit nothing for a
             // whole run. execution_complete_ above is the exit path for that
@@ -1256,6 +1308,19 @@ private:
     std::vector<std::thread> mgmt_drain_threads_;
     std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
+
+    // Two-phase quiescence handshake. Each phase is a monotonic epoch the
+    // caller publishes and every worker of that phase echoes back once it has
+    // reached the quiescent condition for its own shard.
+    //
+    // The phases are ordered, not concurrent: a collector that reported its
+    // shard empty before mgmt finished its sweep would be reporting on a queue
+    // mgmt is still about to push into. So collect_quiesce_epoch_ is published
+    // only after every drain ack for that epoch has landed.
+    std::atomic<uint64_t> drain_quiesce_epoch_{0};
+    std::atomic<uint64_t> collect_quiesce_epoch_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> drain_acked_{};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> collect_acked_{};
 };
 
 }  // namespace profiling_common

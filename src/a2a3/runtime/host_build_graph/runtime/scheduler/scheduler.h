@@ -15,12 +15,11 @@
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
  * 2. Polling-completion dependency resolution: a GLOBAL task is ready when every
- *    producer named in its inline fanin has set its completion_flags byte, an
+ *    producer named in its inline fanin has a COMPLETED task_states byte, an
  *    IN_GRAPH one when every producer in its Graph's fanin wire has reached
  *    task_state == COMPLETED (that table has no flag bytes); a producer publishes
  *    completion + drains its wake list on finish
- * 3. Publishing task_state (PENDING -> COMPLETED) and advancing the
- *    completed_watermark (consumer-retirement signal)
+ * 3. Publishing completion (task_state PENDING -> COMPLETED, task_states byte)
  * 4. Two-stage mixed-task completion (subtask done bits -> mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU. host_build_graph is scheduler-only (the
@@ -35,18 +34,23 @@
 
 #include <atomic>
 
-#include "common/core_type.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
 #include "async_wait.h"
 #include "host_build_graph/graph_execution.h"
-#include "host_build_graph/task_id_encoding.h"
-#include "host_build_graph/task_allocator.h"
+#include "host_build_graph/task_id.h"
+#include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/shared_memory.h"
+// Defines the SIMPLER_*_PROFILING levels the conditionals below test. An #if on an
+// undefined macro evaluates to 0, so a profiling block reached through a transitive
+// include would switch itself off silently if that path ever went away.
+#include "profiling_config.h"
 
-#include "aicpu/device_time.h"  // get_sys_cnt_aicpu (weak; used by early-dispatch doorbell timing too)
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+#include "aicpu/device_time.h"  // get_sys_cnt_aicpu, used only by the timed blocks below
+#endif
 #if SIMPLER_SCHED_PROFILING
 #define SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define SCHED_CYCLE_LAP(acc)        \
@@ -471,6 +475,7 @@ struct SchedulerLayout {
     size_t off_graph_prepare_queue_slots;
     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
+    size_t off_ed_publish_drain_queue_slots;
     ReadyQueueCapacities capacities;
 };
 
@@ -490,7 +495,7 @@ struct SchedulerState {
         SharedMemoryTaskHeader *tasks;
 
         // Polling: no dep_pool. Readiness is derived from the task table's
-        // completion_flags; there is no arena-side wiring pool to reserve or wire.
+        // task_states; there is no arena-side wiring pool to reserve or wire.
         // The `tasks` field stores the device address of the SM task header —
         // computed via offset arithmetic, no SM dereference.
         bool init_data_from_layout(void *sm_dev_base);
@@ -553,6 +558,21 @@ struct SchedulerState {
     }
 
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+        // Early-dispatch release: a pre-staged candidate launches by doorbell
+        // right here — the moment its readiness is decided — and skips the
+        // queue round-trip. Only host-qualified candidates can hold a staging
+        // claim, so every other task pays one hot-line flag test. A ready
+        // sync_start candidate also publishes to its drain owner, which may
+        // already hold it for an all-or-nothing stage.
+        if ((slot_state->ed_flags & ED_FLAG_CANDIDATE) != 0) {
+            const bool early_handled = try_early_dispatch_release(*slot_state);
+            if (slot_state->task_attrs.requires_sync_start()) {
+                const bool drain_owned = publish_ready_to_early_sync_drain(slot_state->to_payload());
+                if (early_handled || drain_owned) return;
+            } else if (early_handled) {
+                return;
+            }
+        }
         bool pushed;
         if (slot_state->task_kind == TaskKind::GRAPH) {
             pushed = graph_ready_queue.push(slot_state);
@@ -581,24 +601,35 @@ struct SchedulerState {
 
     // ---- Polling completion primitives ---------------------------------------
     // Readiness: a task is ready iff every producer named in its inline fanin has
-    // set its completion_flags byte. A producer is named by its local id alone, so
+    // a COMPLETED task_states byte. A producer is named by its local id alone, so
     // there is no per-edge indirection.
 
     // Unmet-fanin classification. Returns -1 (all fanins met -> route to ready)
     // or the index of an unmet fanin (register on that producer's wake list).
     // Scan direction is load-bearing: the builder fills the fanin region in
-    // submission order, so the last unmet entry is the latest-submitted
-    // producer -- the one likeliest to complete last. Targeting it minimises
+    // submission order (and an early-dispatch candidate's row is sorted by
+    // local id, making the order exact), so the last unmet entry is the
+    // latest-submitted producer -- the one likeliest to complete last.
+    // Targeting it minimises
     // wake-list transfers (a consumer re-registered onto a second producer once
     // its first one completes) and the CAS traffic those transfers put on the
     // lists. The decision is terminal: tasks are never re-polled; a producer's
     // completion re-scans its waiters via on_mixed_task_complete's wake drain.
-    int classify_fanin_state(const ChipTaskSlotState *s) const {
+    // Resumes at the wake-scan cursor: entries above it were completed at the
+    // last classification and the task_states byte is monotone, so re-walking
+    // them cannot change the verdict. An unmet verdict records itself as the
+    // new cursor — the caller hangs the task exactly there, and this
+    // classifier is the task's only owner at that moment.
+    int classify_fanin_state(ChipTaskSlotState *s) const {
         const TaskPayload &p = s->to_payload();
         const SharedMemoryTaskHeader &tasks = *task_view.tasks;
         const int32_t *fanin = p.fanin_data();
-        for (int32_t i = p.fanin_count - 1; i >= 0; i--) {
-            if (!tasks.is_completion_flag_set(fanin[i])) return i;
+        const int32_t start = s->wake_scan_cursor < p.fanin_count ? s->wake_scan_cursor : p.fanin_count - 1;
+        for (int32_t i = start; i >= 0; i--) {
+            if (!tasks.is_completed(fanin[i])) {
+                s->wake_scan_cursor = static_cast<uint16_t>(i);
+                return i;
+            }
         }
         return -1;
     }
@@ -606,7 +637,7 @@ struct SchedulerState {
     // Register `consumer` on `producer`'s wake list. If the producer already
     // completed (head == SENTINEL), re-classify against ALL fanins: route to
     // ready only when every fanin is met, else re-target the next unmet producer
-    // and retry. Monotonic completion_flags guarantee termination.
+    // and retry. The monotone task_states bytes guarantee termination.
     void register_wake(ChipTaskSlotState *producer, ChipTaskSlotState *consumer) {
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
         while (true) {
@@ -628,18 +659,20 @@ struct SchedulerState {
         }
     }
 
-    // Producer completion under polling: publish the host-visible task_state
-    // mirror + the device-visible completion_flags byte, drain the wake list
-    // (route/re-register each waiter), then CAS-advance the monotonic
-    // completed_watermark (load-bearing: the host wait_for_consumers gates on
-    // watermark >= producer.last_consumer_local_id). Whole-graph-resident hbg
+    // Producer completion under polling: publish the task_state completion
+    // mirror + the device-visible task_states byte, then drain the wake list
+    // (route/re-register each waiter). Whole-graph-resident hbg
     // has no device slot reclaim, so nothing advances a reclaim cursor here.
     void on_mixed_task_complete(ChipTaskSlotState &slot_state) {
-        const int32_t task_id = static_cast<int32_t>(simpler::hbg::task_local_id(slot_state.to_descriptor().task_id));
+        const int32_t task_id = slot_state.to_descriptor().task_id.local_id();
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
 
-        slot_state.mark_completed();  // host-visible mirror (task_state = COMPLETED)
-        tasks.set_completion_flag(task_id);
+        slot_state.mark_completed();  // completion mirror (task_state = COMPLETED)
+        tasks.store_completed(task_id);
+        // COMPLETED >= PUBLISHED, so a tracked producer that never published
+        // (DUMMY, predicate-retired) still releases its publish-list waiters
+        // here. Idempotent after a publish-time seal.
+        if ((slot_state.ed_flags & ED_FLAG_TRACKED) != 0) seal_ed_publish_list(slot_state);
 
         ChipTaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
@@ -657,21 +690,10 @@ struct SchedulerState {
             }
             waiter = next;
         }
-
-        // completed_watermark = highest id such that every task in [0, watermark]
-        // has its completion_flags byte set. The host wait_for_consumers gates on
-        // watermark >= producer.last_consumer_local_id, so the walk must extend to
-        // the full contiguous completed prefix — NOT cap at task_id. Capping at task_id
-        // makes the final value order-dependent: a low-id task completing after a
-        // higher one would leave the watermark stuck below the true prefix, hanging
-        // any wait_for_consumers whose last_consumer sits in the gap.
-        tasks.update_completed_watermark();
     }
 
     // Polling: there is no ready-claim CAS (a producer routes each waiter exactly
     // once via the wake-list drain) and no per-producer consumer/scope refcount.
-    // Consumer retirement is observed by the host through completed_watermark >=
-    // producer.last_consumer_local_id, not by bumping a producer refcount.
 
     // Early-dispatch release. If the now-ready task was pre-staged
     // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
@@ -731,6 +753,29 @@ struct SchedulerState {
     // otherwise. HBG producer propagation currently leaves this queue dormant.
     ChipReadyQueue early_sync_start_queue;
 
+    // Pending-drain queue of the publish list. Each entry is the head of a
+    // waiter chain a producer's publish event sealed and detached; idle
+    // threads pop one per Phase 4b pass and rescan its waiters. A full queue
+    // drops the chain — those candidates miss early dispatch and proceed on
+    // the normal ready path; nothing blocks. The drop count surfaces at
+    // teardown (no log on the dispatch path).
+    ChipReadyQueue ed_publish_drain_queue;
+    std::atomic<uint64_t> ed_publish_drain_drops{0};
+
+#if SIMPLER_SCHED_PROFILING
+    // Publish-list probe. Relaxed counters, read once at teardown.
+    struct EdPublishListStats {
+        std::atomic<uint64_t> registered{0};           // candidates hung at intake
+        std::atomic<uint64_t> immediate_at_intake{0};  // all-published already at intake
+        std::atomic<uint64_t> publish_seals{0};        // tracked producers fully published
+        std::atomic<uint64_t> chains_detached{0};      // seals that handed off a non-empty chain
+        std::atomic<uint64_t> waiters_rescanned{0};
+        std::atomic<uint64_t> rehangs{0};           // bet missed: waiter moved to another producer
+        std::atomic<uint64_t> candidates_ready{0};  // all-published verdicts (ED triggers)
+    };
+    EdPublishListStats ed_publish_stats;
+#endif
+
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
@@ -773,9 +818,206 @@ struct SchedulerState {
         );
     }
 
-    inline void record_published_blocks(ChipTaskSlotState &slot_state, int32_t count) {
-        if (count <= 0 || !slot_state.task_attrs.allow_early_resolve()) return;
-        slot_state.to_payload().published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
+    // All-published verdict -> ED queue. The exactly-once claim is the
+    // NONE->STAGING CAS: a consumer that already became ready lost the state
+    // to the release path's NONE->DISPATCHED and is dropped here. A failed
+    // push returns the claim so readiness takes the ordinary queue path.
+    inline void enqueue_early_dispatch_candidate(ChipTaskSlotState &consumer) {
+        uint8_t expected = EARLY_DISPATCH_NONE;
+        if (!consumer.to_payload().early_dispatch_state.compare_exchange_strong(
+                expected, EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return;
+        }
+        const uint64_t task_id = static_cast<uint64_t>(consumer.to_descriptor().task_id.raw);
+        // A sync_start cohort parks in the shape-agnostic queue so one owner can
+        // choose an all-or-nothing local stage or the global-drain fallback.
+        const bool queued =
+            consumer.task_attrs.requires_sync_start() ?
+                early_sync_start_queue.push_tagged(&consumer, task_id) :
+                early_dispatch_queues[static_cast<int32_t>(consumer.active_mask.to_shape())].push_tagged(
+                    &consumer, task_id
+                );
+        if (!queued) {
+            expected = EARLY_DISPATCH_STAGING;
+            consumer.to_payload().early_dispatch_state.compare_exchange_strong(
+                expected, EARLY_DISPATCH_NONE, std::memory_order_seq_cst, std::memory_order_seq_cst
+            );
+        }
+    }
+
+    // Early-dispatch release, run at the ready funnel the moment readiness is
+    // decided. Returns true when the task is fully handled (every block
+    // launches by doorbell) and must NOT be queued. Returns false to route
+    // normally: never pre-staged, or a partially staged SPMD consumer whose
+    // remaining blocks dispatch off the ready queue from next_block_idx.
+    // Lock-free claim shared with the stagers: winning CAS NONE->DISPATCHED
+    // means not pre-staged; otherwise flip STAGING->DISPATCHED and
+    // destructively claim the published doorbell bits — a late stager rings
+    // only the bits this pass did not take, so each gated core has exactly
+    // one doorbell writer.
+    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state) {
+        TaskPayload &payload = slot_state.to_payload();
+        uint8_t expect = EARLY_DISPATCH_NONE;
+        if (payload.early_dispatch_state.compare_exchange_strong(
+                expect, EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return false;
+        }
+        // Defensive: a duplicate that observes an in-progress launch must never
+        // route the same partial task a second time.
+        if (expect != EARLY_DISPATCH_STAGING) return true;
+        const bool sync_start = slot_state.task_attrs.requires_sync_start();
+        if (!sync_start && !try_claim_early_dispatch_launch(payload)) return true;
+        expect = EARLY_DISPATCH_STAGING;
+        payload.early_dispatch_state.compare_exchange_strong(
+            expect, EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+        if (sync_start) {
+            // The flip to DISPATCHED is only the producer-released half of the
+            // rendezvous; the ring fires once every gated core also occupies a
+            // running slot, from whichever half completes second.
+            try_launch_sync_start_cohort(slot_state);
+        } else {
+            for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                uint64_t owned = claim_all_staged_doorbell_bits(payload.staged_core_mask[w]);
+                ring_staged_doorbell_bits(w, owned);
+            }
+            wmb();
+            payload.early_dispatch_launch_state.store(EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst);
+        }
+        // A still-queued early-dispatch entry for this consumer is now
+        // DISPATCHED and is dropped when a peer pops it.
+        return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
+    }
+
+    // Publication accounting for the producers early dispatch watches. Only
+    // ED_FLAG_TRACKED tasks pay: the host set that bit exactly on the
+    // producers of at least one candidate. When the count reaches the task's
+    // logical blocks, the state byte advances to PUBLISHED and the caller seals
+    // the publish list — everything past that leaves the dispatch path.
+    //
+    // "Published" counts placement, not launch: a gated candidate's staged
+    // blocks publish here too, so its consumers may pre-stage while it still
+    // waits for its own doorbell. Such chains cannot deadlock on cores: a
+    // consumer is detected only after this seal, hence after every producer
+    // block already occupies its slot, so every waits-for edge between gated
+    // tasks points from a later-staged task to an earlier-staged one — the
+    // earliest unreleased gated task has only completed or released
+    // producers, rings, and unwinds the chain in staging order. (The
+    // reclaiming tensormap_and_ringbuffer runtime instead defers propagation
+    // to launch visibility; whole-graph-resident hbg holds no reclaimable
+    // resource a gated chain could pin, so placement is the sufficient gate.)
+    // Called BEFORE the batch's MMIO token writes, with the count that batch is
+    // about to publish. Returns true when this call reached the task's total,
+    // i.e. this caller owns the seal and must call seal_ed_publish_list once its
+    // tokens are flushed.
+    //
+    // The call site owes one precondition, and it is the one to re-check when
+    // adding a publish site: every block counted here has its token written by
+    // this same caller before it returns. A path that could reach the total and
+    // then not emit those tokens would publish a task whose blocks never launch,
+    // and its consumers would wait on a completion that cannot arrive.
+    //
+    // Accounting ahead of the tokens is what makes the state byte a plain
+    // sequential store: it puts PUBLISHED before every token this task will
+    // ever emit, so PUBLISHED ≺ token ≺ FIN ≺ COMPLETED holds no matter how
+    // fast a core FINs or how sibling publishers interleave — the total-reaching
+    // thread's store precedes its own tokens, and those tokens' FINs gate the
+    // all-FIN completion. Cores are claimed at prepare time, before any of this,
+    // so a consumer staged off the early PUBLISHED cannot occupy cores the
+    // producer's in-flight blocks still need.
+    inline bool account_published_blocks(ChipTaskSlotState &slot_state, int32_t count) {
+        if (count <= 0 || (slot_state.ed_flags & ED_FLAG_TRACKED) == 0) return false;
+        const int16_t total = static_cast<int16_t>(
+            slot_state.to_payload().published_block_count.fetch_add(
+                static_cast<int16_t>(count), std::memory_order_seq_cst
+            ) +
+            count
+        );
+        if (total != slot_state.logical_block_num) return false;
+        task_view.tasks->store_published(slot_state.to_descriptor().task_id.local_id());
+        return true;
+    }
+
+    // Seal event of a tracked producer, after its tokens are flushed. The
+    // PUBLISHED store already happened in account_published_blocks, so a scanner
+    // that meets the sentinel is guaranteed to read the byte as published. The
+    // exchange makes the seal exactly-once (a second call gets the sentinel
+    // back), so the completion path can call this too for tracked producers that
+    // never publish (DUMMY / predicate-retired), whose COMPLETED byte already
+    // compares as published. A full pending-drain queue drops the chain: those
+    // candidates miss early dispatch, nothing blocks.
+    inline void seal_ed_publish_list(ChipTaskSlotState &slot_state) {
+        // The sentinel is monotone (set once, never cleared), so an
+        // already-sealed list needs no exchange.
+        if (slot_state.ed_publish_list_head.load(std::memory_order_acquire) == ED_PUBLISH_LIST_SENTINEL) return;
+        ChipTaskSlotState *head =
+            slot_state.ed_publish_list_head.exchange(ED_PUBLISH_LIST_SENTINEL, std::memory_order_acq_rel);
+        if (head == ED_PUBLISH_LIST_SENTINEL) return;
+#if SIMPLER_SCHED_PROFILING
+        ed_publish_stats.publish_seals.fetch_add(1, std::memory_order_relaxed);
+#endif
+        if (head == nullptr) return;
+#if SIMPLER_SCHED_PROFILING
+        ed_publish_stats.chains_detached.fetch_add(1, std::memory_order_relaxed);
+#endif
+        if (!ed_publish_drain_queue.push(head)) {
+            ed_publish_drain_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Resume candidate `c`'s publish scan at its cursor. The row is sorted and
+    // the state byte is monotone, so entries above the cursor stay published
+    // forever and each entry is loaded once per life. Returns true when every
+    // producer is published — the early-dispatch trigger; false when `c` was
+    // re-hung on a still-unpublished producer's publish list. A hang CAS that
+    // meets the sentinel treats the producer as published and advances.
+    bool advance_ed_publish_scan(ChipTaskSlotState &c) {
+        SharedMemoryTaskHeader &tasks = *task_view.tasks;
+        const TaskPayload &p = c.to_payload();
+        const int32_t *fanin = p.fanin_data();
+        int32_t i = c.ed_publish_scan_cursor;
+        while (i >= 0) {
+            if (tasks.is_published(fanin[i])) {
+                i--;
+                continue;
+            }
+            ChipTaskSlotState &producer = tasks.get_slot_state_by_task_id(fanin[i]);
+            ChipTaskSlotState *expected = producer.ed_publish_list_head.load(std::memory_order_acquire);
+            bool hung = false;
+            while (expected != ED_PUBLISH_LIST_SENTINEL) {
+                c.next_in_ed_publish_list = expected;
+                if (producer.ed_publish_list_head.compare_exchange_weak(
+                        expected, &c, std::memory_order_acq_rel, std::memory_order_acquire
+                    )) {
+                    hung = true;
+                    break;
+                }
+            }
+            if (hung) {
+                c.ed_publish_scan_cursor = static_cast<uint8_t>(i);
+                return false;
+            }
+            // Sentinel: the producer published between the bit load and here.
+            i--;
+        }
+        return true;
+    }
+
+    // Publish-list registration at intake. Only called for a candidate that
+    // is not yet ready (its completion classification hung it on a wake list).
+    // Returns true when every producer is already published at intake.
+    bool register_on_ed_publish_list(ChipTaskSlotState &c) {
+        c.ed_publish_scan_cursor = static_cast<uint8_t>(c.to_payload().fanin_count - 1);
+#if SIMPLER_SCHED_PROFILING
+        ed_publish_stats.registered.fetch_add(1, std::memory_order_relaxed);
+#endif
+        const bool all_published = advance_ed_publish_scan(c);
+#if SIMPLER_SCHED_PROFILING
+        if (all_published) ed_publish_stats.immediate_at_intake.fetch_add(1, std::memory_order_relaxed);
+#endif
+        return all_published;
     }
 
     // Ring one sync_start cohort from its stable staged_core_mask. The caller owns
@@ -849,7 +1091,7 @@ struct SchedulerState {
     // release and each pending->running promotion); whichever observes the second half
     // wins the launch latch and rings exactly once. Returns true only to that winner,
     // which may then expose the cohort to its fanout.
-    inline bool maybe_rendezvous_ring(ChipTaskSlotState &slot_state) {
+    inline bool try_launch_sync_start_cohort(ChipTaskSlotState &slot_state) {
         // running_slot_count is the publication seed: every staged_core_mask OR
         // happens-before its final store. Read the seed first, then the mask, so
         // observing the final count cannot be paired with a partially published
@@ -872,23 +1114,6 @@ struct SchedulerState {
         return true;
     }
 
-    inline bool retry_sync_start_rendezvous_after_staging(ChipTaskSlotState &slot_state) {
-        if (!maybe_rendezvous_ring(slot_state)) return false;
-        propagate_dispatch_fanin(slot_state);
-        return true;
-    }
-
-    // Milestone 1: early-dispatch (predicated / allow_early_resolve) is stubbed.
-    // This producer-push propagation walked the wiring fanout list bumping each
-    // consumer's dispatch_fanin to pre-stage early-dispatch candidates — all of
-    // which (fanout_head, dispatch_fanin, fanin_actual_count, dispatch_propagated)
-    // are gone under polling. Nothing pre-stages into early_dispatch_queues /
-    // early_sync_start_queue, so tasks reach cores only through the normal ready
-    // path (wake drain -> push_ready_routed). Milestone 2 replaces this with the
-    // consumer-pull publish_flags design. sync_start cohorts still launch via
-    // ready_sync_queues (unaffected).
-    void propagate_dispatch_fanin(ChipTaskSlotState & /*p*/) {}
-
     int get_ready_tasks_batch(ChipReadyQueue *queues, ResourceShape shape, ChipTaskSlotState **out, int max_count) {
         return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
     }
@@ -905,18 +1130,46 @@ struct SchedulerState {
     // Orch owns dependency discovery and saves the immutable fanin wire.
     // Scheduler polling only chooses which already-wired producer a consumer
     // waits on at this instant; it never recomputes producer relationships.
-    int32_t graph_first_unmet_producer(const GraphExecution &execution, const ChipTaskSlotState &consumer) const {
-        const uint32_t task_index = static_cast<uint32_t>(consumer.in_graph_task_index);
-        const uint32_t begin = execution.fanin_offsets[task_index];
-        const uint32_t end = execution.fanin_offsets[task_index + 1];
-        for (uint32_t edge = begin; edge < end; ++edge) {
-            const uint16_t producer_index = execution.fanin_indices[edge];
-            const ChipTaskSlotState &producer = execution.task_at(producer_index).slot;
+    //
+    // Returns -1 (every producer complete -> route to ready) or the consumer's
+    // own CSR row index of an unmet producer, which graph_producer_at maps back
+    // to that producer. Hanging on the producer that completes last minimises
+    // wake-list transfers (a consumer re-registered onto a second producer once
+    // its first one completes) and the CAS traffic those transfers put on the
+    // lists, so the scan walks the row from its tail.
+    //
+    // What the tail names depends on the row. A row holds the consumer's
+    // deduplicated operand order, which is a declaration order and carries no
+    // relation to producer depth. Only an early-dispatch candidate's row is
+    // sorted by producer index (graph_fill_definition), and a producer is
+    // emitted before its consumers, so there the tail is the deepest producer
+    // and the bet is exact. On an unsorted row the tail is the last-declared
+    // operand and the scan is a heuristic, no worse-founded than picking the
+    // head.
+    //
+    // Resumes at the wake-scan cursor: entries above it were complete at the
+    // last classification and completion is monotonic, so re-walking them
+    // cannot change the verdict.
+    int32_t graph_first_unmet_producer(const GraphExecution &execution, ChipTaskSlotState &consumer) const {
+        const int32_t task_index = consumer.in_graph_local_id;
+        const int32_t begin = execution.fanin_offsets[task_index];
+        const int32_t count = execution.fanin_offsets[task_index + 1] - begin;
+        const int32_t start = consumer.wake_scan_cursor < count ? consumer.wake_scan_cursor : count - 1;
+        for (int32_t row = start; row >= 0; --row) {
+            const ChipTaskSlotState &producer = execution.task_at(execution.fanin_indices[begin + row]).slot;
             if (producer.task_state.load(std::memory_order_acquire) != CHIP_TASK_COMPLETED) {
-                return static_cast<int32_t>(producer_index);
+                consumer.wake_scan_cursor = static_cast<uint16_t>(row);
+                return row;
             }
         }
         return -1;
+    }
+
+    // The producer a graph_first_unmet_producer row index names.
+    ChipTaskSlotState &
+    graph_producer_at(const GraphExecution &execution, const ChipTaskSlotState &consumer, int32_t row) const {
+        const int32_t begin = execution.fanin_offsets[consumer.in_graph_local_id];
+        return execution.task_at(execution.fanin_indices[begin + row]).slot;
     }
 
     void register_graph_wake(GraphExecution &execution, ChipTaskSlotState *producer, ChipTaskSlotState *consumer) {
@@ -939,25 +1192,32 @@ struct SchedulerState {
                 push_ready_routed(consumer);
                 return;
             }
-            producer = &execution.task_at(unmet_producer).slot;
+            producer = &graph_producer_at(execution, *consumer, unmet_producer);
         }
     }
 
     uint32_t drain_graph_wake_list(GraphExecution &execution, ChipTaskSlotState &producer) {
-        uint32_t consumers_rescanned = 0;
+        uint32_t consumers_resolved = 0;
         ChipTaskSlotState *waiter = producer.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             ChipTaskSlotState *next = waiter->next_in_wake_list;
+            const int32_t local_id = waiter->in_graph_local_id;
+            if (execution.fanin_offsets[local_id + 1] - execution.fanin_offsets[local_id] == 1) {
+                push_ready_routed(waiter);  // single-producer waiter was waiting only on us
+                consumers_resolved++;
+                waiter = next;
+                continue;
+            }
             const int32_t unmet_producer = graph_first_unmet_producer(execution, *waiter);
             if (unmet_producer < 0) {
                 push_ready_routed(waiter);
             } else {
-                register_graph_wake(execution, &execution.task_at(unmet_producer).slot, waiter);
+                register_graph_wake(execution, &graph_producer_at(execution, *waiter, unmet_producer), waiter);
             }
-            consumers_rescanned++;
+            consumers_resolved++;
             waiter = next;
         }
-        return consumers_rescanned;
+        return consumers_resolved;
     }
 
     // Push every materialized-and-published root that has not been routed yet,
@@ -1002,7 +1262,7 @@ struct SchedulerState {
             if (unmet < 0) {
                 push_ready_routed(&task);
             } else {
-                register_graph_wake(execution, &execution.task_at(unmet).slot, &task);
+                register_graph_wake(execution, &graph_producer_at(execution, task, unmet), &task);
             }
         }
         execution.published_tasks.store(last, std::memory_order_release);
@@ -1086,13 +1346,8 @@ struct SchedulerState {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
-        const int32_t saved_task_index = slot_state.in_graph_task_index;
-        if (saved_task_index < 0) {
-            outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
-            return outcome;
-        }
-        const uint32_t task_index = static_cast<uint32_t>(saved_task_index);
-        if (task_index >= static_cast<uint32_t>(execution->task_count)) {
+        const int32_t task_index = slot_state.in_graph_local_id;
+        if (task_index < 0 || task_index >= execution->task_count) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
@@ -1155,9 +1410,9 @@ struct SchedulerState {
         int thread_idx
 #endif
     ) {
-        // Polling completion: publish the host-visible task_state mirror + the
-        // device-visible completion_flags byte, drain the wake list (route or
-        // re-register each waiter), and advance the watermark. Replaces the
+        // Polling completion: publish the task_state completion mirror + the
+        // device-visible task_states byte and drain the wake list (route or
+        // re-register each waiter). Replaces the
         // fanout-list walk + fanin_refcount decrements of the wiring model.
         on_mixed_task_complete(slot_state);
 #if SIMPLER_SCHED_PROFILING
@@ -1171,10 +1426,10 @@ struct SchedulerState {
     }
 
     // on_task_release is gone under polling. It existed to bump each producer's
-    // fanout_refcount so the host wait_for_consumers could observe consumer
-    // retirement; that signal is now the completed_watermark advanced by
-    // on_mixed_task_complete. There is likewise no self CONSUMED flip (host-orch
-    // never reclaimed slots on device).
+    // fanout_refcount so a host-side consumer wait could observe consumer
+    // retirement; no such wait exists — orchestration rejects scalar access to a
+    // tensor with a producer instead. There is likewise no self CONSUMED flip
+    // (host-orch never reclaimed slots on device).
 
     // === Cold-path API (defined in scheduler.cpp) ===
 

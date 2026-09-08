@@ -48,13 +48,12 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <unordered_map>
 #include <vector>
 
+#include "assert_compat.h"
 #include "host_build_graph/runtime_status.h"
-#include "host_build_graph/common.h"
 #include "host_build_graph/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
@@ -72,7 +71,7 @@
 #include "../../../../common/worker/runtime_c_api.h"
 #include "callable.h"
 #include "common/host_log_binding.h"
-#include "common/log_clock.h"
+#include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host_log.h"
@@ -240,16 +239,28 @@ record_bind_phase(HostPhaseKind kind, const BindPhaseMark &mark, const char *att
     auto since = [](uint64_t current, uint64_t mark) {
         return current >= mark ? current - mark : 0;
     };
+    // Counters first, caller attributes after. The buffer is the span attribute
+    // field's own width, so an overlong segment loses its tail: a caller's
+    // quantity is recoverable from the artifact's `detail` or the run's own
+    // sizing, while the counters are this record's only copy and phase_time_split
+    // has nothing to fall back on.
     char with_counters[kBindAttrsCapacity];
-    snprintf(
+    const int formatted = snprintf(
         with_counters, sizeof(with_counters),
-        "%s%sminflt=%" PRIu64 " tminflt=%" PRIu64 " nivcsw=%" PRIu64 " nvcsw=%" PRIu64 " cpu_ns=%" PRIu64
-        " rec_cpu_ns=%" PRIu64,
-        attrs, *attrs == '\0' ? "" : " ", since(now.minflt, mark.counters.minflt),
-        since(now.thread_minflt, mark.counters.thread_minflt), since(now.nivcsw, mark.counters.nivcsw),
-        since(now.nvcsw, mark.counters.nvcsw), since(now.cpu_ns, mark.counters.cpu_ns),
-        since(now.recorder_cpu_ns, mark.counters.recorder_cpu_ns)
+        "minflt=%" PRIu64 " tminflt=%" PRIu64 " nivcsw=%" PRIu64 " nvcsw=%" PRIu64 " cpu_ns=%" PRIu64
+        " rec_cpu_ns=%" PRIu64 "%s%s",
+        since(now.minflt, mark.counters.minflt), since(now.thread_minflt, mark.counters.thread_minflt),
+        since(now.nivcsw, mark.counters.nivcsw), since(now.nvcsw, mark.counters.nvcsw),
+        since(now.cpu_ns, mark.counters.cpu_ns), since(now.recorder_cpu_ns, mark.counters.recorder_cpu_ns),
+        *attrs == '\0' ? "" : " ", attrs
     );
+    // Mark the cut here, because nothing downstream can: this buffer is exactly
+    // as wide as the span's attribute field, so the value the logger receives
+    // already fits and its own `~` marker never fires. An unmarked truncation
+    // reads as a complete attribute list that is one field short.
+    if (formatted >= static_cast<int>(sizeof(with_counters))) {
+        with_counters[sizeof(with_counters) - 2] = '~';
+    }
     host_phase_record_bind(
         static_cast<uint32_t>(kind), static_cast<uint64_t>(start_ns), with_counters, payload,
         static_cast<uint64_t>(end_ns)
@@ -526,15 +537,14 @@ bool bind_graph_definitions(
             return false;
         }
         GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count == 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
+        if (definition->task_count <= 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
             definition->full_key != upload->full_key ||
             !graph_execution_storage_layout(
-                static_cast<int32_t>(definition->task_count), definition->tensor_arg_count,
-                definition->scalar_arg_count, &storage_layout
+                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
             ) ||
             storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != static_cast<int32_t>(definition->boundary_count) ||
-            upload->outer_slot->to_payload().scalar_count != static_cast<int32_t>(definition->boundary_scalar_count)) {
+            upload->outer_slot->to_payload().tensor_count != definition->boundary_count ||
+            upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
             LOG_ERROR("host-orch: invalid Graph Definition for task");
             return false;
         }
@@ -561,7 +571,7 @@ bool bind_graph_definitions(
                 LOG_ERROR("host-orch: invalid Graph Definition in-graph task array");
                 return false;
             }
-            for (uint32_t i = 0; i < definition->task_count; ++i) {
+            for (int32_t i = 0; i < definition->task_count; ++i) {
                 // Sizing takes the kind materialize will give this task. add_task
                 // singles out GRAPH and routes everything else by shape, and a Graph
                 // body member is never the shell, so the shape decides. Derived here
@@ -599,7 +609,7 @@ int32_t run_host_orchestration(
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
 
-    // Init-on-write: descriptors, payloads, slot_states and completion_flags are
+    // Init-on-write: descriptors, payloads, slot_states and task_states are
     // each written per task at submit and read only for [0, total_tasks). Zero
     // only the fixed-size header here; the per-slot segments are initialized in
     // orch::prepare_task and shipped bounded to total_tasks below.
@@ -631,7 +641,7 @@ int32_t run_host_orchestration(
     // actually needs, and compact_live_image moves every address the orchestrator
     // wrote onto the real base before the image travels.
     if (!orchestrator.init(
-            host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity, rt->scheduler
+            host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
         )) {
         LOG_ERROR("host-orch: orchestrator init against host SM failed");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -717,14 +727,12 @@ int32_t run_host_orchestration(
     {
         const OrchProfilingData prof = orchestrator_get_profiling();
         const std::pair<const char *, uint64_t> steps[] = {
-            {"alloc", prof.alloc_cycle},   {"args", prof.args_cycle},   {"lookup", prof.lookup_cycle},
-            {"insert", prof.insert_cycle}, {"fanin", prof.fanin_cycle},
+            {"alloc", prof.alloc_ns},   {"args", prof.args_ns},   {"lookup", prof.lookup_ns},
+            {"insert", prof.insert_ns}, {"fanin", prof.fanin_ns},
         };
         for (const auto &step : steps) {
             if (step.second == 0) continue;
-            LOG_TIMING(
-                "host-orch step=%s cycles=%" PRIu64 " submits=%" PRId64, step.first, step.second, prof.submit_count
-            );
+            LOG_TIMING("host-orch step=%s ns=%" PRIu64 " submits=%" PRId64, step.first, step.second, prof.submit_count);
         }
     }
 #endif
@@ -814,7 +822,7 @@ int32_t run_host_orchestration(
     host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
     // The count travels inside the header the restack copies wholesale, which is
-    // what lets the device bound its completed_watermark walk without a second
+    // what lets the device bound its slot walks without a second
     // carrier. Written after the range check above, so the value the device reads
     // is one the segments are actually pitched to.
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.total_tasks = total_tasks;
@@ -936,10 +944,12 @@ int32_t run_host_orchestration(
         ~static_cast<uintptr_t>(CHIP_ALIGN_SIZE - 1)
     );
 
-    // The copied zone carries no host address: the orchestrator is host-only and
-    // no device code may reach host memory through the image. Its work is done, so
-    // the pointer goes early rather than at the guard's scope exit.
+    // The copied zone carries no host address: the orchestrator and the ops table are
+    // both host-only, and no device code may reach host memory through the image.
+    // Their work is done, so the pointers go early rather than at the guard's scope
+    // exit.
     rt->orchestrator = nullptr;
+    rt->ops = nullptr;
     std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
     const uint64_t compacted = sm_layout::compact_live_image(
         static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
@@ -953,7 +963,8 @@ int32_t run_host_orchestration(
     }
     {
         // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels, which is what sets kBindAttrsCapacity's margin.
+        // their labels. With the counters ahead of it in the recorded string, this
+        // is the tail a truncation eats first.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),

@@ -30,17 +30,14 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>   // for fprintf, printf
-#include <string.h>  // for memset
 
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
-#include "dispatch_payload.h"
 #include "task_args.h"
+#include "aicore_teardown.h"
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
 
 // =============================================================================
@@ -73,7 +70,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * 4. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
  * 5. Task Execution: AICore reads the cached DispatchPayload and executes
  * 6. Task Completion: AICore writes FIN to COND; AICPU observes completion
- * 7. Shutdown: AICPU writes the exit signal to DATA_MAIN_BASE; AICore exits
+ * 7. Shutdown (A2/A3): EXIT -> EXITED -> window-close -> GM release -> AICore returns
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
  * task execution across multiple cores.
@@ -101,6 +98,14 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
+
+// The AICore owns this line's writeback: it flushes the whole line with
+// dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
+// must publish independently cannot live here — a stale line writeback would
+// overwrite it. The A2/A3 post-close return gates live in
+// Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
+static_assert(sizeof(Handshake) == 64);
+static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 
 /**
  * simpler::hbg::Tensor pair for tracking host-device memory mappings.
@@ -143,7 +148,13 @@ class Runtime {
 public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-    int worker_count;                       // Number of active workers
+    // A2/A3 post-close return gates, one isolated cache line per worker. The
+    // AICPU stores here only after that worker's register window is closed;
+    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
+    // Separate from workers[] because the AICore flushes its whole Handshake
+    // line, which would overwrite a gate sharing it. Unused on A5.
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
+    int worker_count;  // Number of active workers
 
     // Execution parameters for AICPU scheduling.
     //
@@ -235,6 +246,7 @@ public:
     void *get_tracr_data_sizes() const { return tracrDataSizes_; }
     void set_tracr_data_sizes(void *p) { tracrDataSizes_ = p; }
     Handshake *get_workers() { return workers; }
+    AicoreTeardownControl *get_teardown_gates() { return teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }

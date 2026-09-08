@@ -888,7 +888,7 @@ struct SchedulerState {
     // release and each pending->running promotion); whichever observes the second half
     // wins the launch latch and rings exactly once. Returns true only to that winner,
     // which may then expose the cohort to its fanout.
-    inline bool maybe_rendezvous_ring(ChipTaskSlotState &slot_state) {
+    inline bool try_launch_sync_start_cohort(ChipTaskSlotState &slot_state) {
         // running_slot_count is the publication seed: every staged_core_mask OR
         // happens-before its final store. Read the seed first, then the mask, so
         // observing the final count cannot be paired with a partially published
@@ -912,7 +912,7 @@ struct SchedulerState {
     }
 
     inline bool retry_sync_start_rendezvous_after_staging(ChipTaskSlotState &slot_state) {
-        if (!maybe_rendezvous_ring(slot_state)) return false;
+        if (!try_launch_sync_start_cohort(slot_state)) return false;
         propagate_dispatch_fanin(slot_state);
         return true;
     }
@@ -957,7 +957,7 @@ struct SchedulerState {
     // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or
     // sync_start staging), but no-ops until every logical block is launch-visible. Only then
     // does it walk p's fanout and bump each consumer's
-    // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_actual_count (= every
+    // dispatch_fanin. A consumer whose dispatch_fanin reaches early_dispatch_target() (= every
     // producer is flagged-and-fully-dispatched, or was already complete when the consumer was
     // wired) is an early-dispatch candidate: CAS NONE->STAGING (exactly-once) and push to
     // early_dispatch_queues[shape] (or early_sync_start_queue for a require_sync_start cohort)
@@ -997,15 +997,21 @@ struct SchedulerState {
         for (; edge != nullptr; edge = edge->next) {
             ChipTaskSlotState *c = edge->slot_state;
             if (c->task_attrs.has_predicate()) continue;  // predicated consumers never early-dispatch
-            // Compare to fanin_actual_count (the real producer-edge count), NOT
-            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
-            // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
-            // the wiring-time flagged-pre-completed seed and is bumped here by flagged
-            // producers; reaching fanin_actual_count means every producer is
-            // flagged-and-fully-published or was pre-completed. An unflagged producer leaves the
-            // seed short and never bumps, so this stays unreachable for that consumer.
+            // Compare to early_dispatch_target(), NOT fanin_count or
+            // fanin_actual_count: fanin_count = fanin_wait_count + 1 (a
+            // self/wiring +1 that ready_fanin gets but dispatch_fanin does not),
+            // and fanin_actual_count also counts RETAIN-only and
+            // reduction-dropped edges, which never link onto fanout_head and so
+            // never bump dispatch_fanin. dispatch_fanin starts at the
+            // wiring-time flagged-pre-completed seed and is bumped here by
+            // flagged producers; reaching the target means every WAIT producer
+            // is flagged-and-fully-published or was pre-completed. An unflagged
+            // producer leaves the seed short and never bumps -- whether it is
+            // still a WAIT producer or was reduced away and left its unit in
+            // early_dispatch_blocked -- so this stays unreachable for that
+            // consumer either way.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->payload->early_dispatch_target()) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }
@@ -1047,12 +1053,12 @@ struct SchedulerState {
         // Producer released: ring the gated cores. A non-sync_start consumer launches
         // each block the instant its doorbell fires. A sync_start consumer instead holds
         // for the rendezvous — every gated core must occupy a running slot first — so the
-        // flip to DISPATCHED above is only the producer-released half; maybe_rendezvous_ring
+        // flip to DISPATCHED above is only the producer-released half; try_launch_sync_start_cohort
         // rings now iff running_slot_count already reached popcount(staged_core_mask) (all
         // gated cores took idle running slots), else the last pending->running promotion rings.
         bool launched = true;
         if (sync_start) {
-            launched = maybe_rendezvous_ring(slot_state);
+            launched = try_launch_sync_start_cohort(slot_state);
         } else {
             // Destructively claim every published bit. A stager racing this pass
             // can claim only bits that land after the exchange, so each gated core

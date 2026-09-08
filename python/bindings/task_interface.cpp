@@ -62,9 +62,9 @@
 #include "chip_worker.h"
 #include "common/host_span_names.h"
 #include "common/host_span_scope.h"
+#include "common/log_clock.h"
 #include "host_log.h"
 #include "data_type.h"
-#include "dma_workspace.h"
 #include "worker_chip_orch_comm.h"
 #include "worker_bind.h"
 #include "task_args_wire.h"
@@ -1598,9 +1598,62 @@ void region_vmm_test_set_unmap_already_gone() {
 
 // The int wire value of a dtype given either a DataType enumerator or its int value. The nanobind
 // DataType enum is not arithmetic, so a caller holding one has only `.value`; accept both forms.
-uint8_t datatype_wire_value(nb::object dtype) {
-    if (nb::hasattr(dtype, "value")) dtype = dtype.attr("value");
+// The enumerator is tried first as a type check: `hasattr` costs an attribute lookup, and on an int
+// it costs a raised-and-cleared AttributeError as well.
+uint8_t datatype_wire_value(nb::handle dtype) {
+    if (nb::isinstance<DataType>(dtype)) return static_cast<uint8_t>(nb::cast<DataType>(dtype));
+    if (nb::hasattr(dtype, "value")) return nb::cast<uint8_t>(nb::getattr(dtype, "value"));
     return nb::cast<uint8_t>(dtype);
+}
+
+// Write a view's `ndims` / `shapes` / `strides` into `t`. A `strides` of None is contiguous
+// (row-major): strides[i] = prod(shapes[i+1:]). The two ways to build a Tensor from Python — the
+// constructor and `BufferDescriptor.tensor` — share this so a view means the same thing in both.
+// Bounds only; `validate_tensor` is the gate on the finished Tensor.
+void fill_view(Tensor *t, nb::handle shapes, nb::handle strides) {
+    // PySequence_Fast hands back a tuple or list unchanged, so the common call reads its elements
+    // straight out of the caller's own object.
+    PyObject *raw_shapes = PySequence_Fast(shapes.ptr(), "Tensor shapes must be a sequence");
+    if (raw_shapes == nullptr) throw nb::python_error();
+    nb::object shapes_fast = nb::steal(raw_shapes);
+    const Py_ssize_t ndims = PySequence_Fast_GET_SIZE(raw_shapes);
+    if (ndims == 0 || ndims > static_cast<Py_ssize_t>(MAX_TENSOR_DIMS)) {
+        throw std::invalid_argument(
+            "Tensor ndims must be in [1, " + std::to_string(MAX_TENSOR_DIMS) + "], got " + std::to_string(ndims)
+        );
+    }
+    PyObject **shape_items = PySequence_Fast_ITEMS(raw_shapes);
+    t->ndims = static_cast<uint32_t>(ndims);
+    for (Py_ssize_t i = 0; i < ndims; ++i)
+        t->shapes[i] = nb::cast<uint32_t>(nb::handle(shape_items[i]));
+
+    if (strides.is_none()) {
+        // A stride is a u32 field, so a suffix product that does not fit one names no representable
+        // view: rejecting is what keeps a wrapped-small stride from passing validate_tensor's extent
+        // check while the view really spans past the backing. The accumulator is u64 and bounded
+        // before every further multiply, so it cannot wrap either.
+        uint64_t acc = 1;
+        for (Py_ssize_t i = ndims; i-- > 0;) {
+            t->strides[i] = static_cast<uint32_t>(acc);
+            acc *= t->shapes[i];
+            if (i > 0 && acc > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                throw std::invalid_argument(
+                    "Tensor contiguous stride does not fit in uint32: prod(shapes[" + std::to_string(i) + ":]) is " +
+                    std::to_string(acc)
+                );
+            }
+        }
+        return;
+    }
+    PyObject *raw_strides = PySequence_Fast(strides.ptr(), "Tensor strides must be a sequence");
+    if (raw_strides == nullptr) throw nb::python_error();
+    nb::object strides_fast = nb::steal(raw_strides);
+    if (PySequence_Fast_GET_SIZE(raw_strides) != ndims) {
+        throw std::invalid_argument("Tensor shapes and strides must have equal length");
+    }
+    PyObject **stride_items = PySequence_Fast_ITEMS(raw_strides);
+    for (Py_ssize_t i = 0; i < ndims; ++i)
+        t->strides[i] = nb::cast<uint32_t>(nb::handle(stride_items[i]));
 }
 
 // The leading `ndims` entries of a wire shapes[] / strides[] array as a Python tuple. The trailing
@@ -1638,6 +1691,24 @@ ChipTensor materialize_one(const Tensor &r, nb::dict resolved) {
         static_cast<AddressSpace>(addr_space)
     );
 }
+
+// Which device allocations a dispatch's operands may name: the private snapshot of every live
+// child allocation, keyed by the identity that resolves it. The owner-side Python registry is the
+// source of truth for lifetime; this mirror exists so the per-argument dispatch check reads the
+// registered descriptor without materializing one Python object per argument.
+struct ProvenanceEntry {
+    BufferDescriptor descriptor;
+    int32_t owner_worker_id;
+};
+
+struct ProvenanceTable {
+    std::unordered_map<CanonicalIdentity, ProvenanceEntry, CanonicalIdentityHash> entries;
+};
+
+// Why one argument failed the dispatch check. The caller names the argument and raises: the
+// identity's rendering and the api name live on the Python side, and the failure path is cold.
+constexpr int PROV_NOT_LIVE = 0;
+constexpr int PROV_DESCRIPTOR_MISMATCH = 1;
 
 // The same rule the submit point enforces, applied early so a mistake surfaces at the offending
 // add_tensor call rather than at submit. A tag can change afterwards, which is why submit re-checks.
@@ -1714,6 +1785,14 @@ NB_MODULE(_task_interface, m) {
         "Return whether this extension currently emits TIMING-level host spans."
     );
     m.def(
+        "_monotonic_now_ns",
+        [] {
+            return simpler::log::monotonic_now_ns();
+        },
+        "Read the clock every host record is stamped with, so a Python-timed span shares one clock with the C++ "
+        "spans by construction rather than by both platforms happening to map their monotonic clock the same way."
+    );
+    m.def(
         "_host_log_directory",
         [] {
             const char *bound = HostLogger::get_instance().log_directory();
@@ -1736,12 +1815,62 @@ NB_MODULE(_task_interface, m) {
     );
     m.def(
         "_initialize_host_log",
-        [](int level) {
+        [](int level, bool defer_writer) {
             if (!simpler::log::is_valid_level(level)) return false;
-            HostLogger::get_instance().set_level(static_cast<simpler::log::LogLevel>(level));
-            return true;
+            HostLogger &logger = HostLogger::get_instance();
+            if (defer_writer && !logger.prepare_to_fork()) return false;
+            logger.set_level(static_cast<simpler::log::LogLevel>(level), /*defer_writer=*/true);
+            return defer_writer || logger.start_writer();
         },
-        nb::arg("level"), "Seed the process-owned host-log state before workers fork or load runtime modules."
+        nb::arg("level"), nb::arg("defer_writer") = false,
+        "Seed the process-owned host-log state. A hierarchical worker defers its writer until after its last fork."
+    );
+    m.def(
+        "_start_host_log_writer",
+        [] {
+            return HostLogger::get_instance().start_writer();
+        },
+        "Start this process's bounded host-log writer after its final local fork."
+    );
+    m.def(
+        "_flush_host_log",
+        [](uint32_t timeout_ms) {
+            return HostLogger::get_instance().flush(timeout_ms);
+        },
+        nb::arg("timeout_ms") = 1000, nb::call_guard<nb::gil_scoped_release>(),
+        "Wait boundedly for all host-log records accepted by this process to be written."
+    );
+    m.def(
+        "_host_log_dropped_records",
+        [] {
+            return HostLogger::get_instance().dropped_records();
+        },
+        "Return the number of host-log records rejected by or lost from this process sink."
+    );
+    m.def(
+        "_host_log_dropped_records_by_reason",
+        [] {
+            const HostLogger &logger = HostLogger::get_instance();
+            nb::dict counts;
+            counts["queue_full"] = logger.dropped_records(SIMPLER_HOST_LOG_DROP_QUEUE_FULL);
+            counts["claim_exhausted"] = logger.dropped_records(SIMPLER_HOST_LOG_DROP_CLAIM_EXHAUSTED);
+            counts["output_failed"] = logger.dropped_records(SIMPLER_HOST_LOG_DROP_OUTPUT_FAILED);
+            counts["not_admitted"] = logger.dropped_records(SIMPLER_HOST_LOG_DROP_NOT_ADMITTED);
+            return counts;
+        },
+        "Return this process's host-log drops attributed by cause. The keys sum to "
+        "_host_log_dropped_records(). `queue_full` means the queue is too small for the burst; "
+        "`claim_exhausted` means the lock-free claim budget lost to contention with room still "
+        "in the queue; `output_failed` means the destination rejected the write; `not_admitted` "
+        "means there was no sink to submit to. They call for different fixes, which is why the "
+        "total alone is not actionable."
+    );
+    m.def(
+        "_host_log_pending_records",
+        [] {
+            return HostLogger::get_instance().pending_records();
+        },
+        "Return the number of accepted host-log records not yet written by this process sink."
     );
     m.def(
         "_set_host_log_directory",
@@ -1946,6 +2075,22 @@ NB_MODULE(_task_interface, m) {
                 return a != b;
             }
         )
+        .def(
+            "tensor",
+            [](const BufferDescriptor &self, nb::object shapes, nb::object dtype, nb::object strides,
+               uint64_t byte_offset) -> Tensor {
+                Tensor t{};
+                t.buffer = self;
+                t.byte_offset = byte_offset;
+                t.dtype = static_cast<DataType>(datatype_wire_value(dtype));
+                fill_view(&t, shapes, strides);
+                validate_tensor(t);
+                return t;
+            },
+            nb::arg("shapes"), nb::arg("dtype"), nb::arg("strides") = nb::none(), nb::arg("byte_offset") = 0,
+            "A Tensor viewing this backing. `strides` default to contiguous (row-major) element strides."
+        )
+
         .def("__repr__", [](const BufferDescriptor &self) -> std::string {
             std::ostringstream os;
             os << "BufferDescriptor(buffer_id=" << self.identity.buffer_id
@@ -1968,25 +2113,11 @@ NB_MODULE(_task_interface, m) {
             "__init__",
             [](Tensor *self, const BufferDescriptor &buffer, uint64_t byte_offset, nb::sequence shapes,
                nb::sequence strides, nb::object dtype) {
-                const size_t ndims = nb::len(shapes);
-                if (ndims != nb::len(strides)) {
-                    throw std::invalid_argument("Tensor shapes and strides must have equal length");
-                }
-                if (ndims == 0 || ndims > static_cast<size_t>(MAX_TENSOR_DIMS)) {
-                    throw std::invalid_argument(
-                        "Tensor ndims must be in [1, " + std::to_string(MAX_TENSOR_DIMS) + "], got " +
-                        std::to_string(ndims)
-                    );
-                }
                 new (self) Tensor{};
                 self->buffer = buffer;
                 self->byte_offset = byte_offset;
-                self->ndims = static_cast<uint32_t>(ndims);
-                for (size_t i = 0; i < ndims; ++i) {
-                    self->shapes[i] = nb::cast<uint32_t>(shapes[i]);
-                    self->strides[i] = nb::cast<uint32_t>(strides[i]);
-                }
                 self->dtype = static_cast<DataType>(datatype_wire_value(dtype));
+                fill_view(self, shapes, strides);
                 validate_tensor(*self);
             },
             nb::arg("buffer"), nb::arg("byte_offset"), nb::arg("shapes"), nb::arg("strides"), nb::arg("dtype")
@@ -2361,6 +2492,31 @@ NB_MODULE(_task_interface, m) {
         .def("tensor_count", &TaskArgs::tensor_count)
         .def("scalar_count", &TaskArgs::scalar_count)
 
+        .def(
+            "identities",
+            [](const TaskArgs &self) {
+                const int32_t n = self.tensor_count();
+                nb::list out;
+                for (int32_t i = 0; i < n; ++i)
+                    out.append(nb::cast(self.tensor(i).buffer.identity));
+                return out;
+            },
+            "Every tensor arg's buffer identity, in argument order."
+        )
+
+        .def(
+            "has_device_backed_tensor",
+            [](const TaskArgs &self) {
+                const int32_t n = self.tensor_count();
+                for (int32_t i = 0; i < n; ++i) {
+                    const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
+                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
+                }
+                return false;
+            },
+            "Whether any arg names memory behind a chip boundary, which a dispatch must authorize."
+        )
+
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -2369,6 +2525,75 @@ NB_MODULE(_task_interface, m) {
                 return self.tensor_count() + self.scalar_count();
             },
             "Return total number of arguments (tensors + scalars)."
+        );
+
+    // --- ProvenanceTable ---
+    // The owner's live child device allocations, as the dispatch path consumes them. The Python
+    // Worker writes it alongside its own registry and reads it back only through `check_dispatch`.
+    m.attr("PROV_NOT_LIVE") = PROV_NOT_LIVE;
+    m.attr("PROV_DESCRIPTOR_MISMATCH") = PROV_DESCRIPTOR_MISMATCH;
+
+    nb::class_<ProvenanceTable>(m, "ProvenanceTable")
+        .def(nb::init<>())
+
+        .def(
+            "insert",
+            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id) {
+                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id};
+            },
+            nb::arg("descriptor"), nb::arg("owner_worker_id"),
+            "Register one allocation, keyed by its descriptor's identity."
+        )
+
+        .def(
+            "erase",
+            [](ProvenanceTable &self, const CanonicalIdentity &identity) {
+                self.entries.erase(identity);
+            },
+            nb::arg("identity"), "Revoke one allocation; absent identities are ignored."
+        )
+
+        .def(
+            "clear",
+            [](ProvenanceTable &self) {
+                self.entries.clear();
+            }
+        )
+
+        .def(
+            "__len__",
+            [](const ProvenanceTable &self) {
+                return self.entries.size();
+            }
+        )
+
+        .def(
+            "__contains__",
+            [](const ProvenanceTable &self, const CanonicalIdentity &identity) {
+                return self.entries.find(identity) != self.entries.end();
+            }
+        )
+
+        .def(
+            "check_dispatch",
+            [](const ProvenanceTable &self, const TaskArgs &args, int32_t target_worker_id) -> nb::object {
+                const int32_t n = args.tensor_count();
+                for (int32_t i = 0; i < n; ++i) {
+                    const BufferDescriptor &d = args.tensor(i).buffer;
+                    const auto backend = static_cast<BackendKind>(d.backend_kind);
+                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
+                    auto it = self.entries.find(d.identity);
+                    if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
+                        return nb::make_tuple(i, PROV_NOT_LIVE);
+                    }
+                    // Authorization and execution consume the same Buffer, so a same-identity
+                    // descriptor with a changed body/backend/extent/access is a different value.
+                    if (!(d == it->second.descriptor)) return nb::make_tuple(i, PROV_DESCRIPTOR_MISMATCH);
+                }
+                return nb::none();
+            },
+            nb::arg("args"), nb::arg("target_worker_id"),
+            "None when every device arg is live on target_worker_id, else (arg_index, reason)."
         );
 
     // --- ArgDirection enum ---
@@ -2789,6 +3014,15 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def_prop_rw(
+            "capture_clock_anchors",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.capture_clock_anchors);
+            },
+            [](CallConfig &c, bool v) {
+                c.capture_clock_anchors = v ? 1 : 0;
+            }
+        )
+        .def_prop_rw(
             "output_prefix",
             [](const CallConfig &c) -> std::string {
                 return std::string(c.output_prefix, ::strnlen(c.output_prefix, sizeof(c.output_prefix)));
@@ -2810,7 +3044,8 @@ NB_MODULE(_task_interface, m) {
                << ", enable_chip_swimlane=" << self.enable_chip_swimlane
                << ", enable_dump_args=" << self.enable_dump_args << ", enable_pmu=" << self.enable_pmu
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
-               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
+               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
+               << ", capture_clock_anchors=" << (self.capture_clock_anchors ? "True" : "False");
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
                 append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);
@@ -2908,13 +3143,9 @@ NB_MODULE(_task_interface, m) {
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
                const std::string &sdma_warmup_path) {
-                // Translate the Python bool into a DmaWorkspaceKind bitmask so the
-                // platform-agnostic ChipWorker stays free of the enum. Empty mask
-                // when disabled leaves the Worker with no async-DMA provisioning.
-                uint32_t dma_workspace_mask = enable_sdma ? (uint32_t{1} << DMA_WORKSPACE_SDMA) : 0;
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
-                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr, dma_workspace_mask, sim_context_path,
+                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,
                     sdma_warmup_path
                 );
             },
@@ -2932,7 +3163,7 @@ NB_MODULE(_task_interface, m) {
             "given, its ring sizing is built + cached inside init (fork-constant, no "
             "cross-process control command). A no-op for runtimes without a prebuilt arena. "
             "When enable_sdma is True, provisions the async-DMA (SDMA) workspace at init so "
-            "kernels can use get_dma_workspace; init raises if the platform lacks SDMA."
+            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

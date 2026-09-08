@@ -26,7 +26,9 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import sys
 import threading
 import uuid
 import weakref
@@ -52,6 +54,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_STATE_VALUES,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
+    PROV_DESCRIPTOR_MISMATCH,
+    PROV_NOT_LIVE,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -60,6 +64,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    ProvenanceTable,
     RuntimeEnv,
     TaskArgs,
     TaskHandle,
@@ -77,10 +82,22 @@ from _task_interface import (
     _emit_host_log as _native_emit_host_log,
 )
 from _task_interface import (
+    _flush_host_log as _native_flush_host_log,
+)
+from _task_interface import (
     _host_log_directory as _native_host_log_directory,
 )
 from _task_interface import (
+    _host_log_dropped_records as _native_host_log_dropped_records,
+)
+from _task_interface import (
+    _host_log_pending_records as _native_host_log_pending_records,
+)
+from _task_interface import (
     _initialize_host_log as _native_initialize_host_log,
+)
+from _task_interface import (
+    _start_host_log_writer as _native_start_host_log_writer,
 )
 
 from .buffer import Buffer, Tensor
@@ -179,6 +196,9 @@ __all__ = [
     # Distributed runtime
     "WorkerType",
     "TaskState",
+    "ProvenanceTable",
+    "PROV_NOT_LIVE",
+    "PROV_DESCRIPTOR_MISMATCH",
     "_Worker",
     "MAILBOX_SIZE",
     "MAILBOX_FRAME_SIZE",
@@ -785,11 +805,20 @@ def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> 
 
 
 def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
+    """``args``' sidecar storage, extended to cover every arg added so far.
+
+    ``sidecars`` is indexed by arg position and covers a prefix of the list: a local arg names no
+    remote memory, so it occupies a ``None`` slot, and the positions past the last remote ref carry
+    no slot at all. The caller appends this ref's own sidecar after adding its placeholder, so
+    padding here is what puts that append at the placeholder's index.
+    """
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
-        if storage is None or len(storage.sidecars) != args.tensor_count():
-            storage = _RemoteTaskArgsStorage([None for _ in range(args.tensor_count())], bytearray())
+        if storage is None:
+            storage = _RemoteTaskArgsStorage([], bytearray())
             _REMOTE_TASK_ARGS_STORAGE[args] = storage
+        while len(storage.sidecars) < args.tensor_count():
+            storage.sidecars.append(None)
         return storage
 
 
@@ -823,10 +852,6 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
     _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
-    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
-        storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
-        if storage is not None:
-            storage.sidecars.append(None)
 
 
 def _task_args_clear(self: TaskArgs) -> None:
@@ -853,10 +878,14 @@ def _remote_sidecar_for(args: TaskArgs) -> _RemoteTaskArgsSidecar | None:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
         if storage is None:
             return None
-        if len(storage.sidecars) != args.tensor_count():
+        # The wire form is one slot per arg; local args added after the last remote ref are the
+        # tail `sidecars` does not reach. More slots than args is storage for a different arg list.
+        missing = args.tensor_count() - len(storage.sidecars)
+        if missing < 0:
             _REMOTE_TASK_ARGS_STORAGE.pop(args, None)
             return None
-        return _RemoteTaskArgsSidecar(tuple(storage.sidecars), bytes(storage.inline_payload))
+        tensors = tuple(storage.sidecars) + (None,) * missing
+        return _RemoteTaskArgsSidecar(tensors, bytes(storage.inline_payload))
 
 
 def _remote_access_label(flags: int) -> str:
@@ -1240,8 +1269,8 @@ class GlobalCommDomainView:
         return self._committed
 
 
-def _initialize_host_log(log_level: int | None = None) -> None:
-    """Seed the extension-owned host-log state before runtime use or fork.
+def _initialize_host_log(log_level: int | None = None, *, defer_writer: bool = False) -> None:
+    """Seed host-log state, optionally leaving its writer stopped for local forks.
 
     Also points the Python `simpler` logger at that same host logger, so the two
     stop being separate logging systems that agree only on a threshold. This is
@@ -1253,9 +1282,61 @@ def _initialize_host_log(log_level: int | None = None) -> None:
 
     if log_level is None:
         log_level = _log.get_current_config()
-    if not _native_initialize_host_log(int(log_level)):
+    if int(log_level) not in (10, 20, 25, 30, 40, 60):
         raise ValueError(f"unsupported simpler log threshold: {log_level}")
+    if not _native_initialize_host_log(int(log_level), bool(defer_writer)):
+        raise RuntimeError(f"cannot initialize simpler host logging at threshold {log_level}")
     _log.attach_unified_log_handler(_native_emit_host_log, _native_host_log_directory)
+
+
+def _start_host_log_writer() -> None:
+    """Start the process-owned writer after the process's final local fork."""
+    if not _native_start_host_log_writer():
+        raise RuntimeError("cannot start simpler host-log writer")
+
+
+def _flush_host_log(timeout_ms: int = 1000) -> bool:
+    """Wait boundedly for this process's accepted host-log records."""
+    return bool(_native_flush_host_log(int(timeout_ms)))
+
+
+def _host_log_dropped_records() -> int:
+    """Return the process-owned sink's explicit loss counter."""
+    return int(_native_host_log_dropped_records())
+
+
+def _host_log_pending_records() -> int:
+    """Return accepted records that the process writer has not completed."""
+    return int(_native_host_log_pending_records())
+
+
+def _flush_host_log_or_warn(context: str, timeout_ms: int = 1000) -> bool:
+    """Flush boundedly and make a timeout or logger failure observable."""
+    try:
+        flushed = _flush_host_log(timeout_ms)
+    except BaseException as flush_error:  # noqa: BLE001
+        # The native logger is the failed component, so stderr is the only
+        # non-recursive diagnostic path left during teardown.
+        with contextlib.suppress(BaseException):
+            sys.stderr.write(f"WARNING: host-log flush failed during {context}: {flush_error}\n")
+        return False
+    if flushed:
+        return True
+
+    try:
+        pending: int | str = _host_log_pending_records()
+    except BaseException:  # noqa: BLE001
+        pending = "unknown"
+    try:
+        dropped: int | str = _host_log_dropped_records()
+    except BaseException:  # noqa: BLE001
+        dropped = "unknown"
+    with contextlib.suppress(BaseException):
+        sys.stderr.write(
+            f"WARNING: host-log flush timed out after {timeout_ms} ms during {context}; "
+            f"pending_records={pending}, dropped_records={dropped}; accepted records may be lost.\n"
+        )
+    return False
 
 
 class ChipWorker:
@@ -1377,6 +1458,7 @@ class ChipWorker:
         try:
             self._impl.finalize()
         finally:
+            _flush_host_log_or_warn("ChipWorker.finalize()")
             with self._registry_lock:
                 self._callable_registry.clear()
                 self._identity_registry.clear()

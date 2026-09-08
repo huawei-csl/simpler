@@ -27,6 +27,7 @@
 #include "callable.h"
 #include "call_config.h"
 #include "device_runner_base.h"
+#include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "prepare_callable_common.h"
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
@@ -54,10 +55,42 @@
 // time against `libunified_dlog.so` / `libascendalog.so`.
 extern "C" int dlog_setlevel(int moduleId, int level, int enableEvent);
 
+// Forward-declared for the same reason: the host-orchestrated graph capture lives
+// in the host_build_graph runtime .so, and its header pulls in that runtime's own
+// types. Each platform .so carries weak `false` / `-1` fallbacks for the runtimes
+// that capture on the device instead — see each arch's device_runner.cpp.
+extern "C" bool dep_gen_host_graph_active();
+extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
+
 using OnboardNativeRunContext = NativeRunContext<DeviceRunnerBase>;
 // Phase entry points validate raw caller storage before beginning object
 // lifetime, so the on-storage magic must remain the leading bytes.
 static_assert(__builtin_offsetof(OnboardNativeRunContext, magic) == 0, "native-run magic must lead runtime storage");
+
+/**
+ * Write a host-orchestrated run's dependency graph, at the point its capture
+ * window closes.
+ *
+ * The graph is complete when bind returns — host_build_graph runs its
+ * orchestrator there — and it lives in state private to the thread that ran it.
+ * Writing it here keeps the write on that thread and ahead of any later capture,
+ * which is what the alternative (writing at drain) cannot promise: a drain may
+ * land on another thread, and a successor's bind resets the capture state.
+ *
+ * The destination comes from this run's own config rather than the runner's,
+ * which a concurrent prepare deliberately leaves untouched.
+ *
+ * A no-op for runtimes that capture on the device: their `dep_gen_host_graph_active`
+ * is the weak `false`, and their graph is emitted from the collector at drain.
+ */
+static void emit_host_dep_gen_graph(const CallConfig &config, const char *trace_attrs) {
+    if (config.enable_dep_gen == 0 || !dep_gen_host_graph_active()) return;
+    const std::string deps_path = make_deps_json_path(config.output_prefix);
+    const int emit_rc = dep_gen_host_graph_emit(deps_path.c_str());
+    if (emit_rc != 0) {
+        LOG_ERROR("dep_gen host graph emit failed (%d) — deps.json not produced (%s)", emit_rc, trace_attrs);
+    }
+}
 
 extern "C" {
 
@@ -206,6 +239,13 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<DeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static bool publish_chip_swimlane_extension(
+    void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+) {
+    return runner_ctx != nullptr &&
+           static_cast<DeviceRunnerBase *>(runner_ctx)->publish_chip_swimlane_extension(section, json_value, json_size);
+}
+
 static void *host_phase_pool_arm(void *runner_ctx, int producer_wants_records) {
     if (runner_ctx == nullptr) return nullptr;
     return static_cast<DeviceRunnerBase *>(runner_ctx)->host_phase_pool_arm(producer_wants_records != 0);
@@ -317,6 +357,7 @@ static const HostApiOps g_host_api_ops = {
     .get_chip_swimlane_level = get_chip_swimlane_level,
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
+    .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
 };
 
 /* ===========================================================================
@@ -391,7 +432,7 @@ int finalize_device(DeviceContextHandle ctx) {
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
-    const CallConfig *prewarm_config
+    const CallConfig *prewarm_config, int enable_sdma, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
 ) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
 
@@ -430,16 +471,25 @@ int simpler_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
+        // Recorded before the bring-up below, which provisions the workspace and
+        // publishes its addresses in the same one-shot simpler_aicpu_init launch.
+        const uint8_t *warmup_bytes = static_cast<const uint8_t *>(sdma_warmup_binary);
+        std::vector<uint8_t> warmup_vec;
+        if (warmup_bytes != NULL && sdma_warmup_size > 0) {
+            warmup_vec.assign(warmup_bytes, warmup_bytes + sdma_warmup_size);
+        }
+        runner->set_dma_workspace_request(enable_sdma != 0, std::move(warmup_vec));
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     // Eagerly run the one-shot device setup: create persistent AICPU/AICore
-    // streams, upload the dispatcher + inner SO bundle, and resolve the per-
-    // symbol rtFuncHandle for per-task launch — so the first simpler_register_callable
-    // / simpler_run does not pay any of these costs. Streams live until
-    // finalize_device; the cached rtFuncHandle on LoadAicpuOp and the
-    // preinstall file both live until ~DeviceRunner.
+    // streams, upload the dispatcher + inner SO bundle, resolve the per-symbol
+    // rtFuncHandle for per-task launch, and provision + publish + warm the
+    // async-DMA workspaces — so the first simpler_register_callable / simpler_run
+    // does not pay any of these costs. Streams live until finalize_device; the
+    // cached rtFuncHandle on LoadAicpuOp and the preinstall file both live until
+    // ~DeviceRunner.
     try {
         rc = runner->ensure_device_initialized();
     } catch (...) {
@@ -815,6 +865,7 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc, true);
+        emit_host_dep_gen_graph(state->config, state->trace_attrs);
         rc = runner->prepare_execution(
             state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
             &state->prepared_execution
@@ -1145,19 +1196,6 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
         info->free_bytes = static_cast<uint64_t>(free_bytes);
         info->total_bytes = static_cast<uint64_t>(total_bytes);
         return 0;
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-}
-
-int simpler_provision_dma_workspace(
-    DeviceContextHandle ctx, uint32_t required_mask, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
-) {
-    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<DeviceRunnerBase *>(ctx)->provision_dma_workspace(
-            required_mask, sdma_warmup_binary, static_cast<size_t>(sdma_warmup_size)
-        );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

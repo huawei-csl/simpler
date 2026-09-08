@@ -25,12 +25,14 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
 
+#include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/clock_correlation.h"
 #include "common/memory_barrier.h"
@@ -231,21 +233,21 @@ struct ChipSwimlaneModule {
             break;
         }
         case ChipSwimlaneBufferKind::AicpuSchedPhase: {
-            auto *state = get_sched_phase_buffer_state(shm, num_cores, static_cast<int>(entry.core_index));
+            auto *state = get_sched_phase_buffer_state(shm, static_cast<int>(entry.core_index));
             site.free_queue = &state->free_queue;
             site.buffer_size = sizeof(ChipSwimlaneAicpuSchedPhaseBuffer);
             site.info.type = ProfBufferType::AICPU_SCHED_PHASE;
             break;
         }
         case ChipSwimlaneBufferKind::AicpuOrchPhase: {
-            auto *state = get_orch_phase_buffer_state(shm, num_cores, static_cast<int>(entry.core_index));
+            auto *state = get_orch_phase_buffer_state(shm, static_cast<int>(entry.core_index));
             site.free_queue = &state->free_queue;
             site.buffer_size = sizeof(ChipSwimlaneAicpuOrchPhaseBuffer);
             site.info.type = ProfBufferType::AICPU_ORCH_PHASE;
             break;
         }
         case ChipSwimlaneBufferKind::AicoreTask: {
-            auto *ac_state = get_aicore_buffer_state(shm, num_cores, static_cast<int>(entry.core_index));
+            auto *ac_state = get_aicore_buffer_state(shm, static_cast<int>(entry.core_index));
             site.free_queue = &ac_state->free_queue;
             site.buffer_size = sizeof(ChipSwimlaneAicoreTaskBuffer);
             site.info.type = ProfBufferType::AICORE_TASK;
@@ -268,7 +270,7 @@ struct ChipSwimlaneModule {
 
         // AicoreTask: per-core (kind 3)
         for (int i = 0; i < num_cores; i++) {
-            auto *ac_state = get_aicore_buffer_state(shm, num_cores, i);
+            auto *ac_state = get_aicore_buffer_state(shm, i);
             cb(/*kind=*/static_cast<int>(ChipSwimlaneBufferKind::AicoreTask), &ac_state->free_queue,
                sizeof(ChipSwimlaneAicoreTaskBuffer));
         }
@@ -282,7 +284,7 @@ struct ChipSwimlaneModule {
             num_sched_phase_threads = 0;
         }
         for (int t = 0; t < num_sched_phase_threads; t++) {
-            auto *state = get_sched_phase_buffer_state(shm, num_cores, t);
+            auto *state = get_sched_phase_buffer_state(shm, t);
             cb(/*kind=*/static_cast<int>(ChipSwimlaneBufferKind::AicpuSchedPhase), &state->free_queue,
                sizeof(ChipSwimlaneAicpuSchedPhaseBuffer));
         }
@@ -293,7 +295,7 @@ struct ChipSwimlaneModule {
             num_orch_phase_threads = 0;
         }
         for (int t = 0; t < num_orch_phase_threads; t++) {
-            auto *state = get_orch_phase_buffer_state(shm, num_cores, t);
+            auto *state = get_orch_phase_buffer_state(shm, t);
             cb(/*kind=*/static_cast<int>(ChipSwimlaneBufferKind::AicpuOrchPhase), &state->free_queue,
                sizeof(ChipSwimlaneAicpuOrchPhaseBuffer));
         }
@@ -359,8 +361,8 @@ public:
      *
      * @param num_aicore               Number of AICore instances
      * @param device_id                Device ID (forwarded to register_cb)
-     * @param chip_swimlane_level   Collection granularity (DISABLED / AICORE_TIMING
-     *                                 / AICPU_TIMING / SCHED_PHASES / ORCH_PHASES).
+     * @param chip_swimlane_level   Collection granularity (DISABLED / TASK_TIMING
+     *                                 / SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES).
      *                                 Written into
      *                                 `ChipSwimlaneDataHeader::chip_swimlane_level`
      *                                 so AICPU can promote it in
@@ -379,11 +381,48 @@ public:
      *                                 upstream.
      * @return 0 on success, error code on failure
      */
+    // Allocates the device-side resources.
+    //
+    // The pool-array offsets are fixed at compile time from PLATFORM_MAX_CORES,
+    // so the host and AICPU sides cannot disagree about them. num_aicore and
+    // aicpu_thread_num decide which of those fixed slots get buffers, and a
+    // core's recycled lane is assigned modulo aicpu_thread_num — so a collector
+    // that outlives a run holds pools shaped for those two counts, and the
+    // caller rebuilds it when a later run changes them.
+    //
+    // Per-run configuration (artifact prefix, level) is bound separately by
+    // begin_run(), which must run before this on the first run: the level
+    // selects the orch phase pool here.
     int initialize(
-        int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
-        const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
-        const ChipSwimlaneFreeCallback &free_cb, const std::string &output_prefix
+        int num_aicore, int aicpu_thread_num, int device_id, const ChipSwimlaneAllocCallback &alloc_cb,
+        ChipSwimlaneRegisterCallback register_cb, const ChipSwimlaneFreeCallback &free_cb
     );
+
+    /**
+     * Start a run's collection window: bind its artifact configuration, drop the
+     * previous run's records, counters, and runtime extensions, and — once the
+     * region exists — republish the level the device reads.
+     *
+     * The collector initializes once and serves every run, so this is the only
+     * point at which a run's records, counters and device level are established;
+     * initialize() establishes none of them. Skip it and this run's artifact
+     * carries the records every earlier run collected, reconcile compares an
+     * accumulated collected count against one run's device total, and the device
+     * stays on whichever level the first run asked for.
+     *
+     * Before the first initialize() there is no region and no shard storage yet;
+     * reset_collector_shards() is then a no-op over empty extents, and
+     * initialize() picks the level up from the member this sets.
+     */
+    void begin_run(const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level) {
+        output_prefix_ = output_prefix;
+        chip_swimlane_level_ = chip_swimlane_level;
+        json_extensions_.fill({});
+        reset_collector_shards();
+        publish_run_config();
+    }
+
+    bool set_json_extension(ChipSwimlaneExtensionSection section, const std::string &json_value);
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Dispatches on
@@ -396,7 +435,7 @@ public:
     /**
      * Publish per-core core_type (AIC/AIV/...) so the host emit path can
      * resolve the lane label without consulting an AICPU task record. Required
-     * for AICORE_TIMING (level=1) where complete_task is bypassed and the
+     * for TASK_TIMING (level=1) where complete_task is bypassed and the
      * AICore record alone is on disk. Caller is the device_runner — sim sets
      * it from `runtime.workers[i].core_type` (rule-based), onboard sets it
      * from the handshake-discovered table.
@@ -497,6 +536,10 @@ public:
      */
     void read_phase_header_metadata();
 
+    // Push the run's level into the device-visible header. A no-op before the
+    // region exists, and a single narrow field write once it does.
+    void publish_run_config();
+
     /**
      * Sum per-core / per-thread total_record_count and dropped_record_count
      * for both the PERF and PHASE pools, cross-check
@@ -555,6 +598,7 @@ private:
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/chip_swimlane_records.json.
     std::string output_prefix_;
+    std::array<std::string, static_cast<size_t>(ChipSwimlaneExtensionSection::Count)> json_extensions_{};
 
     // Merged data, populated from per-collector shards after collector threads join.
     std::vector<std::vector<ChipSwimlaneAicpuTaskRecord>> collected_perf_records_;
