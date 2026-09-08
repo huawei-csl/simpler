@@ -566,6 +566,11 @@ struct alignas(64) SchedChipSwimlaneCounters {
     uint64_t sched_complete_perf_cycle{0};
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};
+    // Immediate dispatch straight out of the completion sweep: tasks offered,
+    // blocks actually placed, and offers that found no free core of their shape.
+    uint64_t imm_offered{0};
+    uint64_t imm_placed{0};
+    uint64_t imm_no_core{0};
 #endif
     void reset() { *this = SchedChipSwimlaneCounters{}; }
 };

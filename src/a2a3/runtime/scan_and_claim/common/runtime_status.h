@@ -46,6 +46,9 @@
 #define SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED 103
 // push into a ready queue found no free slot (full, or window > capacity)
 #define SIMPLER_ERROR_READY_QUEUE_OVERFLOW 104
+// a task became ready on a scheduler thread that had no free core of its shape;
+// raised only by the kAbortWhenNoCoreForReadyTask diagnostic switch
+#define SIMPLER_ERROR_NO_CORE_FOR_READY_TASK 105
 
 static inline int32_t runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
     if (orch_error_code != SIMPLER_ERROR_NONE) {

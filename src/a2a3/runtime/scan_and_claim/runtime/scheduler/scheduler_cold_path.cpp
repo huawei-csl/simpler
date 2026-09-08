@@ -473,6 +473,11 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, int32_t cur
             complete_hit_rate
         );
         LOG_INFO(
+            "Thread %d:     imm_dispatch : offered=%" PRIu64 ", blocks_placed=%" PRIu64 ", no_core=%" PRIu64 "",
+            thread_idx, static_cast<uint64_t>(chip_swimlane.imm_offered),
+            static_cast<uint64_t>(chip_swimlane.imm_placed), static_cast<uint64_t>(chip_swimlane.imm_no_core)
+        );
+        LOG_INFO(
             "Thread %d:     otc_lock     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "", thread_idx,
             cycles_to_us(sp.lock_cycle), sp.lock_cycle * 100.0 / c_parent,
             cycles_to_us(sp.lock_cycle - sp.lock_wait_cycle), cycles_to_us(sp.lock_wait_cycle),

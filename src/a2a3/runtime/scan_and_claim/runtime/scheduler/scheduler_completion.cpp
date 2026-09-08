@@ -265,6 +265,128 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
     core.running_reg_task_id = AICPU_TASK_INVALID;
 }
 
+// Diagnostic switch. When true, a ready task that finds no free core of its
+// shape fails the scheduler instead of falling back to the deferred-ready FIFO.
+// A wavefront wider than a thread's core count legitimately exhausts every
+// core -- PA Case1 opens 16,384 blocks wide -- so the FIFO fallback is the
+// shipped behaviour and this exists to make the exhaustion visible on demand.
+static constexpr bool kAbortWhenNoCoreForReadyTask = false;
+
+void SchedulerContext::flush_dispatch_burst(int32_t thread_idx, DispatchBurst &burst, bool &made_progress) {
+    if (burst.handle_count > 0) {
+        wmb();
+        uint64_t dispatch_ts = 0;
+#if SIMPLER_DFX
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            dispatch_ts = get_sys_cnt_aicpu();
+        }
+#endif
+        for (int32_t i = 0; i < burst.handle_count; i++) {
+            publish_subtask_to_core(burst.handles[i], dispatch_ts, thread_idx);
+        }
+        burst.handle_count = 0;
+        made_progress = true;
+    }
+    for (int32_t i = 0; i < burst.published_n; i++) {
+        sched_->record_published_blocks(*burst.published_list[i], burst.published_counts[i]);
+        sched_->propagate_dispatch_fanin(*burst.published_list[i]);
+    }
+    burst.published_n = 0;
+}
+
+void SchedulerContext::place_ready_immediate(
+    int32_t thread_idx, int32_t freed_core_offset, CoreTracker &tracker, DispatchBurst &burst
+) {
+    // A sync_start cohort is gathering cores. sync_start_pending stops every
+    // thread's dispatch phase precisely so running work drains and the whole
+    // cohort can be staged at once; re-arming cores from the completion sweep
+    // would take the cores the drain is waiting for and the cohort would never
+    // assemble.
+    if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) return;
+
+    // Nothing free to place onto: skip the walk. This thread's FIFO can list
+    // hundreds of ready tasks when the wavefront is wide, and re-walking them
+    // once per FIN of the same sweep would cost more than the placement saves.
+    // Four bitmask tests decide it; MIX and DUMMY are handled by the FIFO
+    // drain, so only AIC and AIV matter here.
+    const bool any_core_free =
+        tracker.get_idle_core_offset_states(PTO2ResourceShape::AIC).has_value() ||
+        tracker.get_idle_core_offset_states(PTO2ResourceShape::AIV).has_value() ||
+        tracker.get_pending_core_offset_states(PTO2ResourceShape::AIC).has_value() ||
+        tracker.get_pending_core_offset_states(PTO2ResourceShape::AIV).has_value();
+    if (!any_core_free) return;
+
+    const CoreTracker::BitStates freed_bit =
+        (freed_core_offset >= 0) ? CoreTracker::BitStates::bit(freed_core_offset) : CoreTracker::BitStates(0);
+
+    sched_->place_deferred_ready(thread_idx, [&](ChipTaskSlotState &s, PTO2ResourceShape shape) {
+        // Re-read per task: prepare_block_for_dispatch marks the core occupied
+        // in the tracker as it goes, so a snapshot taken once per sweep would
+        // hand out a core the previous task of the same sweep already filled.
+        auto idle = tracker.get_idle_core_offset_states(shape);
+        auto pend = tracker.get_pending_core_offset_states(shape);
+        int32_t placed = 0;
+
+        while (burst.room() > 0) {
+            // A core must be secured BEFORE the block is claimed: claim_block_range
+            // advances next_block_idx irreversibly, so claiming first and then
+            // finding no core would strand that block -- no scan rediscovers it,
+            // and the graph hangs.
+            int32_t core_offset = -1;
+            bool to_pending = false;
+            if ((idle & freed_bit).has_value()) {
+                core_offset = freed_core_offset;
+                idle.clear_bit(core_offset);
+            } else if (idle.has_value()) {
+                core_offset = idle.pop_first();
+            } else if (pend.has_value()) {
+                core_offset = pend.pop_first();
+                to_pending = true;
+            } else {
+                break;
+            }
+
+            int32_t start = 0;
+            int32_t claim = s.claim_block_range(s.logical_block_num, 1, start);
+            if (claim == 0) break;  // a peer took the last block; the core stays free
+
+            burst.handle_count += prepare_block_for_dispatch(
+                thread_idx, core_offset, s, shape, to_pending, start, &burst.handles[burst.handle_count]
+            );
+            burst.published_list[burst.published_n] = &s;
+            burst.published_counts[burst.published_n] = static_cast<int16_t>(claim);
+            burst.published_n++;
+            placed += claim;
+        }
+
+        const bool blocks_remain = s.next_block_idx.load(std::memory_order_acquire) < s.logical_block_num;
+        // A burst buffer that filled up is not core exhaustion: the remaining
+        // tasks stay listed and the next sweep, or normal dispatch, places them.
+        const bool no_core = (placed == 0 && burst.room() > 0);
+#if SIMPLER_SCHED_PROFILING
+        auto &counters = sched_chip_swimlane_[thread_idx];
+        counters.imm_offered++;
+        counters.imm_placed += static_cast<uint64_t>(placed);
+        if (no_core) counters.imm_no_core++;
+#endif
+        if (kAbortWhenNoCoreForReadyTask && no_core && blocks_remain) {
+            LOG_ERROR(
+                "scan_and_claim: ready task %d (shape=%d, blocks=%d) found no free core on thread %d "
+                "(idle=%d, pipelineable=%d)",
+                static_cast<int32_t>(s.task->task_id.local()), static_cast<int32_t>(shape),
+                static_cast<int32_t>(s.logical_block_num), thread_idx,
+                tracker.get_idle_core_offset_states(shape).count(),
+                tracker.get_pending_core_offset_states(shape).count()
+            );
+            int32_t no_err = SIMPLER_ERROR_NONE;
+            inline_complete_error_.compare_exchange_strong(
+                no_err, SIMPLER_ERROR_NO_CORE_FOR_READY_TASK, std::memory_order_acq_rel, std::memory_order_relaxed
+            );
+        }
+        return blocks_remain;
+    });
+}
+
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
     bool &made_progress
@@ -273,6 +395,7 @@ void SchedulerContext::check_running_cores_for_completion(
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
+    DispatchBurst burst;
     auto running_core_states = tracker.get_all_running_cores();
     while (running_core_states.has_value()) {
         int32_t bit_pos = running_core_states.pop_first();
@@ -442,7 +565,25 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_done) {
             made_progress = true;
         }
+
+        // 5. Immediate dispatch. The consumers this FIN just made ready (they
+        // are in this thread's deferred-ready FIFO, appended by
+        // on_mixed_task_complete above) go onto free cores now, rather than
+        // waiting for the dispatch phase at the far end of the loop -- a lap
+        // this thread measures at ~7 us against ~3.7 us of task duration.
+        //
+        // Safe here and not inside the transition: CoreExecState is settled,
+        // the tracker already lists the core as free, and running_core_states
+        // has popped its bit, so a task placed on it is not polled again until
+        // the next sweep.
+        if (t.running_done || t.pending_done) {
+            if (burst.room() <= 0) {
+                flush_dispatch_burst(thread_idx, burst, made_progress);
+            }
+            place_ready_immediate(thread_idx, bit_pos, tracker, burst);
+        }
     }
+    flush_dispatch_burst(thread_idx, burst, made_progress);
 }
 
 // =============================================================================

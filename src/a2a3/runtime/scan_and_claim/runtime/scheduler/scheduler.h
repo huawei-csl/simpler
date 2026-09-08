@@ -835,6 +835,50 @@ struct PTO2SchedulerState {
         return found;
     }
 
+    // Offer this thread's deferred-ready entries for immediate placement.
+    // `place(slot_state, shape)` dispatches what it can onto free cores and
+    // returns true while the task still has unclaimed blocks.
+    //
+    // Entry admission matches service_deferred_ready, minus three shapes that
+    // this path deliberately leaves in the FIFO. MIX needs a co-resident
+    // AIC+AIV0+AIV1 triple; sync_start needs the drain coordinator to assemble
+    // a whole cohort before any block is rung; and retiring a dependency-only
+    // or predicate-failed task resolves ITS fanouts, which appends to the very
+    // FIFO being walked. All three belong to the iterative drain in
+    // service_deferred_ready, so this stays a pure placement fast track over an
+    // unchanged discovery path -- anything it declines is found again there.
+    template <typename PlaceFn>
+    void place_deferred_ready(int thread_idx, PlaceFn &&place) {
+        DeferredReadyFifo &fifo = deferred_ready_[thread_idx];
+        if (fifo.count == 0) return;
+        PTO2SharedMemoryRingHeader &ring = *ring_sched_state.ring;
+        int32_t kept = 0;
+        for (int32_t idx = 0; idx < fifo.count; ++idx) {
+            const int32_t i = fifo.ids[idx];
+            bool keep = false;
+            do {
+                if (ring.is_completion_flag_set(i)) break;  // retired by a peer's claim
+                ChipTaskSlotState &s = ring.get_slot_state_by_task_id(i);
+                if (s.task == nullptr || s.payload == nullptr) break;
+                if (s.task_kind == TaskKind::GRAPH || s.task_kind == TaskKind::GRAPH_NODE) break;
+                if (ring.fanin_pending(i)) break;  // survivor of a previous round's window
+
+                keep = true;
+                const PTO2ResourceShape shape = s.active_mask.to_shape();
+                if (shape == PTO2ResourceShape::MIX || shape == PTO2ResourceShape::DUMMY) break;
+                if (s.task_attrs.requires_sync_start()) break;
+                if (s.task_attrs.has_predicate() && !s.payload->predicate.pass()) break;
+                if (s.next_block_idx.load(std::memory_order_acquire) >= s.logical_block_num) {
+                    keep = false;  // fully claimed
+                    break;
+                }
+                keep = place(s, shape);
+            } while (false);
+            if (keep) fifo.ids[kept++] = fifo.ids[idx];
+        }
+        fifo.count = kept;
+    }
+
     // Producer completion under polling: publish the host-visible task_state
     // mirror + the device-visible completion_flags byte, drain the wake list
     // (route/re-register each waiter), then CAS-advance the monotonic

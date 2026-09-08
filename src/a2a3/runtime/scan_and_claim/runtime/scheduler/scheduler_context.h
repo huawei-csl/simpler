@@ -405,6 +405,44 @@ private:
         bool to_pending, int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
+    // Subtask handles prepared but not yet published, plus the block ledger
+    // their publication owes record_published_blocks. One wmb() covers the
+    // whole burst, so a completion sweep that re-arms several cores pays a
+    // single barrier rather than one per task -- the cross-task batching
+    // measured in docs/investigations/2026-06-cross-task-batched-publish.md
+    // (~6 us of first-to-last AICore start spread down to ~60 ns).
+    //
+    // CAP is the chip's whole core count: at one scheduler thread that thread
+    // owns every core, so nothing smaller bounds a sweep. Filling it is not an
+    // error -- placement stops and the tasks stay in the deferred-ready FIFO.
+    struct DispatchBurst {
+        static constexpr int32_t CAP = CoreTracker::MAX_CLUSTERS * 3;
+        PublishHandle handles[CAP];
+        ChipTaskSlotState *published_list[CAP];
+        int16_t published_counts[CAP];
+        int32_t handle_count{0};
+        int32_t published_n{0};
+        int32_t room() const {
+            const int32_t h = CAP - handle_count;
+            const int32_t p = CAP - published_n;
+            return (h < p) ? h : p;
+        }
+    };
+
+    // Publish an accumulated burst -- one wmb, then every handle, then the
+    // early-resolve block ledger -- and leave it empty.
+    void flush_dispatch_burst(int32_t thread_idx, DispatchBurst &burst, bool &made_progress);
+
+    // Place the consumers this thread's completions just made ready straight
+    // onto its own free cores, preferring `freed_core_offset`: the core whose
+    // FIN is being processed is guaranteed free, cache-hot, and already popped
+    // from the sweep's snapshot, so re-arming it cannot disturb the sweep.
+    // Handles accumulate into `burst`; a task that finds no core of its shape
+    // stays in the deferred-ready FIFO for the next dispatch pass.
+    void place_ready_immediate(
+        int32_t thread_idx, int32_t freed_core_offset, CoreTracker &tracker, DispatchBurst &burst
+    );
+
     void dispatch_shape(
         int32_t thread_idx, PTO2ReadyQueue *disp_queues, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
