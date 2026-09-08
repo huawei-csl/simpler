@@ -385,25 +385,8 @@ int32_t SchedulerContext::handle_timeout_exit(
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
 #if SIMPLER_DFX
-        // Capture the in-flight kernels' partial output before signalling the
-        // cores to exit, so the dump reflects the live stuck state.
-        if (is_dump_args_enabled()) {
-            dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, cores_total_num_,
-                [this](int32_t cid) {
-                    return core_exec_states_[cid].running_slot_state;
-                },
-                [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
-                    return get_function_bin_addr(func_id);
-                },
-                [](const ChipTaskSlotState &slot_state) {
-                    return &slot_state.payload->dump_metadata;
-                }
-            );
-        }
+        // The in-flight kernels' partial output is not dumped here:
+        // dump_running_task_outputs went with the rest of the args-dump family.
 #endif
         emergency_shutdown(runtime);
     }
@@ -551,7 +534,28 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, int32_t cur
 // =============================================================================
 // Shutdown: deinit AICore regs for this thread's cores (and PMU finalize if enabled).
 // Orchestrator threads have core_trackers_[thread_idx].core_num() == 0 -> no-op.
-// platform_deinit_aicore_regs is idempotent; safe to call after early completion.
+// Retiring a core is idempotent; safe after early completion.
+
+// Retire one AICore: signal exit, wait for it to report EXITED, then close its
+// register window.
+//
+// This is what platform_deinit_aicore_regs did before it was replaced by the
+// group API platform_retire_aicore_group. That API also releases a per-core
+// teardown gate, a mechanism this runtime's AICore executor does not take part
+// in -- it reports exit by writing AICORE_EXITED_VALUE to COND and returns -- so
+// the two surviving primitives reproduce the old behaviour exactly, with the
+// register cleanup now carrying its own completing read-back.
+//
+// On timeout the window is deliberately left open: the core is unresponsive and
+// the host clears all hardware state with aclrtResetDevice.
+static int32_t retire_one_aicore(uint64_t reg_addr, uint64_t deadline) {
+    platform_signal_aicore_exit(reg_addr);
+    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
+        if (get_sys_cnt_aicpu() > deadline) return -1;
+    }
+    platform_close_aicore_window(reg_addr);
+    return 0;
+}
 // =============================================================================
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
@@ -566,12 +570,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 
     LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
     int32_t rc = 0;
+    const uint64_t exit_deadline = platform_aicore_exit_deadline();
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cores[i];
         uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr != 0) {
             // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
-            if (platform_deinit_aicore_regs(reg_addr) != 0) {
+            if (retire_one_aicore(reg_addr, exit_deadline) != 0) {
                 LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
                 rc = -1;
             }
@@ -792,13 +797,14 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
     int32_t timeout_count = 0;
+    const uint64_t exit_deadline = platform_aicore_exit_deadline();
     for (int32_t i = 0; i < cores_total_num_; i++) {
-        // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
+        // The exit signal writes DATA_MAIN_BASE=EXIT, which both
         // releases a core still polling for its window to open and signals it to
         // exit. Cores never opened (reg_addr==0) are reaped by the host device
         // reset that follows a handshake failure.
         if (core_exec_states_[i].reg_addr != 0) {
-            if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
+            if (retire_one_aicore(core_exec_states_[i].reg_addr, exit_deadline) != 0) {
                 timeout_count++;
             }
         }
