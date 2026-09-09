@@ -891,17 +891,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     constexpr bool pmu_active = false;
 #endif
 
-#ifdef INDEP_ORCH
-    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
-    LOG_INFO(
-        "[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx,
-        g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed)
-    );
-    while (!orchestrator_done_.load(std::memory_order_acquire)) {
-        SPIN_WAIT_HINT();
-    }
-#endif
-
 #if SIMPLER_DFX
     chip_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
