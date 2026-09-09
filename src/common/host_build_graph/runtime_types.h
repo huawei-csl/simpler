@@ -84,11 +84,7 @@
 // actually writes. Raising it costs virtual address space, bounded by the int32
 // reach of a payload's self-relative region deltas (checked in
 // SharedMemoryHandle::init).
-#ifdef INDEP_ORCH
-#define CHIP_DEFAULT_GRAPH_TASKS 65536  // Default per-ring task window size (power of 2)
-#else
 #define CHIP_DEFAULT_GRAPH_TASKS 16384  // Default task window size (power of 2)
-#endif
 
 // host_build_graph carries no per-scope-depth task partition: host-orch builds
 // the whole graph on the host and the device runs it once without reclaim. tmr's
