@@ -46,13 +46,30 @@ def _anchored(spec):
     return spec
 
 
+# This runtime is ring-based and sizes its GM heap from runtime_env.ring_heap.
+# host_build_graph does not: its graph heap is committed after orchestration at
+# the size orchestration measured, so it ignores the knob, and the base scene
+# dropped the sizing it used to carry. Inheriting that leaves this runtime on
+# the 256 MiB default, where the batch=256 graph's task outputs exhaust the heap
+# during bind -- alloc_tensors then returns nothing and the orchestration trips
+# `index < output_count_`. These are the values the base scene carried before.
+_RING_HEAP = {"Case1": 512 * 1024 * 1024, "Case2": 512 * 1024 * 1024, "Case3": 1024 * 1024 * 1024}
+
 @scene_test(level=2, runtime="scan_and_claim")
 class TestBatchPagedAttentionScanAndClaim(_HbgBase):
     CALLABLE = _anchored(_HbgBase.CALLABLE) if isinstance(_HbgBase.CALLABLE, dict) else _HbgBase.CALLABLE
+
     CASES = [
         {
             **deepcopy(case),
-            "config": {**deepcopy(case.get("config", {})), "aicpu_thread_num": _SAC_THREADS},
+            "config": {
+                **deepcopy(case.get("config", {})),
+                "aicpu_thread_num": _SAC_THREADS,
+                "runtime_env": {
+                    **deepcopy(case.get("config", {}).get("runtime_env", {})),
+                    "ring_heap": _RING_HEAP.get(case["name"], 512 * 1024 * 1024),
+                },
+            },
         }
         for case in _HbgBase.CASES
     ]
