@@ -9,7 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Manual scan_and_claim coverage for the disabled SPMD paged-attention workload."""
 
-import os
 
 from copy import deepcopy
 from pathlib import Path
@@ -21,8 +20,6 @@ from tests.st.a2a3.tensormap_and_ringbuffer.spmd_paged_attention.test_spmd_paged
 
 
 # M4 sweeps the AICPU thread count without editing this file:
-#   SAC_THREADS=1|2|3|4  (default 4; set 1 for the single-threaded correctness gate)
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestSpmdPagedAttentionScanAndClaim(_TmrBase):
@@ -45,7 +42,7 @@ class TestSpmdPagedAttentionScanAndClaim(_TmrBase):
             "manual": True,
             # M3 runs single-threaded: merged, not replaced, so any
             # ring-sizing runtime_env on the base case survives.
-            "config": {**deepcopy(case.get("config", {})), "aicpu_thread_num": _SAC_THREADS},
+            "config": {**deepcopy(case.get("config", {})), "aicpu_thread_num": 4},
         }
         for case in _TmrBase.CASES
     ]

@@ -13,7 +13,6 @@ and same shapes, dispatched by the scan/eager scheduler.
 The workload is GRAPH-free, so it needs nothing sac does not implement.
 """
 
-import os
 
 from copy import deepcopy
 from pathlib import Path
@@ -23,7 +22,6 @@ from tests.st.a2a3.host_build_graph.batch_paged_attention.test_batch_paged_atten
 
 # Thread count under test; 4 is the measured optimum, 1 is the single-threaded
 # correctness gate.
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 # Kernel and orchestration sources in the base CALLABLE may be written relative
 # to the base scene's directory, which is not this file's directory.
@@ -64,7 +62,7 @@ class TestBatchPagedAttentionScanAndClaim(_HbgBase):
             **deepcopy(case),
             "config": {
                 **deepcopy(case.get("config", {})),
-                "aicpu_thread_num": _SAC_THREADS,
+                "aicpu_thread_num": 4,
                 "runtime_env": {
                     **deepcopy(case.get("config", {}).get("runtime_env", {})),
                     "ring_heap": _RING_HEAP.get(case["name"], 512 * 1024 * 1024),

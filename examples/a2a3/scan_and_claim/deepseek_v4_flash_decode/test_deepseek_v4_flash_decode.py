@@ -19,7 +19,6 @@ Distributed: EP2/TP2 over N_RANKS devices, so this needs `-d <d0>,<d1>`.
 """
 
 import copy
-import os
 
 from pathlib import Path
 
@@ -29,7 +28,6 @@ from examples.a2a3.tensormap_and_ringbuffer.deepseek_v4_flash_decode.test_deepse
 )
 
 # 4 is the measured optimum; 1 is the single-threaded correctness gate.
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 # Kernel and orchestration sources are written relative to the tmr scene dir.
 _SHARED_DIR = Path(__file__).resolve().parents[2] / "tensormap_and_ringbuffer/deepseek_v4_flash_decode"
@@ -50,7 +48,7 @@ class TestDeepseekV4FlashDecodeScanAndClaim(_TmrBase):
     CASES = [
         {
             **copy.deepcopy(case),
-            "config": {**copy.deepcopy(case.get("config", {})), "aicpu_thread_num": _SAC_THREADS},
+            "config": {**copy.deepcopy(case.get("config", {})), "aicpu_thread_num": 4},
         }
         for case in _TmrBase.CASES
     ]

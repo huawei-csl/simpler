@@ -13,7 +13,6 @@ Tests scan_and_claim runtime with AIC+AIV mixed execution and INOUT tensors.
 Templated kernels support variable tile sizes via runtime dispatch.
 """
 
-import os
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -24,8 +23,6 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 
 
 # M4 sweeps the AICPU thread count without editing this file:
-#   SAC_THREADS=1|2|3|4  (default 4; set 1 for the single-threaded correctness gate)
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestPagedAttentionScanAndClaim(SceneTestCase):
@@ -82,7 +79,7 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
             # a large PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP if needed.
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS,
+            "config": {"aicpu_thread_num": 4,
                        # whole-graph-resident: window and heap must hold the entire
                        # graph. The PTO2_RING_* env vars are retired on main (warn +
                        # ignore), so sizing lives here, per case.
@@ -102,7 +99,7 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS,
+            "config": {"aicpu_thread_num": 4,
                        # whole-graph-resident: window and heap must hold the entire
                        # graph. The PTO2_RING_* env vars are retired on main (warn +
                        # ignore), so sizing lives here, per case.
@@ -122,7 +119,7 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
         {
             "name": "small1",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {"aicpu_thread_num": 4},
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -137,7 +134,7 @@ class TestPagedAttentionScanAndClaim(SceneTestCase):
         {
             "name": "small2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {"aicpu_thread_num": 4},
             "manual": True,
             "params": {
                 "batch": 1,

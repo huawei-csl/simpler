@@ -13,7 +13,6 @@ Computation: f = (a + b + 1) * (a + b + 2), where a=2.0, b=3.0, so f=42.0.
 Tests scan_and_claim runtime with intermediate tensors allocated from HeapRing.
 """
 
-import os
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -22,8 +21,6 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
 # M4 sweeps the AICPU thread count without editing this file:
-#   SAC_THREADS=1|2|3|4  (default 4; set 1 for the single-threaded correctness gate)
-_SAC_THREADS = int(os.environ.get("SAC_THREADS", "4"))
 
 @scene_test(level=2, runtime="scan_and_claim")
 class TestVectorExampleScanAndClaim(SceneTestCase):
@@ -66,7 +63,7 @@ class TestVectorExampleScanAndClaim(SceneTestCase):
             "platforms": ["a2a3sim", "a2a3"],
             "manual": ["a2a3sim"],
             "params": {},
-            "config": {"aicpu_thread_num": _SAC_THREADS},
+            "config": {"aicpu_thread_num": 4},
         },
     ]
 
