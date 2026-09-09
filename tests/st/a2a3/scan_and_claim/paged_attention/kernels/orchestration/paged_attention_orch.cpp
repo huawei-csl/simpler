@@ -123,18 +123,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         static_cast<uint32_t>(total_blocks_count * block_size), static_cast<uint32_t>(head_dim)
     };
     uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    Tensor query = simpler::hbg::make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    Tensor key_cache = simpler::hbg::make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    Tensor value_cache = simpler::hbg::make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
+    Tensor out = simpler::hbg::make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
     Tensor block_table =
-        make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+        simpler::hbg::make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
-        make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
+        simpler::hbg::make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
     uint32_t tile2d_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};

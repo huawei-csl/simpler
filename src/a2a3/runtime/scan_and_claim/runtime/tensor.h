@@ -596,6 +596,9 @@ using Tensor = simpler::hbg::Tensor;
 using simpler::hbg::make_tensor_external;
 }  // namespace simpler::tmr
 
-// The runtime's own sources name these unqualified.
+// The runtime's own sources name the type unqualified. make_tensor_external is
+// deliberately NOT pulled into the global namespace: task_interface declares its
+// own boundary-returning overload there, and a four-argument call matches both
+// once each one's defaults apply. Callers spell this one qualified, as the shared
+// scene sources already do.
 using Tensor = simpler::hbg::Tensor;
-using simpler::hbg::make_tensor_external;
