@@ -61,7 +61,7 @@ inline thread_local int g_TraCR_thread_idx{-1};
 //   Idle              sac: a pass that made no forward progress
 //   Drain             hbg, tmr: idle-pass deferred producer-release drain
 //   Resolving         hbg: its dedicated resolution thread (3S+1P)
-//   Orchestrating / DLL_loading / Allocating / Barrier
+//   Orchestrating / DLL_loading / Allocating
 //                     tmr: it orchestrates on device
 //
 // sac has neither a device orchestrator nor a P thread, so it marks no
@@ -81,7 +81,6 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Allocating)          \
     X(Running_Task_Single) \
     X(Running_Task_Pair)   \
-    X(Barrier)             \
     X(Resolving)           \
     /* --- scan_and_claim --- appended, so existing ids stay put --- */ \
     X(Scanning)            \
