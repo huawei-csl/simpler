@@ -148,7 +148,7 @@ struct PTO2OrchestratorState {
 
     void set_scheduler(PTO2SchedulerState *scheduler);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
-    void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
+    void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);

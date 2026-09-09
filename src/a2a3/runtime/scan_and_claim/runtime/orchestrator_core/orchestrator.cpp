@@ -1263,7 +1263,7 @@ static bool prepare_task(
 // Scope Management
 // =============================================================================
 
-void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
+void PTO2OrchestratorState::begin_scope(ScopeMode mode) {
     auto *orch = this;
     if (orch->fatal) {
         return;
@@ -1282,19 +1282,19 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
         // end_scope stays balanced -- the recording is doomed either way, since
         // graph_commit turns an unsupported recording into SIMPLER_ERROR_INVALID_ARGS.
         if (recording->scope_stack_top >= PTO2_MAX_SCOPE_DEPTH - 1 ||
-            (mode == PTO2ScopeMode::AUTO && recording->in_manual_scope())) {
+            (mode == ScopeMode::AUTO && recording->in_manual_scope())) {
             recording->unsupported = true;
         }
         if (recording->scope_stack_top < PTO2_MAX_SCOPE_DEPTH - 1) {
             ++recording->scope_stack_top;
-            if (mode == PTO2ScopeMode::MANUAL && !recording->in_manual_scope()) {
+            if (mode == ScopeMode::MANUAL && !recording->in_manual_scope()) {
                 recording->manual_begin_depth = recording->scope_stack_top;
             }
         }
         return;
     }
     assert(orch->scope_stack_top < PTO2_MAX_SCOPE_DEPTH - 1 && "Scope stack overflow");
-    if (mode == PTO2ScopeMode::AUTO && orch->in_manual_scope()) {
+    if (mode == ScopeMode::AUTO && orch->in_manual_scope()) {
         report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "auto scope nested inside manual scope is not supported"
         );
@@ -1303,7 +1303,7 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
 
     bool already_in_manual_scope = orch->in_manual_scope();
     ++orch->scope_stack_top;
-    if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
+    if (mode == ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
 }

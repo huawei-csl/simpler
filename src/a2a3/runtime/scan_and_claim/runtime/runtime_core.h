@@ -168,7 +168,7 @@ struct RuntimeArenaLayout {
 struct RuntimeContext {
     // Ops table (first field — used by orchestration .so via function pointers)
     const RuntimeOps *ops;
-    PTO2ScopeMode pending_scope_mode;
+    ScopeMode pending_scope_mode;
 
     // Components
     PTO2SharedMemoryHandle *sm_handle;
