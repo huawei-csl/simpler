@@ -588,6 +588,14 @@ inline Tensor make_tensor_strided(
 }
 }  // namespace simpler::hbg
 
+// Scenes derived from tensormap_and_ringbuffer spell it simpler::tmr::Tensor
+// instead; this runtime's generated copies reuse those .cpp files too, so both
+// spellings have to reach the same type here.
+namespace simpler::tmr {
+using Tensor = simpler::hbg::Tensor;
+using simpler::hbg::make_tensor_external;
+}  // namespace simpler::tmr
+
 // The runtime's own sources name these unqualified.
 using Tensor = simpler::hbg::Tensor;
 using simpler::hbg::make_tensor_external;
