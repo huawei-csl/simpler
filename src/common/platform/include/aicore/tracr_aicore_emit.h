@@ -69,7 +69,7 @@
 
 /** Payload capacity of a buffer of `words` int64 words. */
 __aicore__ __attribute__((always_inline)) inline int tracr_aicore_capacity(int words) {
-    return (words - kTracrHeaderWords) / kTracrWordsPerPayload;
+    return tracr_capacity_for_words(words);
 }
 
 /** Open a buffer for writing. Required before the first emit. No-op for a
@@ -82,8 +82,28 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ 
     if (capacity < 0) {
         return;
     }
+    // Words 0 and 1 only: word 2 carries the writer identity, published once by
+    // the kernel entry before any kernel body runs. Zeroing it here would erase
+    // the one thing the host needs to name this lane.
     buf[0] = 0;
     buf[1] = 0;
+#endif
+}
+
+/**
+ * Record which core owns this slice. Called once by the AICore kernel entry,
+ * which is the only place that knows both values.
+ */
+__aicore__ __attribute__((always_inline)) inline void tracr_aicore_publish_identity(
+    __gm__ int64_t *buf, int core_type, int block_idx
+) {
+#ifndef ENABLE_TRACR
+    (void)buf;
+    (void)core_type;
+    (void)block_idx;
+#else
+    if (buf == nullptr) return;
+    buf[2] = tracr_pack_identity(core_type, block_idx);
 #endif
 }
 
@@ -166,4 +186,85 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_flow_end(
     __gm__ int64_t *buf, int capacity, uint32_t channel, uint32_t flow_id
 ) {
     tracr_aicore_emit(buf, capacity, channel, kTracrEventFlowEnd, flow_id, get_sys_cnt_aicore());
+}
+
+// ---------------------------------------------------------------------------
+// Entry points for generated kernels.
+//
+// PyPTO codegen cannot thread a buffer to a call site: the marker is reached
+// from PTO IR through a declaration-only `func.func private`, and ptoas emits
+// it as an `extern "C" AICORE` call with exactly the operands the IR named. So
+// these take no buffer and fetch it from the per-core accessor the kernel entry
+// published.
+//
+// `extern "C"` because that is what ptoas emits, which also means no
+// overloading and no default arguments: the signature here and the declaration
+// in the .pto must match exactly.
+//
+// The accessor is forward-declared rather than included: it lives in the
+// arch-specific `aicore/aicore_profiling_state.h`, and this header is shared.
+// Same shape as `get_chip_swimlane_aicore_head()`, declared in a header and
+// defined weakly in each platform's kernel.cpp.
+// ---------------------------------------------------------------------------
+
+#ifdef ENABLE_TRACR
+__aicore__ __gm__ int64_t *get_tracr_aicore_buffer();
+
+/** Capacity of one per-core slice, in records. */
+__aicore__ __attribute__((always_inline)) inline int tracr_slice_capacity() {
+    return tracr_aicore_capacity(kTracrAicoreWordsPerCore);
+}
+#endif
+
+/** Open a span on `channel`. Generated-code entry point; see above. */
+extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_set(
+    int32_t channel, int32_t event, int32_t extra
+) {
+#ifndef ENABLE_TRACR
+    (void)channel;
+    (void)event;
+    (void)extra;
+#else
+    tracr_aicore_mark_set(
+        get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
+        static_cast<uint32_t>(event), static_cast<uint32_t>(extra)
+    );
+#endif
+}
+
+/** Close the span open on `channel`. */
+extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_reset(int32_t channel) {
+#ifndef ENABLE_TRACR
+    (void)channel;
+#else
+    tracr_aicore_mark_reset(get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel));
+#endif
+}
+
+/** Tail of a causal arrow. */
+extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_start(
+    int32_t channel, int32_t flow_id
+) {
+#ifndef ENABLE_TRACR
+    (void)channel;
+    (void)flow_id;
+#else
+    tracr_aicore_flow_start(
+        get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
+        static_cast<uint32_t>(flow_id)
+    );
+#endif
+}
+
+/** Head of a causal arrow. */
+extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(int32_t channel, int32_t flow_id) {
+#ifndef ENABLE_TRACR
+    (void)channel;
+    (void)flow_id;
+#else
+    tracr_aicore_flow_end(
+        get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
+        static_cast<uint32_t>(flow_id)
+    );
+#endif
 }

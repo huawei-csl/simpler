@@ -342,6 +342,9 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
         return rc;
     }
+    // 0 when allocation failed: the kernel entry reads that as "not recording".
+    // Losing a profile must never fail the run it was profiling.
+    execution->kernel_args.args.tracr_aicore_data_base = DevAllocTracrAicore(this);
 #endif
 
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the

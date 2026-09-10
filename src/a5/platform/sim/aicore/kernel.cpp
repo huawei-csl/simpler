@@ -27,6 +27,9 @@
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "runtime.h"
+#ifdef ENABLE_TRACR
+#include "aicore/tracr_aicore_emit.h"
+#endif
 
 // Per-thread simulated register state — use pthread TLS instead of C++
 // thread_local to avoid glibc TLSDESC issues when the AICore SO is loaded
@@ -39,6 +42,9 @@ static pthread_key_t g_aicore_profiling_flag_key;
 // aicore_profiling_state.h for the lazy-deref contract.
 static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
 static pthread_key_t g_chip_swimlane_aicore_head_key;
+#ifdef ENABLE_TRACR
+static pthread_key_t g_tracr_aicore_buffer_key;
+#endif
 static pthread_key_t g_aicore_pmu_ring_key;
 static pthread_key_t g_pmu_reg_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
@@ -50,6 +56,9 @@ static void create_tls_keys() {
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
+#ifdef ENABLE_TRACR
+    pthread_key_create(&g_tracr_aicore_buffer_key, nullptr);
+#endif
     pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
     pthread_key_create(&g_pmu_reg_base_key, nullptr);
 }
@@ -71,6 +80,22 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag) {
 __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
+
+#ifdef ENABLE_TRACR
+// Sim is one process: the region base is a plain global the host publishes, and
+// only the per-core slice is thread-local. Kept out of the wrapper's parameter
+// list because that signature is a dlsym ABI shared with the host.
+static uint64_t g_tracr_aicore_data_base = 0;
+
+extern "C" void set_platform_tracr_aicore_data_base(uint64_t base) { g_tracr_aicore_data_base = base; }
+
+__aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf) {
+    pthread_setspecific(g_tracr_aicore_buffer_key, reinterpret_cast<void *>(buf));
+}
+__aicore__ __gm__ int64_t *get_tracr_aicore_buffer() {
+    return reinterpret_cast<__gm__ int64_t *>(pthread_getspecific(g_tracr_aicore_buffer_key));
+}
+#endif  // ENABLE_TRACR
 
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     pthread_setspecific(g_chip_swimlane_aicore_head_slot_key, reinterpret_cast<void *>(slot_ptr));
@@ -152,6 +177,17 @@ extern "C" void aicore_execute_wrapper(
     } else {
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
+
+#ifdef ENABLE_TRACR
+    if (g_tracr_aicore_data_base != 0) {
+        __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(g_tracr_aicore_data_base);
+        __gm__ int64_t *slice = tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore;
+        set_tracr_aicore_buffer(slice);
+        tracr_aicore_publish_identity(slice, static_cast<int>(core_type), block_idx);
+    } else {
+        set_tracr_aicore_buffer(nullptr);
+    }
+#endif  // ENABLE_TRACR
     if ((enable_profiling_flag & SIMPLER_DFX_FLAG_PMU) && aicore_pmu_ring_addrs != 0) {
         uint64_t *pmu_ring_table = reinterpret_cast<uint64_t *>(aicore_pmu_ring_addrs);
         set_aicore_pmu_ring(reinterpret_cast<__gm__ PmuAicoreRing *>(pmu_ring_table[block_idx]));

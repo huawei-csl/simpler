@@ -113,6 +113,88 @@ inline size_t DeviceChannelCount(RuntimeT &runtime) {
 }
 
 /**
+ * Serialize the AICore record slices as `.bts` lanes.
+ *
+ * One slice per core; a slice whose count word is 0 wrote nothing and is
+ * skipped, which is why the region is zeroed at allocation. `first_thread_index`
+ * continues the `thread.<n>` numbering after the AICPU threads, and each payload
+ * is stamped with the channel the writer's identity word resolves to -- the
+ * kernel cannot know that index, because the channel table is sized by the run's
+ * core count.
+ *
+ * Returns the number of lanes written, or -1 on failure.
+ */
+template <typename DeviceRunnerT, typename RuntimeT>
+int TracrAicoreLanes2BTS(
+    DeviceRunnerT *device_runner, RuntimeT &runtime, size_t first_thread_index, const fs::path &proc_dir
+) {
+    const uint64_t base = device_runner->get_tracr_aicore_base();
+    if (base == 0) return 0;
+
+    const size_t words = static_cast<size_t>(PLATFORM_MAX_CORES) * kTracrAicoreWordsPerCore;
+    std::vector<int64_t> host(words, 0);
+    if (device_runner->copy_from_device(host.data(), reinterpret_cast<void *>(base), words * sizeof(int64_t)) !=
+        0) {
+        LOG_ERROR("TraCR AICore region: readback failed");
+        return -1;
+    }
+
+    // Channel table layout, mirroring StoreTracrMetaData: aicpu_thread_num
+    // AICPU_i, then worker_count/3 AICube_i, then 2*worker_count/3 AIVector_i.
+    const int aicpu = runtime.get_aicpu_thread_num();
+    const int cube_count = static_cast<int>(runtime.get_worker_count() / 3);
+
+    int lanes = 0;
+    for (int core = 0; core < PLATFORM_MAX_CORES; ++core) {
+        const int64_t *slice = host.data() + static_cast<size_t>(core) * kTracrAicoreWordsPerCore;
+        const int64_t count = slice[0];
+        if (count <= 0) continue;
+
+        const int64_t dropped = slice[1];
+        if (dropped > 0) {
+            LOG_TIMING("[TraCR] AICore slice %d dropped %lld record(s): buffer too small", core,
+                       static_cast<long long>(dropped));
+        }
+
+        const int core_type = tracr_identity_core_type(slice[2]);
+        const int block_idx = tracr_identity_block_idx(slice[2]);
+        // CoreType::AIC == 0, AIV == 1.
+        const int channel = (core_type == 0) ? (aicpu + block_idx) : (aicpu + cube_count + block_idx);
+
+        const int64_t capacity = tracr_capacity_for_words(kTracrAicoreWordsPerCore);
+        const int64_t usable = (count < capacity) ? count : capacity;
+
+        std::vector<TraCR::Payload> payloads;
+        payloads.reserve(static_cast<size_t>(usable));
+        for (int64_t i = 0; i < usable; ++i) {
+            const int64_t word0 = slice[kTracrHeaderWords + i * kTracrWordsPerPayload];
+            const int64_t ts = slice[kTracrHeaderWords + i * kTracrWordsPerPayload + 1];
+            TraCR::Payload payload;
+            payload.channelId = static_cast<uint16_t>(channel);
+            payload.eventId = static_cast<uint16_t>((static_cast<uint64_t>(word0) >> 16) & 0xFFFFu);
+            payload.extraId = static_cast<uint32_t>(static_cast<uint64_t>(word0) >> 32);
+            payload.timestamp = static_cast<uint64_t>(ts);
+            payloads.push_back(payload);
+        }
+
+        fs::path thread_dir = proc_dir / ("thread." + std::to_string(first_thread_index + lanes + 1));
+        fs::create_directories(thread_dir);
+        std::ofstream out(thread_dir / "traces.bts", std::ios::binary);
+        if (!out) {
+            LOG_ERROR("Cannot open %s", (thread_dir / "traces.bts").c_str());
+            return -1;
+        }
+        out.write(reinterpret_cast<const char *>(payloads.data()), payloads.size() * sizeof(TraCR::Payload));
+        if (!out) {
+            LOG_ERROR("Write failed for %s", (thread_dir / "traces.bts").c_str());
+            return -1;
+        }
+        ++lanes;
+    }
+    return lanes;
+}
+
+/**
  * A method for storing the TraCR metadata.json
  */
 template <typename RuntimeT>
@@ -231,9 +313,27 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
         return rc;
     }
 
+    // AICore lanes continue the thread numbering after the AICPU threads, so
+    // the merged trace shows the cores beside the threads that dispatched them.
+    const int aicore_lanes = TracrAicoreLanes2BTS(
+        device_runner, runtime, static_cast<size_t>(runtime.get_aicpu_thread_num()),
+        expand_user_path(tracr_dir)
+    );
+    if (aicore_lanes < 0) {
+        LOG_ERROR("TracrAicoreLanes2BTS() failed");
+        return -1;
+    }
+    if (aicore_lanes > 0) {
+        LOG_TIMING("[TraCR] wrote %d AICore lane(s)", aicore_lanes);
+    }
+
     // Free device TraCR memory data placeholder
     device_runner->free_tensor(runtime.get_tracr_data());
     device_runner->free_tensor(runtime.get_tracr_data_sizes());
+    if (device_runner->get_tracr_aicore_base() != 0) {
+        device_runner->free_tensor(reinterpret_cast<void *>(device_runner->get_tracr_aicore_base()));
+        device_runner->set_tracr_aicore_base(0);
+    }
 
     rc = StoreTracrMetaData(runtime);
     if (rc != 0) {
@@ -279,7 +379,9 @@ uint64_t DevAllocTracrAicore(DeviceRunnerT *device_runner) {
         device_runner->free_tensor(dev_ptr);
         return 0;
     }
-    return reinterpret_cast<uint64_t>(dev_ptr);
+    const uint64_t base = reinterpret_cast<uint64_t>(dev_ptr);
+    device_runner->set_tracr_aicore_base(base);
+    return base;
 }
 
 template <typename DeviceRunnerT, typename RuntimeT>

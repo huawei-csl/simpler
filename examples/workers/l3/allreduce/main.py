@@ -60,9 +60,14 @@ DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 # The kernel writes TraCR Payloads (16 B = two int64 words) into this buffer:
 # one notify span plus one wait span per peer, each a SET/RESET pair.
-TRACR_PAYLOAD_CAP = 1 + 2 + 4 * K_MAX_SUPPORTED_RANKS  # header + notify span
+# Header words, mirroring kTracrHeaderWords in aicore/tracr_aicore_layout.h:
+# [0] record count, [1] dropped count, [2] writer identity. Changing the header
+# on the device side without changing this shifts every payload and the decode
+# silently yields nonsense, so the two must move together.
+TRACR_HEADER_WORDS = 3
+TRACR_PAYLOAD_CAP = 1 + 4 * K_MAX_SUPPORTED_RANKS  # notify span
 #   + per peer: one flow start (notify loop) and SET/RESET/flow end (wait loop)
-TRACR_SLOTS = 2 * TRACR_PAYLOAD_CAP
+TRACR_SLOTS = TRACR_HEADER_WORDS + 2 * TRACR_PAYLOAD_CAP
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -136,11 +141,12 @@ def decode_payloads(words: list[int]) -> list[tuple[int, int, int, int]]:
     than zeros and must not be read.
     """
     count = words[0] & 0xFFFFFFFFFFFFFFFF if words else 0
-    count = min(count, len(words) // 2 - 1)  # word 1 is the drop count
+    count = min(count, max(0, (len(words) - TRACR_HEADER_WORDS) // 2))
     out = []
-    for i in range(1, count + 1):
-        w0 = words[i * 2] & 0xFFFFFFFFFFFFFFFF
-        ts = words[i * 2 + 1] & 0xFFFFFFFFFFFFFFFF
+    for i in range(count):
+        base = TRACR_HEADER_WORDS + i * 2
+        w0 = words[base] & 0xFFFFFFFFFFFFFFFF
+        ts = words[base + 1] & 0xFFFFFFFFFFFFFFFF
         out.append((w0 & 0xFFFF, (w0 >> 16) & 0xFFFF, (w0 >> 32) & 0xFFFFFFFF, ts))
     return out
 

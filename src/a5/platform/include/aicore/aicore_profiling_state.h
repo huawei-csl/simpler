@@ -87,6 +87,16 @@ __aicore__ uint32_t get_aicore_profiling_flag();
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr);
 __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head();
 
+#ifdef ENABLE_TRACR
+/**
+ * This core's TraCR record slice: `base + block_idx * kTracrAicoreWordsPerCore`.
+ * Nothing lazy here, unlike the swimlane head above -- the host allocates before
+ * launch, so the address is already final. Null when none was allocated.
+ */
+__aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf);
+__aicore__ __gm__ int64_t *get_tracr_aicore_buffer();
+#endif  // ENABLE_TRACR
+
 /**
  * Per-core PMU staging ring (a5-only — AICore writes the snapshot).
  */

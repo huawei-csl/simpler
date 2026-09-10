@@ -94,6 +94,11 @@ struct KernelArgs {
     // indexes by block_idx and forwards into per-core platform state.
     // ChipSwimlaneActiveHead* per core (rotation channel); 0 when chip swimlane is off
     uint64_t chip_swimlane_aicore_rotation_table{0};
+    // Base of the AICore TraCR record region: PLATFORM_MAX_CORES slices of
+    // kTracrAicoreWordsPerCore int64 words. 0 when TraCR did not allocate one.
+    // Unconditional field: host, AICPU and AICore compile separately, so an
+    // #ifdef'd member would shift the layout whenever two disagree on the flag.
+    uint64_t tracr_aicore_data_base{0};
     uint64_t aicore_pmu_ring_addrs{0};  // PmuAicoreRing* per core; 0 when PMU is off
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
                                         // a5 has no halHostRegister — host keeps a separate shadow and

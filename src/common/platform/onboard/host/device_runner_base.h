@@ -142,6 +142,24 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
+
+#ifdef ENABLE_TRACR
+    /**
+     * Device address of the AICore TraCR record region, or 0 when none.
+     *
+     * Kept here rather than on `Runtime` or threaded through `StoreTracrData`
+     * because the allocation happens in prepare and the readback happens in
+     * drain, and this is the one object that spans both without touching a
+     * per-arch signature.
+     */
+    void set_tracr_aicore_base(uint64_t base) { tracr_aicore_base_ = base; }
+    [[nodiscard]] uint64_t get_tracr_aicore_base() const { return tracr_aicore_base_; }
+
+private:
+    uint64_t tracr_aicore_base_{0};
+
+public:
+#endif
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
     int acquire_graph_definition_block(

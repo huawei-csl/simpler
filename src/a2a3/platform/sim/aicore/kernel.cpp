@@ -158,7 +158,9 @@ extern "C" void aicore_execute_wrapper(
 #ifdef ENABLE_TRACR
     if (g_tracr_aicore_data_base != 0) {
         __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(g_tracr_aicore_data_base);
-        set_tracr_aicore_buffer(tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore);
+        __gm__ int64_t *slice = tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore;
+        set_tracr_aicore_buffer(slice);
+        tracr_aicore_publish_identity(slice, static_cast<int>(core_type), block_idx);
     } else {
         set_tracr_aicore_buffer(nullptr);
     }

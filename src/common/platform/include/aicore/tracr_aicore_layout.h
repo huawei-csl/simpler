@@ -38,8 +38,36 @@ constexpr uint32_t kTracrExtraNone = 0xFFFFFFFFu;
 // timestamps are nanoseconds.
 constexpr int64_t kTracrNsPerTick = 20;
 
-constexpr int kTracrHeaderWords = 2;
+// Header words: [0] record count, [1] dropped count, [2] writer identity.
+//
+// The identity word exists because the host cannot otherwise name the lane. A
+// slice's index says which *slot* recorded, not whether that was a cube or a
+// vector core, and the channel table is grouped by kind
+// (AICPU_* then AICube_* then AIVector_*). The device knows what it is; the
+// host resolves the table position from that. Same division of labour as the
+// D1 channel placeholder: the kernel writes what it knows, the host resolves
+// what only it knows.
+constexpr int kTracrHeaderWords = 3;
 constexpr int kTracrWordsPerPayload = 2;
+
+/**
+ * Records a buffer of `words` int64 words can hold.
+ *
+ * Lives here, not next to the emitter, because the host computes it too when
+ * bounding a decode. One formula, one place.
+ */
+inline constexpr int tracr_capacity_for_words(int words) {
+    return (words - kTracrHeaderWords) / kTracrWordsPerPayload;
+}
+
+/** Pack a writer's core kind and block index into the identity word. */
+inline constexpr int64_t tracr_pack_identity(int core_type, int block_idx) {
+    return (static_cast<int64_t>(core_type) << 32) | static_cast<int64_t>(block_idx & 0xFFFFFFFF);
+}
+inline constexpr int tracr_identity_core_type(int64_t packed) { return static_cast<int>(packed >> 32); }
+inline constexpr int tracr_identity_block_idx(int64_t packed) {
+    return static_cast<int>(packed & 0xFFFFFFFF);
+}
 
 // Capacity value that silently disables recording, without counting a drop.
 //

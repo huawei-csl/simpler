@@ -19,6 +19,9 @@
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "simt_anchor.h"
+#ifdef ENABLE_TRACR
+#include "aicore/tracr_aicore_emit.h"
+#endif
 
 class Runtime;
 
@@ -62,6 +65,15 @@ __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ 
     s_chip_swimlane_aicore_head_slot = slot_ptr;
     s_chip_swimlane_aicore_head = nullptr;  // force lazy resolution on next get
 }
+#ifdef ENABLE_TRACR
+[[block_local]] static __gm__ int64_t *s_tracr_aicore_buffer;
+
+__attribute__((weak)) __aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf) {
+    s_tracr_aicore_buffer = buf;
+}
+__attribute__((weak)) __aicore__ __gm__ int64_t *get_tracr_aicore_buffer() { return s_tracr_aicore_buffer; }
+#endif  // ENABLE_TRACR
+
 __attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() {
     // Lazy first-call resolve. AICPU publishes the slot before opening any
     // register window, so it is valid after AICore observes Phase 2 exit.
@@ -135,6 +147,18 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     } else {
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
+
+#ifdef ENABLE_TRACR
+    if (k_args->tracr_aicore_data_base != 0) {
+        __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(k_args->tracr_aicore_data_base);
+        __gm__ int64_t *slice = tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore;
+        set_tracr_aicore_buffer(slice);
+        tracr_aicore_publish_identity(slice, static_cast<int>(core_type), block_idx);
+    } else {
+        set_tracr_aicore_buffer(nullptr);
+    }
+#endif  // ENABLE_TRACR
+
     if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU)) {
         __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_pmu_ring_addrs);
         if (pmu_ring_table != nullptr) {

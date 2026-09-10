@@ -146,7 +146,11 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // count word be a plain load/store.
     if (k_args->tracr_aicore_data_base != 0) {
         __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(k_args->tracr_aicore_data_base);
-        set_tracr_aicore_buffer(tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore);
+        __gm__ int64_t *slice = tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore;
+        set_tracr_aicore_buffer(slice);
+        // Publish before any kernel body runs; tracr_aicore_reset deliberately
+        // leaves this word alone.
+        tracr_aicore_publish_identity(slice, static_cast<int>(core_type), block_idx);
     } else {
         set_tracr_aicore_buffer(nullptr);
     }

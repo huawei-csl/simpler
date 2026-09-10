@@ -93,6 +93,9 @@ private:
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_chip_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_platform_chip_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};
+#ifdef ENABLE_TRACR
+    void (*set_platform_tracr_aicore_data_base_func_)(uint64_t){nullptr};
+#endif
     void (*set_chip_swimlane_enabled_func_)(bool){nullptr};
     void (*set_pmu_enabled_func_)(bool){nullptr};
     void (*set_platform_dep_gen_base_func_)(uint64_t){nullptr};
