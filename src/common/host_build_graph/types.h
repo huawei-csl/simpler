@@ -37,6 +37,7 @@
 #include <arm_neon.h>
 #endif
 
+#include "assert_compat.h"
 #include "aicpu/dump_arg_selection.h"
 #include "common/device_phase.h"
 #include "data_type.h"
@@ -691,8 +692,8 @@ private:
 using CoreTaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 
 // Tensor and scalar capacity of a Graph boundary.
-inline constexpr uint32_t GRAPH_MAX_TENSOR_ARGS = 128;
-inline constexpr uint32_t GRAPH_MAX_SCALAR_ARGS = 64;
+inline constexpr int32_t GRAPH_MAX_TENSOR_ARGS = 128;
+inline constexpr int32_t GRAPH_MAX_SCALAR_ARGS = 64;
 
 // Boundary arguments of a Graph. Sized independently of CoreTaskArgs because the
 // outer GRAPH payload carries the whole boundary, while materialize stages only

@@ -93,84 +93,39 @@ python examples/my_example/test_my_example.py -p a2a3sim
 in `CASES`**, not on the decorator. Ordinary cases should omit `"config"` and
 use the architecture's automatic AICPU thread count. Add `aicpu_thread_num`
 only when a test specifically depends on a thread-count or scheduler-topology
-behavior; `runtime_env` holds ring-sizing overrides for
-`tensormap_and_ringbuffer`. See the [Python API reference](../reference/python-api.md)
+behavior. `runtime_env` holds TRB ring-sizing overrides; HBG also reads
+`ring_task_window[0]` to size its graph task table. See the [Python API reference](../reference/python-api.md)
 for the full `CallConfig` field list.
 
 ## Option B — the `Worker` API directly
 
-Use this when you need to see the stages, or when your program is not a test.
-The canonical worked example is
-[`examples/workers/l2/vector_add/main.py`](../../../examples/workers/l2/vector_add/main.py);
-the shape is:
+Use the runnable
+[`examples/workers/l2/vector_add/main.py`](../../../examples/workers/l2/vector_add/main.py)
+example to follow compilation, callable construction, registration, device
+allocation, copies, execution, and golden comparison in one place:
 
-```python
-from simpler.task_interface import (
-    ArgDirection, CallConfig, ChipCallable, ChipStorageTaskArgs,
-    CoreCallable, DataType, Tensor,
-)
-from simpler.worker import Worker
-
-from simpler_setup.kernel_compiler import KernelCompiler
-from simpler_setup.pto_isa import ensure_pto_isa_root
-
-# 1. Compile. pto_isa_root is the managed sibling header checkout.
-kc = KernelCompiler(platform=platform)
-kernel_bytes = kc.compile_incore(
-    source_path=".../kernels/aiv/my_kernel.cpp",
-    core_type="aiv",
-    pto_isa_root=ensure_pto_isa_root(),
-    extra_include_dirs=kc.get_orchestration_include_dirs("tensormap_and_ringbuffer"),
-)
-# On real hardware only, extract .text before wrapping:
-if not platform.endswith("sim"):
-    from simpler_setup.elf_parser import extract_text_section
-    kernel_bytes = extract_text_section(kernel_bytes)
-
-orch_bytes = kc.compile_orchestration(
-    runtime_name="tensormap_and_ringbuffer",
-    source_path=".../kernels/orchestration/my_orch.cpp",
-)
-
-# 2. Wrap into callables. children maps func_id -> CoreCallable.
-core = CoreCallable.build(
-    signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-    binary=kernel_bytes,
-)
-chip = ChipCallable.build(
-    signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-    func_name="my_orchestration",
-    binary=orch_bytes,
-    children=[(0, core)],
-)
-
-# 3. Register BEFORE init(), then init.
-worker = Worker(level=2, platform=platform,
-                runtime="tensormap_and_ringbuffer", device_id=device_id)
-handle = worker.register(chip)
-worker.init()
-try:
-    # 4. Device memory + H2D.
-    dev_a, dev_out = worker.malloc(nbytes), worker.malloc(nbytes)
-    worker.copy_to(dev_a, host_a.data_ptr(), nbytes)
-
-    # 5. Task args, in the same order as the signature.
-    args = ChipStorageTaskArgs()
-    args.add_tensor(Tensor.make(dev_a, (rows, cols), DataType.FLOAT32))
-    args.add_tensor(Tensor.make(dev_out, (rows, cols), DataType.FLOAT32))
-
-    # 6. Run, then D2H.
-    worker.run(handle, args, CallConfig())
-    worker.copy_from(host_out.data_ptr(), dev_out, nbytes)
-    worker.free(dev_a); worker.free(dev_out)
-finally:
-    worker.close()          # always; a leaked device stays locked
+```bash
+python examples/workers/l2/vector_add/main.py -p a2a3sim -d 0
 ```
 
-Ordering rules that are not optional:
+The same implementation is exercised by
+[`test_vector_add.py`](../../../examples/workers/l2/vector_add/test_vector_add.py).
+Its cases are manual; run the simulator case with:
 
-- **`register()` happens before `init()`.** Construction only stashes config;
-  `init()` is where runtime binaries are resolved and the device is opened.
+```bash
+pytest examples/workers/l2/vector_add/test_vector_add.py --platform a2a3sim --manual include
+```
+
+The example uses contiguous CPU torch tensors of shape `(128, 128)` and dtype
+`torch.float32`. Device allocations return `Buffer` handles. For partial copies,
+pass `nbytes`, `src_offset`, and `dst_offset` by keyword.
+
+Lifecycle and argument rules:
+
+- **Register before use.** Registration before `init()` enters the startup
+  snapshot. Registration after `init()` installs and prewarms the callable
+  before returning; at L3+ it also publishes to eligible live children. The
+  worker topology must be established before `init()`.
 - **`close()` belongs in a `finally`.** Skipping it leaves the device held, and
   the next job on that device hangs.
 - **Task-arg order must match the callable `signature`**, positionally.

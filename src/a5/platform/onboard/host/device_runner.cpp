@@ -43,6 +43,7 @@
 #include "utils/elf_build_id.h"
 #include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
+#include "host/dfx_run_config.h"
 #include "host/raii_scope_guard.h"
 #include "utils/fatal_shutdown_latch.h"
 
@@ -50,20 +51,42 @@ namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
 }
 
-// dep_gen_replay_emit_deps_json: strong symbol provided by
-// runtime/tensormap_and_ringbuffer/host/dep_gen_replay.cpp when that runtime is
-// linked into host_runtime.so. host_build_graph has no replay implementation
-// today, so its host_runtime.so falls through to this weak stub. visibility=
-// hidden keeps the stub off the global dynamic symbol table so it can't
-// accidentally shadow the strong symbol via RTLD_GLOBAL.
-// LOG_DEBUG (not WARN): runtimes that don't link dep_gen never enable it in
-// practice, so this path is unreachable for end users — the symbol exists
-// purely to keep the .so loadable.
+// dep_gen has two shapes, one per orchestration site, and each runtime provides
+// the strong symbols for the one it uses:
+//   - device orchestration (tensormap_and_ringbuffer): the AICPU writes a ring
+//     of captured submits, the host collector drains it, and
+//     `dep_gen_replay_emit_deps_json` (runtime/.../host/dep_gen_replay.cpp)
+//     replays them into deps.json.
+//   - host orchestration (host_build_graph): the graph is captured from the
+//     orchestrator's own dependency path as it runs on the host, and
+//     `dep_gen_host_graph_*` (common/host_build_graph/host/dep_gen_host_graph.cpp)
+//     writes it out directly — no ring, no collector, nothing to reconcile.
+// A runtime links only its own half, so each half needs a weak fallback here.
+// visibility=hidden keeps the stubs off the global dynamic symbol table so they
+// can't accidentally shadow a strong symbol via RTLD_GLOBAL.
+// LOG_DEBUG (not WARN): the runner picks the shape via
+// `dep_gen_host_graph_active()`, so neither stub is reachable when dep_gen is on
+// — they exist purely to keep the .so loadable.
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_deps_json(
     const struct DepGenRecord * /*records*/, size_t /*num_records*/, const char * /*deps_json_path*/
 ) {
     LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
     return -1;
+}
+
+extern "C" __attribute__((weak, visibility("hidden"))) bool dep_gen_host_graph_active() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_set_enabled(bool /*enable*/) {}
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_emit(const char * /*deps_json_path*/) {
+    LOG_DEBUG("dep_gen host graph not implemented for this runtime — deps.json skipped");
+    return -1;
+}
+
+// Each host_runtime.so links one runtime source set. A5 HBG replaces this
+// no-op with the publisher for its resident scheduler state.
+extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip_swimlane_extensions(
+    Runtime * /*runtime*/
+) noexcept {
+    return true;
 }
 
 // =============================================================================
@@ -229,11 +252,23 @@ void DeviceRunner::clear_aicpu_topology_cache() {
     aicpu_topology_ = {};
 }
 
+void DeviceRunner::set_dep_gen_enabled(bool enable) {
+    enable_dep_gen_ = enable;
+    // Arms host-side capture for a host-orch runtime (no-op weak stub for the
+    // device-orch one). The c_api latches the CallConfig before bind, and the
+    // orchestration entry resets the graph before recording it.
+    dep_gen_host_graph_set_enabled(enable);
+}
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    // Resolved from this run's own CallConfig rather than read off the runner:
+    // apply_call_config() is skipped when this prepare overlaps an in-flight
+    // predecessor, so the members still describe that predecessor.
+    const DfxRunConfig dfx = DfxRunConfig::from(config);
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->resources_owned = true;
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
@@ -287,11 +322,15 @@ int DeviceRunner::prepare_execution(
 
     // Build the profiling-flag bitfield.
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
-    if (enable_dump_args_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
-    if (enable_chip_swimlane_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
-    if (enable_pmu_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
-    if (enable_dep_gen_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
-    if (enable_scope_stats_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
+    if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    if (dfx.pmu_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    // The device flag drives the AICPU writer only; a host-orch runtime has no
+    // device-side dep_gen to switch on.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    }
+    if (dfx.scope_stats_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     execution->kernel_args.args.enable_profiling_flag = enable_profiling_flag;
 
     resolve_task_binary_addrs(runtime);
@@ -383,35 +422,53 @@ int DeviceRunner::prepare_execution(
     }
 
     // Initialize per-subsystem shared memory.
-    if (enable_chip_swimlane_) {
-        rc = init_chip_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args);
+    //
+    // Collectors stay initialized across runs, so pools built for an earlier
+    // run's core / AICPU-thread counts have to go before this run seeds pools
+    // and recycled lanes at different ones.
+    if (collector_shape_is_stale(num_aicore, runtime.get_aicpu_thread_num(), active_aicpu_num)) {
+        finalize_collectors();
+    }
+    latch_collector_shape(num_aicore, runtime.get_aicpu_thread_num(), active_aicpu_num);
+
+    if (dfx.chip_swimlane_enabled()) {
+        rc = init_chip_swimlane(
+            num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args, dfx.output_prefix,
+            dfx.chip_swimlane_level
+        );
         if (rc != 0) {
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
     }
 
-    if (enable_dump_args_) {
-        rc = init_args_dump(runtime, device_id_, execution->kernel_args);
+    if (dfx.dump_args_enabled()) {
+        rc = init_args_dump(runtime, device_id_, execution->kernel_args, dfx.output_prefix, dfx.dump_args_level);
         if (rc != 0) {
             LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
 
-    if (enable_pmu_) {
+    if (dfx.pmu_enabled) {
         rc = init_pmu(
-            num_aicore, active_aicpu_num, make_pmu_csv_path(output_prefix_), pmu_event_type_, device_id_,
+            num_aicore, active_aicpu_num, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, device_id_,
             execution->kernel_args
         );
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             execution->kernel_args.args.pmu_data_base = 0;
+            // Written to the runner, not to `dfx`: the launch arming and the
+            // teardown both read this member, and neither can see a local. It is
+            // therefore the one DFX value this prepare still writes runner-wide.
             enable_pmu_ = false;
         }
     }
 
-    if (enable_dep_gen_) {
+    // A host-orch runtime already holds the graph in host memory; standing up
+    // the device ring and its collector would allocate shared memory and a
+    // drain thread for a stream that never produces a record.
+    if (dfx.dep_gen_enabled && !dep_gen_host_graph_active()) {
         rc = init_dep_gen(active_aicpu_num, device_id_, execution->kernel_args);
         if (rc != 0) {
             LOG_ERROR("init_dep_gen failed: %d", rc);
@@ -419,7 +476,7 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    if (enable_scope_stats_) {
+    if (dfx.scope_stats_enabled) {
         rc = init_scope_stats(active_aicpu_num, device_id_, execution->kernel_args);
         if (rc != 0) {
             LOG_ERROR("init_scope_stats failed: %d", rc);
@@ -466,7 +523,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared->kernel_args);
                 start_shared_collectors_for_run();
-                if (enable_dep_gen_) {
+                if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
                     auto thread_factory = [this](std::function<void()> fn) {
                         return create_thread(std::move(fn));
                     };
@@ -597,12 +654,14 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         recover_device_or_mark_unusable(rc);
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
+        if (enable_chip_swimlane_ && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+            LOG_WARN("Runtime chip-swimlane extension publication failed");
+        }
         teardown_shared_collectors_after_run(false);
         return rc;
     }
 
     read_device_wall_ns();
-
     // Download and Free TraCR memory from Device and store in memory (~/ascend/)
 #ifdef ENABLE_TRACR
     rc = StoreTracrData(this, *prepared.runtime);
@@ -612,14 +671,20 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
     }
 #endif
 
+    if (enable_chip_swimlane_ && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+        LOG_WARN("Runtime chip-swimlane extension publication failed");
+    }
     teardown_shared_collectors_after_run(true);
 
-    // a5-specific dep_gen teardown: stop + reconcile + replay emit.
-    if (enable_dep_gen_) {
-        dep_gen_collector_.stop();
+    // a5-specific dep_gen teardown, device-orch shape: the collector stops, the
+    // ring reconciles, and the records replay. The host-orch shape emits at the
+    // end of bind instead, where its capture window closes — see
+    // `emit_host_dep_gen_graph` in c_api_shared.cpp.
+    if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
+        dep_gen_collector_.quiesce();
         if (dep_gen_collector_.reconcile_counters()) {
-            const auto &records = dep_gen_collector_.records();
             const std::string deps = make_deps_json_path(output_prefix_);
+            const auto &records = dep_gen_collector_.records();
             int replay_rc = dep_gen_replay_emit_deps_json(records.data(), records.size(), deps.c_str());
             if (replay_rc != 0) {
                 LOG_ERROR("dep_gen replay failed (%d) — deps.json not produced", replay_rc);
@@ -641,7 +706,8 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
     const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors stop before device/runtime arguments and register buffers.
-    finalize_collectors(abandon);
+    // The collectors' device resources are not per-run: they are released in
+    // finalize(), which owns them for the worker's lifetime.
     if (abandon) {
         prepared.kernel_args.abandon_after_device_failure();
     } else {
@@ -963,11 +1029,11 @@ int DeviceRunner::finalize() {
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
-    // On drain or enqueue rollback, release the diagnostics collectors' shared
-    // memory. They are only re-initialized per run, so a
-    // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
-    // otherwise re-enter init_chip_swimlane() with stale state still allocated.
-    // Matches a2a3's finalize_collectors().
+    // Release the diagnostics collectors' shared memory. Collectors survive an
+    // ordinary run, so the callers of this are the paths where their pools must
+    // not: drain, enqueue rollback, a run whose core / AICPU-thread counts
+    // differ from the pools', and Worker finalize.
+    clear_collector_shape();
     auto free_cb = [this, abandon_device_resources](void *dev_ptr) -> int {
         if (abandon_device_resources) return 0;
         return mem_alloc_.free(dev_ptr);
@@ -990,7 +1056,8 @@ void DeviceRunner::finalize_collectors(bool abandon_device_resources) {
 }
 
 int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args
+    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+    const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -998,9 +1065,9 @@ int DeviceRunner::init_chip_swimlane(
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
+    chip_swimlane_collector_.begin_run(output_prefix, chip_swimlane_level);
     int rc = chip_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level_, alloc_cb,
-        /*register_cb=*/nullptr, free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
     if (rc == 0) {
         kernel_args.args.chip_swimlane_data_base =
@@ -1011,7 +1078,10 @@ int DeviceRunner::init_chip_swimlane(
     return rc;
 }
 
-int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::init_args_dump(
+    Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, const std::string &output_prefix,
+    DumpArgsLevel dump_args_level
+) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
@@ -1020,9 +1090,8 @@ int DeviceRunner::init_args_dump(Runtime &runtime, int device_id, KernelArgsHelp
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, /*register_cb=*/nullptr, free_cb, output_prefix_, dump_args_level_
-    );
+    dump_collector_.begin_run(output_prefix, dump_args_level);
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, /*register_cb=*/nullptr, free_cb);
     if (rc != 0) {
         return rc;
     }
@@ -1041,9 +1110,8 @@ int DeviceRunner::init_pmu(
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = pmu_collector_.init(
-        num_cores, num_threads, csv_path, event_type, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id
-    );
+    pmu_collector_.begin_run(csv_path, event_type);
+    int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
     if (rc == 0) {
         kernel_args.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
         kernel_args.args.aicore_pmu_ring_addrs =
@@ -1053,6 +1121,7 @@ int DeviceRunner::init_pmu(
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    scope_stats_collector_.begin_run();
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
@@ -1072,6 +1141,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    dep_gen_collector_.begin_run();
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device. No
     // halHostRegister on a5 (matches PMU / chip swimlane / dump collectors).

@@ -29,6 +29,7 @@
 #include "chip_callable_layout.h"
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
+#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
@@ -303,6 +304,46 @@ int SimDeviceRunnerBase::ensure_device_initialized() {
     int rc = attach_current_thread(device_id_);
     if (rc != 0) return rc;
     return ensure_binaries_loaded();
+}
+
+int SimDeviceRunnerBase::ensure_dma_workspace_provisioned() {
+    if (dma_workspace_handle_ != nullptr) {
+        return 0;
+    }
+    const uint32_t supported = dma_workspace_supported_mask();
+    constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
+    if (sdma_requested_ && (supported & kSdmaBit) == 0) {
+        LOG_ERROR("dma workspace: SDMA requested where unsupported (supported=0x%x)", supported);
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    const uint32_t required_mask = sdma_requested_ ? supported : (supported & ~kSdmaBit);
+    if (required_mask == 0) {
+        return 0;
+    }
+    if ((required_mask & (required_mask - 1)) != 0) {
+        LOG_ERROR(
+            "dma workspace: mask=0x%x names %d engines; one handle owns one provider", required_mask,
+            __builtin_popcount(required_mask)
+        );
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        dma_workspace_addr_[kind] = 0;
+    }
+
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("dma workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+            dma_workspace_addr_[kind] = 0;
+        }
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+    return 0;
 }
 
 int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
@@ -731,6 +772,7 @@ void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
     set_dep_gen_enabled(config.enable_dep_gen != 0);
     set_scope_stats_enabled(config.enable_scope_stats != 0);
+    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
@@ -753,8 +795,14 @@ HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_want
     }
     if (!swimlane_wants_records) return pool;
 
-    // Only the chip-swimlane reader places these records against device
-    // timestamps, so only it needs the two clocks anchored.
+    begin_clock_correlation_session_if_needed();
+    return pool;
+}
+
+void SimDeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
+    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
+        return;
+    }
     try {
         clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
         chip_swimlane_collector_.begin_clock_correlation_session(
@@ -775,7 +823,6 @@ HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_want
             chip_swimlane_collector_.finish_clock_correlation_session();
         }
     }
-    return pool;
 }
 
 void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
@@ -785,6 +832,73 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
         host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
         host_phase_records_.dropped_records()
     );
+}
+
+void SimDeviceRunnerBase::start_shared_collectors_for_run() {
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (enable_chip_swimlane_) {
+        if (capture_clock_anchors_) begin_clock_correlation_session_if_needed();
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    if (enable_dump_args_) {
+        dump_collector_.start(thread_factory);
+    }
+    if (enable_pmu_) {
+        pmu_collector_.start(thread_factory);
+    }
+    if (enable_scope_stats_) {
+        scope_stats_collector_.start(thread_factory);
+    }
+}
+
+void SimDeviceRunnerBase::write_host_phase_records_artifact() {
+    // Every phase this records is produced on the host during bind and the store
+    // is finished before launch, so it touches no device state and is callable
+    // from any point after bind — including a path that never launched.
+    // `output_prefix_` is non-empty exactly when this run produces diagnostic
+    // artifacts, and the store writes a pass at most once.
+    if (!output_prefix_.empty() && host_phase_records_.finished()) {
+        (void)host_phase_records_.write_records_jsonl(make_host_phase_records_path(output_prefix_));
+    }
+}
+
+void SimDeviceRunnerBase::teardown_shared_collectors_after_run(bool device_execution_complete) {
+    // The order is fixed by three couplings, not by preference: the clock
+    // correlation session closes before the swimlane export reads it, the host
+    // phase records reach the collector before that same export serializes them,
+    // and each collector drains before it reconciles before it exports.
+    // Diagnostic exports use the per-task `output_prefix_` directory the user set
+    // on CallConfig (CallConfig::validate() enforces non-empty upstream).
+    finish_clock_correlation_session(device_execution_complete);
+    if (enable_chip_swimlane_) {
+        chip_swimlane_collector_.quiesce();
+        chip_swimlane_collector_.read_phase_header_metadata();
+        chip_swimlane_collector_.reconcile_counters();
+        publish_host_phase_records_to_swimlane();
+        publish_chip_swimlane_runtime_extensions();
+        chip_swimlane_collector_.export_swimlane_json();
+    }
+
+    write_host_phase_records_artifact();
+
+    if (enable_dump_args_) {
+        dump_collector_.quiesce();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+    }
+
+    if (enable_pmu_) {
+        pmu_collector_.quiesce();
+        pmu_collector_.reconcile_counters();
+    }
+
+    if (enable_scope_stats_) {
+        scope_stats_collector_.quiesce();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(output_prefix_);
+    }
 }
 
 void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {

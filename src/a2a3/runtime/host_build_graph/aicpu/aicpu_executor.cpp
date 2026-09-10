@@ -8,50 +8,29 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include <unistd.h>
-
 #include <atomic>
-#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#ifdef __linux__
-#include <sys/mman.h>
-#endif
 
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
 
-#include "aicpu/device_time.h"
 #include "aicpu/device_phase_aicpu.h"
-#include "callable_protocol.h"
-#include "dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
 #include "host_build_graph/runtime_core.h"
-#include "host_build_graph/runtime_types.h"
 #include "host_build_graph/shared_memory.h"
 
-// Performance profiling headers
-#include "aicpu/chip_swimlane_collector_aicpu.h"
-#include "aicpu/args_dump_aicpu.h"
-#include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
-#include "common/platform_config.h"
 #include "utils/thread_completion_gate.h"
-
-// Core type definitions
-#include "common/core_type.h"
-
-// CoreCallable for resolved dispatch address
-#include "callable.h"
 
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
 #include "scheduler/scheduler_types.h"
@@ -246,13 +225,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // A boot failure falls through to the common teardown at the end of
         // run() — it must NOT return early. This thread owns a core slice
         // (handshake_partition assigns [lo, total) to the last thread), so an
-        // early return would skip shutdown(thread_idx) — leaving its AICore
-        // cores spinning on an unclosed register window — and the completion
-        // gate never opens, so the host hangs into the op-execute
-        // timeout (507018) instead of seeing the failure. On failure: record it
-        // in run_rc, leave rt null so the dispatch block below skips, and still
-        // publish runtime_init_ready_ (single point at the block's end) so the
-        // peer threads stop spinning.
+        // early return would skip its shutdown() and leave those workers
+        // blocked on return gates no one will open, and the completion gate
+        // never opens, so the host hangs into the op-execute timeout (507018)
+        // instead of seeing the failure. On failure: record it in run_rc,
+        // leave rt null so the dispatch block below skips, and still publish
+        // runtime_init_ready_ (single point at the block's end) so the peer
+        // threads stop spinning.
         bool boot_ok = (prebuilt_arena != nullptr);
         if (!boot_ok) {
             LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
@@ -310,8 +289,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
 
         if (boot_ok) {
-            runtime_bind_ops(rt);
-
             sched_ctx_.bind_runtime(rt);
 
             // Latch the host-built task count (on_graph_attached sets total_tasks_)
@@ -388,9 +365,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
 
-    // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    // This thread has stopped dispatching, so it can retire the cores it owns
+    // without waiting for its peers. Retirement stays ahead of the completion
+    // gate below because that gate is a last-one-out latch, not a barrier: a
+    // thread that returns early never reaches it, and a worker whose gate was
+    // never released would spin until the op-execute timeout.
+    // platform_retire_aicore_group claims per core, so a concurrent
+    // emergency_shutdown sweep and this call retire each core exactly once.
+    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }

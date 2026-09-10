@@ -13,7 +13,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 namespace {
 
@@ -38,7 +41,6 @@ struct FakeHeader {
     Entry queues[PLATFORM_MAX_AICPU_THREADS][kReadyQueueSize] = {};
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS] = {};
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS] = {};
-    DfxBackpressureHeader backpressure = {};
 };
 
 struct FakeState {
@@ -117,7 +119,10 @@ TEST(ProfilerDeviceEngineTest, SwitchPublishesOldBufferAndPopsReplacement) {
     EXPECT_EQ(new_buffer.count, 0u);
 }
 
-TEST(ProfilerDeviceEngineTest, SwitchDoesNotReusePublishedBufferAfterPushGateTimeout) {
+// A full ready queue is the only way the push gate can fail, and it fails
+// BEFORE publishing: the tail never advances, so the caller still owns the
+// buffer and must account its records dropped rather than hand it to the host.
+TEST(ProfilerDeviceEngineTest, SwitchDropsWithoutPublishingWhenReadyQueueStaysFull) {
     FakeHeader header;
     FakeState state;
     FakeBuffer old_buffer;
@@ -126,22 +131,23 @@ TEST(ProfilerDeviceEngineTest, SwitchDoesNotReusePublishedBufferAfterPushGateTim
     state.current_ptr = reinterpret_cast<uint64_t>(&old_buffer);
     state.current_seq = 7;
     old_buffer.count = 3;
-    header.backpressure.rq_freeze_active = 1;
+    // head == tail + 1 leaves no slot: next_tail wraps onto head forever.
+    header.queue_tails[0] = 0;
+    header.queue_heads[0] = 1;
     state.free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(&new_buffer);
     state.free_queue.tail = 1;
 
     Engine::switch_buffer(context(&header, &current), &state);
 
-    EXPECT_EQ(header.queue_tails[0], 1u);
-    EXPECT_EQ(header.queues[0][0].buffer_ptr, reinterpret_cast<uint64_t>(&old_buffer));
-    EXPECT_EQ(header.queues[0][0].buffer_seq, 7u);
-    EXPECT_EQ(state.dropped, 0u);
-    EXPECT_EQ(old_buffer.count, 3u);
-    EXPECT_EQ(state.free_queue.head, 1u);
-    EXPECT_EQ(state.current_ptr, reinterpret_cast<uint64_t>(&new_buffer));
-    EXPECT_EQ(state.current_seq, 8u);
-    EXPECT_EQ(current, &new_buffer);
-    EXPECT_EQ(new_buffer.count, 0u);
+    EXPECT_EQ(header.queue_tails[0], 0u);
+    EXPECT_EQ(header.queues[0][0].buffer_ptr, 0u);
+    EXPECT_EQ(state.dropped, 3u);
+    EXPECT_EQ(old_buffer.count, 0u);
+    // The replacement was never claimed: switch_buffer returns on the enqueue
+    // failure, so the buffer the caller holds is the one it came in with.
+    EXPECT_EQ(state.free_queue.head, 0u);
+    EXPECT_EQ(state.current_ptr, reinterpret_cast<uint64_t>(&old_buffer));
+    EXPECT_EQ(state.current_seq, 7u);
 }
 
 TEST(ProfilerDeviceEngineTest, SwitchClearsCurrentBufferWhenReplacementIsUnavailable) {
@@ -152,7 +158,8 @@ TEST(ProfilerDeviceEngineTest, SwitchClearsCurrentBufferWhenReplacementIsUnavail
     state.current_ptr = reinterpret_cast<uint64_t>(&old_buffer);
     state.current_seq = 7;
     old_buffer.count = 3;
-    header.backpressure.fq_freeze_active = 1;
+    // Free queue left empty and nothing refills it, so the pop gate exhausts its
+    // own budget — the wait is bounded even with no host handshake at all.
 
     Engine::switch_buffer(context(&header, &current), &state);
 
@@ -180,12 +187,11 @@ TEST(ProfilerDeviceEngineTest, PopFreeSupportsRecoveryAfterSwitchFailure) {
     EXPECT_EQ(new_buffer.count, 0u);
 }
 
-TEST(ProfilerDeviceEngineTest, PopFreeDoesNotParkWhileAFreeSlotIsAvailable) {
+TEST(ProfilerDeviceEngineTest, PopFreeReturnsAtOnceWhenAFreeSlotIsAvailable) {
     FakeHeader header;
     FakeState state;
     FakeBuffer new_buffer;
     FakeBuffer *current = nullptr;
-    header.backpressure.fq_freeze_active = 1;
     state.free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(&new_buffer);
     state.free_queue.tail = 1;
 
@@ -195,15 +201,42 @@ TEST(ProfilerDeviceEngineTest, PopFreeDoesNotParkWhileAFreeSlotIsAvailable) {
     EXPECT_EQ(state.free_queue.head, 1u);
 }
 
-TEST(ProfilerDeviceEngineTest, WaitForReleaseUsesCallerTimeoutBudget) {
-    FakeHeader header;
-    header.backpressure.fq_contended = 1;
+// The pop gate must give up on its own deadline when nothing ever refills the
+// queue — the property `docs/dfx/backpressure-design.md` states as "each gate is
+// bounded by Module::kBackpressureWaitCycles". One budget spans every iteration,
+// so a host that stops making progress cannot hold the lane forever.
+//
+// Every object the worker touches is static on purpose: a regression leaves it
+// spinning forever, and a detached thread must not reference a freed frame. That
+// storage therefore outlives the test body, so each invocation has to establish
+// the state it asserts on rather than inherit it from the previous one.
+TEST(ProfilerDeviceEngineTest, PopGateGivesUpWhenNothingEverRefillsTheQueue) {
+    static FakeFreeQueue free_queue;
+    static std::atomic<bool> finished{false};
+    static std::atomic<bool> acquired{true};
 
-    EXPECT_FALSE(dfx_backpressure::wait_for_release(&header, get_sys_cnt_aicpu(), 0));
+    free_queue.head = 0;
+    free_queue.tail = 0;
+    finished.store(false);
+    acquired.store(true);
 
-    header.backpressure.fq_contended = 0;
-    EXPECT_TRUE(dfx_backpressure::wait_for_release(&header, get_sys_cnt_aicpu(), 0));
-    EXPECT_TRUE(dfx_backpressure::wait_for_release<FakeHeader>(nullptr, get_sys_cnt_aicpu(), 0));
+    ASSERT_EQ(free_queue.head, free_queue.tail);  // the gate finds no slot
+
+    std::thread worker([] {
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        acquired.store(Engine::wait_for_free_queue_entry(&free_queue, &head, &tail));
+        finished.store(true);
+    });
+    worker.detach();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!finished.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    ASSERT_TRUE(finished.load()) << "pop gate spun with no deadline of its own";
+    EXPECT_FALSE(acquired.load());
 }
 
 TEST(ProfilerDeviceEngineTest, TryPopFreeReturnsImmediatelyWhenStartupQueueIsEmpty) {
@@ -217,7 +250,6 @@ TEST(ProfilerDeviceEngineTest, TryPopFreeReturnsImmediatelyWhenStartupQueueIsEmp
     EXPECT_EQ(current, nullptr);
     EXPECT_EQ(state.current_ptr, 0u);
     EXPECT_EQ(state.current_seq, 0u);
-    EXPECT_EQ(header.backpressure.fq_contended, 0u);
 }
 
 }  // namespace

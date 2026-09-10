@@ -17,9 +17,9 @@
 
 #include "host_build_graph/runtime.h"
 
+#include <cstring>
+
 #include "common/unified_log.h"
-#include "host_build_graph/runtime_types.h"
-#include "host_build_graph/shared_memory.h"
 
 // =============================================================================
 // Constructor
@@ -27,12 +27,12 @@
 
 Runtime::Runtime() {
     // Initialize handshake buffers
-    memset(workers, 0, sizeof(workers));
+    std::memset(workers, 0, sizeof(workers));
     worker_count = 0;
     aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     flow_id = 0;
-    memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
+    std::memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
     host_total_tasks = 0;

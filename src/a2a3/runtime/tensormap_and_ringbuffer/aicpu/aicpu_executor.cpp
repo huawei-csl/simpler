@@ -883,13 +883,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
     }
 
-    // Shutdown AICore even when sched_ctx_.completed_ was already true:
-    // platform_deinit_aicore_regs is idempotent, and orchestrator threads have
-    // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
-    // A fatal run is the exception — shutdown() returns immediately there,
-    // because emergency_shutdown() has already quiesced every core.
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    // This thread has stopped dispatching, so it can retire the cores it owns
+    // without waiting for its peers. Retirement stays ahead of the completion
+    // count below because that count is a last-one-out latch, not a barrier: a
+    // thread that returns early never reaches it, and a worker whose gate was
+    // never released would spin until the op-execute timeout.
+    // platform_retire_aicore_group claims per core, so a concurrent
+    // emergency_shutdown sweep and this call retire each core exactly once.
+    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }

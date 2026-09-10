@@ -123,7 +123,7 @@ struct FixtureStorage {
         owner_states =
             scheduler_state_at<SchedulerReadyOwnerState>(scheduler_state->base(), layout.ready_owner_states_offset);
         run_control->aiv_active_worker_count = workers;
-        run_control->resolver_count = workers;
+        run_control->scheduler_count = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
             SchedulerWorkerContext &context = contexts[worker];
             context.core_type = static_cast<int32_t>(CoreType::AIV);
@@ -172,6 +172,77 @@ struct FixtureStorage {
     SchedulerTaskMetadata *metadata{nullptr};
     uint64_t *callable_addresses{nullptr};
 };
+
+TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
+    AicoreSchedulerLayout disabled{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
+    EXPECT_EQ(disabled.activity_buffers_offset, 0u);
+
+    AicoreSchedulerLayout enabled{};
+    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &enabled, true));
+    ASSERT_NE(enabled.activity_buffers_offset, 0u);
+    EXPECT_EQ(
+        enabled.total_size - disabled.total_size,
+        static_cast<uint64_t>(SCHEDULER_CLUSTER_CAPACITY) * sizeof(SchedulerActivityBuffer)
+    );
+    SchedulerStateBuffer storage(enabled);
+    auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), enabled.worker_contexts_offset);
+    auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(storage.base(), enabled.activity_buffers_offset);
+    contexts[0].worker_index = SCHEDULER_WORKER_CAPACITY - 1;
+    contexts[0].is_scheduler = 1;
+    contexts[0].scheduler_index = SCHEDULER_CLUSTER_CAPACITY - 1;
+    contexts[0].profiling_loop_iter = 17;
+    SchedulerActivityBuffer &buffer = buffers[SCHEDULER_CLUSTER_CAPACITY - 1];
+    buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;
+
+    scheduler_append_idle_activity(storage.base(), &contexts[0], 10, 20);
+    scheduler_append_idle_activity(storage.base(), &contexts[0], 30, 40);
+
+    EXPECT_EQ(buffer.committed, SCHEDULER_ACTIVITY_CAPACITY);
+    EXPECT_EQ(buffer.dropped, 1u);
+    const SchedulerIdleRecord &last = buffer.records[SCHEDULER_ACTIVITY_CAPACITY - 1];
+    EXPECT_EQ(last.start_time, 10u);
+    EXPECT_EQ(last.end_time, 20u);
+    EXPECT_EQ(last.loop_iter, 17u);
+}
+
+TEST(SchedulerActivityBuffer, RejectsCorruptCommittedCountOnHost) {
+    EXPECT_TRUE(scheduler_activity_record_count_valid(SCHEDULER_ACTIVITY_CAPACITY));
+    EXPECT_FALSE(scheduler_activity_record_count_valid(SCHEDULER_ACTIVITY_CAPACITY + 1));
+}
+
+TEST(SchedulerProfilingLevel, EnablesOnlyTheRequestedGranularity) {
+    EXPECT_FALSE(scheduler_task_timing_enabled(0));
+    EXPECT_TRUE(scheduler_task_timing_enabled(SCHEDULER_PROFILING_TASK_TIMING_LEVEL));
+    EXPECT_FALSE(scheduler_schedule_timing_enabled(SCHEDULER_PROFILING_TASK_TIMING_LEVEL));
+    EXPECT_TRUE(scheduler_schedule_timing_enabled(SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL));
+    EXPECT_FALSE(scheduler_phase_timing_enabled(SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL));
+    EXPECT_TRUE(scheduler_phase_timing_enabled(SCHEDULER_PROFILING_SCHED_PHASES_LEVEL));
+}
+
+TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
+    for (uint64_t level = 0; level <= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL; ++level) {
+        FixtureStorage storage(1, 2);
+        GraphBuffer graph(1);
+        graph.executable(0, 0);
+        storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIC);
+        SchedulerReadyClaim ready_claim{};
+        ready_claim.task_id = 0;
+        ready_claim.claim_start_cycles = 123;
+        ready_claim.claim_end_cycles = 456;
+
+        ASSERT_TRUE(scheduler_fill_dispatch_slot(
+            graph.graph(), storage.scheduler_state->base(), &storage.contexts[1], storage.run_control,
+            SchedulerFreeSlotClaim{1, 0, 0}, ready_claim, level
+        ));
+        auto *traces =
+            scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
+        EXPECT_EQ(traces[0].worker_id, level == 0 ? 0u : storage.contexts[1].worker_index);
+        EXPECT_EQ(traces[0].task_id, 0u);
+        EXPECT_EQ(traces[0].claim_start_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 123u : 0u);
+        EXPECT_EQ(traces[0].claim_end_cycles, level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? 456u : 0u);
+    }
+}
 
 TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
     FixtureStorage storage(4, 2);
@@ -248,7 +319,7 @@ TEST(SchedulerBootstrap, PublishesExclusiveInboxAndAggregatesDirectory) {
     EXPECT_EQ(stats.batch_count, 1u);
 }
 
-TEST(SchedulerReadyInbox, RejectsResolverCapacityBoundary) {
+TEST(SchedulerReadyInbox, RejectsSchedulerCapacityBoundary) {
     FixtureStorage storage(1, 1);
     SchedulerReadyStats stats{};
     SchedulerReadyBatch batch{};
@@ -256,20 +327,19 @@ TEST(SchedulerReadyInbox, RejectsResolverCapacityBoundary) {
     uint64_t ready_types = 0;
 
     EXPECT_FALSE(scheduler_bootstrap_ready_batch_publish(
-        storage.scheduler_state->base(), &storage.contexts[0], 0, SCHEDULER_RESOLVER_CAPACITY, &batch, &stats,
-        &ready_types
+        storage.scheduler_state->base(), &storage.contexts[0], 0, SCHEDULER_CAPACITY, &batch, &stats, &ready_types
     ));
-    storage.contexts[0].inbox_index = SCHEDULER_RESOLVER_CAPACITY;
+    storage.contexts[0].inbox_index = SCHEDULER_CAPACITY;
     EXPECT_FALSE(scheduler_ready_owner_maintain_type(
         storage.scheduler_state->base(), &storage.contexts[0], 0, &storage.owner_states[0]
     ));
     EXPECT_FALSE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), &storage.contexts[0], 0, SCHEDULER_RESOLVER_CAPACITY, &batch, &stats,
+        storage.scheduler_state->base(), &storage.contexts[0], 0, SCHEDULER_CAPACITY, &batch, &stats,
         &storage.owner_states[0]
     ));
     storage.contexts[0].inbox_index = 0;
     EXPECT_FALSE(scheduler_bootstrap_ready_directory_publish(
-        storage.scheduler_state->base(), &storage.contexts[0], SCHEDULER_RESOLVER_CAPACITY + 1
+        storage.scheduler_state->base(), &storage.contexts[0], SCHEDULER_CAPACITY + 1
     ));
 }
 
@@ -512,7 +582,7 @@ TEST(SchedulerReadyInbox, StealsOnlyFromMarkedVictim) {
     EXPECT_EQ(stats.steal_count, 1u);
 }
 
-TEST(SchedulerReadyInbox, DirectoryShardIgnoresResolverTail) {
+TEST(SchedulerReadyInbox, DirectoryShardIgnoresSchedulerTail) {
     FixtureStorage storage(1, 9);
     auto *directory = scheduler_ready_directory_at(storage.scheduler_state->base(), &storage.contexts[0]);
     directory->core_types[0][1].bits = UINT64_C(1) << 6;
@@ -1080,7 +1150,7 @@ TEST(SchedulerReadyWake, ConcurrentRegistrationAndCloseResolveEveryConsumerExact
     }
 }
 
-TEST(SchedulerReadyWake, WakeResolvePublishesConsumerToResolverLocalInbox) {
+TEST(SchedulerReadyWake, WakeResolvePublishesConsumerToSchedulerLocalInbox) {
     FixtureStorage storage(2, 1);
     GraphBuffer graph(2);
     graph.executable(0, 0);

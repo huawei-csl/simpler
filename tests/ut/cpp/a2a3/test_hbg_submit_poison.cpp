@@ -32,9 +32,10 @@
 #include <vector>
 
 #include "utils/device_arena.h"
+#include "scheduler/scheduler.h"
 #include "host_build_graph/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
-#include "host_build_graph/task_id_encoding.h"
+#include "host_build_graph/task_id.h"
 
 namespace {
 
@@ -67,7 +68,7 @@ protected:
         // Same order the AICPU boots in: the slot arrays are not part of the
         // uploaded image, so nothing can push until they carry their ramp.
         sched.seed_queue_slots();
-        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, CHIP_DEFAULT_GRAPH_TASKS, &sched));
+        ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, CHIP_DEFAULT_GRAPH_TASKS));
     }
 
     void TearDown() override {
@@ -76,14 +77,14 @@ protected:
         sm_arena.release();
     }
 
-    // Fill the task table (storage entries / completion_flags) with poison.
+    // Fill the task table (storage entries / task_states) with poison.
     // init_header wrote only the header, so this is the state the table
     // is in before any submit writes it — modelling the never-zeroed device SM.
     void poison_task_table() {
         auto &tasks = sm_handle->header->tasks;
         const size_t n = static_cast<size_t>(CHIP_DEFAULT_GRAPH_TASKS);
         std::memset(tasks.task_storage, POISON, n * sizeof(ChipTaskStorage));
-        std::memset(tasks.completion_flags, POISON, n * sizeof(std::atomic<uint8_t>));
+        std::memset(tasks.task_states, POISON, n * sizeof(std::atomic<ChipTaskState>));
     }
 };
 
@@ -140,16 +141,16 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
         const ChipTaskSlotState &st = entry.slot;
 
         // Descriptor: the task id is written to this exact local id.
-        EXPECT_EQ(simpler::hbg::task_local_id(desc.task_id), static_cast<uint32_t>(local));
+        EXPECT_EQ(desc.task_id.local_id(), local);
         // task_state is written at submit (reset_for_reuse skips it): PENDING for a
         // dispatchable task, COMPLETED for a pre-completed hidden-alloc. Either way a
         // real enum, never poison.
         const ChipTaskState state = st.task_state.load(std::memory_order_relaxed);
         EXPECT_TRUE(state == CHIP_TASK_PENDING || state == CHIP_TASK_COMPLETED);
-        // Completion flag is written to a real 0/1 (pending vs pre-completed), not a
-        // poison byte (0xAA).
-        const uint8_t cflag = tasks.completion_flags[local].load(std::memory_order_relaxed);
-        EXPECT_LE(cflag, uint8_t{1});
+        // The progress byte is written to a real state (pending vs pre-completed),
+        // not a poison byte (0xAA).
+        const ChipTaskState sm_state = tasks.task_states[local].load(std::memory_order_relaxed);
+        EXPECT_TRUE(sm_state == CHIP_TASK_PENDING || sm_state == CHIP_TASK_COMPLETED);
         // Payload counts are real, not the poison bit pattern.
         EXPECT_GE(pl.fanin_count, 0);
         EXPECT_LE(pl.fanin_count, CHIP_MAX_FANIN);
@@ -164,7 +165,7 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     }
 
     // Field-specific coverage on the real task: tensors, scalar, packed output buffer.
-    const ChipTaskStorage &root_entry = tasks.storage_at(simpler::hbg::task_local_id(root.task_id()));
+    const ChipTaskStorage &root_entry = tasks.storage_at(root.task_id().local_id());
     const TaskDescriptor &root_desc = root_entry.task;
     const TaskPayload &root_pl = root_entry.payload;
     EXPECT_EQ(root_pl.tensor_count, 1);
@@ -177,9 +178,9 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     EXPECT_EQ(root_desc.kernel_id[static_cast<int>(SubtaskSlot::AIV0)], 0);
 
     // The consumer's fanin is written: two duplicate deps dedupe to one.
-    const TaskPayload &cons_pl = tasks.storage_at(simpler::hbg::task_local_id(consumer.task_id())).payload;
+    const TaskPayload &cons_pl = tasks.storage_at(consumer.task_id().local_id()).payload;
     EXPECT_EQ(cons_pl.fanin_count, 1);
-    EXPECT_EQ(cons_pl.fanin_data()[0], static_cast<int32_t>(simpler::hbg::task_local_id(root.task_id())));
+    EXPECT_EQ(cons_pl.fanin_data()[0], root.task_id().local_id());
 }
 
 TEST_F(HbgSubmitPoisonTest, InvalidDispatchPredicateIsRejectedBeforeTaskAllocation) {

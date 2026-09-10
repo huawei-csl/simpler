@@ -500,14 +500,15 @@ def pytest_configure(config):
         "fixtures and standalone runners build its Worker with enable_sdma=True "
         "unless worker_workspace=False selects a platform-provisioned "
         "communication-domain workspace. "
-        "Worker-global provisioning creates 48 "
+        "On onboard a2a3, worker-global provisioning creates 48 "
         "device-only STARS streams that sit in the device fault domain, which "
         "makes a later AICore fault on that device cost minutes instead of "
         "~0.3 s (#1425). Two consequences follow from the one marker: such a "
         "test never shares an L2 Worker (the pool key carries the flag) and it "
         "sorts after every ordinary test, so fault-injection cases run on a "
         "device that has never provisioned. The a2a3 CI additionally runs them "
-        "in a step of their own via -m sdma until #1425 is fixed",
+        "in a step of their own via -m sdma until #1425 is fixed. On sim platforms, "
+        "the workspace is inert scratch and no hardware streams are created.",
     )
     config.addinivalue_line(
         "markers",
@@ -722,24 +723,22 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
     items.sort(key=sort_key)
 
-    # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
-    # that all write chip_swimlane_records_<ts>.json to the same directory with
-    # second-precision timestamps, so they trample each other. Block the
-    # combination up front; waiting for a proper device-id-in-filename fix.
+    # The automatic rankN/dN layout is scoped to one same-host L3 Worker. Every
+    # level above NODE owns several L3 Workers, each of which numbers its local
+    # chips from zero, so accepting one would reintroduce directory collisions.
     if config.getoption("--enable-chip-swimlane", default=0) and config.getoption("--rounds", default=1) <= 1:
-        l3_items = [
-            i
-            for i in items
-            if _item_scene_level(i) == SceneTestLevel.NODE and not any(m.name == "skip" for m in i.iter_markers())
+        multi_node_items = [
+            item
+            for item in items
+            if (_item_scene_level(item) or SceneTestLevel.CHIP) > SceneTestLevel.NODE
+            and not any(marker.name == "skip" for marker in item.iter_markers())
         ]
-        if l3_items:
-            sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
-            more = "" if len(l3_items) <= 3 else f" (+{len(l3_items) - 3} more)"
+        if multi_node_items:
+            sample = ", ".join(sorted({item.nodeid for item in multi_node_items})[:3])
+            more = "" if len(multi_node_items) <= 3 else f" (+{len(multi_node_items) - 3} more)"
             raise pytest.UsageError(
-                f"--enable-chip-swimlane is not supported for L3 tests yet — "
-                f"multi-chip-process filename collision unresolved. "
-                f"L3 items in this session: {sample}{more}. "
-                f"Either drop --enable-chip-swimlane or scope to L2 with --level 2."
+                "--enable-chip-swimlane supports automatic multi-Rank merging only for same-host L3 tests; "
+                f"NETWORK1/L4 needs a node namespace before it is safe. Items: {sample}{more}."
             )
 
 
@@ -872,7 +871,45 @@ def _strip_value_options(args, options):
     return stripped
 
 
-def _resource_child_command(spec, device_ids, platform, manual_mode):
+# Options that change what a case does rather than which case runs. The
+# resource child's argv is built from scratch so it can be narrowed to one
+# nodeid (see _build in the dispatcher), which means nothing reaches it that is
+# not listed here — a diagnostic the parent asked for is silently dropped
+# otherwise, and the run passes while producing no artifact at all.
+#
+# The options that select which case runs — --manual and --case — are forwarded
+# by _resource_child_command alongside the nodeid they refine, because a nodeid
+# names a whole SceneTestCase class: `--case` filters inside its single
+# `test_run` item at run time, so a child that does not receive it runs every
+# case of the class the parent narrowed to one.
+_RESOURCE_CHILD_VALUE_OPTIONS = (
+    ("--rounds", 1),
+    ("--enable-chip-swimlane", 0),
+    ("--dump-args", 0),
+    ("--enable-pmu", 0),
+)
+_RESOURCE_CHILD_FLAG_OPTIONS = (
+    "--skip-golden",
+    "--enable-dep-gen",
+    "--enable-scope-stats",
+    "--enable-swimlane-overhead",
+)
+
+
+def _resource_child_diagnostic_argv(cfg):
+    """Forward the parent's diagnostic and round selection to a resource child."""
+    argv = []
+    for option, unset in _RESOURCE_CHILD_VALUE_OPTIONS:
+        value = cfg.getoption(option, default=unset)
+        if value != unset:
+            argv.extend([option, str(value)])
+    for option in _RESOURCE_CHILD_FLAG_OPTIONS:
+        if cfg.getoption(option, default=False):
+            argv.append(option)
+    return argv
+
+
+def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
     command = [
         sys.executable,
         "-m",
@@ -888,6 +925,9 @@ def _resource_child_command(spec, device_ids, platform, manual_mode):
     if platform:
         command.extend(["--platform", platform])
     command.extend(["--manual", manual_mode])
+    for selector in cfg.getoption("--case", default=None) or []:
+        command.extend(["--case", str(selector)])
+    command.extend(_resource_child_diagnostic_argv(cfg))
     return command
 
 
@@ -1050,7 +1090,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                 # this job in the same subprocess, which has only this job's
                 # allocated devices — e.g. TestL3Group (needs 2) would fail
                 # inside TestL3ChildMemory's 1-device subprocess.
-                return _resource_child_command(_spec, ids, platform, manual_mode)
+                return _resource_child_command(_spec, ids, platform, manual_mode, session.config)
 
             jobs.append(
                 _ps.Job(

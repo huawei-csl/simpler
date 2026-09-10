@@ -224,10 +224,26 @@ public:
      *                          before any dispatch.
      * @return 0 on success, error code on failure
      */
+    // Allocates the device-side resources: header, per-thread DumpBufferStates,
+    // DumpMetaBuffers and payload arenas.
+    //
+    // The per-run configuration (output prefix, level) is NOT taken here — it
+    // is bound separately via begin_run(), which the caller must run before this
+    // on the first run.
     int initialize(
         int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-        const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
+        const DumpFreeCallback &free_cb
     );
+
+    // Start a run's collection window: bind its artifact configuration, drop the
+    // previous run's shard state and counters, and — once the region exists —
+    // republish the level the device reads. The prefix is read when the writer
+    // thread starts lazily on the first collected buffer.
+    //
+    // The collector initializes once and serves every run, so this is the only
+    // point at which a run's collected records, dropped/truncated counts and
+    // device level are established; initialize() establishes none of them.
+    void begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -275,8 +291,12 @@ public:
      */
     void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
-    /** Return whether an active args-dump freeze may release. An idle call returns false. */
-    bool backpressure_release_ready() const;
+    /**
+     * Publish, per AICPU thread, how many of that thread's payloads have reached
+     * args.bin. The device blocks on this watermark before overwriting arena
+     * bytes. Called once per replenish tick; a no-op before initialize().
+     */
+    void publish_arena_acks();
 
 private:
     struct alignas(64) CollectorShardCounters {

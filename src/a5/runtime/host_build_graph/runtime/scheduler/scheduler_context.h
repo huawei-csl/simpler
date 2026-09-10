@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "assert_compat.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
@@ -19,7 +20,6 @@
 
 #include "scheduler/scheduler.h"
 
-#include "aicore_completion_mailbox.h"
 #include "dispatch_payload.h"
 
 // runtime.h cannot be included here — it pulls in Handshake, which this header
@@ -142,7 +142,7 @@ public:
 
     // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
     // per-S CompletedTaskQueues and runs on_task_complete for each finished task
-    // (completion_flags publish + wake-list drain + watermark advance), making P
+    // (task_states publish + wake-list drain), making P
     // the sole producer of the ready queues. Owns completed_tasks_ / termination.
     int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
 
@@ -316,7 +316,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below SCHEDULE_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;

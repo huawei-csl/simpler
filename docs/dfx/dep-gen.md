@@ -34,7 +34,10 @@ deps.json now fully replaces the removed `fanout[]`.
 
 dep_gen has two shapes, chosen by where the orchestrator runs. Both emit the
 same `deps.json` (§4), so every consumer — deps viewer, swimlane join — reads
-either one the same way.
+either one the same way, with one documented exception: an edge's `flags`
+(WAIT/RETAIN) describes `tensormap_and_ringbuffer`'s own dependency computation,
+which `host_build_graph` has no equivalent of, so only the device-orchestrated
+shape emits it. A consumer must treat `flags` as optional.
 
 ### 2.1 Device orchestration (`tensormap_and_ringbuffer`)
 
@@ -79,6 +82,23 @@ inputs to each submit are captured and the graph is reconstructed afterwards.
   inline and overflow records.
 - **Output.** `<output_prefix>/deps.json` — strided-Tensor schema with
   `tasks[]`, `tensors[]`, and tensor-annotated `edges[]` (see §4).
+- **Edges are as-constructed, not as-reduced.** Both passes replay the same
+  fanin construction, so `deps.json` records the pre-reduction edge set.
+  The `tensormap_and_ringbuffer` runtime's bounded bitmap transitive
+  reduction (`reduce_wait_edges`, applied when the builder flushes in
+  `submit_task_common`) runs *after* construction and clears the `wait`
+  flag on a direct edge already covered by a WAIT path through the
+  producer's own transitive ancestors. A diamond `A→B→C` + `A→C` still
+  shows `A→C` with its constructed flags. The differential gate is
+  unaffected — both passes replay the same construction. What the
+  reduction changes is the edge's flags: a redundant `WAIT|RETAIN` edge
+  demotes to RETAIN-only and a redundant `WAIT`-only edge drops to
+  `DEP_NONE`, with the entry kept either way, so retention and
+  pin-release accounting are preserved and only readiness enforcement
+  is relaxed.
+  [`wait_reduction_sim`](../../simpler_setup/tools/README.md#wait_reduction_sim)
+  replays the reduction offline over a capture to measure its coverage
+  against the full-DAG upper bound.
 
 ### 2.2 Host orchestration (`host_build_graph`)
 
@@ -96,9 +116,13 @@ nothing to capture-then-reconstruct.
   shared-memory ring, and the drain thread are all skipped
   (`dep_gen_host_graph_active()` tells the runner). Nothing is dropped under
   back-pressure because nothing is streamed.
-- **Output.** The same `deps.json`, written during the device-runner drain.
-  The graph is thread-local, and prepare's host orchestration and the drain that
-  emits it both run on the child progress loop's single thread.
+- **Output.** The same `deps.json`, written at the end of the run's own `bind` —
+  the point where host orchestration completes and the graph is final. The graph
+  is thread-local, so it is written on the thread that captured it rather than
+  waiting for the drain, which the run lane does not pin to that thread: it
+  serializes with a mutex, which gives mutual exclusion but not thread affinity.
+  A consequence worth knowing: a run whose device execution later fails still
+  leaves its `deps.json`, because its orchestration did happen.
 
 ---
 
@@ -186,7 +210,7 @@ Task ids are `TaskId::raw`. The low 32 bits are a local id; the high 32 bits
 mean whatever the runtime that minted the record says they mean — a ring index
 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`) or an id space
 (`host_build_graph`, `0 = GLOBAL`, `1 = IN_GRAPH`). See
-`src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id_encoding.h`.
+`src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id.h`.
 Which one a record carries is a property of its runtime, not of the value:
 
 ```python
@@ -222,7 +246,7 @@ Each edge is `{pred, succ}` plus annotation. Fields:
 | `pred`, `succ` | uint64 (string) | always | `TaskId::raw` of producer and consumer |
 | `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
 | `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
-| `flags` | string array | `tensormap_and_ringbuffer` | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges start with the per-dependency kind captured at submit time, so `CoreTaskArgsWithDeps::add_dep_wait()` emits `["wait"]` while the default dependency kind emits `["wait","retain"]`. When the same producer is also the creator of an input, replay matches runtime fanin dedup by OR-accumulating the creator's flags into the explicit edge. The host_build_graph writer does not currently emit this field. |
+| `flags` | string array | `tensormap_and_ringbuffer` | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges start with the per-dependency kind captured at submit time, so `CoreTaskArgsWithDeps::add_dep_wait()` emits `["wait"]` while the default dependency kind emits `["wait","retain"]`. When the same producer is also the creator of an input, replay matches runtime fanin dedup by OR-accumulating the creator's flags into the explicit edge. `DepFlags` is a `tensormap_and_ringbuffer` runtime concept — it does not exist in the host_build_graph tree — so the host-orchestrated writer omits the field rather than lagging behind it. Consumers must treat it as optional. |
 | `overlap` | string | `source=tensormap` | `covered` (producer slice fully contains consumer slice) or `other` |
 | `tensor_id` | uint64 (string) | not `explicit` | Identity of the underlying tensor; cross-references `tensors[]` |
 | `consumer_dtype` | string | not `explicit` | Element type the consumer reads as |
@@ -411,8 +435,11 @@ list; only the dep_gen replay graph loses the tail.
 | Host-direct capture (host-orch) | `src/common/host_build_graph/dep_gen_host_graph.h`, `src/common/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/common/host_build_graph/dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
 | Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` at teardown — reading the thread-local graph its own orchestration built on the same child progress thread — and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
 | Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
-| Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py`, `tests/st/a2a3/host_build_graph/dfx/dep_gen/test_dep_gen.py` | Smoke test + 6-edge validation against `vector_example` orchestration (both platforms share byte-identical orchestration code). The host_build_graph case runs the *same* orchestration through host-direct capture and asserts the same 6 edges, so a divergence between the two shapes fails a test. |
+| Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py`, `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` | Smoke test + edge validation against a `vector_example`-shaped orchestration. Each `host_build_graph` case runs an orchestration through host-direct capture and asserts its declared edges, so a divergence between the two shapes fails a test. The orchestrations are not shared across the two cases — a2a3's dep_gen test carries its own 5-task / 6-edge copy, a5's reuses the 4-task / 4-edge `vector_example` scene test's — so each asserts its own graph. |
 
 The device-orch shape is supported on both a2a3 and a5. The a5 host collector differs from a2a3 only in its host↔device transport path (a5 has no SVM, so all transfers go through `profiling_copy_to_device` / `profiling_copy_from_device` instead of relying on `halHostRegister`'s shared mapping); the AICPU writer, shared-memory ABI, runtime call site, and replay are platform-agnostic.
 
-The host-direct shape lives in a2a3's `host_build_graph`, the one host-orchestrated runtime. `src/a5/runtime/host_build_graph/` has no dep_gen of either shape.
+The host-direct shape is supported on both a2a3 and a5, and is what `host_build_graph`
+uses on either. Both architectures reach it through the same
+`src/common/host_build_graph/` sources — neither `src/a2a3/runtime/host_build_graph/`
+nor `src/a5/runtime/host_build_graph/` carries a dep_gen implementation of its own.

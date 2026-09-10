@@ -202,28 +202,32 @@ void SchedulerContext::complete_slot_task(
         }
         chip_swimlane.phase_complete_count++;
 #endif
-        if (deferred_release_count < DEFERRED_RELEASE_CAP) {
-            deferred_release_slot_states[deferred_release_count++] = &slot_state;
-        } else {
-            while (deferred_release_count > 0) {
+        // At capacity, elide deferred releases (including the overflowing slot)
+        // when orchestration is done; otherwise drain then push.
+        bool release_elided = false;
+        if (deferred_release_count >= DEFERRED_RELEASE_CAP) {
+            release_elided = orchestrator_done_.load(std::memory_order_acquire);
+            drain_or_elide_deferred_releases(
+                sched_, deferred_release_slot_states, deferred_release_count, release_elided
 #if SIMPLER_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                ,
+                thread_idx
 #endif
-            }
+            );
+        }
+        if (!release_elided) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         }
         completed_this_turn++;
     }
 
 #if SIMPLER_DFX
-    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
     // {start, end, task_token_raw}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
-    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task.
-    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane.chip_swimlane_enabled && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
@@ -346,7 +350,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // BEFORE any fanin / deferred-release work. Anything later would
         // charge AICPU completion-processing cost to (end → finish).
         uint64_t finish_ts = 0;
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
             finish_ts = get_sys_cnt_aicpu();
         }
 #endif
@@ -407,7 +411,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 promote_pending_to_running(core);
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    if (sched_->maybe_rendezvous_ring(*promoted)) {
+                    if (sched_->try_launch_sync_start_cohort(*promoted)) {
                         sched_->propagate_dispatch_fanin(*promoted);
                     }
                 }
@@ -534,7 +538,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
                 dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
             }
 #endif

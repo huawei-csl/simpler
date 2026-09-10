@@ -31,6 +31,7 @@ from simpler_setup.tools.strace_timing import (
     main,
     node_span_leaf,
     parse_clock_anchors,
+    parse_drop_summaries,
     parse_spans,
     print_rounds_table,
     span_family,
@@ -245,6 +246,53 @@ def test_count_record_heads_sees_a_torn_record_that_parse_spans_drops():
 
     assert count_record_heads(lines) == 2
     assert len(list(parse_spans(lines))) == 1
+
+
+def _drop_summary(pid, new, total, queue_full=0, claim_exhausted=0, output_failed=0, not_admitted=0):
+    return (
+        f"[mono_ns=1000][T0xabc][ERROR] host_log_drops: [HOSTLOG_DROPS] v=1 pid={pid} new={new} "
+        f"total={total} queue_full={queue_full} claim_exhausted={claim_exhausted} "
+        f"output_failed={output_failed} not_admitted={not_admitted}\n"
+    )
+
+
+def test_parse_drop_summaries_keeps_the_running_total_per_process():
+    # A process reports a growth at every quiescent boundary, so the reader must
+    # keep the last (largest) figure rather than summing the reports.
+    lines = [
+        _drop_summary(71, new=2, total=2, queue_full=2),
+        _drop_summary(72, new=1, total=1, output_failed=1),
+        _drop_summary(71, new=3, total=5, queue_full=5),
+    ]
+
+    summaries = parse_drop_summaries(lines)
+    assert summaries[71] == {
+        "total": 5,
+        "queue_full": 5,
+        "claim_exhausted": 0,
+        "output_failed": 0,
+        "not_admitted": 0,
+    }
+    assert summaries[72]["total"] == 1
+    assert summaries[72]["output_failed"] == 1
+
+
+def test_parse_drop_summaries_ignores_an_unknown_grammar_version():
+    lines = [_drop_summary(71, new=1, total=1).replace("v=1", "v=2")]
+
+    assert parse_drop_summaries(lines) == {}
+
+
+def test_main_warns_that_dropped_records_make_the_timing_incomplete(tmp_path, capsys):
+    log_file = tmp_path / "host.71.log"
+    log_file.write_text(_record(1, 1, "chip.run", "rank=0") + "\n" + _drop_summary(71, new=4, total=4, queue_full=4))
+
+    main([str(log_file)])
+
+    stderr = capsys.readouterr().err
+    assert "pid 71 dropped 4 host-log record(s)" in stderr
+    assert "queue_full=4" in stderr
+    assert "incomplete log" in stderr
 
 
 def test_host_swimlane_keeps_real_host_lanes_and_builds_dispatch_flow():
@@ -991,10 +1039,10 @@ def test_host_record_spans_nest_bind_segments_and_orchestrator_operations(tmp_pa
         }
     ]
 
-    out, orphaned, covered = host_record_spans(spans, passes)
+    out, orphaned, skipped = host_record_spans(spans, passes)
 
     assert orphaned == 0
-    assert covered == frozenset({(9, 5)})
+    assert skipped == 0
     by_name = {span.name: span for span in out}
     bind_depth = spans[0].depth
     assert by_name["chip.run.bind.args"].depth == bind_depth + 1
@@ -1078,11 +1126,67 @@ def test_host_record_spans_drop_passes_with_no_matching_bind(tmp_path):
     spans = list(parse_spans([_span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=1_000, dur=500)]))
     passes = [{"pid": 9, "inv": 999, "records": [{"phase": "args", "start_ns": 1_000, "end_ns": 1_100}]}]
 
-    out, orphaned, covered = host_record_spans(spans, passes)
+    out, orphaned, skipped = host_record_spans(spans, passes)
 
     assert out == []
     assert orphaned == 1
-    assert covered == frozenset()
+    assert skipped == 0
+
+
+def test_a_bind_segment_the_log_already_carries_is_not_drawn_twice(tmp_path):
+    """Both channels describe the same segment, and the log's copy is the one kept.
+
+    The runtime emits each bind segment as a span, and that span carries the
+    segment's own attributes — byte counts, fault and CPU counters — where the
+    artifact record carries only `detail`. Drawing both would put two bars on one
+    interval, and keeping the artifact's would lose the attributes.
+    """
+    spans = list(
+        parse_spans(
+            [
+                _span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=1_000, dur=500),
+                _span_record(
+                    pid=9, tid=9, inv=5, name="chip.run.bind.args", ts=1_000, dur=100, depth=2, attrs="bytes=4096"
+                ),
+            ]
+        )
+    )
+    passes = [
+        {
+            "pid": 9,
+            "inv": 5,
+            "records": [
+                {"phase": "args", "start_ns": 1_000, "end_ns": 1_100, "detail": 4096, "tid": 9},
+                {"phase": "graph_submit", "start_ns": 1_200, "end_ns": 1_250, "detail": 77, "tid": 9},
+            ],
+        }
+    ]
+
+    out, orphaned, skipped = host_record_spans(spans, passes)
+
+    assert orphaned == 0
+    assert skipped == 1
+    assert [span.name for span in out] == ["chip.run.bind.host_orch.graph_submit"]
+
+    drawn = [span for span in spans + out if span.name == "chip.run.bind.args"]
+    assert len(drawn) == 1
+    assert "bytes=4096" in drawn[0].attrs
+
+
+def test_a_bind_segment_only_the_artifact_has_is_still_drawn():
+    """A run may collect records without emitting the segments' spans.
+
+    The breakdown switch and the record pool are separate conditions, so a
+    chip-swimlane capture arms the pool with the switch off. Then the artifact is
+    the only source for the segments and must still be admitted.
+    """
+    spans = list(parse_spans([_span_record(pid=9, tid=9, inv=5, name="chip.run.bind", ts=1_000, dur=500)]))
+    passes = [{"pid": 9, "inv": 5, "records": [{"phase": "args", "start_ns": 1_000, "end_ns": 1_100, "tid": 9}]}]
+
+    out, orphaned, skipped = host_record_spans(spans, passes)
+
+    assert (orphaned, skipped) == (0, 0)
+    assert [span.name for span in out] == ["chip.run.bind.args"]
 
 
 # ---------------------------------------------------------------------------

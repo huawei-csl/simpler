@@ -79,11 +79,11 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -267,6 +267,7 @@ from .task_interface import (
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    PROV_NOT_LIVE,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -276,11 +277,14 @@ from .task_interface import (
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
     GlobalCommDomainView,
+    ProvenanceTable,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    _flush_host_log_or_warn,
     _initialize_host_log,
+    _start_host_log_writer,
     _Worker,
 )
 from .worker_chip_orch_comm import (
@@ -321,12 +325,13 @@ _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
 # 7 int32 (aicpu_thread_num, enable_chip_swimlane, enable_dump_args,
-# enable_pmu, enable_dep_gen, enable_scope_stats, flow_id) + uint64 ring sizing
-# overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT: ring_task_window,
-# ring_heap, ring_dep_pool) + 1024-byte NUL-terminated output_prefix. Log config
-# travels separately via ChipWorker.init(log_level) — not on per-task wire.
+# enable_pmu, enable_dep_gen, enable_scope_stats, flow_id, capture_clock_anchors)
+# + uint64 ring sizing overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT:
+# ring_task_window, ring_heap, ring_dep_pool) + 1024-byte NUL-terminated
+# output_prefix. Log config travels separately via ChipWorker.init(log_level) —
+# not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # The generation-safe pipeline lease follows CONFIG. Args start after the
 # lease, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -358,14 +363,17 @@ _OFF_FRAME_RUN_ID = _OFF_ACCEPTED - 32
 _OFF_FRAME_SLOT_ID = _OFF_ACCEPTED - 24
 _OFF_FRAME_GENERATION = _OFF_ACCEPTED - 16
 _OFF_FRAME_DISPATCH_ID = _OFF_ACCEPTED - 8
-_TASK_PROTOCOL_VERSION = 3
+_OFF_FRAME_TASK_SLOT = _OFF_ACCEPTED - 48
+_OFF_FRAME_GROUP_INDEX = _OFF_ACCEPTED - 56
+_OFF_FRAME_GROUP_SIZE = _OFF_ACCEPTED - 64
+_TASK_PROTOCOL_VERSION = 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
 # return-to-IDLE), any of which overwrites a _SHUTDOWN store; only a
 # terminating parent writes this word, 0 -> 1, and nothing clears it. The word
 # is reserved on every frame so a task-args blob can never reach it.
-_OFF_SHUTDOWN = _OFF_FRAME_PROTOCOL - 8
+_OFF_SHUTDOWN = _OFF_ACCEPTED - 72
 _SHUTDOWN_REQUESTED = 1
 _MAILBOX_ARGS_CAPACITY = _OFF_SHUTDOWN - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
@@ -1981,6 +1989,74 @@ def _read_task_digest(buf) -> bytes:
     return bytes(buf[_OFF_TASK_CALLABLE_HASH : _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES])
 
 
+def _read_task_frame_identity(buf: memoryview) -> tuple[int, int, int, int, int, int, int, int]:
+    """Read the versioned parent-run identity from one task-frame trailer."""
+    return (
+        struct.unpack_from("=Q", buf, _OFF_FRAME_PROTOCOL)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_RUN_ID)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_SLOT_ID)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_GENERATION)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_DISPATCH_ID)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_TASK_SLOT)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_GROUP_INDEX)[0],
+        struct.unpack_from("=Q", buf, _OFF_FRAME_GROUP_SIZE)[0],
+    )
+
+
+def _config_diagnostics_any(cfg: CallConfig) -> bool:
+    """Mirror of `CallConfig::diagnostics_any()`, which nanobind does not bind."""
+    return bool(
+        cfg.enable_chip_swimlane
+        or cfg.enable_dump_args
+        or cfg.enable_pmu
+        or cfg.enable_dep_gen
+        or cfg.enable_scope_stats
+    )
+
+
+def _write_dispatch_identity_sidecar(
+    output_prefix: str,
+    *,
+    frame_identity: tuple[int, int, int, int, int, int, int, int],
+    chip_rank: int,
+    capture_index: int,
+    callable_digest: bytes,
+) -> None:
+    """Write parent-DAG identity beside one Rank-local diagnostic artifact."""
+    protocol, run_id, pipeline_slot, generation, endpoint_dispatch_id, task_slot, group_index, group_size = (
+        frame_identity
+    )
+    if (
+        protocol != _TASK_PROTOCOL_VERSION
+        or run_id == 0
+        or generation == 0
+        or endpoint_dispatch_id == 0
+        or group_size == 0
+        or group_index >= group_size
+    ):
+        raise RuntimeError(f"invalid diagnostic task frame identity {frame_identity}")
+    os.makedirs(output_prefix, exist_ok=True)
+    path = os.path.join(output_prefix, "dispatch_identity.json")
+    temporary_path = f"{path}.{os.getpid()}.tmp"
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "task_slot": task_slot,
+        "group_index": group_index,
+        "group_size": group_size,
+        "chip_rank": chip_rank,
+        "local_capture_index": capture_index,
+        "endpoint_dispatch_id": endpoint_dispatch_id,
+        "pipeline_slot": pipeline_slot,
+        "pipeline_generation": generation,
+        "callable_digest": callable_digest.hex(),
+    }
+    with open(temporary_path, "w") as file:
+        json.dump(payload, file, indent=2)
+        file.write("\n")
+    os.replace(temporary_path, path)
+
+
 def _format_digest(digest: bytes) -> str:
     return "sha256:" + digest.hex()
 
@@ -2802,6 +2878,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     on_task_done_success=None,
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
+    chip_rank: int | None = None,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -2837,16 +2914,48 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    diagnostic_capture_index = 0
+
+    def read_task_config(
+        task_buf: memoryview,
+        frame_identity: tuple[int, int, int, int, int, int, int, int],
+        callable_digest: bytes,
+    ) -> CallConfig:
+        nonlocal diagnostic_capture_index
+        capture_index = diagnostic_capture_index
+        cfg = _read_config_from_mailbox(
+            task_buf,
+            chip_rank=chip_rank,
+            capture_index=capture_index,
+        )
+        # Same gate as the rankN/dN redirect in _read_config_from_mailbox: a loop
+        # with no Rank identity writes at the case root, and a sidecar naming a
+        # Rank it does not have would be a lie.
+        if chip_rank is None or not (_config_diagnostics_any(cfg) and cfg.output_prefix):
+            return cfg
+        _write_dispatch_identity_sidecar(
+            cfg.output_prefix,
+            frame_identity=frame_identity,
+            chip_rank=chip_rank,
+            capture_index=capture_index,
+            callable_digest=callable_digest,
+        )
+        diagnostic_capture_index += 1
+        return cfg
 
     def handle_task(task_buf) -> tuple[int, str]:
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
+        frame_identity = _read_task_frame_identity(task_buf)
         cid = identity_table.get(digest)
-        cfg = _read_config_from_mailbox(task_buf)
 
         code = 0
         msg = ""
         try:
+            # Inside the try because it writes the diagnostic sidecar: a full or
+            # read-only output_prefix must surface as this task's error, not as
+            # an exception that leaves the loop before TASK_DONE is published.
+            cfg = read_task_config(task_buf, frame_identity, digest)
             if cid is None:
                 raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
             # Run only consumes a prepared slot — it never lazily
@@ -3050,7 +3159,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             index: int
             frame_buf: memoryview
             frame_addr: int
-            identity: tuple[int, int, int, int, int]
+            identity: tuple[int, int, int, int, int, int, int, int]
             cid: int
             config: CallConfig
             activated: bool
@@ -3058,15 +3167,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             launched_published: bool = False
 
         staged_frames: dict[int, _StagedFrame] = {}
-
-        def read_identity(frame_buf: memoryview) -> tuple[int, int, int, int, int]:
-            return (
-                struct.unpack_from("=Q", frame_buf, _OFF_FRAME_PROTOCOL)[0],
-                struct.unpack_from("=Q", frame_buf, _OFF_FRAME_RUN_ID)[0],
-                struct.unpack_from("=Q", frame_buf, _OFF_FRAME_SLOT_ID)[0],
-                struct.unpack_from("=Q", frame_buf, _OFF_FRAME_GENERATION)[0],
-                struct.unpack_from("=Q", frame_buf, _OFF_FRAME_DISPATCH_ID)[0],
-            )
 
         def task_frame_references_digest(digest: bytes) -> bool:
             live_states = (_TASK_READY, _PREPARE_READY, _ACTIVATE, _FRAME_STAGED, _TASK_LAUNCHED)
@@ -3085,8 +3185,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             frame_buf = frame_bufs[index]
             frame_addr = frame_addrs[index]
             try:
-                identity = read_identity(frame_buf)
-                protocol, run_id, slot_id, generation, dispatch_id = identity
+                identity = _read_task_frame_identity(frame_buf)
+                protocol, run_id, slot_id, generation, dispatch_id, _task_slot, _group_index, _group_size = identity
                 pipeline_slot, pipeline_reserved, pipeline_generation = _PIPELINE_LEASE_FMT.unpack_from(
                     frame_buf, _OFF_PIPELINE_LEASE
                 )
@@ -3119,7 +3219,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     frame_addr=frame_addr,
                     identity=identity,
                     cid=int(cid),
-                    config=_read_config_from_mailbox(frame_buf),
+                    config=read_task_config(frame_buf, identity, digest),
                     activated=initial_state in (_TASK_READY, _ACTIVATE),
                 )
             except Exception as e:  # noqa: BLE001
@@ -3128,7 +3228,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 return None
 
         def submit_frame(frame: _StagedFrame) -> None:
-            _protocol, run_id, slot_id, generation, dispatch_id = frame.identity
+            _protocol, run_id, slot_id, generation, dispatch_id, _task_slot, _group_index, _group_size = frame.identity
             # The frame carries the wire blob; the runtime reads the chip POD. The bytes decode
             # once into the wire TaskArgs, whose tensors resolve to local bases (map-once, cached
             # by canonical identity) and rebuild at those bases, as the non-pipelined task path
@@ -3191,7 +3291,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                                 new_frames.append(staged)
                         continue
                     if frame_state == _ACTIVATE and not staged.activated:
-                        if read_identity(staged.frame_buf) != staged.identity:
+                        if _read_task_frame_identity(staged.frame_buf) != staged.identity:
                             stale_message = f"chip_process dev={device_id}: stale activation identity"
                             try:
                                 staged.chip_run.abandon()
@@ -3310,6 +3410,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     runtime: str = "",
     prewarm_config=None,
     enable_sdma: bool = False,
+    chip_rank: int | None = None,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3387,12 +3488,18 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_runtime=runtime,
             prepared=prepared,
             task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
+            chip_rank=chip_rank,
         )
     finally:
         cw.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
+def _read_config_from_mailbox(
+    buf: memoryview,
+    *,
+    chip_rank: int | None = None,
+    capture_index: int | None = None,
+) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     (
         aicpu_tn,
@@ -3402,6 +3509,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
         dep_gen,
         scope_stats,
         flow_id,
+        _capture_clock_anchors,
         *ring_values,
         prefix_bytes,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
@@ -3421,9 +3529,22 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     cfg.runtime_env.ring_dep_pool = ring_dep_pool
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
-    # A forked chip child owns its own log file under the same directory.
+    # Keep per-process host logs at the case root. Profiling artifacts are
+    # routed below, after the log directory has been configured, so changing
+    # capture directories does not add log-directory churn to every dispatch.
     if cfg.output_prefix:
         _native_set_host_log_directory(cfg.output_prefix)
+    if cfg.output_prefix and chip_rank is not None and capture_index is not None and _config_diagnostics_any(cfg):
+        # Every diagnostic below output_prefix uses a fixed filename, so N
+        # ChipWorker children sharing one prefix overwrite each other's
+        # artifacts. rankN/dN is the storage convention that separates them, and
+        # it is read only by the offline tools: no runtime or platform code
+        # parses this path, or knows that a Rank is what produced it.
+        cfg.output_prefix = os.path.join(cfg.output_prefix, f"rank{chip_rank}", f"d{capture_index}")
+        # Only the swimlane reader places its records against a Host timeline,
+        # so it alone needs both clocks anchored; the other diagnostics get the
+        # directory separation without paying for the anchors.
+        cfg.capture_clock_anchors = bool(cfg.enable_chip_swimlane)
     return cfg
 
 
@@ -4342,6 +4463,12 @@ class RunHandle:
             raise
 
 
+def _exit_after_host_log_flush(status: int) -> NoReturn:
+    """Boundedly preserve accepted records before a fork child uses os._exit()."""
+    _flush_host_log_or_warn("fork-child os._exit()")
+    os._exit(status)
+
+
 def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
     """Run a forked child to completion, always terminating via ``os._exit``.
 
@@ -4388,6 +4515,9 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
         try:
             try:
                 ctx = setup()
+                # setup may recursively fork a complete lower-level subtree.
+                # Starting here keeps every C++ writer behind the final fork.
+                _start_host_log_writer()
             finally:
                 setup_active = False
         except _StartupCancelled:
@@ -4411,7 +4541,7 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_lea
             else:
                 exit_code = 0
     finally:
-        os._exit(exit_code)
+        _exit_after_host_log_flush(exit_code)
 
 
 # ---------------------------------------------------------------------------
@@ -4433,6 +4563,59 @@ def attach_exception_note(error: BaseException, note: str) -> None:
         notes.append(note)
         return
     object.__setattr__(error, "__notes__", [note])
+
+
+class _DeviceAllocations:
+    """Every live child device allocation, in both forms a dispatch consumes.
+
+    The snapshot answers lifetime, ownership and capability questions; the native table answers the
+    per-argument dispatch check, which walks a whole argument list and would otherwise materialize a
+    Python object per argument. One object owns both, so an allocation cannot be live in one and
+    absent from the other -- the register / revoke / clear methods here are the only way to change
+    either, and each writes both.
+
+    Not a lock: the caller holds ``Worker._child_prov_lock`` across every method.
+    """
+
+    __slots__ = ("_snapshots", "_table")
+
+    def __init__(self) -> None:
+        self._snapshots: dict[CanonicalIdentity, Buffer] = {}
+        self._table = ProvenanceTable()
+
+    def register(self, snapshot: Buffer) -> None:
+        """Make ``snapshot`` nameable by an operand. It must be a Buffer no caller can still reach,
+        so that neither form can drift from the descriptor registered here."""
+        self._snapshots[snapshot.identity] = snapshot
+        self._table.insert(snapshot.to_descriptor(), int(snapshot.owner_worker_id))
+
+    def revoke(self, identity: CanonicalIdentity) -> None:
+        """Drop one allocation; an identity that is not registered is left alone."""
+        self._snapshots.pop(identity, None)
+        self._table.erase(identity)
+
+    def clear(self) -> None:
+        self._snapshots.clear()
+        self._table.clear()
+
+    def get(self, identity: CanonicalIdentity) -> Buffer | None:
+        """The registered snapshot for ``identity``, or None."""
+        return self._snapshots.get(identity)
+
+    def values(self) -> Iterable[Buffer]:
+        """Every registered snapshot."""
+        return self._snapshots.values()
+
+    def check_dispatch(self, args: Any, target_worker_id: int) -> tuple[int, int] | None:
+        """None when every device arg in ``args`` is live on ``target_worker_id``, else the first
+        offending ``(arg_index, reason)``."""
+        return self._table.check_dispatch(args, target_worker_id)
+
+    def __contains__(self, identity: CanonicalIdentity) -> bool:
+        return identity in self._snapshots
+
+    def __len__(self) -> int:
+        return len(self._snapshots)
 
 
 class Worker:
@@ -4676,30 +4859,7 @@ class Worker:
         self._region_instance_registry = RegionInstanceRegistry()
         self._worker_chip_orch_comm_host_buffers: dict[int, int] = {}
 
-        # Live device allocations, keyed by the identity that names one. Membership authorizes an
-        # operand; it does not own the memory. Nothing in this table releases anything -- a malloc'd
-        # allocation is freed by `free`, a domain's window by its collective release -- which is the
-        # contract `self._buffers` does NOT have, where membership means "close() me".
-        # Ordering is safety-first: an entry is recorded only after the native alloc succeeds, and
-        # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
-        # op never leaves an identity resolving to memory that is already gone. Cleared on close().
-        self._child_alloc: dict[CanonicalIdentity, Buffer] = {}
-        # Which identities each CommDomain allocation minted, so its release revokes them together.
-        self._domain_members: dict[int, set[CanonicalIdentity]] = {}
-        # Guards both device-allocation tables. Entry points take it (`_require_device_capability`,
-        # `_device_worker_for`, `_child_prov_check_dispatch`, `_drop_domain_allocs`); the `_locked`
-        # helpers and the record/drop-one helpers assume the caller holds it. It is not reentrant,
-        # so an entry point must never be called with it already held -- including indirectly
-        # through `_child_prov_worker_lock`, which takes it to reach the per-worker lock table.
-        # Authorization is fenced by that per-worker lock, not by this one: an op holds its chip's
-        # lock across both the check and the native call, and every revoker of an allocation on
-        # that chip takes the same lock before revoking.
-        self._child_prov_lock = threading.Lock()
-        # Per-worker locks for the *native* half of a provenance-guarded device op.
-        # ``_child_prov_lock`` stays the bookkeeping lock (short, process-wide); the
-        # long native call (malloc / free / copy) is serialized per worker instead, so
-        # ops on different chips overlap while same-worker ordering is unchanged.
-        self._child_prov_worker_locks: dict[int, threading.Lock] = {}
+        self._init_device_allocation_tables()
 
         # Owner-side Buffer state (P1-B): a per-incarnation opaque nonce, a monotonic buffer_id
         # (0 reserved), and the live handles this Worker owns. create_buffer allocates a handle whose
@@ -7674,6 +7834,20 @@ class Worker:
             try:
                 self._cleanup_partial_init()
             finally:
+                # _start_hierarchical() quiesces the process-owned log writer
+                # before its first fork. If anything fails before the normal
+                # post-fork restart, restore that process-global service after
+                # rollback; otherwise this failed Worker silently disables logs
+                # from unrelated Workers and callers in the same parent.
+                if self.level >= 3:
+                    try:
+                        _start_host_log_writer()
+                    except BaseException as log_restore_error:  # noqa: BLE001 -- preserve the startup cause
+                        with contextlib.suppress(BaseException):
+                            sys.stderr.write(
+                                f"[worker pid={os.getpid()}] WARN: failed to restore host-log writer after "
+                                f"startup rollback: {log_restore_error}\n"
+                            )
                 with self._hierarchical_start_cv:
                     # Only an INITIALIZING epoch commits FAILED. FAILED is only
                     # written by the init thread. CLOSED is absorbing.
@@ -7876,7 +8050,7 @@ class Worker:
         # and emits their spans. A chip child re-seeds its inherited state before
         # binding the logger copies embedded in the runtime modules it loads.
         chip_log_level = _simpler_log.get_current_config()
-        _initialize_host_log(chip_log_level)
+        _initialize_host_log(chip_log_level, defer_writer=True)
 
         # Bind the level word this process's host-scheduler spans lead with. The
         # C++ emit sites in Orchestrator / WorkerThread are level-agnostic — the
@@ -7969,6 +8143,7 @@ class Worker:
                             runtime=str(self._config["runtime"]),
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
+                            chip_rank=idx,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -7977,8 +8152,8 @@ class Worker:
                         if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
                             _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
                             _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-                        os._exit(1)
-                    os._exit(0)
+                        _exit_after_host_log_flush(1)
+                    _exit_after_host_log_flush(0)
                 else:
                     self._chip_pids.append(pid)
                     if self._is_startup_root:
@@ -8068,6 +8243,11 @@ class Worker:
         # its descendants, so its INIT_READY means the whole subtree is ready. A
         # failure, exit, or hang aborts startup here.
         self._await_children_ready(self._next_level_shms, self._next_level_pids, "next_level", deadline)
+
+        # No local fork may follow this point. Only now is it safe to create the
+        # process-owned C++ writer thread; remote activation below creates its
+        # own health threads too.
+        _start_host_log_writer()
 
         # Last local fork is done. Now — and only now — open and register remote
         # L3 sessions: opening starts the remote subtree and registering spawns
@@ -10111,6 +10291,33 @@ class Worker:
                 self._child_prov_worker_locks[int(worker_id)] = lock
             return lock
 
+    def _init_device_allocation_tables(self) -> None:
+        """The device-allocation tables and the locks that fence them."""
+        # Live device allocations, keyed by the identity that names one. Membership authorizes an
+        # operand; it does not own the memory. Nothing in this table releases anything -- a malloc'd
+        # allocation is freed by `free`, a domain's window by its collective release -- which is the
+        # contract `self._buffers` does NOT have, where membership means "close() me".
+        # Ordering is safety-first: an entry is recorded only after the native alloc succeeds, and
+        # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
+        # op never leaves an identity resolving to memory that is already gone. Cleared on close().
+        self._child_alloc = _DeviceAllocations()
+        # Which identities each CommDomain allocation minted, so its release revokes them together.
+        self._domain_members: dict[int, set[CanonicalIdentity]] = {}
+        # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
+        # `_device_worker_for`, `_child_prov_check_dispatch`, `_drop_domain_allocs`); the `_locked`
+        # helpers and the record/drop-one helpers assume the caller holds it. It is not reentrant,
+        # so an entry point must never be called with it already held -- including indirectly
+        # through `_child_prov_worker_lock`, which takes it to reach the per-worker lock table.
+        # Authorization is fenced by that per-worker lock, not by this one: an op holds its chip's
+        # lock across both the check and the native call, and every revoker of an allocation on
+        # that chip takes the same lock before revoking.
+        self._child_prov_lock = threading.Lock()
+        # Per-worker locks for the *native* half of a provenance-guarded device op.
+        # ``_child_prov_lock`` stays the bookkeeping lock (short, process-wide); the
+        # long native call (malloc / free / copy) is serialized per worker instead, so
+        # ops on different chips overlap while same-worker ordering is unchanged.
+        self._child_prov_worker_locks: dict[int, threading.Lock] = {}
+
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
 
@@ -10120,7 +10327,9 @@ class Worker:
         every execution field, so changing a public handle can never change the worker id, address,
         extent, access mode, or descriptor used by a later operation.
         """
-        self._child_alloc[handle.identity] = replace(handle)
+        snapshot = replace(handle)
+        snapshot.freeze_descriptor()
+        self._child_alloc.register(snapshot)
         if domain_allocation_id is not None:
             self._domain_members.setdefault(domain_allocation_id, set()).add(handle.identity)
 
@@ -10130,7 +10339,7 @@ class Worker:
         Called BEFORE the native free (safety-first), so an interrupted free never leaves an
         identity resolvable to an address that is already gone.
         """
-        self._child_alloc.pop(identity, None)
+        self._child_alloc.revoke(identity)
 
     def _drop_domain_allocs(self, allocation_id: int) -> None:
         """Revoke every identity a CommDomain allocation minted. Caller holds neither lock.
@@ -10166,10 +10375,10 @@ class Worker:
                     for identity in tuple(self._domain_members.get(allocation_id, ())):
                         handle = self._child_alloc.get(identity)
                         if handle is not None and int(handle.owner_worker_id) == worker_id:
-                            self._child_alloc.pop(identity, None)
+                            self._drop_device_alloc(identity)
         with self._child_prov_lock:
             for identity in self._domain_members.pop(allocation_id, set()):
-                self._child_alloc.pop(identity, None)
+                self._drop_device_alloc(identity)
 
     def _require_freeable(self, handle: Buffer, *, api: str) -> Buffer:
         """The registered allocation ``handle`` names, provided ``free`` is what releases it.
@@ -10296,25 +10505,20 @@ class Worker:
             return self._require_device_capability_locked(identity, capability, nbytes, offset=offset, api=api)
 
     @staticmethod
-    def _device_identities_in_args(args: Any) -> list[tuple[CanonicalIdentity, int]]:
-        """``(identity, arg_index)`` for every arg that names a child device allocation.
+    def _names_device_allocation(args: Any) -> bool:
+        """Whether any arg names a child device allocation, and so needs authorizing.
 
         A ``DEVICE_MALLOC`` (worker device malloc) or ``VMM_WINDOW`` (domain-carved) ref names an
         allocation behind a chip boundary, so its identity is what the owner can resolve.
         Host-backed refs (POSIX/fork shm) name nothing the owner allocation table holds and
         contribute nothing.
         """
-        out: list[tuple[CanonicalIdentity, int]] = []
-        for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            if desc.backend_kind in (BackendKind.DEVICE_MALLOC, BackendKind.VMM_WINDOW):
-                out.append((desc.identity, i))
-        return out
+        return args.has_device_backed_tensor()
 
     @staticmethod
     def _identities_in_args(args: Any) -> set[CanonicalIdentity]:
         """Every tensor arg's identity in ``args``."""
-        return {args.tensor(i).buffer.identity for i in range(args.tensor_count())}
+        return set(args.identities())
 
     def _record_touched_identities(self, args: Any) -> None:
         """Add every tensor arg's identity in ``args`` to the current run's touched set.
@@ -10339,14 +10543,7 @@ class Worker:
             return
         resources.touched_identities.update(self._identities_in_args(args))
 
-    def _child_prov_check_dispatch_locked(
-        self,
-        device_args: list[tuple[CanonicalIdentity, int]],
-        target_worker_id: int,
-        *,
-        args: Any,
-        api: str,
-    ) -> None:
+    def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
         """Validate device args against the worker they are dispatched to.
 
         The caller holds ``_child_prov_lock`` and keeps holding it through the native submit, which
@@ -10358,19 +10555,25 @@ class Worker:
         must also match the private allocation snapshot exactly: authorization and execution consume
         the same Buffer, so a same-identity descriptor with a changed body/backend/extent/access is
         rejected before the submit can commit.
+
+        The walk itself runs in ``ProvenanceTable``: one dispatch names every argument, and reading
+        each one's descriptor back into Python costs more than comparing it. Only the refusal
+        returns here, where naming the argument is worth an object.
         """
-        for identity, arg_index in device_args:
-            handle = self._child_alloc.get(identity)
-            if handle is None or int(handle.owner_worker_id) != target_worker_id:
-                raise ValueError(
-                    f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
-                    f"allocation on target worker {target_worker_id} (wrong worker, or stale)"
-                )
-            if args.tensor(arg_index).buffer != handle.to_descriptor():
-                raise ValueError(
-                    f"orch.{api}: device argument (arg {arg_index}, {identity}) does not match "
-                    "the descriptor registered for that allocation"
-                )
+        failure = self._child_alloc.check_dispatch(args, target_worker_id)
+        if failure is None:
+            return
+        arg_index, reason = failure
+        identity = args.tensor(arg_index).buffer.identity
+        if reason == PROV_NOT_LIVE:
+            raise ValueError(
+                f"orch.{api}: device argument (arg {arg_index}, {identity}) is not a live "
+                f"allocation on target worker {target_worker_id} (wrong worker, or stale)"
+            )
+        raise ValueError(
+            f"orch.{api}: device argument (arg {arg_index}, {identity}) does not match "
+            "the descriptor registered for that allocation"
+        )
 
     def _require_local_next_level_target(self, worker_id: int, *, api: str) -> None:
         """Reject a local callable pinned to a remote NEXT_LEVEL worker.
@@ -11921,6 +12124,11 @@ class Worker:
                     if result is None:
                         result = exc
                 finally:
+                    # CLOSED prevents new admissions and teardown has quiesced
+                    # this Worker's producers. Preserve accepted records before
+                    # publishing completion, but never turn a stuck output into
+                    # an unbounded wait or a new close failure.
+                    _flush_host_log_or_warn("Worker.close()")
                     # The immutable outcome reference is the completion flag and
                     # result. A reader can therefore never observe completion
                     # without its error/incomplete payload. Publication precedes

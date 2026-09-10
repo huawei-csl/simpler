@@ -20,8 +20,10 @@
 
 #include "host/chip_swimlane_collector.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
@@ -35,7 +37,12 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "host/profiling_copy.h"
+#include "host/scheduler_profiling_json.h"
 #include "../../../worker/runtime_c_api.h"
+
+#ifndef SIMPLER_RUNTIME_NAME
+#error "SIMPLER_RUNTIME_NAME must be defined by RuntimeBuilder"
+#endif
 
 // =============================================================================
 // ChipSwimlaneCollector Implementation
@@ -46,6 +53,16 @@
 // the source of truth).
 
 namespace {
+
+std::string linux_boot_clock_domain_id() {
+    std::ifstream boot_id_file("/proc/sys/kernel/random/boot_id");
+    std::string boot_id;
+    if (!(boot_id_file >> boot_id) || boot_id.empty()) return {};
+    for (unsigned char ch : boot_id) {
+        if (!std::isalnum(ch) && ch != '-') return {};
+    }
+    return "linux-boot-id:" + boot_id;
+}
 
 int owner_recycled_shard_for_core(int core_index, int thread_count) {
     int cluster_index = core_index / PLATFORM_CORES_PER_BLOCKDIM;
@@ -83,13 +100,32 @@ ChipSwimlaneCollector::~ChipSwimlaneCollector() {
     }
 }
 
+bool ChipSwimlaneCollector::set_json_extension(ChipSwimlaneExtensionSection section, const std::string &json_value) {
+    if (!chip_swimlane_extension_has_expected_root(section, json_value)) return false;
+    std::string &slot = json_extensions_[static_cast<size_t>(section)];
+    if (!slot.empty()) return false;
+    slot = json_value;
+    return true;
+}
+
 int ChipSwimlaneCollector::initialize(
-    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
-    const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
-    const ChipSwimlaneFreeCallback &free_cb, const std::string &output_prefix
+    int num_aicore, int aicpu_thread_num, int device_id, const ChipSwimlaneAllocCallback &alloc_cb,
+    ChipSwimlaneRegisterCallback register_cb, const ChipSwimlaneFreeCallback &free_cb
 ) {
     if (shm_host_ != nullptr) {
-        LOG_ERROR("ChipSwimlaneCollector already initialized");
+        // Already holding this run's device resources. They are not per-run:
+        // configuration arrives via begin_run() and the layout is fixed at
+        // compile time, so there is nothing here left to re-apply.
+        return 0;
+    }
+    if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
+        LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (aicpu_thread_num <= 0 || aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Invalid number of AICPU threads: %d (valid range: 1-%d)", aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
+        );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -102,30 +138,18 @@ int ChipSwimlaneCollector::initialize(
 
     LOG_INFO("Initializing performance profiling");
 
-    if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
-        LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (aicpu_thread_num <= 0 || aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR(
-            "Invalid number of AICPU threads: %d (valid range: 1-%d)", aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-
     // Must precede the recycled-lane seeding below: push_recycled() folds its
     // shard argument modulo the manager's shard count.
     set_aicpu_thread_num(aicpu_thread_num);
 
     num_aicore_ = num_aicore;
     aicpu_thread_num_ = aicpu_thread_num;
-    chip_swimlane_level_ = chip_swimlane_level;
-    output_prefix_ = output_prefix;
     total_perf_collected_ = 0;
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
     has_phase_data_ = false;
     collector_shards_merged_ = false;
+    json_extensions_.fill({});
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -149,7 +173,7 @@ int ChipSwimlaneCollector::initialize(
     // both sched and orch — AICPU picks the actual counts at init_phase time
     // and writes them into the header.
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
-    size_t total_size = calc_perf_data_size_with_phases(num_aicore, num_phase_threads, num_phase_threads);
+    size_t total_size = calc_perf_data_size_with_phases();
 
     LOG_DEBUG("Shared memory allocation plan:");
     LOG_DEBUG("  Number of cores:      %d", num_aicore);
@@ -201,7 +225,7 @@ int ChipSwimlaneCollector::initialize(
     // Phase metadata: must be zero-initialized here. alloc_cb returns
     // uninitialized device memory; AICPU only writes these fields when
     // phase init runs (level >= SCHED_PHASES). Without zeroing, lower
-    // levels (AICORE_TIMING / AICPU_TIMING) leave garbage that
+    // levels (TASK_TIMING / SCHEDULE_TIMING) leave garbage that
     // for_each_instance iterates as `num_sched_phase_threads` /
     // `num_orch_phase_threads`, walking off the end of the allocated pool
     // array → segfault. The host-side reader (read_phase_header_metadata)
@@ -280,7 +304,7 @@ int ChipSwimlaneCollector::initialize(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     for (int i = 0; i < num_aicore; i++) {
-        ChipSwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
+        ChipSwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(perf_host_ptr, i);
         memset(ac_state, 0, sizeof(ChipSwimlaneAicoreTaskPool));
 
         const int initial_free_count = kAicoreInitialFreeCount;
@@ -352,13 +376,13 @@ int ChipSwimlaneCollector::initialize(
     // allocated only for the first buffer_count pools. For sched the two are
     // equal; orch is a single instance (pool 0), so it zeroes all slots but
     // allocates buffers for just pool 0 — no buffers wasted on unused slots.
-    auto init_phase_pools = [&](auto *buffer_tag, ChipSwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
-                                int state_count, int buffer_count, int buffers_per_thread, ProfBufferType recycle_kind,
+    auto init_phase_pools = [&](auto *buffer_tag, ChipSwimlaneAicpuTaskPool *(*get_state)(void *, int), int state_count,
+                                int buffer_count, int buffers_per_thread, ProfBufferType recycle_kind,
                                 const char *kind_label) -> int {
         using Buffer = std::remove_pointer_t<decltype(buffer_tag)>;
         constexpr size_t buffer_bytes = sizeof(Buffer);
         for (int t = 0; t < state_count; t++) {
-            auto *state = get_state(perf_host_ptr, num_aicore, t);
+            auto *state = get_state(perf_host_ptr, t);
             memset(state, 0, sizeof(ChipSwimlaneAicpuTaskPool));
             if (t >= buffer_count) continue;  // zeroed state only; no buffers (unused slot)
             const int initial_free_count =
@@ -409,8 +433,8 @@ int ChipSwimlaneCollector::initialize(
         ) != 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    auto orch_get_state = [](void *base, int n_cores, int t) {
-        return get_orch_phase_buffer_state(base, n_cores, t);
+    auto orch_get_state = [](void *base, int t) {
+        return get_orch_phase_buffer_state(base, t);
     };
     const int orch_buffer_count = chip_swimlane_level_ >= ChipSwimlaneLevel::ORCH_PHASES && !host_orchestrated_ ? 1 : 0;
     if (init_phase_pools(
@@ -806,7 +830,7 @@ void ChipSwimlaneCollector::reconcile_counters() {
     reconcile_one(
         "SCHED_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
         [this](int thread_index) {
-            return get_sched_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+            return get_sched_phase_buffer_state(shm_host_, thread_index);
         },
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
@@ -817,13 +841,59 @@ void ChipSwimlaneCollector::reconcile_counters() {
     reconcile_one(
         "ORCH_PHASE", "thread", PLATFORM_MAX_AICPU_THREADS,
         [this](int thread_index) {
-            return get_orch_phase_buffer_state(shm_host_, num_aicore_, thread_index);
+            return get_orch_phase_buffer_state(shm_host_, thread_index);
         },
         [](void *host_ptr) {
             return reinterpret_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
         sizeof(ChipSwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
     );
+}
+
+void ChipSwimlaneCollector::publish_run_config() {
+    // Nothing to publish before the region exists; initialize() writes the level
+    // from the member begin_run() just set.
+    if (shm_host_ == nullptr) return;
+
+    ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
+    header->chip_swimlane_level = static_cast<uint32_t>(chip_swimlane_level_);
+    wmb();
+    // One field, not the region: a bulk write-back would race the AICPU's own
+    // header fields (phase thread counts, core_to_thread) — see
+    // buffer_pool_manager.h's note on narrow write_range_to_device calls. On SVM
+    // platforms copy_to_device is null and this is a no-op, because the store
+    // above already landed in device-visible memory.
+    (void)manager_.write_range_to_device(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level));
+
+    // The pools' record counters are producer-side and never reset by the
+    // device, so they carry the previous run's totals into this run's reconcile
+    // unless cleared here.
+    //
+    // total_record_count and dropped_record_count are adjacent, so one narrow
+    // write covers both and leaves the device-owned fields in the same cache
+    // line (current_buf_ptr, current_buf_seq) untouched.
+    auto reset_head = [this](ChipSwimlaneActiveHead *head) {
+        head->total_record_count = 0;
+        head->dropped_record_count = 0;
+        wmb();
+        static_assert(
+            offsetof(ChipSwimlaneActiveHead, dropped_record_count) ==
+                offsetof(ChipSwimlaneActiveHead, total_record_count) + sizeof(uint32_t),
+            "the two counters must stay adjacent for this single write-back to cover both"
+        );
+        (void)manager_.write_range_to_device(&head->total_record_count, 2 * sizeof(uint32_t));
+    };
+
+    // Every slot, not just this run's: the grid is dimensioned by the platform
+    // maximum and a later run may use more cores than the one that dirtied them.
+    for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
+        reset_head(&get_perf_buffer_state(shm_host_, i)->head);
+        reset_head(&get_aicore_buffer_state(shm_host_, i)->head);
+    }
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        reset_head(&get_sched_phase_buffer_state(shm_host_, t)->head);
+        reset_head(&get_orch_phase_buffer_state(shm_host_, t)->head);
+    }
 }
 
 void ChipSwimlaneCollector::read_phase_header_metadata() {
@@ -924,7 +994,7 @@ void ChipSwimlaneCollector::record_clock_anchor_samples(std::vector<simpler::dfx
 void ChipSwimlaneCollector::finish_clock_correlation_session() { clock_correlation_session_.finish(); }
 
 // JSON v2 emit: the host now dumps raw cycle-domain per-stream records plus
-// metadata, and `swimlane_converter.py` performs the join (AICore↔AICPU on
+// metadata, and `swimlane_converter.py` performs the join (AICore↔Scheduler on
 // reg_task_id, base_time normalization, cycles→µs conversion, sort, core_type
 // lookup, func_id resolution against deps.json). Moving the join into Python
 // makes the schema easy to evolve without round-tripping through C++ + a
@@ -935,11 +1005,23 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     }
     merge_collector_shards();
 
+    auto extension = [this](ChipSwimlaneExtensionSection section) -> const std::string * {
+        const std::string &value = json_extensions_[static_cast<size_t>(section)];
+        return value.empty() ? nullptr : &value;
+    };
+    const std::string *scheduler_extension = extension(ChipSwimlaneExtensionSection::SchedulerRecords);
+    const std::string *aicore_tasks_extension = extension(ChipSwimlaneExtensionSection::AicoreTasks);
+    const std::string *scheduler_tasks_extension = extension(ChipSwimlaneExtensionSection::SchedulerTasks);
+    const std::string *aicpu_lifecycle_extension = extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords);
+
     // Every stream is independently useful for DFX. In particular, a legal
     // HBG can contain only host-side dummy/hidden-allocation records and no
     // AICore dispatch at all.
-    bool has_any_records =
-        !host_submit_records_.empty() || !host_upload_records_.empty() || clock_correlation_session_.started();
+    bool has_any_records = !host_submit_records_.empty() || !host_upload_records_.empty() ||
+                           clock_correlation_session_.started() ||
+                           std::any_of(json_extensions_.begin(), json_extensions_.end(), [](const auto &value) {
+                               return !value.empty();
+                           });
     for (const auto &core_records : collected_perf_records_) {
         if (!core_records.empty()) {
             has_any_records = true;
@@ -961,6 +1043,18 @@ int ChipSwimlaneCollector::export_swimlane_json() {
         return false;
     };
     const bool has_aicpu_orch_phases = any_phase_records(collected_orch_phase_records_);
+    const bool has_aicpu_scheduler_records = any_phase_records(collected_sched_phase_records_);
+    if (scheduler_extension != nullptr && has_aicpu_scheduler_records) {
+        LOG_ERROR("Both runtime and AICPU scheduler records are present; refusing ambiguous export");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const bool has_aicore_tasks = any_phase_records(collected_aicore_records_);
+    const bool has_platform_scheduler_tasks = any_phase_records(collected_perf_records_);
+    if ((aicore_tasks_extension != nullptr && has_aicore_tasks) ||
+        (scheduler_tasks_extension != nullptr && has_platform_scheduler_tasks)) {
+        LOG_ERROR("Both runtime and platform task records are present; refusing ambiguous export");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     has_any_records = has_any_records || any_phase_records(collected_sched_phase_records_) || has_aicpu_orch_phases;
     if (!has_any_records) {
         LOG_WARN("Warning: No performance data to export.");
@@ -1044,7 +1138,26 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             outfile << "\"record_count_mismatch\"}";
         }
     }
+    if (host_phase_records_present_ || clock_correlation_session_.started()) {
+        const std::string host_clock_domain_id = linux_boot_clock_domain_id();
+        if (!host_clock_domain_id.empty()) {
+            outfile << ",\n    \"host_clock_domain_id\": \"" << host_clock_domain_id << "\"";
+        }
+    }
     if (clock_correlation_session_.started()) {
+        uint64_t host_timeline_origin_ns = 0;
+        for (const auto &sample : clock_correlation_session_.samples()) {
+            if (sample.position != simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin || !sample.valid()) {
+                continue;
+            }
+            const uint64_t midpoint = sample.host_before_ns + (sample.host_after_ns - sample.host_before_ns) / 2;
+            if (host_timeline_origin_ns == 0 || midpoint < host_timeline_origin_ns) {
+                host_timeline_origin_ns = midpoint;
+            }
+        }
+        if (host_timeline_origin_ns != 0) {
+            outfile << ",\n    \"host_timeline_origin_ns\": " << host_timeline_origin_ns;
+        }
         outfile << ",\n    \"clock_anchors\": {";
         outfile << "\n      \"provider\": \"" << clock_correlation_session_.provider_name() << "\",";
         outfile << "\n      \"device_timestamp_unit\": \"syscnt_cycles\",";
@@ -1101,121 +1214,70 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // of swimlane_converter.py's v2 reader.
     //
     //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
-    //   aicpu_tasks:  [core_id, reg_task_id, dispatch_cycles, finish_cycles]
+    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
         // collecting from the device side, so no defensive filter here.
-        outfile << "  \"aicore_tasks\": [";
-        bool first = true;
-        size_t total = 0;
-        for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
-            for (const auto &r : collected_aicore_records_[core_idx]) {
-                if (!first) outfile << ",";
-                outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                        << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
-                first = false;
-                total++;
-            }
-        }
-        if (!first) outfile << "\n  ";
-        outfile << "]";
-        LOG_INFO("  aicore_tasks: %zu records", total);
-    }
-    {
-        outfile << ",\n  \"aicpu_tasks\": [";
-        bool first = true;
-        size_t total = 0;
-        for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
-            for (const auto &r : collected_perf_records_[core_idx]) {
-                if (!first) outfile << ",";
-                outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
-                        << r.finish_time << "]";
-                first = false;
-                total++;
-            }
-        }
-        if (!first) outfile << "\n  ";
-        outfile << "]";
-        LOG_INFO("  aicpu_tasks: %zu records", total);
-    }
-
-    // Phase records keep their per-thread sub-array shape so the python
-    // consumer's existing iteration pattern (one thread per inner list) stays
-    // unchanged; only the field names move from *_us to *_cycles.
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
-        auto sched_phase_name = [](ChipSwimlaneSchedPhaseKind kind) -> const char * {
-            switch (kind) {
-            case ChipSwimlaneSchedPhaseKind::Complete:
-                return "complete";
-            case ChipSwimlaneSchedPhaseKind::Dispatch:
-                return "dispatch";
-            case ChipSwimlaneSchedPhaseKind::Release:
-                return "release";
-            case ChipSwimlaneSchedPhaseKind::Dummy:
-                return "dummy";
-            case ChipSwimlaneSchedPhaseKind::EarlyDispatch:
-                return "early_dispatch";
-            case ChipSwimlaneSchedPhaseKind::Resolve:
-                return "resolve";
-            case ChipSwimlaneSchedPhaseKind::ResolveStandalone:
-                return "resolve_standalone";
-            case ChipSwimlaneSchedPhaseKind::DummyTask:
-                return "dummy_task";
-            case ChipSwimlaneSchedPhaseKind::PredicatedSkip:
-                return "predicated_skip";
-            case ChipSwimlaneSchedPhaseKind::Drain:
-                return "drain";
-            case ChipSwimlaneSchedPhaseKind::DrainPrepare:
-                return "drain_prepare";
-            case ChipSwimlaneSchedPhaseKind::DrainPublish:
-                return "drain_publish";
-            case ChipSwimlaneSchedPhaseKind::AsyncPoll:
-                return "async_poll";
-            case ChipSwimlaneSchedPhaseKind::GraphPrepare:
-                return "graph_prepare";
-            }
-            return "unknown";
-        };
-
-        auto emit_depth_array = [&outfile](const char *key, const int16_t arr[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
-            outfile << ", \"" << key << "\": [" << arr[0] << "," << arr[1] << "," << arr[2] << "]";
-        };
-        outfile << ",\n  \"aicpu_scheduler_phases\": [\n";
-        for (size_t t = 0; t < collected_sched_phase_records_.size(); t++) {
-            outfile << "    [";
+        outfile << "  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::AicoreTasks) << "\": ";
+        if (aicore_tasks_extension != nullptr) {
+            outfile << *aicore_tasks_extension;
+        } else {
+            outfile << "[";
             bool first = true;
-            for (const auto &pr : collected_sched_phase_records_[t]) {
-                if (!first) outfile << ",";
-                outfile << "\n      {\"kind\": \"" << sched_phase_name(pr.kind) << "\""
-                        << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
-                        << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed;
-                if (pr.kind == ChipSwimlaneSchedPhaseKind::Dispatch) {
-                    outfile << ", \"pop_hit\": " << pr.phase_data.dispatch.pop_hit
-                            << ", \"pop_miss\": " << pr.phase_data.dispatch.pop_miss;
+            size_t total = 0;
+            for (size_t core_idx = 0; core_idx < collected_aicore_records_.size(); core_idx++) {
+                for (const auto &r : collected_aicore_records_[core_idx]) {
+                    if (!first) outfile << ",";
+                    outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
+                            << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
+                    first = false;
+                    total++;
                 }
-                if (pr.kind == ChipSwimlaneSchedPhaseKind::DummyTask ||
-                    pr.kind == ChipSwimlaneSchedPhaseKind::PredicatedSkip) {
-                    uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.dummy_task.ring_id) << 32) |
-                                       pr.phase_data.dummy_task.local_id;
-                    outfile << ", \"task_id\": " << task_id;
+            }
+            if (!first) outfile << "\n  ";
+            outfile << "]";
+            LOG_INFO("  aicore_tasks: %zu records", total);
+        }
+    }
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+        outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks)
+                << "\": ";
+        if (scheduler_tasks_extension != nullptr) {
+            outfile << *scheduler_tasks_extension;
+        } else {
+            outfile << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicpu\",\n    \"records\": [";
+            bool first = true;
+            size_t total = 0;
+            for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
+                for (const auto &r : collected_perf_records_[core_idx]) {
+                    if (!first) outfile << ",";
+                    outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
+                            << r.finish_time << "]";
+                    first = false;
+                    total++;
                 }
-                if (pr.kind == ChipSwimlaneSchedPhaseKind::GraphPrepare) {
-                    uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.graph_task.ring_id) << 32) |
-                                       pr.phase_data.graph_task.local_id;
-                    outfile << ", \"task_id\": " << task_id;
-                }
-                // Queue-depth snapshots — [AIC, AIV, MIX] per ChipSwimlaneAicpuSchedPhaseRecord docstring.
-                emit_depth_array("shared_at_start", pr.shared_depth_at_start);
-                emit_depth_array("shared_at_end", pr.shared_depth_at_end);
-                outfile << "}";
-                first = false;
             }
             if (!first) outfile << "\n    ";
-            outfile << "]";
-            if (t < collected_sched_phase_records_.size() - 1) outfile << ",";
-            outfile << "\n";
+            outfile << "]\n  }";
+            LOG_INFO("  scheduler_tasks: %zu AICPU records", total);
         }
-        outfile << "  ]";
+    }
+
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+        outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerRecords)
+                << "\": ";
+        if (scheduler_extension != nullptr) {
+            outfile << *scheduler_extension;
+        } else {
+            std::vector<uint32_t> dropped_records(collected_sched_phase_records_.size());
+            for (size_t t = 0; t < collected_sched_phase_records_.size(); ++t) {
+                const auto *pool = get_sched_phase_buffer_state(shm_host_, static_cast<int>(t));
+                dropped_records[t] = pool->head.dropped_record_count;
+            }
+            chip_swimlane_write_scheduler_records(
+                outfile, collected_sched_phase_records_, dropped_records, SIMPLER_RUNTIME_NAME
+            );
+        }
 
         if (has_aicpu_orch_phases) {
             size_t orch_lanes = static_cast<size_t>(get_chip_swimlane_header(shm_host_)->num_orch_phase_threads);
@@ -1264,6 +1326,12 @@ int ChipSwimlaneCollector::export_swimlane_json() {
             if (!first) outfile << "\n    ";
             outfile << "]";
         }
+    }
+
+    if (aicpu_lifecycle_extension != nullptr) {
+        outfile << ",\n  \""
+                << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::AicpuLifecycleRecords)
+                << "\": " << *aicpu_lifecycle_extension;
     }
 
     outfile << "\n}\n";
@@ -1336,7 +1404,7 @@ int ChipSwimlaneCollector::finalize(
         state->head.current_buf_ptr = 0;
         drain_free_queue(state->free_queue);
 
-        ChipSwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(shm_host_, num_aicore_, i);
+        ChipSwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(shm_host_, i);
         release_one_buffer(reinterpret_cast<void *>(ac_state->head.current_buf_ptr), unregister_cb, free_cb);
         ac_state->head.current_buf_ptr = 0;
         drain_free_queue(ac_state->free_queue);
@@ -1362,10 +1430,10 @@ int ChipSwimlaneCollector::finalize(
     };
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
     for (int t = 0; t < num_phase_threads; t++) {
-        release_phase_pool(get_sched_phase_buffer_state(shm_host_, num_aicore_, t));
+        release_phase_pool(get_sched_phase_buffer_state(shm_host_, t));
     }
     for (int t = 0; t < num_phase_threads; t++) {
-        release_phase_pool(get_orch_phase_buffer_state(shm_host_, num_aicore_, t));
+        release_phase_pool(get_orch_phase_buffer_state(shm_host_, t));
     }
 
     // Main shm: unregister + free as a pair, same as every other buffer.
@@ -1412,6 +1480,7 @@ int ChipSwimlaneCollector::finalize(
     host_phase_total_records_ = 0;
     host_phase_dropped_records_ = 0;
     host_phase_submitted_tasks_ = 0;
+    json_extensions_.fill({});
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");

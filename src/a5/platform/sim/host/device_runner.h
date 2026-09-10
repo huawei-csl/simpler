@@ -43,8 +43,11 @@ public:
     int drain_execution(ActiveExecution &active) override;
     int finalize() override;
     // a5 dep_gen enablement setter, overriding the base no-op (the c_api
-    // unconditionally calls it).
-    void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
+    // unconditionally calls it). Also arms the loaded runtime's host-side graph
+    // capture, which a host-orch runtime uses instead of the device collector.
+    // Defined in the .cpp so this header stays free of the runtime-provided
+    // capture symbols.
+    void set_dep_gen_enabled(bool enable) override;
 
 private:
     struct ActiveRun;
@@ -54,8 +57,12 @@ private:
     void unload_executor_binaries();
     void cleanup_active_run() noexcept;
 
-    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
-    int init_args_dump(Runtime &runtime, int device_id);
+    int init_chip_swimlane(
+        int num_aicore, int aicpu_thread_num, int device_id, const std::string &output_prefix,
+        ChipSwimlaneLevel chip_swimlane_level
+    );
+    int
+    init_args_dump(Runtime &runtime, int device_id, const std::string &output_prefix, DumpArgsLevel dump_args_level);
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads);
     int init_dep_gen(int num_threads, int device_id);
@@ -63,6 +70,12 @@ private:
     // Per-run collector teardown: stop + release shm so a session-scoped Worker
     // can re-init collectors on the next enqueue. Matches a2a3 sim.
     void finalize_collectors();
+
+    // a5 publishes runtime-derived swimlane metadata that the other arches do
+    // not have; the base calls this between the host-phase handoff and the
+    // export, the only point where the collector holds this run's records and
+    // has not yet serialized them.
+    void publish_chip_swimlane_runtime_extensions() override;
 
     // a5 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().

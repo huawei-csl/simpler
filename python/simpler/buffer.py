@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import ctypes
 import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any
@@ -115,14 +115,6 @@ BufferDescriptor.owner_worker_path = property(
 )
 
 
-def _row_major_strides(shapes: tuple[int, ...]) -> tuple[int, ...]:
-    """Contiguous (row-major) element strides for ``shapes``: strides[i] = prod(shapes[i+1:])."""
-    strides = [1] * len(shapes)
-    for i in range(len(shapes) - 2, -1, -1):
-        strides[i] = strides[i + 1] * shapes[i + 1]
-    return tuple(strides)
-
-
 def mint_owner_instance_id() -> bytes:
     """A fresh opaque nonce, unique per owner incarnation (defends identity against ABA).
 
@@ -165,11 +157,26 @@ class Buffer:
     # which is the derivation gate — a close() whose unlink raised leaves this false so a retry
     # attempts the unlink again.
     unlinked: bool = False
+    # Set only on a Buffer whose descriptor fields are final for the rest of its life — the private
+    # snapshot `Worker._record_device_alloc` registers. `init=False` keeps `replace()` from carrying
+    # it onto a copy, so a handle a caller still holds derives a fresh descriptor on every call and
+    # a field it changes stays visible to the provenance comparison that rejects it.
+    _descriptor: BufferDescriptor | None = field(default=None, init=False, compare=False, repr=False)
+
+    def freeze_descriptor(self) -> None:
+        """Derive the descriptor once and answer every later `to_descriptor()` from it.
+
+        Valid only on a Buffer no other reference can reach: a field changed afterwards would not
+        reach the descriptor.
+        """
+        self._descriptor = self.to_descriptor()
 
     def to_descriptor(self) -> BufferDescriptor:
         """The wire descriptor for this backing — what a consumer needs to resolve it."""
         if self.closed:
             raise ValueError(f"Buffer: cannot derive a descriptor from a released buffer ({self.identity})")
+        if self._descriptor is not None:
+            return self._descriptor
         return BufferDescriptor(
             identity=self.identity,
             address_space=self.address_space,
@@ -182,27 +189,20 @@ class Buffer:
 
     def tensor(
         self,
-        shapes: tuple[int, ...],
+        shapes: Iterable[int],
         dtype: int | DataType,
-        strides: tuple[int, ...] | None = None,
+        strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
         """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
 
+        ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
         ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
         ``dtype`` accepts a ``DataType`` enum or its int value.
         """
-        shapes = tuple(shapes)
-        strides = _row_major_strides(shapes) if strides is None else tuple(strides)
-        return Tensor(
-            buffer=self.to_descriptor(),
-            byte_offset=byte_offset,
-            shapes=shapes,
-            strides=strides,
-            dtype=dtype,
-        )
+        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than
@@ -333,14 +333,7 @@ def remote_sidecar_tensor(
         nbytes=nbytes,
         body=b"",
     )
-    shapes = tuple(shapes)
-    return Tensor(
-        buffer=descriptor,
-        byte_offset=byte_offset,
-        shapes=shapes,
-        strides=_row_major_strides(shapes),
-        dtype=int(dtype),
-    )
+    return descriptor.tensor(shapes, int(dtype), None, byte_offset)
 
 
 def wrap_fork_inherited(

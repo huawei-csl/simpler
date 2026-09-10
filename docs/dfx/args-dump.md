@@ -96,7 +96,7 @@ pytest tests/st/<case> --platform a5sim --dump-args 2
 # a5 host_build_graph has no examples — use the scene test
 pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args 2
 pytest tests/st/<case> --platform a2a3sim --dump-args 2
-pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim --dump-args 2
+pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args 2
 ```
 
 The level sets `CallConfig::enable_dump_args` (0/1/2/3). The host then
@@ -611,11 +611,12 @@ the fields host modified (advanced `queue_heads[q]`, refilled
 `DumpMetaBuffer` is pulled inside `ProfilerAlgorithms::process_entry`.
 The per-thread arena lives outside the shm region, so
 `on_buffer_collected` separately refreshes `arena_write_offset` and
-copies the arena bytes. The freeze-release predicate refreshes each
-thread's `published_payload_count` and compares it with that thread's writer
-completion count. Once every thread's counts match, Host writes each published
-watermark back as `completed_payload_count`; AICPU requires this acknowledgement
-before reusing that thread's arena.
+copies the arena bytes. The arena-ack pass refreshes each thread's
+`published_payload_count` and compares it with that thread's writer completion
+count. For each thread whose counts match, Host writes that published watermark
+back as `completed_payload_count`; AICPU requires this acknowledgement before
+reusing that thread's arena. The comparison and the write-back are both
+per-thread, so one lane's outstanding payload never holds up another's arena.
 
 ```text
         HOST                                         DEVICE
@@ -773,26 +774,28 @@ contiguous), enough for statistical sampling.
 proportionally) so the arena is at least as large as the biggest
 tensor you need to inspect.
 
-### 7.2 Arena payload freeze release
+### 7.2 Arena payload acknowledgement
 
 `arena_write_offset` remains monotonic and physical writes use `% arena_size`.
 Before reserving an offset or copying payload bytes, AICPU checks whether the
 arena is already one full physical cycle deep or whether the new payload would
-cross the physical end. If so, it seals/publishes the current metadata buffer
-and raises `fq_contended`; the host then opens, drains, and releases the existing
-freeze cycle.
+cross the physical end. If so, it seals and publishes the current metadata
+buffer, then waits for the host to acknowledge the payloads it has published.
 
-At each existing RQ publish point, AICPU counts the non-empty tensor payload
-records in that metadata buffer. The host's single writer increments the
-originating thread's completion count only after `args.bin` accepts a payload.
-`backpressure_release_ready()` therefore holds an existing queue freeze until
-each thread's written count equals its published count. The common framework
-still independently requires all RQs drained and FQs refilled. Host then
-acknowledges each completed per-thread watermark. The triggering thread requires
-that acknowledgement, even if the common queue freeze has already released,
-before aligning its monotonic logical offset to the next physical arena boundary
-and writing the pending payload from the arena start.
-The cursor is never reset and no reclaimed/published arena offset is needed.
+At each RQ publish point, AICPU counts the non-empty tensor payload records in
+that metadata buffer and adds them to that thread's `published_payload_count`.
+The host's single writer increments the originating thread's completion count
+only after `args.bin` accepts a payload, and `publish_arena_acks()` — run once
+per replenish tick — writes that watermark back as the thread's
+`completed_payload_count`. The waiting thread proceeds once its own
+`completed_payload_count` reaches the value it published, then aligns its
+monotonic logical offset to the next physical arena boundary and writes the
+pending payload from the arena start.
+
+Every quantity here is per-thread: each AICPU thread owns its own arena, so
+thread *t* may wrap as soon as thread *t*'s own payloads are on disk. The cursor
+is never reset and no reclaimed/published arena offset is needed. The wait is
+bounded by the 30-second host-crash backstop; on expiry the record is dropped.
 
 ### 7.3 Record discard (`dropped_record_count` / `dropped_records`)
 
@@ -807,11 +810,10 @@ fills (256 records), AICPU tries to:
    host mgmt thread to pick up).
 2. Pop a fresh buffer from the free queue.
 
-If the ready queue is full or the free queue is empty, AICPU raises
-the corresponding DFX contention signal and waits at the existing
-bounded freeze gate while the host drains/refills the queues. If the
-host-crash timeout expires, the current records are accounted as
-dropped.
+If the ready queue is full or the free queue is empty, AICPU spins at
+that buffer-switch gate while the host drains or refills *that thread's*
+queue — no other lane is involved. If the host-crash timeout expires,
+the current records are accounted as dropped.
 
 ```text
 // Reuse current buffer — account for lost records
@@ -836,8 +838,8 @@ host hand-off queue).
 | Condition | Flag | Metadata | Payload | a2a3 | a5 |
 | --------- | ---- | -------- | ------- | ---- | -- |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
-| Arena host writer falls behind | none on success | Preserved | Preserved after bounded freeze | Same | Same |
-| Record buffer full, no free buffer | `dropped_records` summary | Lost | Lost | After freeze timeout | Same |
+| Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
+| Record buffer full, no free buffer | `dropped_records` summary | Lost | Lost | After gate timeout | Same |
 
 ### 7.5 Configuration knobs
 
@@ -914,7 +916,7 @@ on the timeout ordering — the three budgets are tuned so the **AICPU detects t
 hang first**, dumps, and only then the hardware/host timeouts fire:
 
 ```text
-SCHEDULER_TIMEOUT_MS (10 s, onboard)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (50 s)
+SCHEDULER_TIMEOUT_MS (20 s)           <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (50 s)
    AICPU declares hang,                   STARS reaps the AICore op              host stream sync gives up
    flushes + dumps in-flight              and poisons the context                and surfaces the error
 ```
@@ -936,7 +938,7 @@ the no-progress budget without onboard-only ordering limits. CI restores the
 old fast-fail values through these env vars: 2 s scheduler, 3 s op-execute,
 and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
 
-- **Device-side graceful flush (primary).** At 10 s of no progress
+- **Device-side graceful flush (primary).** At 20 s of no progress
   the AICPU declares the hang, runs the end-of-loop flush, *and*
   dumps the **partial output** of every task still RUNNING on a core
   — written at the `after_completion` stage, reflecting current GM,
@@ -963,9 +965,9 @@ This ordering is load-bearing: if the timeouts were inverted (STARS
 reaping before the AICPU's budget, as in earlier versions), the
 device-side dump would never run on a real AICore hang and you would
 only recover what was already in the buffer. The chain lives in
-`spin_hint.h` (`PLATFORM_SCHEDULER_TIMEOUT_MS`, surfaced as
-`SCHEDULER_TIMEOUT_MS` — 10 s for onboard and sim defaults) and
-`platform_config.h` (`PLATFORM_OP_EXECUTE_TIMEOUT_US` /
+`platform_config.h`, which holds all three (`PLATFORM_SCHEDULER_TIMEOUT_MS`,
+surfaced as `SCHEDULER_TIMEOUT_MS` — 20 s, one value for onboard and sim,
+`PLATFORM_OP_EXECUTE_TIMEOUT_US` /
 `PLATFORM_STREAM_SYNC_TIMEOUT_MS`). The env overrides use those constants as
 their unset fallback and keep the `#897` distributed-skew trade-off.
 

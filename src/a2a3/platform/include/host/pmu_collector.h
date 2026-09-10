@@ -216,10 +216,25 @@ public:
      * @param device_id                    Device ID (for register_cb)
      * @return 0 on success, non-zero on failure
      */
+    // Allocates the device-side resources.
+    //
+    // Per-run configuration (CSV destination, event selection) is bound
+    // separately by begin_run(), which must run before this on the first run so
+    // the event type reaches the device header and the CSV header string.
     int init(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type,
-        const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
+        int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
+        const PmuFreeCallback &free_cb, int device_id
     );
+
+    // Start a run's collection window: bind its CSV destination and event
+    // selection, drop the previous run's shard state, rebuild the CSV header
+    // (its columns are named by the event config), and — once the region exists
+    // — republish the event type the device reads.
+    //
+    // The collector initializes once and serves every run, so this is the only
+    // point at which a run's shard files, CSV columns and device event type are
+    // established; init() establishes none of them.
+    void begin_run(const std::string &csv_path, PmuEventType event_type);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -308,6 +323,7 @@ private:
     bool ensure_csv_shard_open(size_t shard);
     bool ensure_csv_open();
     bool close_csv_shards();
+    void rebuild_csv_header();
     void cleanup_csv_shards();
 };
 

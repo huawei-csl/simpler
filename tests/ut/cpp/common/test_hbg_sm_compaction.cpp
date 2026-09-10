@@ -26,7 +26,7 @@
 
 #include "graph_execution.h"
 #include "host_build_graph/shared_memory.h"
-#include "host_build_graph/task_id_encoding.h"
+#include "host_build_graph/task_id.h"
 
 namespace {
 
@@ -74,18 +74,17 @@ public:
         const auto off = sm_layout::segment_offsets(WINDOW);
         auto *header = reinterpret_cast<SharedMemoryHeader *>(image_.base());
         auto &tasks = header->tasks;
-        tasks.completed_watermark.store(-1, std::memory_order_relaxed);
         tasks.total_tasks = static_cast<int32_t>(SUBMITTED);
         storage_ = reinterpret_cast<ChipTaskStorage *>(image_.base() + off.storage);
         tasks.task_storage = storage_;
-        tasks.completion_flags = completion_flags();
+        tasks.task_states = task_states();
 
         // Each live slot takes a packed region in each pool, exactly as the
         // orchestrator's bump cursors hand them out, and gets content that identifies
         // the slot so the compaction can be checked element by element.
         for (uint64_t i = 0; i < SUBMITTED; ++i) {
             ChipTaskStorage &entry = storage_[i];
-            entry.task.task_id = simpler::hbg::make_global_task(static_cast<uint32_t>(i));
+            entry.task.task_id = TaskId::make_global(static_cast<int32_t>(i));
             entry.payload.tensor_count = TENSORS_PER_TASK;
             entry.payload.scalar_count = SCALARS_PER_TASK;
             entry.payload.fanin_count = FANIN_PER_TASK;
@@ -102,12 +101,11 @@ public:
             for (int32_t j = 0; j < FANIN_PER_TASK; ++j) {
                 entry.payload.fanin_data()[j] = static_cast<int32_t>(0x50 + i * 0x10 + j);
             }
-            entry.slot.last_consumer_local_id = static_cast<int32_t>(i);
-            entry.slot.in_graph_task_index = static_cast<int32_t>(200 + i);
-            completion_flags()[i].store(static_cast<uint8_t>(i & 1), std::memory_order_relaxed);
+            entry.slot.in_graph_local_id = static_cast<int32_t>(200 + i);
+            task_states()[i].store(i & 1 ? CHIP_TASK_COMPLETED : CHIP_TASK_PENDING, std::memory_order_relaxed);
         }
         // A slot past the submitted prefix, to prove it does not travel.
-        storage_[SUBMITTED].task.task_id = simpler::hbg::make_global_task(0xBEEF);
+        storage_[SUBMITTED].task.task_id = TaskId::make_global(0xBEEF);
     }
 
     // Overwrite the three fields that can hold a graph-heap address with ones out
@@ -145,9 +143,9 @@ public:
     int32_t *fanin_pool() {
         return reinterpret_cast<int32_t *>(image_.base() + sm_layout::segment_offsets(WINDOW).fanin_pool);
     }
-    std::atomic<uint8_t> *completion_flags() {
-        return reinterpret_cast<std::atomic<uint8_t> *>(
-            image_.base() + sm_layout::segment_offsets(WINDOW).completion_flags
+    std::atomic<ChipTaskState> *task_states() {
+        return reinterpret_cast<std::atomic<ChipTaskState> *>(
+            image_.base() + sm_layout::segment_offsets(WINDOW).task_states
         );
     }
 
@@ -197,8 +195,8 @@ struct Compacted {
     simpler::hbg::Tensor *tensor_pool() {
         return reinterpret_cast<simpler::hbg::Tensor *>(image.base() + off().tensor_pool);
     }
-    std::atomic<uint8_t> *completion_flags() {
-        return reinterpret_cast<std::atomic<uint8_t> *>(image.base() + off().completion_flags);
+    std::atomic<ChipTaskState> *task_states() {
+        return reinterpret_cast<std::atomic<ChipTaskState> *>(image.base() + off().task_states);
     }
 };
 
@@ -220,19 +218,17 @@ TEST(HbgSmCompaction, CarriesEveryLiveSlotsContent) {
 
     for (uint64_t i = 0; i < SUBMITTED; ++i) {
         const ChipTaskStorage &entry = compacted.storage[i];
-        EXPECT_EQ(simpler::hbg::task_local_id(entry.task.task_id), i) << "slot " << i;
+        EXPECT_EQ(entry.task.task_id.local_id(), static_cast<int32_t>(i)) << "slot " << i;
         EXPECT_EQ(entry.payload.tensor_count, TENSORS_PER_TASK) << "slot " << i;
         EXPECT_EQ(entry.payload.tensor_data()[0].buffer.addr, 0x1000 + i * 0x10) << "slot " << i;
-        EXPECT_EQ(entry.slot.last_consumer_local_id, static_cast<int32_t>(i)) << "slot " << i;
-        EXPECT_EQ(entry.slot.in_graph_task_index, static_cast<int32_t>(200 + i)) << "slot " << i;
-        EXPECT_EQ(compacted.completion_flags()[i].load(std::memory_order_relaxed), static_cast<uint8_t>(i & 1))
-            << "slot " << i;
+        EXPECT_EQ(entry.slot.in_graph_local_id, static_cast<int32_t>(200 + i)) << "slot " << i;
+        const ChipTaskState expected_state = i & 1 ? CHIP_TASK_COMPLETED : CHIP_TASK_PENDING;
+        EXPECT_EQ(compacted.task_states()[i].load(std::memory_order_relaxed), expected_state) << "slot " << i;
     }
     // The header's pitch-independent fields come across; the mirror slot past the
     // prefix does not.
     auto &tasks = reinterpret_cast<const SharedMemoryHeader *>(compacted.image.base())->tasks;
-    EXPECT_EQ(tasks.completed_watermark.load(std::memory_order_relaxed), -1);
-    // The device bounds its completed_watermark walk with this, and the restack is
+    // The device bounds its slot walks with this, and the restack is
     // the only thing that carries it there.
     EXPECT_EQ(tasks.total_tasks, static_cast<int32_t>(SUBMITTED));
 }
@@ -280,7 +276,7 @@ TEST(HbgSmCompaction, LeavesNoHostPointerInTheHeader) {
 
     auto &tasks = reinterpret_cast<const SharedMemoryHeader *>(compacted.image.base())->tasks;
     EXPECT_EQ(tasks.task_storage, nullptr);
-    EXPECT_EQ(tasks.completion_flags, nullptr);
+    EXPECT_EQ(tasks.task_states, nullptr);
 }
 
 // A bind that submits nothing still ships its header and still attaches. Its pools
@@ -426,10 +422,10 @@ TEST(HbgSmCompaction, SegmentLayoutHoldsForANonPowerOfTwoCapacity) {
         // The storage sits right after the padded header, whatever the pitch.
         EXPECT_EQ(off.storage, CHIP_ALIGN_UP(sizeof(SharedMemoryHeader), CHIP_ALIGN_SIZE)) << "capacity " << capacity;
 
-        const uint64_t starts[] = {off.storage,     off.completion_flags, off.fanin_pool,
-                                   off.tensor_pool, off.scalar_pool,      off.end};
+        const uint64_t starts[] = {off.storage,     off.task_states, off.fanin_pool,
+                                   off.tensor_pool, off.scalar_pool, off.end};
         const uint64_t spans[] = {
-            capacity * sizeof(ChipTaskStorage), capacity * sizeof(std::atomic<uint8_t>),
+            capacity * sizeof(ChipTaskStorage), capacity * sizeof(std::atomic<ChipTaskState>),
             e.fanin_elems * sizeof(int32_t),    e.tensor_elems * sizeof(simpler::hbg::Tensor),
             e.scalar_elems * sizeof(uint64_t),
         };

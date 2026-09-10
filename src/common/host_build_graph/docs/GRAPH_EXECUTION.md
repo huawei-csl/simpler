@@ -328,6 +328,14 @@ Definition. It contains:
 - in-graph task order and AIC/AIV/MIX/SPMD kernel metadata;
 - `root_indices` plus both directions of the immutable topology:
   fanin CSR and fanout CSR;
+- each in-graph task's early-dispatch verdicts (`ED_FLAG_CANDIDATE` when every
+  producer allows early resolve and the task itself carries no predicate, a
+  dispatchable shape and at least one internal producer; `ED_FLAG_TRACKED` when
+  some candidate names it as a producer). A candidate's fanin CSR row is stored
+  sorted by producer index, so its tail names its deepest producer; every other
+  row keeps record order. `bind_graph_topology` validates these flags but
+  nothing propagates them to a task slot, so they steer no dispatch yet — the
+  sorted row is the only part of the verdict the device acts on;
 - one packed-heap offset per in-graph task;
 - each in-graph task's ChipTensor source:
   `BOUNDARY_EXACT`, `BOUNDARY_VIEW`, `INTERNAL`, or `OWN_OUTPUT`;
@@ -399,7 +407,7 @@ In-graph task storage remains untouched until bounded materialization begins.
 Host orchestration builds the complete task image before device execution. At
 the end of orchestration, the Host copies one bind image containing the
 compacted shared-memory task window and argument pools, then launches the
-resident Scheduler. Slot task and payload references remain self-relative;
+Scheduler. Slot task and payload references remain self-relative;
 `graph_context` is the absolute address of the retained Definition object until
 initial classification localizes the execution in the outer heap.
 
@@ -435,13 +443,19 @@ dependency wiring remains an Orchestrator responsibility:
   resolving its Tensor addresses against the boundary image and its producers'
   packed windows;
 - materialization registers each non-root on one producer selected from its
-  saved fanin CSR;
-- an in-graph task's release/acquire `task_state` is its Graph-local completion flag, so
-  such tasks need neither shared-memory completion flags nor task-table slots;
+  saved fanin CSR, scanning the row from its tail so the bet lands on the
+  producer likeliest to complete last. A row holds the consumer's deduplicated
+  operand order, so the tail is exactly the deepest producer only on an
+  early-dispatch candidate's row, which recording sorts by producer index;
+  elsewhere the direction is a heuristic;
+- an in-graph task's release/acquire `task_state` is its Graph-local completion truth, so
+  such tasks need neither a shared-memory `task_states` byte nor a task-table slot;
 - producer completion closes and drains only its current wake-list rather than
   traversing the saved fanout CSR;
-- a woken consumer scans its saved fanin CSR and either enters its shape queue
-  or registers on the next incomplete producer;
+- a woken consumer with a single producer enters its shape queue directly; any
+  other rescans its saved fanin CSR from its wake-scan cursor and either enters
+  that queue or registers on the deepest incomplete producer. Completion is
+  monotonic, so rows above the cursor stay complete and are never re-walked;
 - `WAKE_LIST_SENTINEL` closes the completion/registration race: a failed
   registration observes completion and immediately rescans.
 
@@ -461,7 +475,7 @@ outer GRAPH
 ```
 
 In-graph tasks count as zero tasks of the run itself. The last one to complete
-finishes the one outer Graph task, publishes that task's completion flag, wakes
+finishes the one outer Graph task, publishes that task's `task_states` byte, wakes
 external consumers, and contributes one to the host-visible completion count.
 
 Localization or materialization failure is fail-fast: the Scheduler latches an

@@ -8,8 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef SCHEDULER_CONTEXT_H
-#define SCHEDULER_CONTEXT_H
+#pragma once
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -103,10 +102,10 @@ public:
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
-    // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
-    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
-    int32_t shutdown(int32_t thread_idx);
+    // Retire the cores this thread owns, on its way out of resolve_and_dispatch.
+    // Orchestrator threads own none and no-op. Runs before the completion
+    // latch, so no run() exit path can leave a worker blocked on its gate.
+    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -180,6 +179,10 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
+    // Per-core retirement claim. The winner owns that core's register window
+    // and return gate for the rest of the run; every other path leaves both
+    // alone. Indexed by core id, reset in pre_handshake_init.
+    std::atomic<bool> core_retired_[PLATFORM_MAX_CORES];
     uint64_t *func_id_to_addr_{nullptr};
 
     // --- Thread/core configuration ---
@@ -225,6 +228,10 @@ private:
     // exit to every handshake'd core. Idempotent.
     bool begin_emergency_shutdown();
     void signal_emergency_shutdown(Runtime *runtime);
+    // Claim and retire the named cores. Cores already claimed elsewhere are
+    // skipped, so callers may name overlapping sets.
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    int32_t retire_all_cores(Runtime *runtime);
     void emergency_shutdown(Runtime *runtime);
 
     // =========================================================================
@@ -264,7 +271,7 @@ private:
     //
     // dispatch_timestamp_slot points to the CoreExecState slot
     // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
-    // prepare time, or nullptr when chip swimlane is below AICPU_TIMING and no
+    // prepare time, or nullptr when chip swimlane is below SCHEDULE_TIMING and no
     // dispatch timestamp is being recorded.
     struct PublishHandle {
         uint64_t reg_addr;
@@ -552,5 +559,3 @@ private:
         return func_id_to_addr_[func_id];
     }
 };
-
-#endif  // SCHEDULER_CONTEXT_H

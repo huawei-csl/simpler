@@ -14,10 +14,11 @@ no repo checkout required.
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `chip.run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
-- **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage phases from `bind phase=` log markers → per-phase min/median/max plus the control-plane total
-- **[phase_time_split](#phase_time_split)** — the same `bind phase=` markers split into on-CPU and off-CPU per phase, from per-thread CPU clocks, with cold and warm binds reported separately
+- **[hbg_bind_phases](#hbg_bind_phases)** — `host_build_graph` `bind`-stage segments from the `chip.run.bind.*` spans → per-segment min/median/max plus the control-plane total
+- **[phase_time_split](#phase_time_split)** — the same segment spans split into on-CPU and off-CPU per segment, from per-thread CPU clocks, with cold and warm binds reported separately
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
+- **[wait_reduction_sim](#wait_reduction_sim)** — `deps.json` (dep_gen) → bounded-bitmap WAIT reduction coverage vs the full-DAG upper bound, per BL
 
 For CLIs that allow an omitted input, auto-detection paths
 (`outputs/*/chip_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
@@ -156,7 +157,33 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimla
 # Reuse a deps.json captured in an earlier dep_gen run (different output dir)
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json \
     --deps-json outputs/<case>_<earlier_ts>/deps.json
+
+# Merge one same-host L3 dispatch laid out as rankN/d0/chip_swimlane_records.json
+python -m simpler_setup.tools.swimlane_converter build_output/<case>/dfx_outputs \
+    --dispatch d0 -o build_output/<case>/dfx_outputs/l3_swimlane.json
+
+# Merge one parent group dispatch even when its members use different dN paths
+python -m simpler_setup.tools.swimlane_converter build_output/<case>/dfx_outputs \
+    --dispatch-id 17:5 -o build_output/<case>/dfx_outputs/l3_swimlane.json
 ```
+
+Directory mode requires level-4 captures with successful Host/Device clock
+anchors and the same non-empty `metadata.host_clock_domain_id`. New captures
+derive that ID from the Linux boot ID; older captures remain supported in
+single-file mode. Every Rank loads its own sibling `deps.json` and unique
+`name_map*.json`, so the single-file override options are intentionally rejected
+in directory mode.
+
+L3 SceneTest runs create `rank<chip-worker>/d<local-capture>/` automatically and
+invoke this directory mode after the case. Each new capture also contains
+`dispatch_identity.json`. Members of one `submit_next_level_group` are paired by
+their common `(run_id, task_slot)` even if their local `dN` suffixes differ; the
+trace metadata records `dispatch_pairing: parent_dispatch_identity`. Old
+captures and individually submitted per-Rank tasks fall back to symmetric `dN`
+pairing and record `dispatch_pairing: local_capture_index`. A `dN` selector whose
+sidecars identify different parent groups is rejected instead of producing a
+plausible but incorrectly paired trace. This layout is scoped to one same-host
+L3 Worker; NETWORK1/L4 needs an additional node namespace.
 
 > Dependency arrows in the Perfetto trace come from `deps.json` (dep_gen
 > replay). The device hot path no longer records fanout, so the typical
@@ -196,13 +223,19 @@ SPMD tasks are present.
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
-| `input` | | Input JSON file (chip_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
-| `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
-| `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
-| `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping |
-| `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
+| `input` | | Input JSON file (chip_swimlane_records_*.json), **or** a `dfx_outputs` directory containing `rank*/dN/` for directory mode. If omitted, the latest file in outputs/ is used |
+| `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
+| `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
+| `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
+| `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
+| `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |
+| `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. Rejected in directory mode |
 | `--overhead` | | Add the 8-line Overhead Analysis counter group (needs `deps.json`). See [sched-overhead-model](../../docs/dfx/sched-overhead-model.md). |
 | `--verbose` | `-v` | Enable verbose output |
+
+Directory mode auto-loads each Rank's own sibling `name_map*.json` and
+`deps.json`, which is why the three global override options above are rejected
+there rather than silently applied to every Rank.
 
 ### Outputs
 
@@ -212,7 +245,8 @@ The tool produces three kinds of output:
 
 A Chrome Trace Event format JSON file that can be visualized in Perfetto:
 
-- File location: `outputs/merged_swimlane_<timestamp>.json`
+- File location: `merged_swimlane.json` beside the input records file, or
+  `l3_swimlane.json` inside the input `dfx_outputs` directory
 - Open <https://ui.perfetto.dev/> and drag-and-drop the file to visualize
 
 #### 2. Task Statistics
@@ -239,30 +273,10 @@ accurately alongside the swimlane capture. Run
 [`sched_overhead_analysis`](#sched_overhead_analysis) manually with both
 artifacts to get the scheduler-starvation / critical-path report.
 
-### Integration with run_example.py
-
-When running a test with profiling enabled, the converter is invoked automatically:
-
-```bash
-# Run the test with profiling enabled - merged_swimlane.json is generated automatically after the test passes
-python examples/scripts/run_example.py \
-    -k examples/host_build_graph/vector_example/kernels \
-    -g examples/host_build_graph/vector_example/golden.py \
-    --enable-chip-swimlane
-```
-
-After the test passes, the tool will:
-
-1. Auto-detect the latest `chip_swimlane_records_*.json` in outputs/
-2. Load function names from the kernel_config.py specified via `-k`
-3. Produce `merged_swimlane_*.json` for visualization
-4. Print the task statistics and scheduler overhead deep-dive report to the console
-
----
-
 ## sched_overhead_analysis
 
-Answer **"is the AICPU scheduler the bottleneck, or is it starved?"** by
+Answer **"is the scheduler the bottleneck, or is it starved?"** for either an
+AICPU or AICore scheduler by
 measuring, dependency- and MIX-aware, how much of the makespan a free core has
 ready, undispatched work — vs. legitimately busy or dependency-limited. Full
 model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md).
@@ -272,9 +286,10 @@ model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md
 `sched_overhead_analysis` needs **two artifacts, captured in SEPARATE runs**
 (co-running the flags perturbs timing — `dep_gen` adds per-submit overhead):
 
-1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 3) from a
-   `--enable-chip-swimlane` run — per-task dispatch/start/end/finish +
-   `aicpu_scheduler_phases`.
+1. **Perf profiling data** (`chip_swimlane_records_*.json`, level >= 2) from a
+   `--enable-chip-swimlane` run — per-task dispatch/start/end/finish. Level >= 3
+   also supplies `scheduler_records` for the phase breakdown (legacy artifacts
+   with `aicpu_scheduler_phases` remain readable).
 2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
    drives `ready(C) = max(producer.end)`, which is what separates scheduler
    bubbles from dependency stalls. **Required** — the tool errors without it.
@@ -300,7 +315,7 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 
 | Option | Description |
 | ------ | ----------- |
-| `--chip-swimlane-records-json` | Path to the chip_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
+| `--chip-swimlane-records-json` | Path to the chip_swimlane_records_*.json file (level >= 2). If omitted, the latest under outputs/ is auto-selected. |
 | `--deps-json` | Path to deps.json from a `--enable-dep-gen` run. **Required.** Falls back to a `deps.json` sibling of the perf JSON if present. |
 
 ### Outputs
@@ -310,10 +325,11 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: AICPU scheduler loop breakdown** — per-thread loops, ns/loop, complete/dispatch/idle phase ratios, pop_hit / pop_miss, fanout / fanin, + the tail-vs-loop cause analysis.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its bootstrap/fanin/ready/dispatch/complete/refill/resolve/idle phase totals without applying AICPU-only queue formulas. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
-The perf JSON must be captured at chip_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-chip-swimlane` if the tool reports the field is missing).
+The common dependency-aware analysis works at chip_swimlane_level >= 2 for
+both scheduler producers. Capture level >= 3 when phase attribution is needed.
 
 ---
 
@@ -387,32 +403,35 @@ The swimlane is the only view that renders `ext.` spans: every table and
 
 ## hbg_bind_phases
 
-Per-phase statistics for `host_build_graph`'s **`bind` stage** from the
-`bind phase=` markers a run emits under `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1` at
-`LOG_TIMING`. One line per segment per bind pass; see
+Per-segment statistics for `host_build_graph`'s **`bind` stage** from the
+`chip.run.bind.<segment>` `[STRACE]` spans a run emits under
+`SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1`. One span per segment per bind; see
 [docs/dfx/hbg-bind-phases.md](../../docs/dfx/hbg-bind-phases.md) for
 what the segments are, the invocation that produces them, and how to compare two
 runs.
 
 ```bash
-# min / median / max per phase over the warm passes, plus the control-plane total
-python -m simpler_setup.tools.hbg_bind_phases path/to/log --rounds 6
+# min / median / max per segment over the warm binds, plus the control-plane total
+python -m simpler_setup.tools.hbg_bind_phases path/to/log
+python -m simpler_setup.tools.hbg_bind_phases outputs/<case>_<ts>/    # a directory of host.*.log
 ```
 
-Passing `--rounds` is what lets it infer the rank count, so it drops one cold
-warm-up pass **per rank** rather than one in total; `--ranks` sets that directly
-and `--keep-first` keeps the cold passes. A run whose every pass is a rank's
-warm-up — `--rounds 1` — is refused rather than reported, since the one number it
-could print is the cold one. Three grouping rules are encoded rather than left to
-the caller, because each silently produces a wrong number: `arena_h2d` closes a
-pass (the segments are not contiguous in time, so timestamp order does not group
-them), the control-plane total is summed **within** a pass before any minimum is
-taken, and the first pass of each rank is warm-up.
+**A bind is one `(pid, inv)`.** A span carries both, so grouping needs no rank
+count, no round count and no inference from emission order — concurrent ranks
+writing one stream separate by pid, and each bind by the run epoch its
+`chip.run.bind` allocated. `--keep-first` keeps the cold binds; by default the
+earliest bind of each pid is dropped as warm-up, which is exactly one per rank.
+A run whose every bind is a rank's warm-up is refused rather than reported, since
+the one number it could print is the cold one.
 
-A run whose control plane is missing a phase entirely — a change can retire one —
-is still totalled, over the phases it has, with the absent ones named. A phase
-missing from only *some* passes is a truncated log instead, and those passes are
-excluded with a warning. If the log's first line is a `[stamp]` line naming the
+Two rules stay encoded rather than left to the caller, because each silently
+produces a wrong number: the control-plane total is summed **within** a bind
+before any minimum is taken, and the first bind of each rank is warm-up.
+
+A run whose control plane is missing a segment entirely — a change can retire one
+— is still totalled, over the segments it has, with the absent ones named. A
+segment missing from only *some* binds means those binds lost records, and they
+are excluded with a warning. If the log's first line is a `[stamp]` line naming the
 command and commit, it is echoed above the table. Distinct
 `torch_backend_autoload` records are printed alongside it. Missing stamps or
 autoload records produce an explicit comparison warning.
@@ -421,7 +440,7 @@ autoload records produce an explicit comparison warning.
 
 ## phase_time_split
 
-The same `bind phase=` markers, read for a different question: was a segment
+The same segment spans, read for a different question: was a segment
 **running** or **waiting**? A duration cannot say, and the answer decides where to
 look next — an on-CPU segment is split further by its fault count and by the
 syscalls inside its window, while an off-CPU one is a wait, and `nvcsw` versus
@@ -631,6 +650,77 @@ python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump/ --index
 
 ---
 
+## wait_reduction_sim
+
+Measure how many redundant WAIT edges the `tensormap_and_ringbuffer`
+runtime's bounded reachability bitmap reduction would remove from a real
+dependency graph, against the exact full-DAG transitive reduction as the
+upper bound (issue #1376 acceptance #9). Decides the production bitmap
+window (BL) from data instead of guesswork.
+
+### Overview
+
+`wait_reduction_sim` reads the same `deps.json` the
+[`deps_viewer`](#deps_viewer) consumes (edges are as-constructed, i.e.
+pre-reduction, so one capture serves baseline and comparison alike). It
+reconstructs the global submission order from the `tasks[]` record order,
+OR-accumulates edge flags per `(pred, succ)` pair, and runs two models over
+the WAIT subgraph:
+
+- **Full reduction** — exact transitive reachability over the whole DAG:
+  the upper bound any reducer could reach.
+- **Online bitmap** — a faithful mirror of the runtime's
+  `reduce_wait_edges` (frozen per-task `R[t]`, two-pass `direct`/`via`
+  fold, `d > BL` window misses kept) at each requested window size.
+
+The report includes per-BL removal counts, `WAIT|RETAIN → RETAIN` demotions
+vs pure WAIT drops, window and cross-ring misses, and the producer→consumer
+submission-distance CDF. `DepGenRecord` does not preserve explicit
+dependency kinds yet (#1827), so removal counts are accurate while the report
+marks affected demote-vs-drop classifications as uncertain.
+
+> **`estimated_dep_pool_entries_removed` and
+> `estimated_readiness_fanout_nodes_removed` are edge-count upper bounds, not
+> runtime savings.** Both equal the removed-edge count, i.e. they assume one
+> removed edge frees one dependency-pool entry. On-device counting shows about
+> 90% of removed edges point at producers that are already
+> `CHIP_TASK_COMPLETED` when the consumer is wired; those take the
+> `completed_fanin` branch and never call `dep_pool.prepend`, so they free no
+> entry. On a DeepSeek-V4 decode step these two columns overstate the measured
+> saving by roughly 10x (990 of 19,114 entries actually saved, −5.2%). The
+> *edge* counts are sound — that step's pure-drop count matched the prediction
+> exactly and the total was within 6%. Full measurement in
+> [`docs/investigations/2026-09-wait-reduction-bitmap-window-sizing.md`](../../docs/investigations/2026-09-wait-reduction-bitmap-window-sizing.md).
+
+### Usage
+
+```bash
+# Capture once (dep_gen records pre-construction edges; see docs/dfx/dep-gen.md)
+pytest examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode --platform a5 --enable-dep-gen
+
+# Compare BL=64/128/256 (default) against the upper bound
+python -m simpler_setup.tools.wait_reduction_sim outputs/<case>_<ts>/deps.json
+
+# Machine-readable output, e.g. to diff two captures
+python -m simpler_setup.tools.wait_reduction_sim deps_a.json deps_b.json --json report.json
+```
+
+Reading the output: when `BL=64 removed ≈ upper_bound`, the single-word
+window already saturates the graph's redundancy and larger windows buy
+nothing; when the `pct_pairs_within_window` column is well below 100 for a
+BL, the graph has far-apart producer/consumer pairs that only a wider
+window could cover.
+
+A low `removed / upper_bound` ratio is **not** on its own a case for widening:
+check `cross_ring_misses` first. Qwen3-14B decode removes 1 of 40 redundant
+edges at BL=64 and the same 1 at BL=256, because 39 of its misses are
+cross-ring long edges that no window in this range reaches. Only
+`pct_pairs_within_window` being the binding constraint argues for a wider BL —
+see the [investigation entry](../../docs/investigations/2026-09-wait-reduction-bitmap-window-sizing.md)
+for the BL=64/128/256 comparison and why BL=64 is the shipped choice.
+
+---
+
 ## Shared Configuration
 
 ### Input File Format
@@ -675,9 +765,13 @@ not from the perf JSON. See [`swimlane_converter --deps-json`](#swimlane_convert
 Top-level layout depends on `chip_swimlane_level`:
 
 - All levels: `chip_swimlane_level`, `tasks[]` (per-task fields above).
-- `>= 3`: also `aicpu_scheduler_phases[]` (per-thread phase records:
-  scan / complete / dispatch / idle) and `core_to_thread[]` (core_id →
-  scheduler thread index).
+- A5 HBG `>= 2`: also `aicpu_lifecycle_records[]`; the converter renders the
+  real handshake, topology/configuration, context-publication, bootstrap-wait,
+  register-release, and exit timestamps under `AICPU Lifecycle`.
+- `>= 3`: also `scheduler_records.streams[]`. Every Record has the common
+  `start_cycles`, `end_cycles`, `loop_iter`, `kind`, `tasks_processed`, and
+  nullable `task_id` fields. Stream metadata selects the AICPU or AICore
+  interpretation; producer-specific counters live in `metrics[]`.
 - `>= 4`: also `aicpu_orchestrator_phases[]` (per-task orchestrator
   phase records).
 

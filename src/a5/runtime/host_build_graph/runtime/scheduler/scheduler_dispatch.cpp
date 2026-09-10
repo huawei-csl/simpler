@@ -14,17 +14,18 @@
 #include <cinttypes>
 #include <limits>
 
-#include "host_build_graph/common.h"  // debug_assert
+#include "assert_compat.h"  // debug_assert
+#include "host_build_graph/common.h"
 
 #include "common/unified_log.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
-#include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "host_build_graph/async_poll_phase_accumulator.h"
+#include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_core.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -237,7 +238,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // boundary. The completion-before-dispatch invariant makes this race-free
     // (all prior tasks on this core have FIN'd, so AICore has dcci'd their
     // records out of the old buffer). Gated on the same enable bit as flush
-    // so level=1 (AICORE_TIMING-only) participates without needing complete_task.
+    // so level=1 (TASK_TIMING-only) participates without needing complete_task.
 #if SIMPLER_DFX
     if (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED) {
         chip_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
@@ -246,7 +247,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     uint64_t *dispatch_timestamp_slot = nullptr;
 #if SIMPLER_DFX
-    if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         dispatch_timestamp_slot =
             to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
     }
@@ -396,20 +397,37 @@ void SchedulerContext::dispatch_shape(
         // Flush prepared-but-unpublished handles. Required before
         // `enter_drain_mode` so the drain coordinator sees cores as occupied,
         // and at the per-task boundary when `any_sync_start` is true.
+        //
+        // The publication ledger is settled around the flush, not after it:
+        // every task whose blocks are in `handles[]` accounts BEFORE the token
+        // writes (so PUBLISHED precedes the tokens whose FINs drive completion)
+        // and the tasks that reached their total seal AFTER, once their tokens
+        // are out.
         auto flush_publish = [&]() {
-            if (handle_count == 0) return;
-            wmb();
-            uint64_t dispatch_ts = 0;
+            int seal_n = 0;
+            for (int i = 0; i < published_n; i++) {
+                if (sched_->account_published_blocks(*published_list[i], published_counts[i])) {
+                    published_list[seal_n++] = published_list[i];
+                }
+            }
+            published_n = 0;
+            if (handle_count != 0) {
+                wmb();
+                uint64_t dispatch_ts = 0;
 #if SIMPLER_DFX
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::AICPU_TIMING) {
-                dispatch_ts = get_sys_cnt_aicpu();
-            }
+                if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+                    dispatch_ts = get_sys_cnt_aicpu();
+                }
 #endif
-            for (int i = 0; i < handle_count; i++) {
-                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
+                for (int i = 0; i < handle_count; i++) {
+                    publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
+                }
+                handle_count = 0;
+                made_progress = true;
             }
-            handle_count = 0;
-            made_progress = true;
+            for (int i = 0; i < seal_n; i++) {
+                sched_->seal_ed_publish_list(*published_list[i]);
+            }
         };
 
         for (int bi = 0; bi < got; bi++) {
@@ -426,9 +444,9 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            // (Early-dispatch pre-staged tasks never reach this ready-pop: they are
-            // released by their doorbell in release_fanin_and_check_ready the
-            // instant their last producer completes — see try_early_dispatch_release.)
+            // (Early-dispatch pre-staged tasks never reach this ready-pop: the
+            // completion path rings their doorbell the instant their last
+            // producer completes, bypassing the ready queue.)
 
             if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
@@ -500,10 +518,6 @@ void SchedulerContext::dispatch_shape(
         }
 
         flush_publish();
-        for (int i = 0; i < published_n; i++) {
-            sched_->record_published_blocks(*published_list[i], published_counts[i]);
-            sched_->propagate_dispatch_fanin(*published_list[i]);
-        }
 #if SIMPLER_SCHED_PROFILING
         chip_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
@@ -669,6 +683,8 @@ int32_t SchedulerContext::stage_consumer_blocks(
     };
     if (idle.has_value()) prepare_from(idle, /*to_pending=*/false);
     if (pend.has_value()) prepare_from(pend, /*to_pending=*/true);
+    // Account before the tokens, seal after them (see account_published_blocks).
+    const bool owns_seal = sched_->account_published_blocks(*c, staged);
     if (n > 0) {
         wmb();
         for (int i = 0; i < n; i++) {
@@ -684,9 +700,16 @@ int32_t SchedulerContext::stage_consumer_blocks(
     for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
         if (my_cores[w] != 0) c->to_payload().staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
 
-    // Full publication and release are independent events. The seq_cst
-    // state/launch/count operations form a two-sided handshake. A released
-    // block must ring before contributing to the publication count.
+    // Full publication and release are independent events. Doorbell ownership
+    // is a two-sided seq_cst handshake between the fetch_or above and the
+    // release path's early_dispatch_state store: each staged bit is claimed
+    // exactly once, by whichever side observes the other's write, so a bit the
+    // releaser missed is rung below and a bit it took is not rung twice.
+    // published_block_count takes no part in that handshake, which is why the
+    // accounting above may precede these rings: a consumer released by the
+    // resulting publication cannot take cores this task's blocks already hold
+    // (prepare_block_for_dispatch claimed them before any of this) and holds
+    // nothing the rings below wait on.
     bool released =
         staged > 0 && c->to_payload().early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_DISPATCHED;
 
@@ -708,20 +731,15 @@ int32_t SchedulerContext::stage_consumer_blocks(
         }
         wmb();
     }
-    sched_->record_published_blocks(*c, staged);
-    // Retry unconditionally after publication. The guards are cheap, and a
-    // pre-ring state read can become stale if release completes before this
-    // count update.
-    sched_->propagate_dispatch_fanin(*c);
+    if (owns_seal) sched_->seal_ed_publish_list(*c);
     return staged;
 }
 
 // Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
 // pre-stage claimed block ranges onto this thread's `shape` cores for `phase`. IDLE
 // stages onto idle cores (RUNNING slot, gated); PENDING stages onto a running core's
-// gated pending slot. Candidates are pushed to the shape's queue EVENT-DRIVEN by
-// propagate_dispatch_fanin, so the shape is the queue index (no per-consumer
-// to_shape()). Returns the number of blocks staged.
+// gated pending slot. A candidate is queued under its own shape, so the shape is
+// the queue index (no per-consumer to_shape()). Returns the number of blocks staged.
 int32_t
 SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase) {
     CoreTracker &tracker = core_trackers_[thread_idx];
@@ -774,9 +792,9 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
         int32_t freecores = bucket.has_value() ? bucket.count() : 0;
         if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
             // A dropped candidate keeps its STAGING claim and is recovered by the
-            // producer release: try_early_dispatch_release rings whatever is staged
-            // and routes the unstaged remainder to the ready queue, because it
-            // returns on next_block_idx rather than on the claim state.
+            // producer release, which rings whatever is staged and routes the
+            // unstaged remainder to the ready queue: release decides on
+            // next_block_idx rather than on the claim state.
             if (!sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi))
                 LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on batch re-push, dropping %d candidate(s) to normal dispatch",
@@ -831,6 +849,33 @@ int32_t SchedulerContext::try_early_dispatch(
 
     int32_t total_staged = 0;
 
+    // Publish-list drain: rescan the waiters a producer's publish event
+    // detached. An all-published verdict claims the candidate and queues it
+    // for pre-staging. The batch bound keeps one huge-fanout chain from
+    // long-tailing a single idle pass; the remainder goes back to the queue.
+    ChipTaskSlotState *waiter = nullptr;
+    if (sched_->ed_publish_drain_queue.size() > 0 && sched_->ed_publish_drain_queue.pop_batch(&waiter, 1) == 1) {
+        int32_t processed = 0;
+        while (waiter != nullptr && processed < ED_PUBLISH_DRAIN_BATCH_MAX) {
+            ChipTaskSlotState *next = waiter->next_in_ed_publish_list;
+            const bool all_published = sched_->advance_ed_publish_scan(*waiter);
+#if SIMPLER_SCHED_PROFILING
+            sched_->ed_publish_stats.waiters_rescanned.fetch_add(1, std::memory_order_relaxed);
+            if (all_published) {
+                sched_->ed_publish_stats.candidates_ready.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                sched_->ed_publish_stats.rehangs.fetch_add(1, std::memory_order_relaxed);
+            }
+#endif
+            if (all_published) sched_->enqueue_early_dispatch_candidate(*waiter);
+            processed++;
+            waiter = next;
+        }
+        if (waiter != nullptr && !sched_->ed_publish_drain_queue.push(waiter)) {
+            sched_->ed_publish_drain_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     // ===== Tier 0: sync_start cohorts (highest occupancy tier, all-or-nothing) =====
     // sync_start candidates park in their own shape-agnostic queue. They cannot ride
     // early_dispatch_shape's per-thread partial range-claim: a partial cohort would strand
@@ -861,7 +906,7 @@ int32_t SchedulerContext::try_early_dispatch(
                 c->to_payload().running_slot_count.store(
                     static_cast<int16_t>(staged.running_cores), std::memory_order_seq_cst
                 );
-                sched_->retry_sync_start_rendezvous_after_staging(*c);
+                sched_->try_launch_sync_start_cohort(*c);
                 SchedulerState::finish_early_sync_drain(c->to_payload());
                 total_staged += staged.staged_blocks;
             } else if (enter_drain_mode(c, c->logical_block_num)) {
@@ -900,12 +945,11 @@ int32_t SchedulerContext::try_early_dispatch(
 // =============================================================================
 
 // P owns no AICore cores. It drains the per-S CompletedTaskQueues and runs
-// on_task_complete for every finished task: publish completion_flags, drain the
-// wake list (route/re-register waiters into the ready queues), advance the
-// watermark. As the sole producer of the ready queues its enqueues never
-// contend. P owns completed_tasks_ and the terminal completed_ flip, so the S
-// threads keep dispatching until P has resolved the whole graph (watermark fully
-// advanced) — the host's wait_for_consumers never observes a stranded prefix.
+// on_task_complete for every finished task: publish task_states, drain the
+// wake list (route/re-register waiters into the ready queues). As the sole
+// producer of the ready queues its enqueues never contend. P owns
+// completed_tasks_ and the terminal completed_ flip, so the S threads keep
+// dispatching until P has resolved the whole graph.
 int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     SharedMemoryHeader *header = sched_->sm_header;

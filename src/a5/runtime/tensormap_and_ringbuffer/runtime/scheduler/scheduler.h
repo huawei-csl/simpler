@@ -537,6 +537,19 @@ struct SchedulerState {
     // stop-the-world drain, per-core MIX placement, head-start spacing).
     ChipReadyQueue ready_sync_queues[NUM_RESOURCE_SHAPES];
 
+    // Set when the orchestrator submits a task with requires_sync_start(), and
+    // stays set for the rest of the epoch. Only such a task reaches
+    // ready_sync_queues[], so while this is clear those queues hold nothing and
+    // the dispatch loop skips the whole Tier-0 staging order -- six shape probes
+    // per iteration, each a load on a line every scheduler thread writes.
+    //
+    // Release here, acquire on the dispatch loop's load: observing it set also
+    // makes visible the submission that set it.
+    //
+    // Own cache line: written once per epoch, read once per dispatch iteration,
+    // so it never joins the lines the scheduler threads already contend for.
+    alignas(64) std::atomic<uint32_t> sync_task_seen;
+
     // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
     // the dispatch loop and completed inline -- never goes to AICore.
     ChipReadyQueue dummy_ready_queue;
@@ -877,7 +890,7 @@ struct SchedulerState {
         }
     }
 
-    inline bool maybe_rendezvous_ring(ChipTaskSlotState &slot_state) {
+    inline bool try_launch_sync_start_cohort(ChipTaskSlotState &slot_state) {
         // Staging publishes the complete mask before seeding running_slot_count.
         // Read the seed first: observing the final seq_cst seed then orders every
         // mask read after all of the stager's mask updates. Reading the mask first
@@ -901,7 +914,7 @@ struct SchedulerState {
     }
 
     inline bool retry_sync_start_rendezvous_after_staging(ChipTaskSlotState &slot_state) {
-        if (!maybe_rendezvous_ring(slot_state)) return false;
+        if (!try_launch_sync_start_cohort(slot_state)) return false;
         propagate_dispatch_fanin(slot_state);
         return true;
     }
@@ -963,8 +976,13 @@ struct SchedulerState {
         for (; edge != nullptr; edge = edge->next) {
             ChipTaskSlotState *c = edge->slot_state;
             if (c->task_attrs.has_predicate()) continue;
+            // early_dispatch_target() is the WAIT-edge count plus any unit held
+            // by a reduced-away unflagged producer: only DEP_WAIT producers link
+            // onto fanout_head and bump dispatch_fanin, so RETAIN-only and
+            // reduction-dropped edges (still counted by fanin_actual_count) stay
+            // out of the count while still being able to hold the target short.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->payload->early_dispatch_target()) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }
@@ -997,7 +1015,7 @@ struct SchedulerState {
         );
         bool launched = true;
         if (sync_start) {
-            launched = maybe_rendezvous_ring(slot_state);
+            launched = try_launch_sync_start_cohort(slot_state);
         } else {
             for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
                 uint64_t owned = claim_all_staged_doorbell_bits(slot_state.payload->staged_core_mask[w]);
@@ -1314,6 +1332,29 @@ struct SchedulerState {
 // Scheduler cold-path API is declared as SchedulerState member functions.
 // See init()/destroy()/print_stats()/print_queues() below the struct definition.
 
+// Drop deferred releases when release_elided; otherwise drain via on_task_release.
+// Callers set release_elided from orchestrator_done_ only at existing release
+// boundaries (full buffer / idle / exit); the async path always passes false.
+inline void drain_or_elide_deferred_releases(
+    SchedulerState *sched, ChipTaskSlotState **slots, int32_t &count, bool release_elided
+#if SIMPLER_SCHED_PROFILING
+    ,
+    int32_t thread_idx
+#endif
+) {
+    if (release_elided) {
+        count = 0;
+        return;
+    }
+    while (count > 0) {
+#if SIMPLER_SCHED_PROFILING
+        (void)sched->on_task_release(*slots[--count], thread_idx);
+#else
+        sched->on_task_release(*slots[--count]);
+#endif
+    }
+}
+
 // Short-circuit NotDeferred completions seen during drain so they don't grow
 // entries[]. Mirrors the a2a3 impl; see that mirror for the rationale.
 inline bool
@@ -1323,16 +1364,15 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 #else
     sink.sched->on_task_complete(slot_state);
 #endif
+    // Async path keeps exact deferred release (no graph-seal observation here).
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
-        while (*sink.deferred_release_count > 0) {
+        drain_or_elide_deferred_releases(
+            sink.sched, sink.deferred_release_slot_states, *sink.deferred_release_count, /*release_elided=*/false
 #if SIMPLER_SCHED_PROFILING
-            (void)sink.sched->on_task_release(
-                *sink.deferred_release_slot_states[--(*sink.deferred_release_count)], sink.thread_idx
-            );
-#else
-            sink.sched->on_task_release(*sink.deferred_release_slot_states[--(*sink.deferred_release_count)]);
+            ,
+            sink.thread_idx
 #endif
-        }
+        );
     }
     sink.deferred_release_slot_states[(*sink.deferred_release_count)++] = &slot_state;
     sink.inline_completed++;
@@ -1395,13 +1435,13 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             sched->on_task_complete(*entry.slot_state);
 #endif
             if (deferred_release_count >= deferred_release_capacity) {
-                while (deferred_release_count > 0) {
+                drain_or_elide_deferred_releases(
+                    sched, deferred_release_slot_states, deferred_release_count, /*release_elided=*/false
 #if SIMPLER_SCHED_PROFILING
-                    (void)sched->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                    sched->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+                    ,
+                    thread_idx
 #endif
-                }
+                );
             }
             deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
             result.completed++;
