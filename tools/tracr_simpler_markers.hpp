@@ -60,7 +60,9 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Running_Task_Single) \
     X(Running_Task_Pair)   \
     X(Barrier)             \
-    X(Resolving)
+    X(Resolving)           \
+    X(CommNotify)          \
+    X(CommWait)
 
 enum MarkerType {
 #define X(name) name,
