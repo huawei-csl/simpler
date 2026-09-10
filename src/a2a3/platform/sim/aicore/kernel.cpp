@@ -26,6 +26,9 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
+#ifdef ENABLE_TRACR
+#include "aicore/tracr_aicore_emit.h"
+#endif
 
 // Per-thread simulated register state — use pthread TLS instead of C++
 // thread_local to avoid glibc TLSDESC issues when the AICore SO is loaded
@@ -37,6 +40,9 @@ static pthread_key_t g_aicore_profiling_flag_key;
 // aicore_profiling_state.h for the lazy-deref contract.
 static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
 static pthread_key_t g_chip_swimlane_aicore_head_key;
+#ifdef ENABLE_TRACR
+static pthread_key_t g_tracr_aicore_buffer_key;
+#endif
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void create_tls_keys() {
@@ -45,6 +51,9 @@ static void create_tls_keys() {
     pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
     pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
+#ifdef ENABLE_TRACR
+    pthread_key_create(&g_tracr_aicore_buffer_key, nullptr);
+#endif
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -64,6 +73,23 @@ __aicore__ void set_aicore_profiling_flag(uint32_t flag) {
 __aicore__ uint32_t get_aicore_profiling_flag() {
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
 }
+
+#ifdef ENABLE_TRACR
+// Sim is a single process, so the region base is a plain global published by the
+// host before launch; only the per-core slice needs to be thread-local. Keeping
+// the base out of aicore_execute_wrapper's parameter list matters because that
+// signature is a dlsym ABI shared with the host.
+static uint64_t g_tracr_aicore_data_base = 0;
+
+extern "C" void set_platform_tracr_aicore_data_base(uint64_t base) { g_tracr_aicore_data_base = base; }
+
+__aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf) {
+    pthread_setspecific(g_tracr_aicore_buffer_key, reinterpret_cast<void *>(buf));
+}
+__aicore__ __gm__ int64_t *get_tracr_aicore_buffer() {
+    return reinterpret_cast<__gm__ int64_t *>(pthread_getspecific(g_tracr_aicore_buffer_key));
+}
+#endif  // ENABLE_TRACR
 
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
     pthread_setspecific(g_chip_swimlane_aicore_head_slot_key, reinterpret_cast<void *>(slot_ptr));
@@ -128,6 +154,15 @@ extern "C" void aicore_execute_wrapper(
     } else {
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
+
+#ifdef ENABLE_TRACR
+    if (g_tracr_aicore_data_base != 0) {
+        __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(g_tracr_aicore_data_base);
+        set_tracr_aicore_buffer(tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore);
+    } else {
+        set_tracr_aicore_buffer(nullptr);
+    }
+#endif  // ENABLE_TRACR
 
     // Set core identity for pto-isa TPUSH/TPOP simulation.
     // Core layout in sim DeviceRunner:

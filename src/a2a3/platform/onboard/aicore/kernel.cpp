@@ -13,6 +13,9 @@
  */
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
+#ifdef ENABLE_TRACR
+#include "aicore/tracr_aicore_emit.h"
+#endif
 #include "common/core_type.h"
 #include "common/kernel_args.h"
 #include "common/chip_swimlane_profiling.h"
@@ -55,6 +58,15 @@ __attribute__((weak)) __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ 
     s_chip_swimlane_aicore_head_slot = slot_ptr;
     s_chip_swimlane_aicore_head = nullptr;  // force lazy resolution on next get
 }
+#ifdef ENABLE_TRACR
+[[block_local]] static __gm__ int64_t *s_tracr_aicore_buffer;
+
+__attribute__((weak)) __aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf) {
+    s_tracr_aicore_buffer = buf;
+}
+__attribute__((weak)) __aicore__ __gm__ int64_t *get_tracr_aicore_buffer() { return s_tracr_aicore_buffer; }
+#endif  // ENABLE_TRACR
+
 __attribute__((weak)) __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() {
     // Lazy first-call resolve. AICPU publishes the slot before opening any
     // register window, so it is valid after AICore observes Phase 2 exit.
@@ -127,6 +139,18 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     } else {
         set_chip_swimlane_aicore_head_slot(nullptr);
     }
+
+#ifdef ENABLE_TRACR
+    // No lazy resolve: the host allocated this before launch, so the address is
+    // already final. Each core takes its own slice, which is what lets the
+    // count word be a plain load/store.
+    if (k_args->tracr_aicore_data_base != 0) {
+        __gm__ int64_t *tracr_base = reinterpret_cast<__gm__ int64_t *>(k_args->tracr_aicore_data_base);
+        set_tracr_aicore_buffer(tracr_base + static_cast<int64_t>(block_idx) * kTracrAicoreWordsPerCore);
+    } else {
+        set_tracr_aicore_buffer(nullptr);
+    }
+#endif  // ENABLE_TRACR
 
     aicore_execute(k_args->runtime_args, block_idx, core_type);
 }

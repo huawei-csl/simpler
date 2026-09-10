@@ -191,6 +191,13 @@ int DeviceRunner::ensure_binaries_loaded() {
                 reinterpret_cast<void **>(&set_platform_chip_swimlane_aicore_rotation_table_func_)
             ))
             return PTO_RUNTIME_ERR_INTERNAL;
+#ifdef ENABLE_TRACR
+        if (!load_sym(
+                "set_platform_tracr_aicore_data_base",
+                reinterpret_cast<void **>(&set_platform_tracr_aicore_data_base_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+#endif
         if (!load_sym("set_chip_swimlane_enabled", reinterpret_cast<void **>(&set_chip_swimlane_enabled_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_pmu_base", reinterpret_cast<void **>(&set_platform_pmu_base_func_)))
@@ -389,6 +396,10 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
         return rc;
     }
+    // Publish the AICore record region. 0 when allocation failed, which the
+    // kernel entry reads as "not recording" rather than treating as an error:
+    // losing a profile must never fail the run it was profiling.
+    kernel_args_.tracr_aicore_data_base = DevAllocTracrAicore(this);
 #endif
 
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
@@ -590,6 +601,9 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
+#ifdef ENABLE_TRACR
+                set_platform_tracr_aicore_data_base_func_(kernel_args_.tracr_aicore_data_base);
+#endif
                 set_chip_swimlane_enabled_func_(enable_chip_swimlane_);
                 set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
                 set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);

@@ -65,37 +65,7 @@
 #include "aicore/aicore.h"
 #include "inner_kernel.h"
 
-// TraCR's EVENTID_RESET: closes the span currently open on the channel.
-constexpr uint32_t kTracrEventReset = 0xFFFFu;
-// TraCR's EVENTID_FLOW_START / EVENTID_FLOW_END: the two endpoints of a causal
-// arrow. Each attaches to whatever span is open on its channel at that instant,
-// and carries the flow id in extraId rather than an event type.
-constexpr uint32_t kTracrEventFlowStart = 0xFFFEu;
-constexpr uint32_t kTracrEventFlowEnd = 0xFFFDu;
-// TraCR's "no extra information" sentinel (UINT32_MAX).
-constexpr uint32_t kTracrExtraNone = 0xFFFFFFFFu;
-// get_sys_cnt_aicore() counts at PLATFORM_PROF_SYS_CNT_FREQ (50 MHz); TraCR
-// timestamps are nanoseconds.
-constexpr int64_t kTracrNsPerTick = 20;
-
-constexpr int kTracrHeaderWords = 2;
-constexpr int kTracrWordsPerPayload = 2;
-
-// Capacity value that silently disables recording, without counting a drop.
-//
-// One buffer has one writer. When several workers run the same kernel source
-// against a shared buffer -- SPMD blocks, or a vector kernel split across a
-// block's two AIV sub-cores -- each of them would read-modify-write the same
-// count word with no atomic, losing records and corrupting the count. The
-// designated writer passes a real capacity and every other worker passes this,
-// so the guard costs one comparison and no buffer traffic.
-//
-// Marker filtering is not a loss for communication: an SPMD collective must
-// already confine its notify/wait to one block, or the peer's counter is
-// incremented once per block and the barrier releases early. For an SPMD
-// *compute* kernel the per-block variation is the signal, and that wants a
-// per-core buffer instead -- see D2 in the project docs.
-constexpr int kTracrDisabled = -1;
+#include "aicore/tracr_aicore_layout.h"
 
 /** Payload capacity of a buffer of `words` int64 words. */
 __aicore__ __attribute__((always_inline)) inline int tracr_aicore_capacity(int words) {

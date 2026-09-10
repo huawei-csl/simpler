@@ -438,6 +438,10 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
         return rc;
     }
+    // Publish the AICore record region. 0 when allocation failed, which the
+    // kernel entry reads as "not recording" rather than treating as an error:
+    // losing a profile must never fail the run it was profiling.
+    execution->kernel_args.args.tracr_aicore_data_base = DevAllocTracrAicore(this);
 #endif
 
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args);

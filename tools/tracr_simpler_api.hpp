@@ -26,6 +26,8 @@
 
 #include <tracr/tracr.hpp>
 #include <tracr_simpler_markers.hpp>
+#include "aicore/tracr_aicore_layout.h"
+#include "common/platform_config.h"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -247,6 +249,39 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
  *
  * Polymorphic to A2A3 and A5 (should be)
  */
+/**
+ * Allocate the AICore TraCR record region and hand back its device address.
+ *
+ * One slice of `kTracrAicoreWordsPerCore` int64 words per core, indexed by the
+ * kernel entry as `base + block_idx * kTracrAicoreWordsPerCore`. Cores never
+ * share a slice, so the count word is a plain load/store and two concurrent
+ * kernels cannot corrupt each other's records.
+ *
+ * **Zeroed here, and that is not optional.** The device writes a record count
+ * into word 0 and the host decodes that many records back. A buffer the device
+ * never touches -- TraCR compiled out of the kernel, or simply no comm on that
+ * core -- would otherwise present stale GM as a count, and the host would decode
+ * garbage rather than nothing. Zeroing makes "did not record" read as "no
+ * records" instead of as a large number of nonsense ones.
+ *
+ * Returns 0 on failure, which the caller stores as the "off" value.
+ */
+template <typename DeviceRunnerT>
+uint64_t DevAllocTracrAicore(DeviceRunnerT *device_runner) {
+    const size_t bytes = static_cast<size_t>(PLATFORM_MAX_CORES) * kTracrAicoreWordsPerCore * sizeof(int64_t);
+    void *dev_ptr = device_runner->allocate_tensor(bytes);
+    if (dev_ptr == nullptr) {
+        LOG_ERROR("TraCR AICore region: alloc %zu bytes failed", bytes);
+        return 0;
+    }
+    if (device_runner->device_memset(dev_ptr, 0, bytes) != 0) {
+        LOG_ERROR("TraCR AICore region: zeroing %zu bytes failed", bytes);
+        device_runner->free_tensor(dev_ptr);
+        return 0;
+    }
+    return reinterpret_cast<uint64_t>(dev_ptr);
+}
+
 template <typename DeviceRunnerT, typename RuntimeT>
 int DevAllocTraCR(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     const size_t size = sizeof(TraCR::Payload) * runtime.get_aicpu_thread_num() * TraCR::CAPACITY;

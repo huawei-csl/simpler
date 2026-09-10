@@ -111,6 +111,15 @@ struct KernelArgs {
     // ChipSwimlaneActiveHead address (rotation channel). AICore kernel entry indexes
     // by block_idx and forwards into platform set/get state. 0 when chip swimlane is off.
     uint64_t chip_swimlane_aicore_rotation_table{0};
+    // Base of the AICore TraCR record region: PLATFORM_MAX_CORES slices of
+    // kTracrAicoreWordsPerCore int64 words. AICore kernel entry hands its own
+    // slice to set_tracr_aicore_buffer(). 0 when TraCR did not allocate one.
+    //
+    // Unconditional field, deliberately: host, AICPU and AICore are three
+    // separately compiled programs, so an #ifdef'd member would shift this
+    // struct's layout the moment two of them disagreed on the flag. Only the
+    // code that reads it is gated.
+    uint64_t tracr_aicore_data_base{0};
     // Device pointer to the run-wall buffer the platform AICPU entry writes.
     // Allocated once and kept resident, reset each run. Onboard AICPU receives
     // KernelArgs as a CANN-private copy (see launch_aicpu_kernel), so an

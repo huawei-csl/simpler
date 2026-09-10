@@ -78,3 +78,24 @@ __aicore__ uint32_t get_aicore_profiling_flag();
  */
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr);
 __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head();
+
+#ifdef ENABLE_TRACR
+/**
+ * This core's TraCR record buffer.
+ *
+ * Unlike the chip-swimlane head above, there is nothing lazy here: the host
+ * allocates the region before launch and its address is final, so the kernel
+ * entry stashes the core's own slice directly and `get` just returns it. The
+ * slice is `base + block_idx * kTracrAicoreWordsPerCore`, which is what keeps
+ * cores from sharing a count word.
+ *
+ * Returns nullptr when the host did not allocate one; the emit helpers treat a
+ * null buffer as "not recording" rather than faulting.
+ *
+ * Declared only under ENABLE_TRACR on purpose. Every caller is itself compiled
+ * away without the flag, so a call that survives is a build mistake worth a
+ * link error rather than a silent null.
+ */
+__aicore__ void set_tracr_aicore_buffer(__gm__ int64_t *buf);
+__aicore__ __gm__ int64_t *get_tracr_aicore_buffer();
+#endif  // ENABLE_TRACR
