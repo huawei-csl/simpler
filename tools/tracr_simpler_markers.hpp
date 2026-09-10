@@ -34,6 +34,13 @@ inline std::atomic<int> g_TraCR_thread_idx_counter{0};
 inline thread_local int g_TraCR_thread_idx{-1};
 
 // X-Macro approach. Pretty cool
+//
+// A marker's position IS its wire id: `payload.eventId` is the 0-based
+// MarkerType value, and AICore-written lanes hard-code those ids as integers
+// because the emitter cannot see this enum (see
+// `src/common/platform/include/aicore/tracr_aicore_emit.h`). So removing or
+// reordering an entry silently renames every lane after it. Append new markers
+// at the end; do not reorder. Host-side callers use the names and are immune.
 #define MARKER_TYPES       \
     X(Orchestrating)       \
     X(Read_Dimensions)     \
@@ -52,6 +59,7 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Allocating)          \
     X(Running_Task_Single) \
     X(Running_Task_Pair)   \
+    X(Barrier)             \
     X(CopyH2D)             \
     X(CopyD2H)             \
     X(Resolving)
