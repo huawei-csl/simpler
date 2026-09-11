@@ -220,10 +220,40 @@ class KernelCompiler:
         Also carries ``src/common/platform/include`` so kernel-facing runtime
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
+
+        Also carries ``src/common/platform/include`` so kernel-facing runtime
+        headers (e.g. ``intrinsic.h``) can pull shared platform headers like
+        ``common/dma_workspace.h`` regardless of what the call site passes.
         """
         return [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
+        ]
+
+    def get_incore_fallback_include_dirs(self) -> list[str]:
+        """
+        Include directories placed *after* the caller's ``extra_include_dirs``.
+
+        These complete the ``aicore/aicore.h`` include chain: that header ends in
+        ``#include "inner_kernel.h"``, which is per-arch AND per-variant (it is
+        where ``__aicore__``, ``dcci`` and ``get_sys_cnt_aicore`` differ between
+        silicon and simulator), and which in turn pulls
+        ``common/platform_config.h`` from the arch's own include root and
+        ``aicore_teardown.h`` from the shared task-interface directory. A kernel
+        reaching a platform intrinsic -- a generated one carrying TraCR markers,
+        for instance -- does not compile without all three.
+
+        They come last because ``src/common/task_interface`` also holds a host
+        ``tensor.h``, and a generated kernel's ``#include "tensor.h"`` means the
+        runtime's device-side tensor header that the call site puts on the path.
+        A directory that completes a transitive chain must never outrank the
+        call site's own choice of a same-named header.
+        """
+        variant = "sim" if self.platform.endswith("sim") else "onboard"
+        return [
+            str(self.platform_dir / "include"),
+            str(self.platform_dir / variant / "aicore"),
+            str(self.project_root / "src" / "common" / "task_interface"),
         ]
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
@@ -541,6 +571,9 @@ class KernelCompiler:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
+        for inc_dir in self.get_incore_fallback_include_dirs():
+            cmd.append(f"-I{compiler_visible_path(inc_dir)}")
+
         cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 
         # Execute compilation
@@ -772,6 +805,9 @@ class KernelCompiler:
         if extra_include_dirs:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{compiler_visible_path(inc_dir)}")
+
+        for inc_dir in self.get_incore_fallback_include_dirs():
+            cmd.append(f"-I{compiler_visible_path(inc_dir)}")
 
         cmd.extend(["-o", output_path, str(compiler_visible_path(source_path))])
 

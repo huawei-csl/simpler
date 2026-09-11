@@ -79,7 +79,7 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_reset(__gm__ 
     (void)buf;
     (void)capacity;
 #else
-    if (capacity < 0) {
+    if (buf == nullptr || capacity < 0) {
         return;
     }
     // Words 0 and 1 only: word 2 carries the writer identity, published once by
@@ -123,7 +123,11 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_emit(
     (void)extra;
     (void)ticks;
 #else
-    if (capacity < 0) {
+    // A null buffer means this writer has no slice -- TraCR is off for the run,
+    // or the runtime published no address for this core. Every store below is
+    // an absolute GM write, so an unchecked null lands at address 0 and
+    // corrupts whatever lives there rather than failing.
+    if (buf == nullptr || capacity < 0) {
         return;
     }
     int64_t n = buf[0];
@@ -192,14 +196,17 @@ __aicore__ __attribute__((always_inline)) inline void tracr_aicore_flow_end(
 // Entry points for generated kernels.
 //
 // PyPTO codegen cannot thread a buffer to a call site: the marker is reached
-// from PTO IR through a declaration-only `func.func private`, and ptoas emits
-// it as an `extern "C" AICORE` call with exactly the operands the IR named. So
-// these take no buffer and fetch it from the per-core accessor the kernel entry
-// published.
+// from PTO IR through a declaration-only `func.func private`, and ptoas emits a
+// call with exactly the operands the IR named. So these take no buffer and
+// fetch it from the per-core accessor the kernel entry published.
 //
-// `extern "C"` because that is what ptoas emits, which also means no
-// overloading and no default arguments: the signature here and the declaration
-// in the .pto must match exactly.
+// `static` because ptoas re-declares every `func.func private` it saw as
+// `static __aicore__ void <name>(...)` near the top of the generated kernel,
+// ahead of the first call. A definition with any other linkage -- `extern "C"`
+// included -- makes that a static-after-non-static redeclaration, which is
+// ill-formed. Static linkage also means no overloading and no default
+// arguments: the signature here and the declaration in the .pto must match
+// exactly, parameter for parameter.
 //
 // The accessor is forward-declared rather than included: it lives in the
 // arch-specific `aicore/aicore_profiling_state.h`, and this header is shared.
@@ -217,7 +224,7 @@ __aicore__ __attribute__((always_inline)) inline int tracr_slice_capacity() {
 #endif
 
 /** Open a span on `channel`. Generated-code entry point; see above. */
-extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_set(
+static __aicore__ __attribute__((always_inline)) inline void tracr_mark_set(
     int32_t channel, int32_t event, int32_t extra
 ) {
 #ifndef ENABLE_TRACR
@@ -233,7 +240,7 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_set(
 }
 
 /** Close the span open on `channel`. */
-extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_reset(int32_t channel) {
+static __aicore__ __attribute__((always_inline)) inline void tracr_mark_reset(int32_t channel) {
 #ifndef ENABLE_TRACR
     (void)channel;
 #else
@@ -251,7 +258,7 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_rese
  *
  * `seq` distinguishes several messages between one pair; 0 until C5 derives it.
  */
-extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_start(
+static __aicore__ __attribute__((always_inline)) inline void tracr_flow_start(
     int32_t channel, int32_t src_rank, int32_t dst_rank, int32_t seq
 ) {
 #ifndef ENABLE_TRACR
@@ -260,6 +267,11 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_star
     (void)dst_rank;
     (void)seq;
 #else
+    // An arrow from a rank to itself is not a device-to-device message. PyPTO
+    // already declines to emit a tail for a notify whose peer is spelled as
+    // this rank, but a peer computed at runtime can still land on it, and a
+    // head's source is an offset the compiler could not prove is a rank.
+    if (src_rank == dst_rank) return;
     tracr_aicore_flow_start(
         get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
         tracr_aicore_flow_id(
@@ -273,7 +285,7 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_star
  * Head of a causal arrow. Argument order matches the tail's, so a receiver
  * closing an arrow from `src` writes the same (src, dst, seq) the sender wrote.
  */
-extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(
+static __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(
     int32_t channel, int32_t src_rank, int32_t dst_rank, int32_t seq
 ) {
 #ifndef ENABLE_TRACR
@@ -282,6 +294,7 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(
     (void)dst_rank;
     (void)seq;
 #else
+    if (src_rank == dst_rank) return;
     tracr_aicore_flow_end(
         get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
         tracr_aicore_flow_id(

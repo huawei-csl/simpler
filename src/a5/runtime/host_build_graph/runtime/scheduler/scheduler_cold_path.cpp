@@ -20,6 +20,8 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
+#include "aicpu/tracr_aicore_aicpu.h"
+#include "aicore/tracr_aicore_layout.h"
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -945,6 +947,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
             slab->error_code = SIMPLER_ERROR_NONE;
+            dp.global_context.tracr_aicore_slice =
+                tracr_slice_address(get_platform_tracr_aicore_base(), core_id);
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

@@ -26,6 +26,8 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
+#include "aicpu/tracr_aicore_aicpu.h"
+#include "aicore/tracr_aicore_layout.h"
 #include "common/memory_barrier.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -991,6 +993,8 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                     dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
                 }
+                dp.global_context.tracr_aicore_slice =
+                    tracr_slice_address(get_platform_tracr_aicore_base(), core_id);
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
@@ -1319,6 +1323,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
                 dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
             }
+            dp.global_context.tracr_aicore_slice =
+                tracr_slice_address(get_platform_tracr_aicore_base(), core_id);
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

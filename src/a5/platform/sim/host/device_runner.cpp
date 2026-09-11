@@ -215,6 +215,11 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_scope_stats_base", reinterpret_cast<void **>(&set_platform_scope_stats_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        // Against the AICPU handle: the scheduler reads it during cold start to
+        // give each core its slice. Defined unconditionally, so this resolves
+        // whether or not the AICPU SO was built with TraCR.
+        if (!load_sym("set_platform_tracr_aicore_base", reinterpret_cast<void **>(&set_platform_tracr_aicore_base_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
 
         // Publish provisioned DMA workspace addresses into the resident AICPU SO.
         using SetDmaWorkspaceAddrFunc = void (*)(int, unsigned long long);
@@ -536,7 +541,8 @@ int DeviceRunner::prepare_execution(
         set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
         set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
         set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
-        set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr || set_platform_tracr_aicore_base_func_ == nullptr ||
+        set_platform_chip_swimlane_base_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
         set_chip_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
@@ -594,6 +600,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_dep_gen_enabled_func_(enable_dep_gen_ && !dep_gen_host_graph_active());
                 set_scope_stats_enabled_func_(enable_scope_stats_);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
+                set_platform_tracr_aicore_base_func_(kernel_args_.tracr_aicore_data_base);
 
                 start_shared_collectors_for_run();
                 if (enable_dep_gen_ && !dep_gen_host_graph_active()) {
@@ -790,6 +797,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_dep_gen_enabled_func_ = nullptr;
         set_scope_stats_enabled_func_ = nullptr;
         set_platform_scope_stats_base_func_ = nullptr;
+        set_platform_tracr_aicore_base_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {

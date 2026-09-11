@@ -23,6 +23,7 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
+#include "aicpu/tracr_aicore_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
 
@@ -82,6 +83,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
     set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
+    set_platform_tracr_aicore_base(k_args->tracr_aicore_data_base);
 
     // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU
     // OCCUPY and wrote it into Runtime; the device side only matches

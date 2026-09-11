@@ -117,3 +117,16 @@ constexpr int kTracrDisabled = -1;
  * GM store on the critical path of whatever is being measured.
  */
 constexpr int kTracrAicoreWordsPerCore = 512;
+
+/**
+ * Device address of core `block_idx`'s slice of a record region based at
+ * `base`, or 0 when `base` is 0 (TraCR off).
+ *
+ * Both the AICore kernel entry, which publishes the identity word, and the
+ * AICPU scheduler, which hands generated kernels their slice through
+ * GlobalContext, index the region this way, so the two agree by construction.
+ */
+TRACR_LAYOUT_FN uint64_t tracr_slice_address(uint64_t base, int block_idx) {
+    return base == 0 ? 0
+                     : base + static_cast<uint64_t>(block_idx) * kTracrAicoreWordsPerCore * sizeof(int64_t);
+}

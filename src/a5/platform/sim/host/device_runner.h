@@ -102,6 +102,7 @@ private:
     void (*set_dep_gen_enabled_func_)(bool){nullptr};
     void (*set_scope_stats_enabled_func_)(bool){nullptr};
     void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
+    void (*set_platform_tracr_aicore_base_func_)(uint64_t){nullptr};
 
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
     DepGenCollector dep_gen_collector_;
