@@ -201,13 +201,6 @@ int DeviceRunner::ensure_binaries_loaded() {
                 reinterpret_cast<void **>(&set_platform_chip_swimlane_aicore_rotation_table_func_)
             ))
             return PTO_RUNTIME_ERR_INTERNAL;
-#ifdef ENABLE_TRACR
-        if (!load_sym(
-                "set_platform_tracr_aicore_data_base",
-                reinterpret_cast<void **>(&set_platform_tracr_aicore_data_base_func_)
-            ))
-            return PTO_RUNTIME_ERR_INTERNAL;
-#endif
         if (!load_sym("set_chip_swimlane_enabled", reinterpret_cast<void **>(&set_chip_swimlane_enabled_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_pmu_base", reinterpret_cast<void **>(&set_platform_pmu_base_func_)))
@@ -299,6 +292,18 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
+
+#ifdef ENABLE_TRACR
+        // AICORE handle: the setter lives in sim/aicore/kernel.cpp and the two
+        // .so files are dlopen'd RTLD_LOCAL, so neither sees the other's globals.
+        set_platform_tracr_aicore_data_base_func_ = reinterpret_cast<void (*)(uint64_t)>(
+            dlsym(aicore_so_handle_, "set_platform_tracr_aicore_data_base")
+        );
+        if (set_platform_tracr_aicore_data_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_tracr_aicore_data_base: %s", dlerror());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+#endif
 
         auto set_identity_helpers =
             reinterpret_cast<void (*)(void *, void *)>(dlsym(aicore_so_handle_, "set_sim_core_identity_helpers"));

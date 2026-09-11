@@ -75,6 +75,13 @@ target_compile_options(aicore_kernel
 # This enables CPU stubs for PTO instructions (TLOAD, TSTORE, TADD, etc.)
 target_compile_definitions(aicore_kernel PRIVATE __CPU_SIM)
 
+
+# TraCR's AICore surface lives in this library: the per-core buffer accessors and
+# the dlsym'd set_platform_tracr_aicore_data_base the sim host calls. Without
+# this the whole block compiles out and the host's lookup fails at load with an
+# undefined symbol -- which no build catches, because the build is what omits it.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicore_kernel)
 # Include directories
 target_include_directories(aicore_kernel
     PRIVATE
