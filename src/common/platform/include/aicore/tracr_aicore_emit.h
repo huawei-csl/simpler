@@ -241,30 +241,52 @@ extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_mark_rese
 #endif
 }
 
-/** Tail of a causal arrow. */
+/**
+ * Tail of a causal arrow, from `src_rank` to `dst_rank`.
+ *
+ * Takes the ranks rather than a packed id because the caller is generated code:
+ * packing in PTO IR would mean emitting shifts and ors, and the id's layout
+ * would then be duplicated in the emitter and in codegen. Here it stays in one
+ * place, and both endpoints derive the same id from the same function.
+ *
+ * `seq` distinguishes several messages between one pair; 0 until C5 derives it.
+ */
 extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_start(
-    int32_t channel, int32_t flow_id
+    int32_t channel, int32_t src_rank, int32_t dst_rank, int32_t seq
 ) {
 #ifndef ENABLE_TRACR
     (void)channel;
-    (void)flow_id;
+    (void)src_rank;
+    (void)dst_rank;
+    (void)seq;
 #else
     tracr_aicore_flow_start(
         get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
-        static_cast<uint32_t>(flow_id)
+        tracr_aicore_flow_id(
+            static_cast<uint32_t>(src_rank), static_cast<uint32_t>(dst_rank), static_cast<uint32_t>(seq)
+        )
     );
 #endif
 }
 
-/** Head of a causal arrow. */
-extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(int32_t channel, int32_t flow_id) {
+/**
+ * Head of a causal arrow. Argument order matches the tail's, so a receiver
+ * closing an arrow from `src` writes the same (src, dst, seq) the sender wrote.
+ */
+extern "C" __aicore__ __attribute__((always_inline)) inline void tracr_flow_end(
+    int32_t channel, int32_t src_rank, int32_t dst_rank, int32_t seq
+) {
 #ifndef ENABLE_TRACR
     (void)channel;
-    (void)flow_id;
+    (void)src_rank;
+    (void)dst_rank;
+    (void)seq;
 #else
     tracr_aicore_flow_end(
         get_tracr_aicore_buffer(), tracr_slice_capacity(), static_cast<uint32_t>(channel),
-        static_cast<uint32_t>(flow_id)
+        tracr_aicore_flow_id(
+            static_cast<uint32_t>(src_rank), static_cast<uint32_t>(dst_rank), static_cast<uint32_t>(seq)
+        )
     );
 #endif
 }
