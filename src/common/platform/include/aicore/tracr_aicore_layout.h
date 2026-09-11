@@ -25,6 +25,21 @@
 
 #include <cstdint>
 
+// These helpers are called from BOTH sides: the device emitter and the host
+// decoder. CCEC partitions functions by address space and rejects a call to a
+// [host] function from an [aicore] one, so a plain `inline` is not enough on
+// the device. g++ does not care -- `__aicore__` is empty for the simulator --
+// which is why only an onboard ccec compile catches this.
+//
+// `__aicore__` is a macro (`[aicore]`, or empty under __CPU_SIM), and the
+// emitter includes aicore/aicore.h before this header, so it is defined in a
+// device translation unit and absent in a host one.
+#ifdef __aicore__
+#define TRACR_LAYOUT_FN __aicore__ inline
+#else
+#define TRACR_LAYOUT_FN inline constexpr
+#endif
+
 // TraCR's EVENTID_RESET: closes the span currently open on the channel.
 constexpr uint32_t kTracrEventReset = 0xFFFFu;
 // TraCR's EVENTID_FLOW_START / EVENTID_FLOW_END: the two endpoints of a causal
@@ -56,16 +71,16 @@ constexpr int kTracrWordsPerPayload = 2;
  * Lives here, not next to the emitter, because the host computes it too when
  * bounding a decode. One formula, one place.
  */
-inline constexpr int tracr_capacity_for_words(int words) {
+TRACR_LAYOUT_FN int tracr_capacity_for_words(int words) {
     return (words - kTracrHeaderWords) / kTracrWordsPerPayload;
 }
 
 /** Pack a writer's core kind and block index into the identity word. */
-inline constexpr int64_t tracr_pack_identity(int core_type, int block_idx) {
+TRACR_LAYOUT_FN int64_t tracr_pack_identity(int core_type, int block_idx) {
     return (static_cast<int64_t>(core_type) << 32) | static_cast<int64_t>(block_idx & 0xFFFFFFFF);
 }
-inline constexpr int tracr_identity_core_type(int64_t packed) { return static_cast<int>(packed >> 32); }
-inline constexpr int tracr_identity_block_idx(int64_t packed) {
+TRACR_LAYOUT_FN int tracr_identity_core_type(int64_t packed) { return static_cast<int>(packed >> 32); }
+TRACR_LAYOUT_FN int tracr_identity_block_idx(int64_t packed) {
     return static_cast<int>(packed & 0xFFFFFFFF);
 }
 
