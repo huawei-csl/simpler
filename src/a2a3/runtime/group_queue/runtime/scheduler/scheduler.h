@@ -515,6 +515,13 @@ inline uint64_t g_task_position[kPositionSlots] = {};
 // rather than clearing the table: the table is sized for the largest graph the
 // runtime accepts, and wiping it per run costs hundreds of kilobytes of writes
 // inside the window being measured.
+// Bumped whenever a task retires. A thread looking for a group to take compares
+// against it to decide whether re-asking could give a different answer: the
+// question costs a walk of a group's fanin, and `completed_tasks_` is not the
+// signal -- a task can retire on a path that never advances it, and the group it
+// unblocks would then be offered to nobody.
+inline std::atomic<uint64_t> g_completion_epoch{0};
+
 inline uint64_t g_position_epoch = 1;
 inline constexpr uint64_t kPositionMask = (1ULL << 40) - 1;
 
@@ -834,6 +841,7 @@ struct SchedulerState {
         SharedMemoryTaskHeader &tasks = *task_view.tasks;
 
         tasks.store_completed(task_id);
+        g_completion_epoch.fetch_add(1, std::memory_order_acq_rel);
         // COMPLETED >= PUBLISHED, so a tracked producer that never published
         // (DUMMY, predicate-retired) still releases its publish-list waiters
         // here. Idempotent after a publish-time seal.

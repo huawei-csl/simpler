@@ -243,7 +243,12 @@ private:
         // external producers have retired costs a walk of its whole fanin, so it
         // is re-asked only when the head of the queue moved or something retired.
         int32_t probed_group = -1;
-        int32_t probed_completed = -1;
+        uint64_t probed_epoch = ~0ULL;
+        // A backstop against a retirement that somehow bumps no epoch: after this
+        // many refusals the question is asked again regardless. Bounds how long a
+        // ready group can sit unclaimed without making the common case pay.
+        static constexpr int32_t kProbeStaleLimit = 256;
+        int32_t probe_skips = 0;
         // A task the controller cannot be told to wait for yet is passed over, not
         // waited on: blocking the cursor would hold every later task in the group,
         // and the group gates every later group. The lowest one passed over is where

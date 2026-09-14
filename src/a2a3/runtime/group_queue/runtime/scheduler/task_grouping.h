@@ -152,16 +152,20 @@ inline bool try_claim_group(int32_t group, int32_t thread_idx) {
         )) {
         return false;
     }
-    // Nothing below the lowest claimed group is worth revisiting.
-    int32_t from = g_scan_from.load(std::memory_order_acquire);
-    while (from == group) {
-        if (g_scan_from.compare_exchange_weak(
-                from, group + 1, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            break;
-        }
-    }
     return true;
+}
+
+// Carry the scan mark past `group`, which is already taken. Groups are claimed
+// out of order, so the mark cannot simply follow the group just claimed: leaving
+// it on a group someone else holds anchors the window there for good, because
+// that group can never be claimed again to move it on. Returns where the mark
+// now stands.
+inline int32_t bump_scan_mark(int32_t group) {
+    int32_t from = group;
+    if (g_scan_from.compare_exchange_strong(from, group + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return group + 1;
+    }
+    return from;  // another thread moved it; use where it landed
 }
 
 inline bool group_is_opened(int32_t group) {

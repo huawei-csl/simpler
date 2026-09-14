@@ -404,18 +404,29 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
 
     while (space.room() > 0 && hold_budget > 0) {
         if (f.group < 0) {
-            const int32_t from = gq_group::g_scan_from.load(std::memory_order_acquire);
-            const int32_t done = completed_tasks_.load(std::memory_order_relaxed);
+            int32_t from = gq_group::g_scan_from.load(std::memory_order_acquire);
+            const uint64_t epoch = gq_group::ENABLED ? g_completion_epoch.load(std::memory_order_acquire) : 0;
             // Judging a group ready walks its fanin, so re-ask only when the scan
             // point moved or something retired -- otherwise an idle thread spends
             // the window it is meant to be measuring.
-            if (from == f.probed_group && done == f.probed_completed) return progress;
+            if (from == f.probed_group && epoch == f.probed_epoch &&
+                ++f.probe_skips < GroupFeed::kProbeStaleLimit) {
+                return progress;
+            }
             f.probed_group = from;
-            f.probed_completed = done;
+            f.probed_epoch = epoch;
+            f.probe_skips = 0;
             int32_t taken = -1;
             const int32_t last = from + gq_group::GROUP_SCAN_WINDOW;
             for (int32_t g = from; g < last && g < gq_group::g_group_count; ++g) {
-                if (gq_group::group_owner(g) != gq_group::NO_OWNER) continue;
+                if (gq_group::group_owner(g) != gq_group::NO_OWNER) {
+                    // Carry the mark past groups already taken, as they are passed.
+                    // Folding it into this walk costs nothing; a separate pass over
+                    // them runs on every probe, and with many short-lived groups that
+                    // is more than the anchor it exists to prevent.
+                    if (g == from) from = gq_group::bump_scan_mark(g);
+                    continue;
+                }
                 if (!group_externals_met(g)) continue;
                 if (gq_group::try_claim_group(g, thread_idx)) {
                     taken = g;
@@ -427,6 +438,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             gq_group::mark_group_opened(f.group);
             f.retry_from = -1;
             f.swept_clean = true;
+            f.probe_skips = 0;
             f.id = f.group * gq_group::GROUP_EXTENT;
             f.end = f.id + gq_group::GROUP_EXTENT;
             f.block = 0;
