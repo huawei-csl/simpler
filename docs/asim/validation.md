@@ -438,7 +438,12 @@ its group, which is fed in order.
 | M0 (`a2a3asim`) | 21.907 ms | — |
 | M2, grouping off | 18.200 ms | −16.9 % |
 | M2 ready group queue, unlimited | 7.794 ms | −64.4 % |
-| **M2 ready group queue, 32 slots / 4 deps** | **9.453 ms** | **−56.9 %** |
+| **M2 ready group queue, 32 slots / 4 deps** | **9.87 ms** | **−55 %** |
+
+The 32/4 figure moved from 9.453 ms as the queue was made correct on a graph of
+chained groups (see qwen below): removing a whole-graph pre-scan from seeding took
+it to 8.575 ms, covering the position table properly put it back to 9.35 ms, and
+handing groups out concurrently costs the rest.
 
 **Same work, verified.** A skip-golden run proves only that nothing deadlocked,
 so work equivalence is measured rather than assumed: compute issued by the
@@ -470,6 +475,52 @@ task that cannot express its producers holds everything behind it in its group's
 feed order, and the ungrouped path pays no such penalty — it can dispatch any
 ready task from anywhere. PA needs 3; 4 buys margin. The slot count is the milder
 knob: 32 versus unlimited costs 21 %.
+
+### qwen decode — where the contract stops working
+
+paged_attention is the shape the contract is built for. qwen decode is not, and
+running it is what says which of the two the structure needs.
+
+Its graph has to be expanded first: the shipped orchestration submits each of the
+40 decoder layers as one Graph the device Scheduler expands, so dep-gen records 45
+outer nodes rather than tasks. Expanded (`decode_fwd_layers_expanded.cpp`) it is
+**11,085 tasks, 23,601 edges, all forward — and ONE weakly-connected component**,
+against paged_attention's 256 disjoint ones. Its critical path is 33 levels, so
+the parallelism is there; the grouping is what fails to use it.
+
+| group size | qwen `device_wall` | internal edges |
+| ---------- | ------------------ | -------------- |
+| ungrouped | **31.93 ms** | — |
+| 277 (one layer) | 91.5 ms | 84.4 % |
+| 64 | 75.1 ms | 32.2 % |
+| 32 | 62.7 ms | ~20 % |
+| 16 | 51.9 ms | ~12 % |
+
+**Grouping loses at every size, and gets better as it does less.** Performance
+improves monotonically as internal-edge capture collapses from 84 % to 12 %, which
+says none of the gain comes from the controller resolving edges — only from
+shrinking the unit of serialisation. Extrapolated, the best group size is 1, which
+is not grouping.
+
+The mechanism is the inverse of the one that wins on paged_attention. Per-thread
+compute spread, ungrouped against grouped:
+
+| case | ungrouped | grouped | |
+| ---- | --------- | ------- | - |
+| paged_attention | 5.6 % | **0.1 %** | grouping balances |
+| qwen decode (G=16) | 0.5 % | **35.2 %** | grouping unbalances |
+
+A group belongs to one thread, and a thread's controller owns 18 of the 72 cores.
+When groups are interchangeable that pins work harmlessly and buys locality; when
+they are chained it pins the machine to a quarter of itself. Compute issued is
+identical either way (+0.03 %, 11,087 of 11,087 tasks completing), so this is
+scheduling, not work.
+
+**The discriminator is whether groups are independent of each other** — not group
+size, not edge density, not how many comparators the controller has. The
+comparator limit never fires on paged_attention and fires in the hundreds on qwen,
+but even a controller with no limits would not fix a graph whose groups cannot run
+at the same time.
 
 ### What this result does not cover
 
