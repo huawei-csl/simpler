@@ -91,13 +91,44 @@ inline bool g_group_external[MAX_GROUPS];
 // rows, so the completion path must not queue them a second time.
 inline std::atomic<int32_t> g_group_opened[MAX_GROUPS];
 
-// The ready group queue. A group is ready when the edges entering it are met;
-// for a self-contained group that is true from the start, so the whole set is
-// seeded once and handed out by a cursor. Groups that external edges reach are
-// not in here at all -- they still arrive task by task.
-inline int32_t g_ready_groups[MAX_GROUPS];
-inline int32_t g_ready_group_count;
-inline std::atomic<uint32_t> g_ready_group_cursor;
+// The ready group queue. A group is ready once every edge entering it from
+// outside is met. Edges run forward and a group is a contiguous id range, so a
+// group's external producers all live in lower-numbered groups: groups become
+// ready in order, and the queue is the position of the lowest group not yet
+// handed out. A graph of self-contained groups has no external edges at all, so
+// every group is ready from the start and the cursor just runs to the end.
+// Whether the ready group queue delivers each task, decided once when the graph
+// is seeded. The completion path asks this for every waiter it releases, so it
+// has to be a bit test rather than a walk of the task's shape and predicate.
+constexpr int32_t MAX_TASKS_TRACKED = 1 << 17;
+inline uint64_t g_delivered[MAX_TASKS_TRACKED / 64];
+
+inline void set_delivered(int32_t id, bool yes) {
+    if (id < 0 || id >= MAX_TASKS_TRACKED) return;
+    const uint64_t bit = 1ULL << (id & 63);
+    if (yes) {
+        g_delivered[id >> 6] |= bit;
+    } else {
+        g_delivered[id >> 6] &= ~bit;
+    }
+}
+
+inline bool is_delivered(int32_t id) {
+    if (id < 0 || id >= MAX_TASKS_TRACKED) return false;
+    return (g_delivered[id >> 6] & (1ULL << (id & 63))) != 0;
+}
+
+inline int32_t g_group_count;
+
+// Where to start looking for a group to take. Groups are handed out to whichever
+// thread finds one ready, not in order: a graph whose groups depend on each other
+// would otherwise offer only one at a time and leave every other controller idle,
+// and a controller only owns its own slice of the cores.
+inline std::atomic<int32_t> g_scan_from;
+
+// How far past the scan point to look. Judging a group ready costs a walk of its
+// fanin, so the window bounds what one probe can spend.
+constexpr int32_t GROUP_SCAN_WINDOW = 24;
 
 inline void reset_group_owners() {
     for (int32_t i = 0; i < MAX_GROUPS; ++i) {
@@ -105,19 +136,32 @@ inline void reset_group_owners() {
         g_group_opened[i].store(0, std::memory_order_relaxed);
         g_group_external[i] = false;
     }
-    g_ready_group_count = 0;
-    g_ready_group_cursor.store(0, std::memory_order_relaxed);
+    for (int32_t i = 0; i < MAX_TASKS_TRACKED / 64; ++i) g_delivered[i] = 0;
+    g_group_count = 0;
+    g_scan_from.store(0, std::memory_order_relaxed);
 }
 
-// The next ready group for `thread_idx`, or -1 when none is left. Taking it is
-// what claims it: one group belongs to one thread for its whole life.
-inline int32_t take_ready_group(int32_t thread_idx) {
-    if (!ENABLED) return -1;
-    const uint32_t i = g_ready_group_cursor.fetch_add(1, std::memory_order_acq_rel);
-    if (i >= static_cast<uint32_t>(g_ready_group_count)) return -1;
-    const int32_t g = g_ready_groups[i];
-    g_group_owner[g].store(thread_idx, std::memory_order_release);
-    return g;
+// Take `group` for `thread_idx`, once. Several groups may be in flight at a time,
+// one per thread; a group still belongs to one thread for its whole life, because
+// an edge can only be expressed between positions in the same controller.
+inline bool try_claim_group(int32_t group, int32_t thread_idx) {
+    if (!ENABLED || group < 0 || group >= g_group_count) return false;
+    int32_t expected = NO_OWNER;
+    if (!g_group_owner[group].compare_exchange_strong(
+            expected, thread_idx, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    // Nothing below the lowest claimed group is worth revisiting.
+    int32_t from = g_scan_from.load(std::memory_order_acquire);
+    while (from == group) {
+        if (g_scan_from.compare_exchange_weak(
+                from, group + 1, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            break;
+        }
+    }
+    return true;
 }
 
 inline bool group_is_opened(int32_t group) {

@@ -479,12 +479,22 @@ struct CompletionStats {
 // one.
 inline constexpr uint64_t kNoPosition = UINT64_MAX;
 
+// Whether the ready group queue delivers this task to a controller. It delivers
+// only what reaches a core: a task with no logical block, no active subtask, or a
+// predicate that did not pass is completed on the ordinary path instead, and the
+// classify, feed and wake sides must agree on that or it reaches neither.
+inline bool group_queue_delivers(const ChipTaskSlotState &slot) {
+    return slot.task_kind != TaskKind::GRAPH && slot.logical_block_num > 0 &&
+           slot.active_mask.to_shape() != ResourceShape::DUMMY &&
+           !(slot.task_attrs.has_predicate() && !slot.to_payload().predicate.pass());
+}
+
 // Indexed by the low bits of the local id. Safe because a consumer only ever asks
 // about a producer it has an edge to, and an edge spans far less than this window
 // (paged_attention Case1: 256 at the widest, inside a 257-task group), so the two
 // can never alias. A graph with edges longer than this needs a wider map, and the
 // annotation is where that would be checked.
-inline constexpr int32_t kPositionSlots = 4096;
+inline constexpr int32_t kPositionSlots = 1 << 17;
 
 // Why the grouping contract does or does not bite, counted rather than reasoned
 // about: how often a consumer was released early because an in-group producer
@@ -495,13 +505,31 @@ inline std::atomic<uint64_t> g_gq_skip_nopos{0};      // would have skipped; pro
 inline std::atomic<uint64_t> g_gq_deps_named{0};      // submit named >=1 in-group producer
 inline std::atomic<uint64_t> g_gq_deps_allcomplete{0};// submit found every producer already retired
 inline std::atomic<uint64_t> g_gq_deps_bailed{0};     // submit found a producer it could not name
+inline std::atomic<int32_t> g_gq_bail_task{-1};      // first task that could not be expressed
+inline std::atomic<int32_t> g_gq_bail_prod{-1};      // and the producer it named
+inline std::atomic<int32_t> g_gq_bail_kind{0};       // 1 = cross-group unmet, 2 = in-group unpositioned
 inline std::atomic<uint64_t> g_gq_deps_toomany{0};    // more unmet producers than comparators; task held back
 inline uint64_t g_task_position[kPositionSlots] = {};
 
+// Entries carry the run that wrote them, so a run starts by bumping the epoch
+// rather than clearing the table: the table is sized for the largest graph the
+// runtime accepts, and wiping it per run costs hundreds of kilobytes of writes
+// inside the window being measured.
+inline uint64_t g_position_epoch = 1;
+inline constexpr uint64_t kPositionMask = (1ULL << 40) - 1;
+
 inline void note_task_position(int32_t local_id, uint64_t pos) {
-    g_task_position[local_id & (kPositionSlots - 1)] = pos;
+    if (local_id < 0 || local_id >= kPositionSlots) return;
+    g_task_position[local_id] =
+        (pos == kNoPosition) ? 0 : ((g_position_epoch << 40) | ((pos + 1) & kPositionMask));
 }
-inline uint64_t task_position(int32_t local_id) { return g_task_position[local_id & (kPositionSlots - 1)]; }
+
+inline uint64_t task_position(int32_t local_id) {
+    if (local_id < 0 || local_id >= kPositionSlots) return kNoPosition;
+    const uint64_t v = g_task_position[local_id];
+    if ((v >> 40) != g_position_epoch || (v & kPositionMask) == 0) return kNoPosition;
+    return (v & kPositionMask) - 1;
+}
 
 struct SchedulerLayout {
     size_t off_ready_queue_slots[NUM_RESOURCE_SHAPES];
@@ -708,10 +736,23 @@ struct SchedulerState {
         for (int32_t k = 0; k < p.fanin_count; ++k) {
             const int32_t prod = fanin[k];
             if (tasks.is_completed(prod)) continue;  // retired: nothing to wait on
-            if (!gq_group::same_group(prod, local_id)) return kDepsUnexpressable;
+            if (!gq_group::same_group(prod, local_id)) {
+                g_gq_deps_bailed.fetch_add(1, std::memory_order_relaxed);
+                int32_t none = -1;
+                g_gq_bail_task.compare_exchange_strong(none, local_id, std::memory_order_relaxed);
+                none = -1;
+                g_gq_bail_prod.compare_exchange_strong(none, prod, std::memory_order_relaxed);
+                g_gq_bail_kind.store(1, std::memory_order_relaxed);  // cross-group, unmet
+                return kDepsUnexpressable;
+            }
             const uint64_t pos = task_position(prod);
             if (pos == kNoPosition) {
                 g_gq_deps_bailed.fetch_add(1, std::memory_order_relaxed);
+                int32_t none = -1;
+                g_gq_bail_task.compare_exchange_strong(none, local_id, std::memory_order_relaxed);
+                none = -1;
+                g_gq_bail_prod.compare_exchange_strong(none, prod, std::memory_order_relaxed);
+                g_gq_bail_kind.store(2, std::memory_order_relaxed);  // in-group, no position
                 return kDepsUnexpressable;
             }
             if (n >= max_out) {
@@ -801,10 +842,13 @@ struct SchedulerState {
         ChipTaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL) {
             ChipTaskSlotState *next = waiter->next_in_wake_list;
-            if (gq_group::ENABLED &&
-                gq_group::group_is_opened(gq_group::group_of(waiter->to_descriptor().task_id.local_id()))) {
-                // Its group queued it when the group was opened; the controller
-                // holds this edge, so completing here releases nothing.
+            // Its group queued it when the group was opened, so the controller holds
+            // this edge and completing here releases nothing -- but only tasks the
+            // group queue actually delivers. One with no logical block never reaches
+            // a core and is not fed, so it still needs releasing from here.
+            const int32_t waiter_id = waiter->to_descriptor().task_id.local_id();
+            if (gq_group::ENABLED && group_queue_delivers(*waiter) &&
+                gq_group::group_is_opened(gq_group::group_of(waiter_id))) {
                 waiter = next;
                 continue;
             }

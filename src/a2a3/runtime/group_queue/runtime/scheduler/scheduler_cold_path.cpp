@@ -33,6 +33,7 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
+
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
@@ -354,6 +355,33 @@ void SchedulerContext::log_shutdown_stall_snapshot(
 
 
 
+
+// Whether every producer that reaches `group` from outside it has retired.
+//
+// Edges run forward and a group is a contiguous id range, so a group's external
+// producers all sit in lower-numbered groups: this can only turn true, and the
+// groups turn true in order. That is what lets the ready group queue be a single
+// position rather than a set, and what replaces a per-group counter the
+// completion path would otherwise have to maintain -- under polling a producer
+// does not enumerate its consumers, so there is no edge list to decrement along.
+bool SchedulerContext::group_externals_met(int32_t group) const {
+    if (!gq_group::ENABLED || sched_->task_view.tasks == nullptr) return false;
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    const int32_t lo = group * gq_group::GROUP_EXTENT;
+    const int32_t hi = lo + gq_group::GROUP_EXTENT;
+    const int32_t submitted = total_tasks_;
+    for (int32_t id = lo; id < hi && id < submitted; ++id) {
+        const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
+        const int32_t *fanin = p.fanin_data();
+        for (int32_t k = 0; k < p.fanin_count; ++k) {
+            const int32_t prod = fanin[k];
+            if (gq_group::group_of(prod) == group) continue;
+            if (!tasks.is_completed(prod)) return false;
+        }
+    }
+    return true;
+}
+
 // Hand the controller more of the group this thread owns, in ascending task
 // order, taking a position and filling it in the same step.
 //
@@ -376,9 +404,29 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
 
     while (space.room() > 0 && hold_budget > 0) {
         if (f.group < 0) {
-            f.group = gq_group::take_ready_group(thread_idx);
-            if (f.group < 0) return progress;
+            const int32_t from = gq_group::g_scan_from.load(std::memory_order_acquire);
+            const int32_t done = completed_tasks_.load(std::memory_order_relaxed);
+            // Judging a group ready walks its fanin, so re-ask only when the scan
+            // point moved or something retired -- otherwise an idle thread spends
+            // the window it is meant to be measuring.
+            if (from == f.probed_group && done == f.probed_completed) return progress;
+            f.probed_group = from;
+            f.probed_completed = done;
+            int32_t taken = -1;
+            const int32_t last = from + gq_group::GROUP_SCAN_WINDOW;
+            for (int32_t g = from; g < last && g < gq_group::g_group_count; ++g) {
+                if (gq_group::group_owner(g) != gq_group::NO_OWNER) continue;
+                if (!group_externals_met(g)) continue;
+                if (gq_group::try_claim_group(g, thread_idx)) {
+                    taken = g;
+                    break;
+                }
+            }
+            if (taken < 0) return progress;
+            f.group = taken;
             gq_group::mark_group_opened(f.group);
+            f.retry_from = -1;
+            f.swept_clean = true;
             f.id = f.group * gq_group::GROUP_EXTENT;
             f.end = f.id + gq_group::GROUP_EXTENT;
             f.block = 0;
@@ -386,11 +434,32 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             f.accounted = false;
         }
         if (f.id >= f.end || f.id >= submitted) {
+            if (!f.swept_clean && f.retry_from >= 0) {
+                // Something was passed over; go round again from the lowest of them.
+                // Returning here rather than looping keeps one pass bounded.
+                f.id = f.retry_from;
+                f.block = 0;
+                f.sub = 0;
+                f.accounted = false;
+                f.retry_from = -1;
+                f.swept_clean = true;
+                return progress;
+            }
             f.group = -1;
             continue;
         }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(f.id);
-        if (tasks.is_completed(f.id) || slot.logical_block_num <= 0) {
+        // A sweep that had to pass something over restarts at the lowest of them, so
+        // it revisits tasks it already emitted. Emitting one twice would count its
+        // blocks twice and the publication seal would never match, leaving a task
+        // that nothing is waiting for permanently unpublished. A position is the
+        // record that it went out.
+        if (f.block == 0 && f.sub == 0 && !f.accounted && task_position(f.id) != kNoPosition) {
+            ++f.id;
+            continue;
+        }
+        if (tasks.is_completed(f.id) || !group_queue_delivers(slot)) {
+            // Not this queue's to deliver; classify left it on the ordinary path.
             ++f.id;
             f.block = 0;
             f.sub = 0;
@@ -398,6 +467,17 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             continue;
         }
         if (!f.accounted) {
+            // Asked once per task, before any of it is accounted or emitted: the
+            // answer is a property of the task, and a task must be emitted whole.
+            uint64_t probe[asimgq::SIM_HELD_MAX_DEPS];
+            if (sched_->group_deps(&slot, f.id, probe, asimgq::SIM_HELD_MAX_DEPS) < 0) {
+                if (f.retry_from < 0) f.retry_from = f.id;
+                f.swept_clean = false;
+                ++f.id;
+                f.block = 0;
+                f.sub = 0;
+                continue;
+            }
             sched_->account_published_blocks(slot, slot.logical_block_num);
             f.accounted = true;
         }
@@ -431,13 +511,9 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
         uint64_t deps[asimgq::SIM_HELD_MAX_DEPS];
         const int d = sched_->group_deps(&slot, f.id, deps, asimgq::SIM_HELD_MAX_DEPS);
         if (d < 0) {
-            // The controller cannot be told to wait for this task: either it has
-            // more unmet producers than it has comparators, or one of them is not
-            // expressible. Hold it -- and with it the rest of the group, which is
-            // fed in order and so depends on it -- until producers retire and the
-            // count comes down. Submitting anyway would run it ahead of them.
+            // Cleared at the task boundary above, so this can only mean a producer
+            // retired mid-task and the answer improved; nothing to express is safe.
             space.unreserve(idx);
-            note_task_position(f.id, kNoPosition);
             return progress;
         }
         const int dep_n = d;
@@ -470,28 +546,13 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
 // controller here holds.
 void SchedulerContext::seed_ready_groups() {
     if (!gq_group::ENABLED || sched_->task_view.tasks == nullptr) return;
-    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
-    const int32_t submitted = total_tasks_;
-    for (int32_t id = 0; id < submitted; ++id) {
-        const int32_t g = gq_group::group_of(id);
-        if (g < 0 || g >= gq_group::MAX_GROUPS) continue;
-        if (gq_group::g_group_external[g]) continue;
-        const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
-        const int32_t *fanin = p.fanin_data();
-        for (int32_t k = 0; k < p.fanin_count; ++k) {
-            if (!gq_group::same_group(fanin[k], id)) {
-                gq_group::g_group_external[g] = true;
-                break;
-            }
-        }
-    }
-    const int32_t groups = (submitted + gq_group::GROUP_EXTENT - 1) / gq_group::GROUP_EXTENT;
-    int32_t n = 0;
-    for (int32_t g = 0; g < groups && g < gq_group::MAX_GROUPS; ++g) {
-        if (!gq_group::g_group_external[g]) gq_group::g_ready_groups[n++] = g;
-    }
-    gq_group::g_ready_group_count = n;
-    LOG_INFO("[GQ_GROUP] ready groups seeded: %d of %d (%d tasks)", n, groups, submitted);
+    // Only the extent of the queue. Whether a group has edges entering it, and
+    // whether a task is one the queue delivers, are both asked where the task slot
+    // is already in hand -- a pre-scan of the whole graph would cost a pass over
+    // every task and every edge, once per run, inside the window being measured.
+    const int32_t groups = (total_tasks_ + gq_group::GROUP_EXTENT - 1) / gq_group::GROUP_EXTENT;
+    gq_group::g_group_count = groups < gq_group::MAX_GROUPS ? groups : gq_group::MAX_GROUPS;
+    LOG_INFO("[GQ_GROUP] groups=%d (%d tasks)", gq_group::g_group_count, total_tasks_);
 }
 
 // Everything the GroupQueue carries that is scoped to one run. Positions and
@@ -504,7 +565,7 @@ void SchedulerContext::gq_prepare_run() {
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         gq_index_[i].init(asimgq::SIM_HELD_CAP);
     }
-    for (int32_t k = 0; k < kPositionSlots; ++k) g_task_position[k] = kNoPosition;
+    ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
     partition_ready_queues_by_owner();
     seed_ready_groups();
@@ -563,6 +624,61 @@ int32_t SchedulerContext::handle_timeout_exit(
             "[GQ_GROUP thread=%d] admitted=%" PRIu64 " promoted=%" PRIu64 " refused=%" PRIu64 " held_high=%u",
             thread_idx, admitted, promoted, refused, high
         );
+        LOG_ERROR(
+            "[GQ_STUCK thread=%d] group=%d id=%d block=%d sub=%d head=%d room=%u heldroom=%u push=%" PRIu64
+            " wm=%" PRIu64
+            " named=%" PRIu64 " toomany=%" PRIu64 " bailed=%" PRIu64 " bail_task=%d bail_prod=%d bail_kind=%d",
+            thread_idx, group_feed_[thread_idx].group, group_feed_[thread_idx].id, group_feed_[thread_idx].block,
+            group_feed_[thread_idx].sub, gq_group::g_scan_from.load(std::memory_order_relaxed),
+            gq_index_[thread_idx].room(), asimgq::read_queue_status(static_cast<uint32_t>(thread_idx)).held_room,
+            gq_index_[thread_idx].push_index(),
+            gq_index_[thread_idx].watermark(), g_gq_deps_named.load(std::memory_order_relaxed),
+            g_gq_deps_toomany.load(std::memory_order_relaxed), g_gq_deps_bailed.load(std::memory_order_relaxed),
+            g_gq_bail_task.load(std::memory_order_relaxed), g_gq_bail_prod.load(std::memory_order_relaxed),
+            g_gq_bail_kind.load(std::memory_order_relaxed)
+        );
+        if (sched_->task_view.tasks != nullptr) {
+            // Why the scan point cannot advance: name the first external producer of
+            // the group sitting there that has not retired, and say what it is.
+            SharedMemoryTaskHeader &tk = *sched_->task_view.tasks;
+            const int32_t g = gq_group::g_scan_from.load(std::memory_order_relaxed);
+            const int32_t lo = g * gq_group::GROUP_EXTENT;
+            const int32_t hi = lo + gq_group::GROUP_EXTENT;
+            bool named = false;
+            for (int32_t id = lo; id < hi && id < total_tasks_ && !named; ++id) {
+                const TaskPayload &pp = tk.get_slot_state_by_task_id(id).to_payload();
+                const int32_t *fi = pp.fanin_data();
+                for (int32_t k = 0; k < pp.fanin_count; ++k) {
+                    const int32_t pr = fi[k];
+                    if (gq_group::group_of(pr) == g || tk.is_completed(pr)) continue;
+                    ChipTaskSlotState &ps = tk.get_slot_state_by_task_id(pr);
+                    LOG_ERROR(
+                        "[GQ_BLOCK] group=%d task=%d waits on ext prod=%d (group %d) blocks=%d shape=%d "
+                        "delivered=%d owner=%d opened=%d published=%d",
+                        g, id, pr, gq_group::group_of(pr), static_cast<int>(ps.logical_block_num),
+                        static_cast<int>(ps.active_mask.to_shape()), group_queue_delivers(ps) ? 1 : 0,
+                        gq_group::group_owner(gq_group::group_of(pr)),
+                        gq_group::group_is_opened(gq_group::group_of(pr)) ? 1 : 0, tk.is_published(pr) ? 1 : 0
+                    );
+                    named = true;
+                    break;
+                }
+            }
+            if (!named) LOG_ERROR("[GQ_BLOCK] group=%d has every external producer retired", g);
+        }
+        {
+            const int32_t bp = g_gq_bail_prod.load(std::memory_order_relaxed);
+            if (bp >= 0 && sched_->task_view.tasks != nullptr && bp < total_tasks_) {
+                SharedMemoryTaskHeader &tk = *sched_->task_view.tasks;
+                ChipTaskSlotState &bs = tk.get_slot_state_by_task_id(bp);
+                LOG_ERROR(
+                    "[GQ_BAILPROD] prod=%d blocks=%d kind=%d shape=%d completed=%d published=%d pos=%llu",
+                    bp, static_cast<int>(bs.logical_block_num), static_cast<int>(bs.task_kind),
+                    static_cast<int>(bs.active_mask.to_shape()), tk.is_completed(bp) ? 1 : 0,
+                    tk.is_published(bp) ? 1 : 0, (unsigned long long)task_position(bp)
+                );
+            }
+        }
     }
 #endif
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
@@ -1394,8 +1510,12 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
             if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
             if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
         }
-        if (gq_group::ENABLED && !gq_group::g_group_external[gq_group::group_of(id)]) {
-            continue;  // the ready group queue delivers this task, whole group at a time
+        // The ready group queue delivers a group's dispatchable tasks, whole group
+        // at a time. It delivers only those: a task with no logical block never
+        // reaches a core, so it keeps the ordinary path, which is what completes it
+        // and releases the consumers that name it.
+        if (gq_group::ENABLED && group_queue_delivers(slot)) {
+            continue;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {

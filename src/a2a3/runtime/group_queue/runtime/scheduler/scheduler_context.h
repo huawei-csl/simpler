@@ -216,8 +216,13 @@ private:
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();
 
-    // Populate the ready group queue with every group no external edge reaches.
+    // Size the ready group queue and record which groups external edges reach.
     void seed_ready_groups();
+
+    // Whether every producer reaching `group` from outside it has retired. Edges
+    // run forward and a group is a contiguous id range, so this can only become
+    // true, never false again.
+    bool group_externals_met(int32_t group) const;
 
     // Hand the controller more of the group this thread is working through, in
     // ascending task order. Returns true if anything was submitted.
@@ -234,6 +239,17 @@ private:
         int32_t block = 0;      // logical block within the task
         int32_t sub = 0;        // subtask slot within the block
         bool accounted = false; // this task's blocks are counted for publication
+        // What the last unsuccessful readiness probe saw. Deciding a group's
+        // external producers have retired costs a walk of its whole fanin, so it
+        // is re-asked only when the head of the queue moved or something retired.
+        int32_t probed_group = -1;
+        int32_t probed_completed = -1;
+        // A task the controller cannot be told to wait for yet is passed over, not
+        // waited on: blocking the cursor would hold every later task in the group,
+        // and the group gates every later group. The lowest one passed over is where
+        // the next sweep of this group restarts.
+        int32_t retry_from = -1;
+        bool swept_clean = true;
     };
     GroupFeed group_feed_[PLATFORM_MAX_AICPU_THREADS];
 
