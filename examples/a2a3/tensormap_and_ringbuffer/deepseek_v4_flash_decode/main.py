@@ -728,6 +728,7 @@ def _build_config(
     dump_args: int,
     enable_pmu: int,
     enable_dep_gen: bool,
+    enable_chip_swimlane: int,
     enable_scope_stats: bool,
     output_prefix: str,
 ) -> CallConfig:
@@ -741,6 +742,7 @@ def _build_config(
     config.enable_dump_args = dump_args
     config.enable_pmu = enable_pmu
     config.enable_dep_gen = enable_dep_gen
+    config.enable_chip_swimlane = enable_chip_swimlane
     config.enable_scope_stats = enable_scope_stats
     # CallConfig::validate() requires a prefix whenever a diagnostic is enabled.
     if output_prefix:
@@ -800,6 +802,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
     dump_args: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
+    enable_chip_swimlane: int = 0,
     enable_scope_stats: bool = False,
     compile_only: bool = False,
     compile_workers: int | None = None,
@@ -829,14 +832,14 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
     # statistics and drops the per-event captures, warning per flag.
     diagnostics = effective_diagnostic_options(
         rounds,
-        chip_swimlane=0,
+        chip_swimlane=enable_chip_swimlane,
         dump_args=dump_args,
         pmu=enable_pmu,
         dep_gen=enable_dep_gen,
         scope_stats=enable_scope_stats,
         swimlane_overhead=False,
     )
-    diagnostics_on = bool(diagnostics.dump_args or diagnostics.pmu or diagnostics.dep_gen or diagnostics.scope_stats)
+    diagnostics_on = bool(diagnostics.dump_args or diagnostics.pmu or diagnostics.dep_gen or diagnostics.scope_stats or diagnostics.chip_swimlane)
     output_prefix = str(build_output_prefix(f"{CASE_LABEL}_{runtime}")) if diagnostics_on else ""
 
     print(f"[dsv4] devices={device_ids} rounds={rounds} skip_golden={skip_golden}", flush=True)
@@ -860,6 +863,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
             dump_args=diagnostics.dump_args,
             enable_pmu=diagnostics.pmu,
             enable_dep_gen=diagnostics.dep_gen,
+            enable_chip_swimlane=diagnostics.chip_swimlane,
             enable_scope_stats=diagnostics.scope_stats,
             output_prefix=output_prefix,
         )
@@ -880,6 +884,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
                 output_prefix,
                 callable_spec=spec,
                 dep_gen=diagnostics.dep_gen,
+                chip_swimlane=diagnostics.chip_swimlane,
                 scope_stats=diagnostics.scope_stats,
             )
     print("[dsv4] PASSED", flush=True)
@@ -921,6 +926,14 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Enable PMU collection. Bare flag = PIPE_UTILIZATION(2)",
     )
     parser.add_argument("--enable-dep-gen", action="store_true", help="Enable dep_gen capture (needs --rounds 1)")
+    parser.add_argument(
+        "--enable-chip-swimlane",
+        nargs="?",
+        const=3,
+        type=int,
+        default=0,
+        help="Per-task AICore/scheduler records (needs --rounds 1). Bare flag = 3 (scheduler phases)",
+    )
     parser.add_argument("--enable-scope-stats", action="store_true", help="Emit per-scope ring-fill peaks")
     parser.add_argument("--log-level", choices=LOG_LEVEL_CHOICES, default=DEFAULT_LOG_LEVEL)
     parser.add_argument("--compile-only", action="store_true", help="compile the kernels and exit, no device needed")
@@ -940,6 +953,7 @@ def main(argv=None, **overrides) -> int:
         dump_args=cli.dump_args,
         enable_pmu=cli.enable_pmu,
         enable_dep_gen=cli.enable_dep_gen,
+        enable_chip_swimlane=cli.enable_chip_swimlane,
         enable_scope_stats=cli.enable_scope_stats,
         compile_only=cli.compile_only,
         compile_workers=cli.compile_workers,

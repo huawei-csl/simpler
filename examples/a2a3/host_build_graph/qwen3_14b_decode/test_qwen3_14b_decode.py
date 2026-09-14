@@ -34,7 +34,7 @@ def _driver():
 
 
 @pytest.mark.manual
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a2a3asim", "a2a3asimgq"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
 def test_qwen3_14b_decode_host_build_graph(st_platform, st_device_ids, request):

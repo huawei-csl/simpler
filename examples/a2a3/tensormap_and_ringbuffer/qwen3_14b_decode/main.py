@@ -461,7 +461,7 @@ class TestQwen314BDecode(SceneTestCase):
     CASES = [
         {
             "name": "StressBatch16Seq3500",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3", "a2a3asim", "a2a3asimgq"],
             "manual": True,
             # A run takes the whole device, matching the lib default.
             "params": {"seed": 1234, "seq_len": 3500},
