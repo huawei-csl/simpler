@@ -252,7 +252,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
           "scheduler_tasks": {
             "schema_version": 1,
             "producer": "<aicpu|aicore>",
-            "records": [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...]
+            "records": [[core_id, reg_task_id, dispatch_cycles, finish_cycles,
+                         func_id?], ...]
           },
           "scheduler_records": {"schema_version": 1, "streams": [...]},
           "aicpu_lifecycle_records": [{worker_id, aicpu_thread_id, ..._cycles}, ...],
@@ -331,10 +332,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         if scheduler_task_producer not in ("aicpu", "aicore"):
             raise ValueError("scheduler_tasks.producer must be 'aicpu' or 'aicore'")
         scheduler_task_rows = scheduler_task_section.get("records")
+        # A fifth column carries the func_id the scheduler recorded for the
+        # dispatch. It is optional: only traces taken after that field existed have
+        # it, and nothing here needs it, so both widths are accepted rather than
+        # forcing every reader and writer to move together.
         if not isinstance(scheduler_task_rows, list) or any(
-            not isinstance(row, list) or len(row) != 4 for row in scheduler_task_rows
+            not isinstance(row, list) or len(row) not in (4, 5) for row in scheduler_task_rows
         ):
-            raise ValueError("scheduler_tasks.records must contain four-column arrays")
+            raise ValueError("scheduler_tasks.records must contain four- or five-column arrays")
     else:
         scheduler_task_rows = legacy_aicpu_rows or []
         scheduler_task_producer = "aicpu" if legacy_aicpu_rows is not None else None
@@ -562,7 +567,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
         r2s_c = int(row[5]) if len(row) > 5 else 0
         _track(start_c - r2s_c)
         _track(end_c)
-    for _, _, d, f in scheduler_task_rows:
+    for row in scheduler_task_rows:
+        d, f = row[2], row[3]
         _track(int(d))
         _track(int(f))
     for thread_records in sched_phases_raw:
@@ -630,7 +636,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None):  # noqa
 
     if scheduler_task_rows:
         for row in scheduler_task_rows:
-            core_id, reg_task_id, dispatch_cycles, finish_cycles = row
+            core_id, reg_task_id, dispatch_cycles, finish_cycles = row[0], row[1], row[2], row[3]
             core_id = int(core_id)
             reg_task_id = int(reg_task_id)
             ac = aicore_lookup.get((core_id, reg_task_id))

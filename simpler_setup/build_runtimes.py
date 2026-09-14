@@ -171,6 +171,19 @@ def build_all(
             logger.warning(f"  {platform}: no runtimes found, skipping")
             continue
 
+        # A simulated-device variant exists to measure one runtime, so it builds
+        # only that one: the others would compile against a device they were not
+        # written for, and their binaries would never be loaded.
+        SIMULATED_DEVICE_RUNTIME = {"asim": "host_build_graph", "asimgq": "group_queue"}
+        paired = SIMULATED_DEVICE_RUNTIME.get(variant)
+        if paired is not None:
+            runtimes = [r for r in runtimes if r == paired]
+        else:
+            # Runtimes that exist only to be measured under a simulated device are
+            # not built for the real ones.
+            simulated_only = set(SIMULATED_DEVICE_RUNTIME.values()) - {"host_build_graph"}
+            runtimes = [r for r in runtimes if r not in simulated_only]
+
         for runtime_name in runtimes:
             tasks.append((platform, runtime_name))
             if platform_embeds_pto_isa(platform):

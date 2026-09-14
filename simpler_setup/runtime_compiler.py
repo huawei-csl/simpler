@@ -155,12 +155,22 @@ class RuntimeCompiler:
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "onboard"
         elif platform == "a2a3sim":
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "sim"
+        elif platform == "a2a3asim":
+            # aSim is an onboard-family variant: real onboard host + aarch64
+            # AICPU, compiled with -DASIM_DEVICE=ON. No parallel platform tree --
+            # the deltas are gated in the onboard sources by __ASIM_DEVICE__.
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "onboard"
+        elif platform == "a2a3asimgq":
+            # Same onboard-family shape, with the GroupQueue device model:
+            # -DASIMGQ_DEVICE=ON pulls in asimgq_core and gates the onboard
+            # deltas by __ASIMGQ_DEVICE__.
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "onboard"
         elif platform == "a5":
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "onboard"
         elif platform == "a5sim":
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "sim"
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a2a3asim, a2a3asimgq, a5, a5sim")
 
         if not self.platform_dir.is_dir():
             raise ValueError(f"Platform '{platform}' not found at {self.platform_dir}")
@@ -169,12 +179,15 @@ class RuntimeCompiler:
             self._init_a2a3()
         elif platform == "a2a3sim":
             self._init_a2a3sim()
+        elif platform in ("a2a3asim", "a2a3asimgq"):
+            # Toolchains are identical to real a2a3; only the cmake define differs.
+            self._init_a2a3()
         elif platform == "a5":
             self._init_a5()
         elif platform == "a5sim":
             self._init_a5sim()
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a2a3asim, a2a3asimgq, a5, a5sim")
 
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
@@ -323,6 +336,13 @@ class RuntimeCompiler:
             target = self.host_target
         else:
             raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
+
+        # aSim variants compile the onboard tree with the simulated device added
+        # and its deltas gated in. The AICore .o is still built, never launched.
+        if self.platform == "a2a3asim" and target_platform in ("aicpu", "host"):
+            cmake_defines = {**(cmake_defines or {}), "ASIM_DEVICE": "ON"}
+        if self.platform == "a2a3asimgq" and target_platform in ("aicpu", "host"):
+            cmake_defines = {**(cmake_defines or {}), "ASIMGQ_DEVICE": "ON"}
 
         cmake_args = target.gen_cmake_args(
             include_dirs,

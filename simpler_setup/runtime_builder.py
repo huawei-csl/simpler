@@ -39,7 +39,7 @@ def platform_embeds_pto_isa(platform: str) -> bool:
     platforms do not embed PTO-ISA host headers.
     """
     arch, variant = parse_platform(platform)
-    if variant != "onboard":
+    if variant not in ("onboard", "asim", "asimgq"):
         return False
     return arch in {"a2a3", "a5"}
 

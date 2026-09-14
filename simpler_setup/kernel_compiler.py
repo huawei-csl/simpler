@@ -121,7 +121,7 @@ class KernelCompiler:
         self.project_root = PROJECT_ROOT
 
         # Map platform to architecture directory
-        if platform in ("a2a3", "a2a3sim"):
+        if platform in ("a2a3", "a2a3sim", "a2a3asim", "a2a3asimgq"):
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
@@ -129,7 +129,7 @@ class KernelCompiler:
             raise ValueError(f"Unknown platform: {platform}")
 
         # Create toolchain objects based on platform
-        if platform in ("a2a3", "a5"):
+        if platform in ("a2a3", "a5", "a2a3asim", "a2a3asimgq"):
             env_manager.ensure("ASCEND_HOME_PATH")
             self.ccec = CCECToolchain(platform)
             self.aarch64 = Aarch64GxxToolchain()
@@ -182,7 +182,7 @@ class KernelCompiler:
             [runtime_dir, platform_host_dir, platform_include_dir]
         """
         # Map platform to runtime architecture
-        if self.platform in ("a2a3", "a2a3sim"):
+        if self.platform in ("a2a3", "a2a3sim", "a2a3asim", "a2a3asimgq"):
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
@@ -230,7 +230,7 @@ class KernelCompiler:
             (include_dirs, source_files) — both as absolute paths, or ([], [])
         """
         # Map platform to runtime architecture
-        if self.platform in ("a2a3", "a2a3sim"):
+        if self.platform in ("a2a3", "a2a3sim", "a2a3asim", "a2a3asimgq"):
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
@@ -294,7 +294,9 @@ class KernelCompiler:
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        if runtime_name == "host_build_graph":
+        # group_queue is a host_build_graph fork: same host-orchestration shape, so
+        # the same toolchain compiles its orchestration source.
+        if runtime_name in ("host_build_graph", "group_queue"):
             return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
             if self.platform.endswith("sim"):
@@ -479,6 +481,10 @@ class KernelCompiler:
         incore_toolchain = self._get_toolchain(
             {
                 "a2a3": ToolchainType.CCEC,
+                # aSim builds the real kernels and never launches them: the
+                # simulated device replays their calibrated duration instead.
+                "a2a3asim": ToolchainType.CCEC,
+                "a2a3asimgq": ToolchainType.CCEC,
                 "a2a3sim": ToolchainType.HOST_GXX_15,
                 "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
                 "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim

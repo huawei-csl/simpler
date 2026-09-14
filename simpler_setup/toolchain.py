@@ -162,10 +162,10 @@ class CCECToolchain(Toolchain):
         # A5 uses dav-c310 architecture, A2A3 uses dav-c220
         if self.platform in ("a5", "a5sim"):
             arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
-        elif self.platform in ("a2a3", "a2a3sim"):
+        elif self.platform in ("a2a3", "a2a3sim", "a2a3asim", "a2a3asimgq"):
             arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
         else:
-            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a2a3asim, a2a3asimgq, a5, a5sim")
 
         flags = [
             "-c",

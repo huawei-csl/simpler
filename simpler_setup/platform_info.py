@@ -21,6 +21,11 @@ from .environment import PROJECT_ROOT
 PLATFORM_MAP: dict[str, tuple[str, str]] = {
     "a2a3": ("a2a3", "onboard"),
     "a2a3sim": ("a2a3", "sim"),
+    # aSim variants: real onboard host + AICPU, AICores replaced by an
+    # AICPU-side simulated device. No parallel platform tree -- the deltas are
+    # gated inside the onboard sources.
+    "a2a3asim": ("a2a3", "asim"),
+    "a2a3asimgq": ("a2a3", "asimgq"),
     "a5": ("a5", "onboard"),
     "a5sim": ("a5", "sim"),
 }

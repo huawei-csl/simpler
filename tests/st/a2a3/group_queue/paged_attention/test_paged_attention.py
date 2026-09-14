@@ -21,9 +21,11 @@ from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 
 
-@scene_test(level=2, runtime="host_build_graph")
-class TestPagedAttentionHostBuildGraph(SceneTestCase):
-    """Paged attention with host_build_graph runtime."""
+@scene_test(level=2, runtime="group_queue")
+class TestPagedAttentionGroupQueue(SceneTestCase):
+    """Paged attention under the GroupQueue: the manager hands tasks to its group's
+    controller and learns of completions as a watermark, instead of choosing cores
+    and polling each one."""
 
     RTOL = 1e-3
     ATOL = 1e-3
@@ -76,7 +78,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             # runtime_env.ring_task_window if needed; the GM heap needs no sizing,
             # since it is committed to the size orchestration measured.
             "name": "Case1",
-            "platforms": ["a2a3", "a2a3asim", "a2a3asimgq"],
+            "platforms": ["a2a3asimgq"],
             "manual": True,
             # host-orchestration populates the whole task graph before the device
             # schedules and reclaims nothing mid-orchestration, so the window must
@@ -99,7 +101,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "Case2",
-            "platforms": ["a2a3", "a2a3asim", "a2a3asimgq"],
+            "platforms": ["a2a3asimgq"],
             "manual": True,
             # host-orchestration populates the whole task graph before the device
             # schedules and reclaims nothing mid-orchestration, so the window must
@@ -122,7 +124,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "small1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3asimgq"],
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -136,7 +138,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "small2",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3asimgq"],
             "manual": True,
             "params": {
                 "batch": 1,

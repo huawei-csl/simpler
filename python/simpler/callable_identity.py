@@ -82,7 +82,9 @@ def _sha256_hashid(data: bytes) -> str:
 
 
 def _platform_arch(platform: str) -> str:
-    if platform in ("a2a3", "a2a3sim"):
+    # aSim variants are a2a3 silicon with the AICores simulated, so a callable
+    # built for them is an a2a3 callable.
+    if platform in ("a2a3", "a2a3sim", "a2a3asim", "a2a3asimgq"):
         return "a2a3"
     if platform in ("a5", "a5sim"):
         return "a5"
