@@ -1214,7 +1214,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
     // of swimlane_converter.py's v2 reader.
     //
     //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
-    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles]
+    //   scheduler_tasks.records: [core_id, reg_task_id, dispatch_cycles, finish_cycles, func_id]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
         // collecting from the device side, so no defensive filter here.
@@ -1252,7 +1252,7 @@ int ChipSwimlaneCollector::export_swimlane_json() {
                 for (const auto &r : collected_perf_records_[core_idx]) {
                     if (!first) outfile << ",";
                     outfile << "\n    [" << core_idx << ", " << r.reg_task_id << ", " << r.dispatch_time << ", "
-                            << r.finish_time << "]";
+                            << r.finish_time << ", " << static_cast<int32_t>(r.func_id) << "]";
                     first = false;
                     total++;
                 }

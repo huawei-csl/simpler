@@ -551,9 +551,18 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
 // dispatch, so the dispatch count IS the AICore-side total. Bumping here
 // (instead of inside complete_task) means level=1 (TASK_TIMING-only) gets
 // accurate reconcile counts even when complete_task is bypassed.
-void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id) {
+// Kernel of each in-flight dispatch, kept until its completion record is written.
+// A core's outstanding dispatches are bounded by its intake depth, far under this
+// window, so indexing by the low bits of the dispatch token cannot collide.
+constexpr uint32_t CHIP_SWIMLANE_FUNC_SLOTS = 256;
+int32_t s_dispatch_func_id[PLATFORM_MAX_CORES][CHIP_SWIMLANE_FUNC_SLOTS] = {};
+
+void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id, int32_t func_id) {
     if (!g_enable_chip_swimlane) {
         return;
+    }
+    if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
+        s_dispatch_func_id[core_id][reg_task_id & (CHIP_SWIMLANE_FUNC_SLOTS - 1)] = func_id;
     }
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return;
@@ -629,6 +638,11 @@ int chip_swimlane_aicpu_complete_task(
     record->reg_task_id = reg_task_id;
     record->dispatch_time = dispatch_time;
     record->finish_time = finish_time;
+    record->func_id = static_cast<uint32_t>(
+        (core_id >= 0 && core_id < PLATFORM_MAX_CORES)
+            ? s_dispatch_func_id[core_id][reg_task_id & (CHIP_SWIMLANE_FUNC_SLOTS - 1)]
+            : -1
+    );
 
     uint32_t new_count = count + 1;
     chip_swimlane_buf->count = new_count;

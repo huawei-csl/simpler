@@ -53,6 +53,15 @@ Runtime::Runtime() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
     }
+#ifdef __SIMULATED_DEVICE__
+    // No calibration entry means the simulated device falls back to its default
+    // compute, so zero is the "unset" value the loader overwrites.
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
+        asim_compute_ns_[i] = 0;
+        asim_compute_sigma_ns_[i] = 0;
+    }
+    asim_lat_ns_[0] = asim_lat_ns_[1] = asim_lat_ns_[2] = asim_lat_ns_[3] = 0;
+#endif
 }
 
 // =============================================================================

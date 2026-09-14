@@ -64,18 +64,67 @@ inline AicpuPhaseRecord *aicpu_phase_self_records() {
     return aicpu_phase_records(get_platform_phase_base(), platform_aicpu_affinity_thread_idx());
 }
 
+// Whether a reported window excludes the model's own excess. On by default: a
+// window that includes it describes the cost of modelling rather than the design.
+// Switched off only to measure the correction itself, by running the same source
+// both ways.
+#ifndef SIM_WINDOW_CORRECTION
+#define SIM_WINDOW_CORRECTION 1
+#endif
+
+uint64_t simulated_device_self_overrun_ticks();
+
+#ifdef __SIMULATED_DEVICE__
+// The model's excess is a running total for the whole run, so a phase must
+// subtract only what accrued inside it. This remembers the total as each phase
+// opened; one slot per phase per thread, written and read by that thread alone.
+inline uint64_t g_sim_self_at_phase_start[PLATFORM_MAX_AICPU_THREADS][NUM_AICPU_PHASES] = {};
+// What the last RunWall close actually subtracted, per thread, so the executor
+// can report it from a scope that has a logger.
+inline uint64_t g_sim_last_correction[PLATFORM_MAX_AICPU_THREADS] = {};
+#endif
+
 /** Stamp the start cycle of `phase` for this thread. No-op if capture is off. */
 inline void aicpu_phase_start(AicpuPhase phase) {
     AicpuPhaseRecord *records = aicpu_phase_self_records();
     if (records == nullptr) return;
+#ifdef __SIMULATED_DEVICE__
+    const int t = platform_aicpu_affinity_thread_idx();
+    if (t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) {
+        g_sim_self_at_phase_start[t][static_cast<int>(phase)] = simulated_device_self_overrun_ticks();
+    }
+#endif
     records[static_cast<int>(phase)].start_cycle = get_sys_cnt_aicpu();
 }
+
+// What the simulated device spent beyond the latency it was modelling, in counter
+// ticks, for the calling thread. Zero on real silicon, where no model runs. Each
+// simulated device defines it; the phase end below subtracts it so a reported
+// window describes the design being modelled rather than the cost of modelling it.
+uint64_t simulated_device_self_overrun_ticks();
 
 /** Stamp the end cycle of `phase` for this thread. No-op if capture is off. */
 inline void aicpu_phase_end(AicpuPhase phase) {
     AicpuPhaseRecord *records = aicpu_phase_self_records();
     if (records == nullptr) return;
-    records[static_cast<int>(phase)].end_cycle = get_sys_cnt_aicpu();
+    uint64_t end = get_sys_cnt_aicpu();
+#ifdef __SIMULATED_DEVICE__
+    // The model runs on this same AICPU, inside the window being measured. Work
+    // that fitted the modelled latency is already hidden by the spin to its
+    // deadline; the excess is not, so it is removed here rather than left for
+    // whoever reads the number to remember to subtract.
+    const int t = platform_aicpu_affinity_thread_idx();
+    const uint64_t before =
+        (t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) ? g_sim_self_at_phase_start[t][static_cast<int>(phase)] : 0;
+    const uint64_t now = simulated_device_self_overrun_ticks();
+    const uint64_t self = now > before ? now - before : 0;
+    const uint64_t start = records[static_cast<int>(phase)].start_cycle;
+    end = (end > start + self) ? end - self : start;
+    if (phase == AicpuPhase::RunWall && t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) {
+        g_sim_last_correction[t] = self;
+    }
+#endif
+    records[static_cast<int>(phase)].end_cycle = end;
 }
 
 /**

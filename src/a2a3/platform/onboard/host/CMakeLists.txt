@@ -126,6 +126,12 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
+# The host side of a simulated-device variant skips the AICore launch (and can
+# provision simulator-owned register backing) via __SIMULATED_DEVICE__.
+if(ASIM_DEVICE OR ASIMGQ_DEVICE)
+    target_compile_definitions(host_runtime PRIVATE __SIMULATED_DEVICE__)
+endif()
+
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
 endif()

@@ -123,6 +123,11 @@ struct ChipSwimlaneAicpuTaskRecord {
     uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
     uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
     uint32_t reg_task_id;    // Per-core dispatch token; host join key vs AICore record
+    // Kernel this dispatch ran. Recorded because deps.json cannot supply it for a
+    // graph-execution case: those tasks are expanded on device and have no deps
+    // node, so a host-side join attributes almost none of them. Occupies padding
+    // the record already carried, so the 32B wire size is unchanged.
+    uint32_t func_id;
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskRecord must be 32B");

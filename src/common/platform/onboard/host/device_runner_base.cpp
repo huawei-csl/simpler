@@ -31,6 +31,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
+#include <sstream>
+#include <fstream>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -1244,6 +1247,52 @@ int DeviceRunnerBase::bind_callable_to_runtime(
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
+#ifdef __SIMULATED_DEVICE__
+    // aSim: load the per-test compute-duration calibration table (one
+    // "func_id mean_ns [sigma_ns]" per line) named by SIMPLER_ASIM_CALIB, and stamp it into
+    // the Runtime for the simulated device to read at bring-up. Without it the
+    // simulated device uses its default compute for every func_id.
+    if (const char *calib_path = std::getenv("SIMPLER_ASIM_CALIB")) {
+        std::ifstream calib(calib_path);
+        if (!calib) {
+            LOG_ERROR("aSim: cannot open SIMPLER_ASIM_CALIB=%s", calib_path);
+        } else {
+            int loaded = 0;
+            std::string line;
+            while (std::getline(calib, line)) {
+                std::istringstream ls(line);
+                std::string tok;
+                if (!(ls >> tok)) {
+                    continue;  // blank line
+                }
+                if (tok == "LAT") {
+                    // Optional "LAT push read ack [notice]" — injected latencies (ns).
+                    ls >> runtime.asim_lat_ns_[0] >> runtime.asim_lat_ns_[1] >> runtime.asim_lat_ns_[2];
+                    uint64_t notice = 0;
+                    if (ls >> notice) {
+                        runtime.asim_lat_ns_[3] = notice;
+                    }
+                    continue;
+                }
+                const int fid = std::atoi(tok.c_str());
+                uint64_t ns = 0;
+                if ((ls >> ns) && fid >= 0 && fid < RUNTIME_MAX_FUNC_ID) {
+                    runtime.asim_compute_ns_[fid] = ns;
+                    // Optional third field: per-func_id compute stddev (ns).
+                    // Absent => 0 => deterministic compute for this func_id.
+                    uint64_t sigma = 0;
+                    if (ls >> sigma) {
+                        runtime.asim_compute_sigma_ns_[fid] = sigma;
+                    }
+                    ++loaded;
+                }
+            }
+            LOG_INFO("aSim: loaded %d func_id compute entries from %s", loaded, calib_path);
+        }
+    } else {
+        LOG_ERROR("aSim: SIMPLER_ASIM_CALIB unset — simulated compute uses the default for all func_ids");
+    }
+#endif
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);

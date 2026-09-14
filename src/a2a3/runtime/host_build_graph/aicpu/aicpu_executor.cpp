@@ -29,6 +29,12 @@
 #include "aicpu/platform_regs.h"
 #include "utils/thread_completion_gate.h"
 
+#ifdef __SIMULATED_DEVICE__
+#include <vector>
+
+#include "aicpu/asim_core.h"
+#endif
+
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
 #include "scheduler/scheduler_types.h"
 
@@ -105,6 +111,71 @@ static AicpuExecutor g_aicpu_executor;
 
 // ===== AicpuExecutor Method Implementations =====
 
+#ifdef __SIMULATED_DEVICE__
+namespace {
+
+// aSim bring-up (leader-only, once, before pre_handshake_init). With no real
+// AICores, the AICPU itself provisions the simulated device: it owns the
+// per-core register backing, publishes each worker's self-report the way a real
+// AICore does at launch (physical_core_id + core_type, then the aicore_done
+// readiness flag the handshake spins on), and seeds each COND to idle. It is the
+// sole writer of the register table (kernel.cpp skips set_platform_regs under
+// __SIMULATED_DEVICE__), so pre_handshake_init captures the aSim registers.
+void asim_bringup(Runtime *runtime) {
+    const int32_t num_cores = runtime->get_worker_count();
+    // AICPU-local backing (no GM / no AICore); persists for the process.
+    static std::vector<uint8_t> reg_backing;
+    static std::vector<uint64_t> reg_bases;
+    // Grown, never re-zeroed: asim::init() below re-seeds every core's COND, and
+    // no other register in the block is read before the scheduler writes it, so
+    // a per-run memset of the whole table would be dead work on the bring-up path.
+    const size_t need = static_cast<size_t>(num_cores) * SIM_REG_BLOCK_SIZE;
+    if (reg_backing.size() < need) {
+        reg_backing.resize(need, 0);
+    }
+    reg_bases.resize(static_cast<size_t>(num_cores));
+    const uint64_t base = reinterpret_cast<uint64_t>(reg_backing.data());
+    for (int32_t i = 0; i < num_cores; ++i) {
+        reg_bases[i] = base + static_cast<uint64_t>(i) * SIM_REG_BLOCK_SIZE;
+    }
+
+    // Configure + seed the simulated device (COND = idle) before publishing
+    // aicore_done, so a peer that observes the readiness flag finds a coherent
+    // register file.
+    asim::configure(base, static_cast<uint32_t>(num_cores));
+    // Injected MMIO latencies: from the calib file's LAT line if present, else
+    // a2a3-measured defaults — posted doorbell write ~5 ns, nGnRE COND read
+    // ~92 ns, push->core-latch ~633 ns (so ack = 633 - push). See DESIGN.md §5a.
+    const uint64_t push_ns = runtime->asim_lat_ns_[0] != 0 ? runtime->asim_lat_ns_[0] : 5;
+    const uint64_t read_ns = runtime->asim_lat_ns_[1] != 0 ? runtime->asim_lat_ns_[1] : 92;
+    const uint64_t ack_ns = runtime->asim_lat_ns_[2] != 0 ? runtime->asim_lat_ns_[2] : 628;
+    // FIN-write -> AICPU-observable floor. The measured (finish - end) spread is
+    // mostly poll-wait, which the simulated scheduler already produces on its
+    // own; only this floor is hardware, so injecting the median would
+    // double-count. See DESIGN.md 5b.
+    const uint64_t notice_ns = runtime->asim_lat_ns_[3] != 0 ? runtime->asim_lat_ns_[3] : 150;
+    asim::set_latencies_ns(push_ns, read_ns, ack_ns, notice_ns);
+    // Per-func_id compute, carried per test in Runtime::asim_compute_ns_ (filled
+    // host-side from the calibration table). A dispatched func_id with no entry
+    // falls back to the default.
+    asim::set_compute_ns_table(
+        runtime->asim_compute_ns_, runtime->asim_compute_sigma_ns_, RUNTIME_MAX_FUNC_ID, /*default*/ 1000
+    );
+    asim::init();
+
+    Handshake *workers = runtime->get_workers();
+    for (int32_t i = 0; i < num_cores; ++i) {
+        workers[i].physical_core_id = static_cast<uint32_t>(i);
+        std::atomic_thread_fence(std::memory_order_release);
+        workers[i].aicore_done = static_cast<uint32_t>(i + 1);
+    }
+
+    set_platform_regs(reinterpret_cast<uint64_t>(reg_bases.data()));
+}
+
+}  // namespace
+#endif  // __SIMULATED_DEVICE__
+
 int32_t AicpuExecutor::init(Runtime *runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
@@ -152,6 +223,10 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         aicpu_thread_num_ = nthreads;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
+#ifdef __SIMULATED_DEVICE__
+        // Provision the simulated device before the register table is captured.
+        asim_bringup(runtime);
+#endif
         if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);

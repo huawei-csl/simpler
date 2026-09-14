@@ -543,6 +543,31 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         pmu_aicpu_finalize(cores, core_num);
     }
 #endif
+#ifdef __SIMULATED_DEVICE__
+    {
+        // Compute the simulated cores were given. Compared against the GroupQueue
+        // runtime's own total, this is what says both ran the same graph -- which a
+        // skip-golden run cannot.
+        uint64_t busy = 0, dispatches = 0;
+        asim::asim_busy_ticks(cores, static_cast<uint32_t>(core_num), &busy, &dispatches);
+        LOG_INFO(
+            "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d", thread_idx, cycles_to_us(busy),
+            dispatches, core_num
+        );
+        if (thread_idx == 0) {
+            uint64_t h[8] = {};
+            asim::asim_func_hist(h, 8);
+            LOG_INFO(
+                "[M0_HIST] f0=%" PRIu64 " f1=%" PRIu64 " f2=%" PRIu64 " f3=%" PRIu64 " f4=%" PRIu64
+                " f5=%" PRIu64 " OTHER=%" PRIu64 " maxid=%" PRIu64 " sum=%" PRIu64,
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+                h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
+            );
+            LOG_INFO("[M0_DONE] completed_tasks=%d total=%d",
+                     completed_tasks_.load(std::memory_order_relaxed), total_tasks_);
+        }
+    }
+#endif
     LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
     return retire_cores(runtime, cores, core_num);
 }

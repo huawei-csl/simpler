@@ -58,12 +58,38 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_SOURCE_DIRS to build AICPU kernel")
 endif()
 
+# Simulated-device variants replace the AICore fabric with an AICPU-hosted state
+# machine. Each variant contributes its own device model; the shared platform
+# deltas are gated by __SIMULATED_DEVICE__ below.
+if(ASIM_DEVICE)
+    list(APPEND AICPU_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../asim/aicpu/asim_core.cpp")
+endif()
+
+if(ASIMGQ_DEVICE)
+    list(APPEND AICPU_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../asimgq/aicpu/asimgq_core.cpp")
+endif()
+
 list(LENGTH AICPU_KERNEL_SOURCES NUM_AICPU_KERNEL_SOURCES)
 message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
+
+# __SIMULATED_DEVICE__ says "no real AICore fabric". It gates the platform-level
+# deltas -- skip the AICore launch, skip set_platform_regs, short-circuit the exit
+# handshake, load the calibration table -- which are identical whichever simulated
+# device model is compiled in. Which model that is is decided by the source lists
+# above, not by a macro.
+if(ASIM_DEVICE OR ASIMGQ_DEVICE)
+    target_compile_definitions(aicpu_kernel PRIVATE __SIMULATED_DEVICE__)
+endif()
+if(ASIM_DEVICE)
+    target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asim")
+endif()
+if(ASIMGQ_DEVICE)
+    target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asimgq")
+endif()
 
 option(WERROR "Treat compiler warnings as errors" ON)
 if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})

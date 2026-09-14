@@ -316,6 +316,26 @@ public:
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+
+#ifdef __SIMULATED_DEVICE__
+    // aSim variant: per-test calibrated compute duration (ns) per func_id, filled
+    // host-side from the calibration table and read by the simulated device at
+    // bring-up. 0 = no entry (falls back to the default). Placed LAST so it never
+    // shifts the offset of any other member -- components compiled without
+    // __SIMULATED_DEVICE__ then see an identical layout for every field they touch.
+    uint64_t asim_compute_ns_[RUNTIME_MAX_FUNC_ID];
+    // Injected MMIO/handshake latencies (ns): [0]=push, [1]=read, [2]=ack,
+    // [3]=notice (FIN raise -> observable). 0 = use the built-in defaults. Filled
+    // from the calibration file's optional "LAT push read ack [notice]" line so
+    // latencies can be swept without a rebuild.
+    uint64_t asim_lat_ns_[4];
+    // Per-func_id compute standard deviation (ns), same indexing as
+    // asim_compute_ns_. 0 = deterministic. Real cores vary per task (measured CV
+    // 13-19%), which scatters completions; without sigma the simulated cores finish
+    // in lockstep batches and the scheduler enters far fewer dispatch/complete
+    // phases than real.
+    uint64_t asim_compute_sigma_ns_[RUNTIME_MAX_FUNC_ID];
+#endif
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

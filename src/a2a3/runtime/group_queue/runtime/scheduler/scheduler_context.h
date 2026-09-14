@@ -1,0 +1,638 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#pragma once
+
+#ifdef __SIMULATED_DEVICE__
+#include "aicpu/asimgq_core.h"
+#include "scheduler/gq_index_space.h"
+#endif
+
+#include "assert_compat.h"
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/platform_regs.h"
+#include "common/chip_swimlane_profiling.h"
+#include "common/platform_config.h"
+#include "common/unified_log.h"
+#include "scheduler_types.h"
+
+#include "scheduler/scheduler.h"
+
+#include "dispatch_payload.h"
+
+// runtime.h cannot be included here — it pulls in Handshake, which this header
+// only forward-declares. RUNTIME_MAX_WORKER therefore reaches the same platform
+// core count runtime.h defines it from, so both spellings carry one value.
+// RUNTIME_MAX_FUNC_ID has no platform-level source and stays a mirrored literal.
+#ifndef RUNTIME_MAX_WORKER
+#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
+#endif
+#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_FUNC_ID 1024
+#endif
+
+// Forward declarations — avoid pulling in full headers for pointer/reference params.
+class Runtime;
+struct Handshake;
+struct RuntimeContext;
+
+class SchedulerContextTestPeer;
+
+/**
+ * SchedulerContext: owns all scheduler-side state and methods.
+ *
+ * Held as a member of AicpuExecutor (sched_ctx_).  The single public entry
+ * point is resolve_and_dispatch(), called once per scheduler thread.
+ *
+ * All dispatch/completion/drain/cold-path logic is implemented as private
+ * member methods, split across three .cpp files by responsibility:
+ *   - scheduler_completion.cpp  (completion polling, drain protocol)
+ *   - scheduler_cold_path.cpp   (exit checks, stall diagnostics, profiling)
+ *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
+ */
+class SchedulerContext {
+public:
+    // =========================================================================
+    // Lifecycle
+    // =========================================================================
+
+    // Initialize scheduler state from the given runtime and thread layout. Split
+    // into three parts so the per-core AICore handshake — a serial, MMIO-bound
+    // loop that dominates preamble (~217 µs of ~283 µs for 72 cores) — can run in
+    // parallel across all AICPU threads. Orchestrated by AicpuExecutor::init:
+    // the leader runs pre_handshake_init, every thread handshakes a disjoint
+    // slice of cores via handshake_partition, then the leader runs
+    // post_handshake_init after a barrier.
+    //
+    // Leader-only: per-core state + config + swimlane buffers + core count. Must
+    // be published before any thread enters handshake_partition. Returns 0 on
+    // success, negative on failure.
+    int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
+    // All threads: handshake this thread's contiguous slice [lo, hi) of cores
+    // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
+    void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Leader-only, after the handshake barrier: build worker-id lists, assign
+    // cores, init profiling subsystems, read task counts, init payloads.
+    int32_t post_handshake_init(Runtime *runtime);
+
+    // Reset all SchedulerContext-owned state to its post-construction defaults.
+    // Called by AicpuExecutor::deinit() during per-run teardown.
+    void deinit();
+
+    // =========================================================================
+    // Per-thread execution entry points (called by AicpuExecutor::run)
+    // =========================================================================
+
+    // Main scheduler thread entry: poll completion + dispatch ready tasks.
+    int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
+
+    // Retire the cores this thread owns, on its way out of resolve_and_dispatch.
+    // Threads that own none no-op. Runs before the completion latch, so no
+    // run() exit path can leave a worker blocked on its gate.
+    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
+
+    // Run all post-attach scheduler bookkeeping, once, on the boot leader:
+    //  - publishes core assignments to the perf collector (SIMPLER_DFX)
+    //  - latches the host-built task count
+    //  - sizes the per-S completed-task queues to it
+    //  - folds inline_completed_tasks into completed_tasks_
+    // The orchestration this graph came from ran to completion on the host, so
+    // there is no orchestrator lifecycle to hook here: the event is the attach.
+    void on_graph_attached(RuntimeContext *rt, int32_t thread_idx, int32_t total_tasks);
+
+    // Seed the ready queues + wake lists for the whole graph at boot. Called by
+    // every AICPU thread on a disjoint slice of the submitted-task range, after
+    // on_graph_attached and before runtime_init_ready_ (the caller barriers
+    // all threads between the two). Concurrency-safe: push_ready_routed and
+    // register_wake are the same lock-free primitives used during the run.
+    void classify_partition(int32_t thread_idx, int32_t nthreads);
+
+    // Bind the RuntimeContext scheduler pointer.
+    void bind_runtime(RuntimeContext *rt);
+
+    // Reset the run-scoped GroupQueue state: position spaces, group claims, and
+    // the per-owner ready rows. Call once per run, after the slot arrays are
+    // seeded and before any thread can push.
+    void gq_prepare_run();
+
+    // =========================================================================
+    // State queries / external synchronization points
+    // =========================================================================
+
+    int32_t aic_count() const { return aic_count_; }
+    int32_t aiv_count() const { return aiv_count_; }
+    bool is_completed() const { return completed_.load(std::memory_order_acquire); }
+
+    friend class SchedulerContextTestPeer;
+
+private:
+    // =========================================================================
+    // State
+    // =========================================================================
+
+    // --- Scheduler binding & per-core runtime state ---
+    alignas(64) SchedulerState *sched_{nullptr};
+    RuntimeContext *rt_{nullptr};
+
+    // Per-core execution state, indexed by core_id (= worker_id)
+    CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
+
+    // Cluster-ordered core trackers, one per scheduler thread
+    CoreTracker core_trackers_[MAX_AICPU_THREADS];
+
+    // Per-core dispatch payload storage: dual-buffer for pipelining.
+    // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
+    DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
+
+    // Per-core deferred-completion software registration storage.  This has
+    // the same runtime lifetime as payload_per_core_, but is kept out of the
+    // dispatch payload so normal task dispatch layout and cache footprint stay
+    // unchanged.
+    DeferredCompletionSlab deferred_slab_per_core_[RUNTIME_MAX_WORKER][2];
+
+    // sync_start drain coordination
+    SyncStartDrainState drain_state_;
+    std::atomic<uint64_t> drain_ack_tokens_[MAX_AICPU_THREADS]{};
+
+#if SIMPLER_DFX
+    SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
+    // Cached once at init() from get_chip_swimlane_level(), AFTER
+    // chip_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
+#endif
+
+    // --- Task-execution tracking ---
+    std::atomic<int32_t> completed_tasks_{0};
+    int32_t total_tasks_{0};
+    std::atomic<bool> completed_{false};
+    // Per-core retirement claim. The winner owns that core's register window
+    // and return gate for the rest of the run; every other path leaves both
+    // alone. Indexed by core id, reset in pre_handshake_init.
+    std::atomic<bool> core_retired_[PLATFORM_MAX_CORES];
+    uint64_t *func_id_to_addr_{nullptr};
+
+    // --- Thread/core configuration ---
+    int32_t active_sched_threads_{0};
+    int32_t aicpu_thread_num_{0};
+    int32_t cores_total_num_{0};
+
+    // Cluster-ordered worker_id lists, populated by post_handshake_init().
+    int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
+    int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};
+    int32_t aic_count_{0};
+    int32_t aiv_count_{0};
+
+    // Compact per-core CoreType, packed contiguously (~2 cache lines total) so
+    // post_handshake_init's ordered discovery scan reads it instead of taking a
+    // per-core volatile GM load from the 64B-aligned Handshake struct. Filled by
+    // each handshake thread for its own [lo,hi) slice during the parallel sweep.
+    uint8_t core_type_compact_[RUNTIME_MAX_WORKER]{};
+
+    // Set by any thread whose slice hits an invalid physical_core_id in
+    // handshake_partition; checked by the leader in post_handshake_init.
+    std::atomic<bool> handshake_failed_{false};
+
+    // Platform AICore-register base array (set by AicpuExecutor before init()).
+    uint64_t regs_{0};
+
+#if SIMPLER_DFX
+    // PMU profiling: physical core IDs for PMU MMIO base resolution.
+    // Separate storage because CoreExecState's 64-byte budget has no room for
+    // physical_core_id when SIMPLER_DFX=1.
+    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
+#endif
+
+    // =========================================================================
+    // Core management (scheduler_cold_path.cpp)
+    // =========================================================================
+
+    // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
+    bool assign_cores_to_threads();
+
+    // Populate the ready group queue with every group no external edge reaches.
+    void seed_ready_groups();
+
+    // Hand the controller more of the group this thread is working through, in
+    // ascending task order. Returns true if anything was submitted.
+    bool feed_open_groups(int32_t thread_idx);
+
+    // Where a thread has reached in the group it owns. A group is fed entry by
+    // entry rather than all at once, because a position is taken and filled in the
+    // same step: the manager retires by contiguous prefix, so a position reserved
+    // and left empty would stop the prefix at itself forever.
+    struct GroupFeed {
+        int32_t group = -1;     // -1 when this thread holds no group
+        int32_t id = 0;         // task being fed
+        int32_t end = 0;        // one past the group's last task
+        int32_t block = 0;      // logical block within the task
+        int32_t sub = 0;        // subtask slot within the block
+        bool accounted = false; // this task's blocks are counted for publication
+    };
+    GroupFeed group_feed_[PLATFORM_MAX_AICPU_THREADS];
+
+    // Tags successive grouped dispatches on one thread. Only its low bit is read,
+    // to pick between a core's two deferred-completion slabs.
+    int32_t feed_seq_[PLATFORM_MAX_AICPU_THREADS] = {};
+
+    // Split every shape's ready-queue slot region into one disjoint span per
+    // Scheduler thread. Runs once per run, before any push.
+    void partition_ready_queues_by_owner();
+
+    // Emergency shutdown: broadcast exit signal to every handshake'd core and
+    // deinit their AICore register blocks. Idempotent.
+    void emergency_shutdown(Runtime *runtime);
+    // Claim and retire the named cores. Cores already claimed elsewhere are
+    // skipped, so callers may name overlapping sets.
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    int32_t retire_all_cores(Runtime *runtime);
+
+    __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
+
+    // =========================================================================
+    // Dispatch (scheduler_dispatch.cpp)
+    // =========================================================================
+
+    static const char *shape_name(ResourceShape shape);
+
+    // Lower-case rendering of SubtaskSlot, used by dispatch and stall logs.
+    // Kept lower-case to match the `kernels=[aic:N aiv0:N aiv1:N]` field
+    // convention already established in the stall log family.
+    static inline const char *subslot_name(SubtaskSlot s) {
+        switch (s) {
+        case SubtaskSlot::AIC:
+            return "aic";
+        case SubtaskSlot::AIV0:
+            return "aiv0";
+        case SubtaskSlot::AIV1:
+            return "aiv1";
+        }
+        return "?";
+    }
+
+    int pop_ready_tasks_batch(
+        ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
+    );
+
+    void build_payload(
+        DispatchPayload &dispatch_payload, ChipTaskSlotState &slot_state, SubtaskSlot subslot, int32_t block_idx,
+        bool force_gate
+    );
+
+    // Batched-dispatch primitives. prepare_* builds the payload and per-core
+    // state; publish_* issues the MMIO register write. Callers must wmb()
+    // between the prepare batch and the publish batch, then sample
+    // get_sys_cnt_aicpu() once and pass it to publish_* for every handle.
+    //
+    // dispatch_timestamp_slot points to the CoreExecState slot
+    // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
+    // prepare time, or nullptr when chip swimlane is below SCHEDULE_TIMING and no
+    // dispatch timestamp is being recorded.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+        uint64_t *dispatch_timestamp_slot;
+        int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+#ifdef __SIMULATED_DEVICE__
+        // Kernel this dispatch runs. A real AICore reads it out of the payload;
+        // the simulated device is handed it directly, because what it replays is
+        // that kernel's calibrated duration.
+        int32_t func_id;
+        int32_t local_id;  // names this task when its consumers look for its position
+        // What the queue reports back has to be turned into a task again, so the
+        // manager records the identity alongside the position it assigns.
+        ChipTaskSlotState *slot;
+        SubtaskSlot subslot;
+        bool is_cube;
+#endif
+    };
+
+#ifdef __SIMULATED_DEVICE__
+    // One index space per manager: positions are private to the thread that
+    // assigns them, so no synchronisation is needed to translate a reported
+    // prefix back into tasks.
+    GqIndexSpace gq_index_[MAX_AICPU_THREADS];
+
+    // Which ring an entry joins. A queue keeps one per shape so a cube at the head
+    // cannot hold up queued vector work.
+    static asimgq::SimTaskType queue_ring_for(const PublishHandle &h) {
+        return h.is_cube ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
+    }
+
+    inline void submit_to_queue(const PublishHandle &h, int32_t thread_idx) {
+        GqIndexSpace &space = gq_index_[thread_idx];
+        const GqIndexSpace::Owner owner{
+            h.slot, static_cast<int32_t>(h.reg_task_id), h.subslot, h.core_offset, h.core_offset
+        };
+        const bool from_group = gq_group::ENABLED && h.local_id >= 0 &&
+                                gq_group::group_is_opened(gq_group::group_of(h.local_id));
+        // An opened group reserved this position when it was queued, ascending
+        // over its members; taking a fresh one here would put the consumer ahead
+        // of producers that already hold theirs.
+        uint64_t idx = from_group ? task_position(h.local_id) : space.assign(owner);
+        if (from_group) {
+            space.set_owner(idx, owner);
+        }
+        if (idx == UINT64_MAX) {
+            LOG_ERROR("Thread %d: GroupQueue index window exhausted", thread_idx);
+            return;
+        }
+        const int32_t fid = h.func_id;
+        // Producers this task still waits on are, by the grouping contract, members
+        // of its own group already held by this controller. Naming them hands the
+        // wait to the controller: it places the task when they retire on its cores,
+        // and the manager never sees the edge at all.
+        uint64_t deps[asimgq::SIM_HELD_MAX_DEPS];
+        int dep_n = 0;
+        if (h.local_id >= 0) {
+            const int d = sched_->group_deps(h.slot, h.local_id, deps, asimgq::SIM_HELD_MAX_DEPS);
+            if (d > 0) dep_n = d;
+        }
+        if (!from_group) note_task_position(h.local_id, idx);
+        if (!asimgq::submit_grouped(
+                static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
+            )) {
+            // Callers size their dispatch by the room the queue reported, which
+            // only grows between the read and the submit, so this cannot fire.
+            LOG_ERROR("Thread %d: GroupQueue refused a submit -- dispatch outran the ring", thread_idx);
+        }
+    }
+#endif
+
+    PublishHandle prepare_subtask_to_core(
+        int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, SubtaskSlot subslot, bool to_pending,
+        int32_t block_idx, bool force_gate
+    );
+
+    // `thread_idx` is the publishing Scheduler thread's index, used to select the
+    // per-thread task-timing record; every call site already has it in scope.
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts, int32_t thread_idx) {
+        if (h.dispatch_timestamp_slot != nullptr) {
+            *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+        // task, folded as min. Untagged tasks pay only this cache-hot compare and
+        // never read the sys counter. Independent of chip swimlane level.
+        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
+        }
+#ifdef __SIMULATED_DEVICE__
+        // The manager does not choose a core: it hands the task to its group's
+        // controller, which holds every core's state and pushes the entry to one
+        // itself. The position it assigns is what the queue reports back.
+        submit_to_queue(h, thread_idx);
+#else
+        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+#endif
+    }
+
+    // Prefetch the cold per-core structures the next block's prepare touches.
+    // Ordering is load-bearing: issue the STALLING LOAD first — CoreExecState,
+    // read by dispatch_seq++ whose value feeds reg_task_id -> buf_idx -> the whole
+    // dispatch — for every core of the block, BEFORE the store-target prefetches.
+    // MSHRs saturate (a MIX block warms 3 cores); issuing the read prefetches
+    // first keeps them from being the ones dropped. The dispatch-buffer writes
+    // still get prefetched (measured to help ~30% on this shallow-store-buffer
+    // control core), just after the reads. rw=1 on CoreExecState (read AND
+    // written) gives Exclusive, serving both without a Shared->Exclusive upgrade.
+    inline void prefetch_block_dst(int32_t thread_idx, int32_t core_offset, bool is_mix) {
+        CoreTracker &tracker = core_trackers_[thread_idx];
+        int32_t cids[3] = {};
+        int32_t nc = 0;
+        if (is_mix) {
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aic_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(core_offset));
+        } else {
+            cids[nc++] = tracker.get_core_id_by_offset(core_offset);
+        }
+        // Stalling loads first.
+        for (int32_t i = 0; i < nc; i++)
+            __builtin_prefetch(&core_exec_states_[cids[i]], 1, 3);
+        // Store targets after (dispatch buffer CL0 control + CL1 args, both bufs).
+        for (int32_t i = 0; i < nc; i++) {
+            for (int32_t buf = 0; buf < 2; buf++) {
+                const char *dp = reinterpret_cast<const char *>(&payload_per_core_[cids[i]][buf]);
+                __builtin_prefetch(dp, 1, 3);
+                __builtin_prefetch(dp + 64, 1, 3);
+            }
+        }
+    }
+
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
+        int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, ResourceShape shape, bool to_pending,
+        int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
+    );
+
+    void dispatch_shape(
+        int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
+        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    );
+
+    // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its
+    // own gating (off-PMU, this thread has a spare slot, and no normal ready work
+    // is queued) and sets made_progress / try_pushed when it stages, so the caller
+    // is a single unconditional call like normal dispatch. After normal dispatch
+    // leaves idle cores spare, pre-stage the consumers of any RUNNING flagged
+    // producer onto those cores with a non-zero src_payload (gated). Touches no dependency
+    // state — the task is released by the doorbell at its normal ready-pop (Hook 2).
+    int32_t try_early_dispatch(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
+
+    // Stage the already-claimed range [start, start+count) of consumer `c` onto
+    // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
+    // cores from the provided free-core sets. The caller claims next_block_idx and
+    // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
+    // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
+    // number of blocks staged.
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, ChipTaskSlotState *c, ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    );
+
+    // Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
+    // pre-stage claimed block ranges onto this thread's free cores of `shape` for the
+    // given phase (IDLE -> onto idle cores in the RUNNING slot; PENDING -> onto a
+    // running core's gated pending slot). Pop is sized to the shape's capacity exactly
+    // as dispatch_shape sizes normal dispatch. Returns the number of blocks staged.
+    int32_t early_dispatch_shape(int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase);
+
+    // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
+    // for MIX then (if no mix residual) AIC/AIV; then PENDING-stage dispatch with
+    // cross-thread idle gating. MIX is strictly prioritized — when mix residual is
+    // detected after MIX-IDLE, AIC/AIV are skipped for the whole pass but
+    // MIX-PENDING still runs.
+    //
+    // Forward-progress argument for AIC/AIV: skip_aic_aiv is sticky for the
+    // current pass only. The next loop iteration re-evaluates after Phase 1
+    // completion polling and the global MIX queue draining (here or on any
+    // peer thread). AIC/AIV starvation is therefore bounded by MIX throughput,
+    // not unbounded — once mix completes on at least one cluster, the next
+    // pass either drains the residual or admits AIC/AIV.
+    void dispatch_ready_tasks(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
+
+    // Shared staging order for both dispatch sources (normal ready + speculative early):
+    // MIX strict priority, IDLE stage before PENDING stage, cross-thread idle gating
+    // (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). `stage(shape, phase)` stages that
+    // shape+phase bucket for the source and returns true to STOP the pass (normal returns
+    // true when it enters drain mode; early always returns false). `residual_mix()` reports
+    // whether MIX work remains queued for the source (normal reads ready_queues[MIX], early
+    // reads early_dispatch_queues[MIX]). IDLE runs under PMU; PENDING is withheld under PMU.
+    template <typename StageFn, typename ResidualMixFn>
+    void run_staging_order(int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix);
+
+    // Returns true if any *other* scheduler thread currently has an idle core
+    // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
+    // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
+    // rationale and the safety argument against the drain worker.
+    bool has_idle_in_other_threads(int32_t self_thread_idx, ResourceShape shape) const;
+
+    // True if mix tasks remain in the global MIX ready queue. Approximate —
+    // ChipReadyQueue::size() (see scheduler.h) snapshots its enqueue/dequeue
+    // positions with std::memory_order_relaxed and may interleave with concurrent
+    // push/pop. A stale read here causes at most one
+    // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
+    bool has_residual_mix() const { return sched_->ready_depth(static_cast<int32_t>(ResourceShape::MIX)) > 0; }
+
+    // Tier-0 analog of has_residual_mix for the ready sync_start lane: true if MIX
+    // sync_start cohorts remain queued, so the Tier-0 pass keeps MIX strict priority
+    // over its own AIC/AIV sync work. Same relaxed-size snapshot caveat.
+    bool has_residual_sync_mix() const {
+        return sched_->ready_sync_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
+    }
+
+    // Early-dispatch analog of has_residual_mix: true if MIX early-dispatch candidates
+    // remain queued. has_residual_mix reads the normal MIX ready queue, which is empty
+    // whenever the Phase-4b early pass runs (it is gated on all ready_queues being
+    // empty), so early-dispatch MIX priority needs its own residual check against
+    // early_dispatch_queues[MIX]. Same relaxed-size snapshot caveat as has_residual_mix.
+    bool has_residual_early_mix() const {
+        return sched_->early_dispatch_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
+    }
+
+    // =========================================================================
+    // Completion & drain (scheduler_completion.cpp)
+    // =========================================================================
+
+    static SlotTransition decide_slot_transition(
+        int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
+    );
+
+    void complete_slot_task(
+        ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot, int32_t thread_idx,
+        int32_t core_id, Handshake *hank, int32_t &completed_this_turn
+#if SIMPLER_DFX
+        ,
+        uint64_t dispatch_ts, uint64_t finish_ts
+#endif
+    );
+
+    static void promote_pending_to_running(CoreExecState &core);
+    static void clear_running_slot(CoreExecState &core);
+
+    void check_running_cores_for_completion(
+        int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
+        bool &made_progress
+    );
+
+    bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num);
+    int32_t count_global_available(ResourceShape shape, uint8_t core_mask, bool include_pending = false);
+    struct SyncStartStageResult {
+        int32_t staged_blocks{0};
+        int32_t running_cores{0};
+    };
+    // CAS-claim sync_start block indices and stage them onto THIS thread's own
+    // cores. The global drain invokes this in parallel on every scheduler;
+    // the local fast path invokes it once after proving this tracker has enough
+    // capacity. record_drain_phases keeps local work attributed to EarlyDispatch.
+    SyncStartStageResult stage_sync_start_cores(
+        ChipTaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated, bool record_drain_phases
+    );
+    // out_stage_wall_cycles (profiling only): cycles this thread spent in stage_sync_start_cores
+    // (prepare + publish), set ONLY on threads that actually staged. Lets the caller isolate
+    // the pure stage wall from the ack-barrier + finalize spans in the Drain bar.
+    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
+
+    // =========================================================================
+    // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
+    // =========================================================================
+
+    // The latched-error test both exit checks below share. Deliberately NOT marked
+    // cold/noinline: it is inlined into each of them, so neither pays a frame for
+    // the shared half — check_exit_conditions runs on every dispatch pass.
+    LoopAction check_latched_sched_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
+
+    // Dispatch-loop exit check: latched scheduler error, then the completion
+    // count against the run's task total. check_idle_fatal_error below is the
+    // error-only half, for the idle path that has no count to compare.
+    __attribute__((noinline, cold)) LoopAction
+    check_exit_conditions(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count);
+
+    __attribute__((noinline, cold)) LoopAction
+    check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
+
+    __attribute__((noinline, cold)) void
+    log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+
+    __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+    );
+
+    // Reverse lookup: given a global core_id, find which scheduler thread's
+    // tracker owns it. Returns -1 if not found. Linear scan — only used on
+    // the cold diagnostic path.
+    int32_t find_core_owner_thread(int32_t core_id) const;
+
+    // Does this thread own any core with a RUNNING task (running_slot_state set)?
+    // Gates the scheduler timeout fatal latch: a thread without an owned
+    // RUNNING task has no first-hand evidence of a stuck dispatch and must
+    // not declare global fatal on its own idle observation. The thread that
+    // does own the stuck task will reach the budget on its own polls and
+    // latch with valid evidence (or recover when the COND register flips).
+    bool self_owns_running_task(int32_t thread_idx) const;
+
+    // Does *any* scheduler thread own a RUNNING task? Used as the second
+    // fatal-latch condition: if the wall-clock budget elapsed AND no thread
+    // owns RUNNING work AND tasks remain incomplete, the system is in a
+    // pre-dispatch / WAIT-only deadlock (e.g. dependency cycle) and the
+    // ownerless idle threads are the only observers — let one of them latch.
+    bool no_thread_owns_running_task() const;
+
+    __attribute__((noinline, cold)) int32_t handle_timeout_exit(
+        int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
+        int32_t last_progress_count
+#if SIMPLER_DFX
+        ,
+        uint64_t sched_start_ts
+#endif
+    );
+
+#if SIMPLER_DFX
+    __attribute__((noinline, cold)) void log_chip_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
+#endif
+
+    // =========================================================================
+    // Small inline helpers
+    // =========================================================================
+
+    uint64_t get_function_bin_addr(int func_id) const {
+        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+            return 0;
+        }
+        return func_id_to_addr_[func_id];
+    }
+};

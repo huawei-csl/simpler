@@ -113,6 +113,16 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     for (size_t i = 0; i < count; ++i)
         acknowledged[i] = false;
     size_t remaining = count;
+#ifdef __SIMULATED_DEVICE__
+    // aSim has no real AICore to acknowledge exit -- the simulated device is torn
+    // down with the process -- so nothing will ever write AICORE_EXITED_VALUE and
+    // the sweep below would spend the whole deadline before abandoning every core.
+    // Treat the group as acknowledged and let the close pass run as it does on
+    // silicon.
+    for (size_t i = 0; i < count; ++i)
+        acknowledged[i] = true;
+    remaining = 0;
+#endif
     while (remaining != 0) {
         for (size_t i = 0; i < count; ++i) {
             if (acknowledged[i]) continue;

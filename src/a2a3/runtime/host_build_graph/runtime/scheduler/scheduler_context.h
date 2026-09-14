@@ -10,6 +10,10 @@
  */
 #pragma once
 
+#ifdef __SIMULATED_DEVICE__
+#include "aicpu/asim_core.h"
+#endif
+
 #include "assert_compat.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -261,6 +265,12 @@ private:
         int32_t core_offset;
         uint64_t *dispatch_timestamp_slot;
         int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+#ifdef __SIMULATED_DEVICE__
+        // Kernel this dispatch runs. A real AICore reads it out of the payload;
+        // the simulated device is handed it directly, because what it replays is
+        // that kernel's calibrated duration.
+        int32_t func_id;
+#endif
     };
 
     PublishHandle prepare_subtask_to_core(
@@ -280,7 +290,14 @@ private:
         if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
             aicpu_task_timing_dispatch(h.task_timing_slot, thread_idx);
         }
+#ifdef __SIMULATED_DEVICE__
+        // No AICore reads DATA_MAIN_BASE here: the task is handed to the
+        // simulated device, which schedules its completion and publishes the
+        // core's COND itself.
+        asim::asim_push(asim::core_index_for_addr(h.reg_addr), static_cast<int32_t>(h.reg_task_id), h.func_id);
+#else
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+#endif
     }
 
     // Prefetch the cold per-core structures the next block's prepare touches.

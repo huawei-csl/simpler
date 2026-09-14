@@ -668,7 +668,14 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             }
 
             LOG_INFO("=== launch_aicore_kernel ===");
+            #ifdef __SIMULATED_DEVICE__
+            // aSim replaces the AICores with an AICPU-side simulated device (the
+            // executor leader publishes each core's aicore_done and drives the register
+            // file), so no real AICore kernel is launched.
+            int launch_rc = 0;
+            #else
             int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.device_k_args_);
+            #endif
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);

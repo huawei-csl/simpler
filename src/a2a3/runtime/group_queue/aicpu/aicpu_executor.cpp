@@ -1,0 +1,604 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include "aicpu/device_phase_aicpu.h"
+#include "runtime.h"
+#include "spin_hint.h"
+
+// Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
+#include "host_build_graph/runtime_core.h"
+#include "host_build_graph/shared_memory.h"
+
+#include "common/unified_log.h"
+
+// Register-based communication
+#include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/platform_regs.h"
+#include "utils/thread_completion_gate.h"
+
+#ifdef __SIMULATED_DEVICE__
+#include <vector>
+
+#include "aicpu/asimgq_core.h"
+#endif
+
+// Scheduler data structures (CoreExecState, CoreTracker, etc.)
+#include "scheduler/scheduler_types.h"
+
+// Scheduler context class
+#include "scheduler/scheduler_context.h"
+#include "scheduler/task_grouping.h"
+
+// From orchestration/common.cpp linked into this DSO — updates g_current_runtime
+// here (cleared on teardown before runtime_destroy).
+extern "C" void framework_bind_runtime(RuntimeContext *rt);
+
+static int32_t read_runtime_status(Runtime *runtime) {
+    if (runtime == nullptr) {
+        return 0;
+    }
+
+    void *sm = runtime->get_gm_sm_ptr();
+    if (sm == nullptr) {
+        return 0;
+    }
+
+    auto *header = static_cast<SharedMemoryHeader *>(sm);
+    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
+    return runtime_status_from_error_code(sched_error_code);
+}
+
+static RuntimeContext *rt{nullptr};
+
+struct AicpuExecutor {
+    // ===== Thread management state =====
+    std::atomic<int32_t> thread_idx_{0};
+    std::atomic<bool> init_done_{false};
+    std::atomic<bool> init_failed_{false};
+
+    // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
+    // is published by the leader once the shared pre-handshake setup is visible;
+    // hs_arrived_ is the barrier counting threads that finished their core slice.
+    // hs_thread_seq_ hands out a distinct [0, nthreads) index when the platform
+    // exposes no affinity idx (sim, where platform_aicpu_affinity_thread_idx()
+    // is -1 during init) so the threads don't all collapse to leader 0.
+    std::atomic<bool> hs_setup_done_{false};
+    std::atomic<int32_t> hs_arrived_{0};
+    std::atomic<int32_t> hs_thread_seq_{0};
+
+    // Parallel-boot-classify coordination (see AicpuExecutor::run). classify_ready_
+    // is published by the boot leader once its leader-only orchestration setup is
+    // visible; classify_arrived_ is the barrier counting threads that finished
+    // their slice of the initial classify. Both are one-shot per run and reset in
+    // deinit().
+    std::atomic<bool> classify_ready_{false};
+    std::atomic<int32_t> classify_arrived_{0};
+
+    int32_t aicpu_thread_num_{0};
+
+    // ===== Task queue state (managed by scheduler ready queues) =====
+
+    simpler::ThreadCompletionGate completion_gate_;
+    std::atomic<bool> runtime_init_ready_{false};
+
+    // Per-Worker arena backing the RuntimeContext + sm_handle + orch/sched/mailbox
+    // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
+    // Default-constructed: libc-backed backend, no ctx.
+    DeviceArena runtime_arena_;
+
+    // ===== Scheduler context (owns all dispatch/completion/drain state) =====
+    SchedulerContext sched_ctx_;
+
+    // ===== Methods =====
+    int32_t init(Runtime *runtime);
+    int32_t run(Runtime *runtime);
+    void deinit(Runtime *runtime);
+};
+
+static AicpuExecutor g_aicpu_executor;
+
+// ===== AicpuExecutor Method Implementations =====
+
+#ifdef __SIMULATED_DEVICE__
+namespace {
+
+// aSim bring-up (leader-only, once, before pre_handshake_init). With no real
+// AICores, the AICPU itself provisions the simulated device: it owns the
+// per-core register backing, publishes each worker's self-report the way a real
+// AICore does at launch (physical_core_id + core_type, then the aicore_done
+// readiness flag the handshake spins on), and seeds each COND to idle. It is the
+// sole writer of the register table (kernel.cpp skips set_platform_regs under
+// __SIMULATED_DEVICE__), so pre_handshake_init captures the aSim registers.
+void asim_bringup(Runtime *runtime, int32_t nthreads) {
+    // Packages are registered later, from the handshake's real grouping.
+    (void)nthreads;
+    const int32_t num_cores = runtime->get_worker_count();
+    // AICPU-local backing (no GM / no AICore); persists for the process.
+    static std::vector<uint8_t> reg_backing;
+    static std::vector<uint64_t> reg_bases;
+    // Grown, never re-zeroed: asim::init() below re-seeds every core's COND, and
+    // no other register in the block is read before the scheduler writes it, so
+    // a per-run memset of the whole table would be dead work on the bring-up path.
+    const size_t need = static_cast<size_t>(num_cores) * SIM_REG_BLOCK_SIZE;
+    if (reg_backing.size() < need) {
+        reg_backing.resize(need, 0);
+    }
+    reg_bases.resize(static_cast<size_t>(num_cores));
+    const uint64_t base = reinterpret_cast<uint64_t>(reg_backing.data());
+    for (int32_t i = 0; i < num_cores; ++i) {
+        reg_bases[i] = base + static_cast<uint64_t>(i) * SIM_REG_BLOCK_SIZE;
+    }
+
+    // Configure + seed the simulated device (COND = idle) before publishing
+    // aicore_done, so a peer that observes the readiness flag finds a coherent
+    // register file.
+    asimgq::configure(base, static_cast<uint32_t>(num_cores));
+    // Injected MMIO latencies: from the calib file's LAT line if present, else
+    // a2a3-measured defaults — posted doorbell write ~5 ns, nGnRE COND read
+    // ~92 ns, push->core-latch ~633 ns (so ack = 633 - push). See DESIGN.md §5a.
+    const uint64_t push_ns = runtime->asim_lat_ns_[0] != 0 ? runtime->asim_lat_ns_[0] : 5;
+    const uint64_t read_ns = runtime->asim_lat_ns_[1] != 0 ? runtime->asim_lat_ns_[1] : 92;
+    const uint64_t ack_ns = runtime->asim_lat_ns_[2] != 0 ? runtime->asim_lat_ns_[2] : 628;
+    // FIN-write -> AICPU-observable floor. The measured (finish - end) spread is
+    // mostly poll-wait, which the simulated scheduler already produces on its
+    // own; only this floor is hardware, so injecting the median would
+    // double-count. See DESIGN.md 5b.
+    const uint64_t notice_ns = runtime->asim_lat_ns_[3] != 0 ? runtime->asim_lat_ns_[3] : 150;
+    asimgq::set_latencies_ns(push_ns, read_ns, ack_ns, notice_ns);
+    // Per-func_id compute, carried per test in Runtime::asim_compute_ns_ (filled
+    // host-side from the calibration table). A dispatched func_id with no entry
+    // falls back to the default.
+    asimgq::set_compute_ns_table(
+        runtime->asim_compute_ns_, runtime->asim_compute_sigma_ns_, RUNTIME_MAX_FUNC_ID, /*default*/ 1000
+    );
+        // What a manager pays to read its own queue: the watermark and look-ahead
+    // buffer live in its package, so the read is local. The controller pays the
+    // cross-die cost of updating them, which is the calibrated `notice`.
+    asimgq::set_queue_latencies_ns(/*report_ns=*/notice_ns, /*poll_ns=*/30);
+    asimgq::init();
+
+    Handshake *workers = runtime->get_workers();
+    for (int32_t i = 0; i < num_cores; ++i) {
+        workers[i].physical_core_id = static_cast<uint32_t>(i);
+        std::atomic_thread_fence(std::memory_order_release);
+        workers[i].aicore_done = static_cast<uint32_t>(i + 1);
+    }
+
+    set_platform_regs(reinterpret_cast<uint64_t>(reg_bases.data()));
+}
+
+}  // namespace
+#endif  // __SIMULATED_DEVICE__
+
+int32_t AicpuExecutor::init(Runtime *runtime) {
+    if (runtime == nullptr) {
+        LOG_ERROR("runtime is nullptr");
+        init_failed_.store(true, std::memory_order_release);
+        return -1;
+    }
+
+    // All AICPU threads enter init. The per-core AICore handshake is the
+    // dominant preamble cost (serial MMIO, ~217 µs of ~283 µs for 72 cores), so
+    // it is parallelized: the leader (tidx 0) does the shared setup, every
+    // thread handshakes a disjoint slice of cores, then the leader finishes init
+    // after a barrier. Non-leaders spin on init_done_.
+    int32_t nthreads = runtime->aicpu_thread_num;
+    if (nthreads == 0) nthreads = 1;
+    if (nthreads < 1 || nthreads > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
+        init_failed_.store(true, std::memory_order_release);
+        return -1;
+    }
+    // Each thread needs a distinct index in [0, nthreads) to pick the leader and
+    // partition the cores. Onboard the gate filter assigns it (exec_idx); sim's
+    // gate does not, so platform_aicpu_affinity_thread_idx() is -1 here for every
+    // thread — hand those a distinct index from a counter (mirrors run()'s
+    // thread_idx_++ fallback) instead of collapsing them all to leader 0, which
+    // would run pre_/post_handshake_init on every thread and race the shared
+    // scheduler state. Exactly nthreads threads reach init (the gate drops the
+    // rest), so the counter yields a gap-free [0, nthreads).
+    int32_t tidx = platform_aicpu_affinity_thread_idx();
+    if (tidx < 0) tidx = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
+    // A thread whose index still falls outside [0, nthreads) owns no core slice:
+    // handshake_partition would compute lo/hi past cores_total_num_ and index
+    // all_handshakes[]/core_exec_states_ out of bounds. Reject it here (mirrors
+    // the bounds guard already in run()). Fail only this thread and do NOT set
+    // init_failed_ — that would make the valid peers abort before their
+    // hs_arrived_ increment and hang the leader at the barrier below.
+    if (tidx >= nthreads) {
+        LOG_ERROR("AICPU affinity thread idx %d out of range [0,%d) in init", tidx, nthreads);
+        return -1;
+    }
+    const bool is_leader = (tidx == 0);
+
+    if (is_leader) {
+        LOG_INFO("AicpuExecutor: Initializing");
+        // The 0 → 1 fixup already applied above.
+        aicpu_thread_num_ = nthreads;
+
+        hs_arrived_.store(0, std::memory_order_relaxed);
+#ifdef __SIMULATED_DEVICE__
+        // Provision the simulated device before the register table is captured.
+        asim_bringup(runtime, aicpu_thread_num_);
+#endif
+        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
+            init_failed_.store(true, std::memory_order_release);
+            hs_setup_done_.store(true, std::memory_order_release);
+            return -1;
+        }
+        hs_setup_done_.store(true, std::memory_order_release);
+    } else {
+        while (!hs_setup_done_.load(std::memory_order_acquire)) {
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+        if (init_failed_.load(std::memory_order_acquire)) return -1;
+    }
+
+    // All threads: handshake this thread's slice of cores in parallel.
+    sched_ctx_.handshake_partition(runtime, tidx, nthreads);
+
+    // Barrier: leader waits for every slice to finish, then completes init.
+    hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
+    if (is_leader) {
+        while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
+        completion_gate_.reset();
+        if (sched_ctx_.post_handshake_init(runtime) != 0) {
+            init_failed_.store(true, std::memory_order_release);
+            init_done_.store(true, std::memory_order_release);
+            return -1;
+        }
+        init_done_.store(true, std::memory_order_release);
+        LOG_INFO("AicpuExecutor: Init complete");
+    } else {
+        while (!init_done_.load(std::memory_order_acquire)) {
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+        if (init_failed_.load(std::memory_order_acquire)) return -1;
+    }
+    return 0;
+}
+
+/**
+ * Shutdown AICore - Send exit signal via registers to all AICore kernels
+ */
+int32_t AicpuExecutor::run(Runtime *runtime) {
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
+    // Every push decides a group's owner and must name the thread making it --
+    // including the initial classify, which runs on all threads well before the
+    // dispatch loop.
+    gq_group::t_sched_thread = thread_idx;
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
+            MAX_AICPU_THREADS, affinity_exec_idx
+        );
+        return -1;
+    }
+    int32_t run_rc = 0;
+
+    // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
+    // host-orch attach. host_build_graph's orchestrator already ran on the host,
+    // and every cross-task reference it wrote is an offset from its own block, so
+    // the SM/arena this thread sees need no address fixup. This thread attaches
+    // the prebuilt arena, points the SM
+    // handle's task-header pointers at the device SM WITHOUT resetting the
+    // host-populated data, hands the host-computed task count to the scheduler,
+    // and releases the other threads. It then falls through and schedules its own
+    // cores like every other thread — host_build_graph has no device-side
+    // orchestrator, so there is no orch/sched split.
+    if (thread_idx == aicpu_thread_num_ - 1) {
+        void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+        size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+
+        // A boot failure falls through to the common teardown at the end of
+        // run() — it must NOT return early. This thread owns a core slice
+        // (handshake_partition assigns [lo, total) to the last thread), so an
+        // early return would skip its shutdown() and leave those workers
+        // blocked on return gates no one will open, and the completion gate
+        // never opens, so the host hangs into the op-execute timeout (507018)
+        // instead of seeing the failure. On failure: record it in run_rc,
+        // leave rt null so the dispatch block below skips, and still publish
+        // runtime_init_ready_ (single point at the block's end) so the peer
+        // threads stop spinning.
+        bool boot_ok = (prebuilt_arena != nullptr);
+        if (!boot_ok) {
+            LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
+            rt = nullptr;
+            run_rc = -1;
+        }
+
+        if (boot_ok) {
+            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+            rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+
+            void *sm_ptr = runtime->get_gm_sm_ptr();
+            // The image the host shipped is pitched to the submitted task count,
+            // not to the count the table was dimensioned for, and the device region
+            // holds exactly that image — so its size comes from the same pitch.
+            // attach_populated rejects a pitch outside (0, task_capacity] and a
+            // region too small for it.
+            const uint64_t live_slots = sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->host_total_tasks));
+            const uint64_t sm_size = runtime->sm_image_bytes;
+            // sm_handle and the scheduler state are the device-only zone: their
+            // bytes never travel, so they start as whatever the pooled arena last
+            // held. Zeroing the handle first is what makes attach_populated's
+            // assignment of every field checkable here rather than by inspecting
+            // attach_populated.
+            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
+            if (!rt->sm_handle->attach_populated(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->sm_image_bytes
+                )) {
+                LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
+                rt = nullptr;
+                run_rc = -1;
+                boot_ok = false;
+            } else if (!rt->scheduler->init_data_from_layout(rt->prebuilt_layout.sched, runtime_arena_, sm_ptr)) {
+                LOG_ERROR("Thread %d: host-orch: scheduler init_data_from_layout failed", thread_idx);
+                rt = nullptr;
+                run_rc = -1;
+                boot_ok = false;
+            } else {
+                // Queue headers are set, so the slot arrays can take their ramp,
+                // and the mailbox ring gets its cursors and publication gates.
+                // All of it precedes runtime_init_ready_, which is what releases
+                // the peer threads into the dispatch loop, so neither a push nor a
+                // completion message sees an uninitialized region.
+                //
+                // Both regions sit in the device-only zone, so their bytes are
+                // whatever the pooled arena last held, and each one's empty state is
+                // whatever its own initializer writes — a ready queue's is a
+                // sequence ramp (slot i holds i), the mailbox's is zeroed cursors
+                // and publication gates. Zeroing the region is a substitute for
+                // neither call.
+                rt->scheduler->seed_queue_slots();
+                rt->aicore_mailbox->init_empty();
+            }
+        }
+
+        if (boot_ok) {
+            sched_ctx_.bind_runtime(rt);
+
+            // Latch the host-built task count (on_graph_attached sets total_tasks_)
+            // BEFORE the runtime_init_ready_ release below — that store is the barrier
+            // that unblocks the scheduler threads. Otherwise they would acquire
+            // runtime_init_ready_ with total_tasks_=0 and race to an early exit before
+            // the host task count is visible (host-orch has no concurrent orchestrator
+            // to keep them alive).
+            // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
+            // called it in run_host_orchestration; the orchestrator's own
+            // task-allocator pointers name host memory the device never reads, so
+            // mark_done()'s active_count() read would dereference it and fault the
+            // AICPU. on_graph_attached only needs total_tasks and the scalar
+            // orchestrator.inline_completed_tasks, both already valid.
+            sched_ctx_.on_graph_attached(rt, thread_idx, runtime->host_total_tasks);
+            // After the task count is latched, because seeding the ready group queue
+            // walks the whole graph; before classify_ready_ below, because classify
+            // asks which groups that queue owns.
+            sched_ctx_.gq_prepare_run();
+            LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
+        }
+
+        // Publish "leader setup done" (SM attached, task count latched, queues
+        // allocated). Every thread then classifies its slice below before any of
+        // them may dispatch — the leader holds runtime_init_ready_ until then.
+        classify_ready_.store(true, std::memory_order_release);
+    }
+
+    // Parallel initial classify. Every AICPU thread waits for the leader's
+    // orchestration setup, seeds its disjoint slice of the whole graph's ready
+    // set + wake lists, then barriers. Only once all slices are done does the
+    // leader publish runtime_init_ready_, so no thread dispatches against a
+    // half-seeded graph.
+    while (!classify_ready_.load(std::memory_order_acquire)) {
+        SPIN_WAIT_HINT();
+    }
+    if (!sched_ctx_.is_completed() && rt != nullptr) {
+        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
+    }
+    classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
+    if (thread_idx == aicpu_thread_num_ - 1) {
+        while (classify_arrived_.load(std::memory_order_acquire) < aicpu_thread_num_) {
+            SPIN_WAIT_HINT();
+        }
+        runtime_init_ready_.store(true, std::memory_order_release);
+    } else {
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+    }
+
+    // Every AICPU thread schedules its assigned cores.
+    if (!sched_ctx_.is_completed()) {
+        if (rt == nullptr) {
+            LOG_ERROR("Thread %d: rt is null after a failed boot, skipping dispatch", thread_idx);
+        } else {
+            sched_ctx_.bind_runtime(rt);
+            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            if (completed < 0) {
+                LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
+                run_rc = completed;
+            } else {
+                LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+#ifdef __SIMULATED_DEVICE__
+                // The simulator's own cost is only hidden while it fits inside the
+                // latency it models. What does not fit is added to the window this
+                // arm reports, so it is measured rather than assumed: a delta
+                // against another arm is only the structure once this is subtracted.
+                {
+                    LOG_ERROR(
+                        "[SIM_WINCORR] thread=%d subtracted_ticks=%llu", thread_idx,
+                        static_cast<unsigned long long>(g_sim_last_correction[thread_idx])
+                    );
+                    uint64_t pov = 0, pcalls = 0, pwork = 0;
+                    asimgq::queue_push_overrun(static_cast<uint32_t>(thread_idx), &pov, &pcalls, &pwork);
+                    LOG_ERROR(
+                        "[ASIM_PUSHOV] thread=%d calls=%llu total_us=%llu mean_work_ns=%llu", thread_idx,
+                        static_cast<unsigned long long>(pcalls), static_cast<unsigned long long>(pov),
+                        static_cast<unsigned long long>(pwork)
+                    );
+                    uint64_t ov = 0, ocalls = 0;
+                    asimgq::queue_poll_overrun(static_cast<uint32_t>(thread_idx), &ov, &ocalls);
+                    LOG_ERROR(
+                        "[ASIM_OVERRUN] thread=%d calls=%llu total_us=%llu", thread_idx,
+                        static_cast<unsigned long long>(ocalls), static_cast<unsigned long long>(ov)
+                    );
+                    uint64_t rns = 0, sns = 0, pc = 0;
+                    asimgq::queue_poll_profile(static_cast<uint32_t>(thread_idx), &rns, &sns, &pc);
+                    LOG_ERROR(
+                        "[ASIM_PROF] thread=%d calls=%llu retire_ns=%llu status_ns=%llu", thread_idx,
+                        static_cast<unsigned long long>(pc), static_cast<unsigned long long>(rns),
+                        static_cast<unsigned long long>(sns)
+                    );
+                }
+#endif
+            }
+        }
+    }
+
+    // This thread has stopped dispatching, so it can retire the cores it owns
+    // without waiting for its peers. Retirement stays ahead of the completion
+    // gate below because that gate is a last-one-out latch, not a barrier: a
+    // thread that returns early never reaches it, and a worker whose gate was
+    // never released would spin until the op-execute timeout.
+    // platform_retire_aicore_group claims per core, so a concurrent
+    // emergency_shutdown sweep and this call retire each core exactly once.
+    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
+    if (shutdown_rc != 0 && run_rc == 0) {
+        run_rc = shutdown_rc;
+    }
+
+    LOG_INFO("Thread %d: Completed", thread_idx);
+
+    completion_gate_.arrive_and_finalize_if_last(aicpu_thread_num_, [&] {
+        aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
+        // Destroy the host_build_graph runtime. sm_handle / rt are recreated
+        // every run, so always tear them down here.
+        if (rt != nullptr) {
+            rt->scheduler->print_queues();
+            // Clear g_current_runtime in this DSO before destroying rt.
+            framework_bind_runtime(nullptr);
+            // A Graph's expansion storage is the tail of its outer task's heap
+            // allocation, so it retires with that allocation; nothing here owns
+            // a separate block to release.
+            runtime_destroy(rt, runtime_arena_);
+            rt = nullptr;
+        }
+    });
+
+    return run_rc;
+}
+
+void AicpuExecutor::deinit(Runtime *runtime) {
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+
+    // Reset all SchedulerContext-owned state in one place.
+    sched_ctx_.deinit();
+
+    completion_gate_.reset();
+    runtime_init_ready_.store(false, std::memory_order_release);
+
+    aicpu_thread_num_ = 0;
+
+    // Clear the file-scope runtime pointer (freed by the last scheduler thread before deinit).
+    rt = nullptr;
+
+    LOG_INFO("DeInit: Runtime execution state reset");
+
+    init_done_.store(false, std::memory_order_release);
+    init_failed_.store(false, std::memory_order_release);
+    hs_setup_done_.store(false, std::memory_order_release);
+    hs_arrived_.store(0, std::memory_order_release);
+    hs_thread_seq_.store(0, std::memory_order_release);
+    classify_ready_.store(false, std::memory_order_release);
+    classify_arrived_.store(0, std::memory_order_release);
+    thread_idx_.store(0, std::memory_order_release);
+
+    LOG_INFO("DeInit: AicpuExecutor reset complete");
+}
+
+// ===== Public Entry Point =====
+
+extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
+    // host_build_graph host-orch: the orchestration .so is dlopen'd on the HOST
+    // during prepare_callable_impl and the whole task graph is built host-side,
+    // so there is no device-side orchestrator .so to pre-load — prewarm is a
+    // no-op. The symbol is retained because the platform onboard kernel
+    // (src/a2a3/platform/onboard/aicpu/kernel.cpp) links it strongly via
+    // simpler_aicpu_prewarm_callable; removing it would break the onboard link.
+    (void)runtime;
+    return 0;
+}
+
+/**
+ * aicpu_execute - Main AICPU kernel execution entry point
+ *
+ * This is called by DynTileFwkBackendKernelServer in kernel.cpp.
+ * Orchestrates the complete task runtime execution:
+ * 1. Initialize executor: all threads enter init(), which handshakes the cores
+ *    in parallel and barriers internally until init is complete (or a thread
+ *    failed); its return value is authoritative on every thread.
+ * 2. Execute tasks on managed cores
+ * 3. Cleanup when last thread finishes
+ *
+ * @param runtime Pointer to Runtime structure
+ * @return 0 on success, non-zero on error
+ */
+extern "C" int32_t aicpu_execute(Runtime *runtime) {
+    if (runtime == nullptr) {
+        LOG_ERROR("%s", "Invalid argument: null Runtime pointer");
+        return -1;
+    }
+
+    LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
+
+    // init() barriers every thread internally until init is complete on the
+    // leader (or a thread failed), then returns the status — so a non-zero
+    // return is authoritative on all threads and no extra spin is needed.
+    if (g_aicpu_executor.init(runtime) != 0) {
+        LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+        return -1;
+    }
+
+    int32_t rc = g_aicpu_executor.run(runtime);
+    if (rc != 0) {
+        LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
+    }
+
+    int32_t runtime_rc = read_runtime_status(runtime);
+
+    // The finalizer publishes cleanup eligibility only after runtime destruction.
+    if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
+        LOG_INFO("aicpu_execute: All threads finished, cleaning up");
+        g_aicpu_executor.deinit(runtime);
+    }
+
+    if (runtime_rc != 0) {
+        LOG_ERROR("aicpu_execute: simpler runtime failed with rc=%d", runtime_rc);
+        return runtime_rc;
+    }
+
+    if (rc != 0) {
+        return rc;
+    }
+
+    LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
+    return 0;
+}

@@ -71,7 +71,13 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Per-device invariants (log config, orch device id) were latched once by
     // simpler_aicpu_init at worker init; only the per-run register tables and
     // profiling-buffer bases are pushed here.
+#ifndef __SIMULATED_DEVICE__
+    // aSim provisions its own register table in the executor leader
+    // (asim_bringup); the host-supplied MMIO bases are meaningless with no real
+    // AICore, so this per-thread write is skipped to keep the leader the sole
+    // writer of g_platform_regs.
     set_platform_regs(k_args->regs);
+#endif
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);

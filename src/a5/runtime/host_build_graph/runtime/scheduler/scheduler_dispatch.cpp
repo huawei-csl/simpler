@@ -241,7 +241,9 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // so level=1 (TASK_TIMING-only) participates without needing complete_task.
 #if SIMPLER_DFX
     if (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED) {
-        chip_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
+        chip_swimlane_aicpu_on_aicore_dispatch(
+            core_id, thread_idx, reg_task_id, slot_state.to_descriptor().kernel_id[static_cast<int32_t>(subslot)]
+        );
     }
 #endif
 

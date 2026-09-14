@@ -107,7 +107,7 @@ void chip_swimlane_aicpu_init(int worker_count);
  *                     boundary dispatch it becomes the ACK gate for releasing
  *                     the just-filled buffer
  */
-void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id);
+void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id, int32_t func_id);
 
 /**
  * Post-completion hook: release an ACK-gated AICore buffer.

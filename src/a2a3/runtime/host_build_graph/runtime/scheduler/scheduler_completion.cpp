@@ -10,6 +10,10 @@
  */
 #include "scheduler_context.h"
 
+#ifdef __SIMULATED_DEVICE__
+#include "aicpu/asim_core.h"
+#endif
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "common/chip_swimlane_profiling.h"
@@ -303,7 +307,14 @@ void SchedulerContext::check_running_cores_for_completion(
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
+#ifdef __SIMULATED_DEVICE__
+        // The simulated device publishes a core's COND when asked, so the poll is
+        // the tick that advances it. Reading the cached pointer would spin on a
+        // value nothing ever writes.
+        uint64_t reg_val = static_cast<uint64_t>(asim::asim_read_status(asim::core_index_for_addr(core.reg_addr)));
+#else
         uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
+#endif
         // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
         // rmb() pins any AICore-published cacheable reads downstream of the
         // FIN observation. Replaces the post-`__sync_synchronize` that the
