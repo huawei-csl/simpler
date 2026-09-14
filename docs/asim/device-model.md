@@ -558,7 +558,8 @@ That is why the saving is a collapse in *poll count* rather than a cheaper poll:
 on qwen a manager reads its queue once per ~19 retirements where the per-core
 poller read once per core per pass. It is also why aSim's own cost lands
 differently in the two arms — see
-[validation.md](validation.md), *The arms are not taxed alike*.
+[validation/m2-scheduling-window.md](validation/m2-scheduling-window.md),
+*The arms are not taxed alike*.
 
 ### What the manager still holds
 

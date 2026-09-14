@@ -22,7 +22,9 @@ Living document — update on every design refinement and every measured result.
 | -------- | -------- |
 | [device-model.md](device-model.md) | The seam and its wire contract, the per-core state machine, substrate and bring-up, `a2a3asim` build scaffolding, the GroupQueue |
 | [calibration.md](calibration.md) | Every injected number, its provenance, and which are measured vs fitted |
-| [validation.md](validation.md) | Method, case selection, current fidelity, residuals, the measured M2 deltas |
+| [validation.md](validation.md) | Method, case selection, current fidelity, residuals, and which M2 campaign is which |
+| [validation/m2-scheduling-window.md](validation/m2-scheduling-window.md) | M2 against `scan_and_claim`, gated on the scheduling window (2026-09-04) |
+| [validation/m2-group-queue.md](validation/m2-group-queue.md) | M2 with the task-grouping contract, gated on `device_wall` (2026-09-14) |
 | [log.md](log.md) | Dated design log |
 
 ## 1. Goal

@@ -57,6 +57,7 @@ validation:
 # nav would bury the rest of the tree. Declaring them here keeps
 # omitted_files strict for everything else.
 not_in_nav: |
+  asim/*
   investigations/*
   remote-l3-worker-design/*
   troubleshooting/device-error-codes/*
@@ -144,6 +145,8 @@ nav:
           - Overview: remote-l3-worker-design.md
           - Design document index: remote-l3-worker-design/README.md
       - MPI L3 group mailbox: mpi-l3-mailbox.md
+  - aSim simulated device:
+      - Design document index: asim/DESIGN.md
   - Profiling and DFX:
       - Overview: dfx/README.md
       - Profiling Framework: dfx/profiling-framework.md
