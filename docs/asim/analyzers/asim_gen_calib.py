@@ -44,7 +44,24 @@ by_func = defaultdict(list)
 # for a graph-execution case — those tasks are expanded on device and have no
 # deps node — so fall back to the deps join only when the array is absent.
 rec_funcs = swim.get("aicpu_task_func_ids") or []
-aicpu_rows = swim.get("aicpu_tasks") or []
+# Newer traces carry the func_id inside each scheduler record (5th field) rather
+# than as a parallel array. That is the only source that works for a
+# graph-execution case, whose tasks have no deps node to join against.
+if not rec_funcs:
+    _rows = (swim.get("scheduler_tasks") or {}).get("records") or []
+    if _rows and len(_rows[0]) >= 5:
+        rec_funcs = [int(r[4]) for r in _rows]
+# The AICPU-side per-task rows moved under a versioned wrapper when the chip
+# swimlane grew a schema version: `scheduler_tasks.records` carries the same
+# [core_id, reg_task_id, dispatch_ts, finish_ts] shape the flat `aicpu_tasks`
+# list used to. Read whichever the trace carries, so one generator serves both.
+def _aicpu_rows(sw):
+    flat = sw.get("aicpu_tasks")
+    if flat:
+        return flat
+    return (sw.get("scheduler_tasks") or {}).get("records") or []
+
+aicpu_rows = _aicpu_rows(swim)
 aicore_rows = swim.get("aicore_tasks") or []
 if rec_funcs and len(rec_funcs) == len(aicpu_rows):
     # Join AICore timing to the AICPU row by (core_id, reg_task_id).
@@ -103,7 +120,7 @@ _end_by = {}
 for _c, _t, _rt, _s, _e, _r in swim.get("aicore_tasks", []):
     _end_by[(int(_c), int(_rt))] = _e
 _d = []
-for _row in swim.get("aicpu_tasks", []):
+for _row in _aicpu_rows(swim):
     _k = (int(_row[0]), int(_row[1]))
     if _k in _end_by:
         _v = (_row[3] - _end_by[_k]) * ns

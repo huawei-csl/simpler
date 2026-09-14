@@ -401,3 +401,85 @@ busy, so it is the closer of the two.
 In-flight capacity: the live index window is twice a manager's core count, which
 is exactly what the 2-deep per-core pipeline allowed. A deeper queue is a
 separate experiment.
+
+## M2 — the ready group queue (2026-09-14 campaign)
+
+A separate campaign from the one above, and not comparable to it: that one reads
+the scheduling window against a `scan_and_claim` M0, this one reads `device_wall`
+against an M0 of `host_build_graph` + simulated cores (`a2a3asim`). Both arms
+here are `a2a3asimgq`; what changes between them is the grouping contract.
+
+**The structure.** The shared ready queue holds *groups*, not tasks. A group's
+dependencies are on sink tasks only, so a group no external edge reaches is ready
+from the start; a scheduler thread takes one and feeds the whole of it to its
+controller, internal edges included. paged_attention Case1 annotates as
+`group = local_id / 257`: 65 792 tasks in 256 components of exactly 257,
+contiguous in local id, with zero edges between them.
+
+**Positions are taken and filled in the same step.** A group is fed in ascending
+task order, and each entry takes its position immediately before being submitted.
+Ascending order is what lets a controller hold an internal edge at all — a
+consumer can only name producers that already hold positions — and it does not
+depend on the order the per-shape rows drain. Taking and filling together is what
+keeps the manager retiring: it harvests completions as a contiguous prefix, so a
+position reserved now and submitted later halts that prefix at itself and nothing
+behind it ever retires. An earlier build reserved a whole group up front and
+measured `push=3840, watermark=0` — every thread wedged at the first hole.
+
+**Hardware limits.** 32 task slots per controller, 4 dependency comparators per
+slot. A slot is occupied from submit until the *manager learns* the task finished,
+by watermark or ahead-notification — an entry the controller has finished but not
+yet reported still holds its slot. A task with more unmet producers than there are
+comparators cannot be expressed, so the manager holds it, and with it the rest of
+its group, which is fed in order.
+
+| config | PA `device_wall` | vs M0 |
+| ------ | ---------------- | ----- |
+| M0 (`a2a3asim`) | 21.907 ms | — |
+| M2, grouping off | 18.200 ms | −16.9 % |
+| M2 ready group queue, unlimited | 7.794 ms | −64.4 % |
+| **M2 ready group queue, 32 slots / 4 deps** | **9.453 ms** | **−56.9 %** |
+
+**Same work, verified.** A skip-golden run proves only that nothing deadlocked,
+so work equivalence is measured rather than assumed: compute issued by the
+controller, dispatches charged, and tasks completed, all at `--rounds 1` so no
+counter's reset semantics can be mistaken for a difference.
+
+| | compute/round | dispatches | completed |
+| - | ------------- | ---------- | --------- |
+| M0 | 97 030.0 µs | 63 701 | 65 792 / 65 792 |
+| M2 grouping off | 97 005.7 µs | 62 923 | 65 792 / 65 792 |
+| M2 group queue, 32/4 | 96 982.1 µs | 63 898 | 65 792 / 65 792 |
+
+Compute agrees to −0.06 %. The mechanism shows up in the balance rather than the
+total: per-thread compute spread is 5.6 % ungrouped and 0.1 % grouped, which is
+the same "fill the idle cores" effect the zero-latency balancer oracle found.
+
+**The comparator count is the parameter that decides the design.**
+
+| comparators | PA `device_wall` | stalls forced |
+| ----------- | ---------------- | ------------- |
+| 1 | 28.254 ms | 293 843 |
+| 2 | 22.549 ms | 195 025 |
+| 3 | 9.690 ms | 0 |
+| 4 | 9.453 ms | 0 |
+
+The cliff is between 2 and 3, not a gentle curve: at 1 comparator the group queue
+is *slower than not grouping at all* (18.200 ms) and slower than M0, because a
+task that cannot express its producers holds everything behind it in its group's
+feed order, and the ungrouped path pays no such penalty — it can dispatch any
+ready task from anywhere. PA needs 3; 4 buys margin. The slot count is the milder
+knob: 32 versus unlimited costs 21 %.
+
+### What this result does not cover
+
+- **Nothing is numerically verified.** Every figure here is `--skip-golden`.
+- **PA is the friendly case**: zero cross-group edges, so the controller resolves
+  *every* edge. A group any external edge reaches still arrives task by task —
+  the sink-completion counter that would make it general is not built.
+- **MIX** tasks are fed as separate cube/vector entries rather than one 3-part
+  package entry, which changes their placement.
+- The bookkeeping core id handed to `complete_slot_task` is the thread's first
+  core, not the controller's actual placement. Inert here (aSim writes no deferred
+  slabs) but wrong for swimlane attribution; `queue_entry_core()` exists to fix it.
+- **qwen does not run this yet** — see `KNOWN_ISSUES.md`.
