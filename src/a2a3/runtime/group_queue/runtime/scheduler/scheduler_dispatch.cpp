@@ -1109,7 +1109,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Refill from the ready group queue before looking for work: a thread works
         // through one group at a time, handing the controller more of it as its
         // position window and the controller's hold room allow.
-        if (gq_group::ENABLED && feed_open_groups(thread_idx)) {
+        if (gq_group::active() && feed_open_groups(thread_idx)) {
             made_progress = true;
         }
 #if SIMPLER_DFX
@@ -1131,7 +1131,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // A grouped entry is placed by the controller and holds no core here, so
         // the core tracker cannot say whether this thread still has work out.
         // Positions handed out but not retired can.
-        const bool gq_outstanding = gq_group::ENABLED && gq_index_[thread_idx].outstanding() > 0;
+        const bool gq_outstanding = gq_group::active() && gq_index_[thread_idx].outstanding() > 0;
         if (!tracker.has_any_running_cores() && !gq_outstanding) {
             LoopAction action = check_exit_conditions(thread_idx, header, runtime, task_count);
             if (action == LoopAction::BREAK_LOOP) break;

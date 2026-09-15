@@ -83,6 +83,9 @@ void rt_scope_begin(RuntimeContext *rt) {
 
 void rt_scope_end(RuntimeContext *rt) { rt->orchestrator->end_scope(); }
 
+static void group_begin_impl(RuntimeContext *rt) { rt->orchestrator->begin_group(); }
+static void group_end_impl(RuntimeContext *rt) { rt->orchestrator->end_group(); }
+
 void rt_orchestration_done(RuntimeContext *rt) {
     // Host orchestration calls this runtime entry directly rather than the
     // orchestration-SO wrapper. Commit here as well so an all-Graph entry has a
@@ -236,6 +239,8 @@ static const RuntimeOps s_runtime_ops = {
 #endif
     .graph_record_start = graph_record_start_impl,
     .graph_record_wait = graph_record_wait_impl,
+    .group_begin = group_begin_impl,
+    .group_end = group_end_impl,
 };
 
 // =============================================================================

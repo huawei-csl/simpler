@@ -1828,6 +1828,9 @@ static TaskOutputTensors submit_task_common(
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
     task.task_id = task_id;
+    task.group = orch->open_group;
+    task.group_first = orch->open_group_first;
+    task.group_extent = 0;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = aiv1_kernel_id;
@@ -2103,6 +2106,9 @@ bool graph_submit_outer(
     slot.task_kind = TaskKind::GRAPH;
 
     task.task_id = task_id;
+    task.group = orch->open_group;
+    task.group_first = orch->open_group_first;
+    task.group_extent = 0;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
     task.packed_buffer_base = allocation.packed_base;
     task.packed_buffer_end = allocation.packed_end;
@@ -2818,6 +2824,35 @@ void OrchestratorState::graph_commit_inner() {
     }
 }
 
+// Open a group declaration. The group takes the next task id as its first member;
+// a declaration left open when orchestration ends covers every task submitted after
+// it, which is what an unclosed one means rather than an error.
+void OrchestratorState::begin_group() {
+    if (is_fatal()) return;
+    if (group_depth++ != 0) return;  // absorbed by the group already open
+    open_group = declared_group_count;
+    open_group_first = task_allocator.active_count();
+}
+
+// Close it, and give every member the run it turned out to cover. The extent is not
+// known until here, so it is back-filled -- over the group's own descriptors, on the
+// host, while the graph is still being built.
+void OrchestratorState::end_group() {
+    if (group_depth == 0 || --group_depth != 0) return;
+    if (open_group == NO_TASK_GROUP) return;
+    const int32_t first = open_group_first;
+    const int32_t end = task_allocator.active_count();
+    if (end > first) {
+        const int32_t extent = end - first;
+        for (int32_t id = first; id < end; ++id) {
+            sm_header->tasks.get_task_by_task_id(id).group_extent = extent;
+        }
+        ++declared_group_count;
+    }
+    open_group = NO_TASK_GROUP;
+    open_group_first = end;
+}
+
 TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
     auto *orch = this;
 
@@ -3021,6 +3056,9 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
 #endif
 
     task.task_id = prepared.task_id;
+    task.group = orch->open_group;
+    task.group_first = orch->open_group_first;
+    task.group_extent = 0;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;

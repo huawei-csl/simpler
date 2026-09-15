@@ -95,4 +95,13 @@ struct RuntimeOps {
     // caller record the body inline instead.
     bool (*graph_record_start)(RuntimeContext *rt, const GraphTaskArgs &args, void *job);
     void (*graph_record_wait)(RuntimeContext *rt);
+
+    // Open and close a task-group declaration. Every task submitted while one is
+    // open is a member of that group, and a member's producers are either retired
+    // or members of the same group -- which is a promise the graph makes, not a
+    // property the runtime checks. A runtime that schedules groups may resolve a
+    // group's internal edges on one controller; one that does not is free to
+    // ignore the declaration entirely.
+    void (*group_begin)(RuntimeContext *rt);
+    void (*group_end)(RuntimeContext *rt);
 };

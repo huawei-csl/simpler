@@ -587,13 +587,13 @@ struct SchedulerState {
     // The ready queues `thread_idx` pops from: its own row when groups are
     // claimed, the single shared set otherwise.
     ChipReadyQueue *ready_for(int32_t thread_idx) {
-        return gq_group::ENABLED ? ready_queues_gq[thread_idx] : ready_queues;
+        return gq_group::active() ? ready_queues_gq[thread_idx] : ready_queues;
     }
 
     // Ready tasks of `shape` across every owner, which is what the drain and
     // early-dispatch gates mean when they ask whether regular work remains.
     uint64_t ready_depth(int32_t shape) {
-        if (!gq_group::ENABLED) return ready_queues[shape].size();
+        if (!gq_group::active()) return ready_queues[shape].size();
         uint64_t n = 0;
         for (int32_t t = 0; t < PLATFORM_MAX_AICPU_THREADS; ++t) n += ready_queues_gq[t][shape].size();
         return n;
@@ -677,10 +677,9 @@ struct SchedulerState {
                 pushed = dummy_ready_queue.push(slot_state);
             } else if (slot_state->task_attrs.requires_sync_start()) {
                 pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
-            } else if (gq_group::ENABLED) {
-                const int32_t owner = gq_group::claim_group(
-                    gq_group::group_of(slot_state->to_descriptor().task_id.local_id()), gq_group::t_sched_thread
-                );
+            } else if (gq_group::active()) {
+                const int32_t owner =
+                    gq_group::claim_group(gq_group::group_of(slot_state->to_descriptor()), gq_group::t_sched_thread);
                 pushed = ready_queues_gq[owner][static_cast<int32_t>(shape)].push(slot_state);
             } else {
                 pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -735,15 +734,16 @@ struct SchedulerState {
     static constexpr int kDepsTooMany = -2;
 
     int group_deps(ChipTaskSlotState *s, int32_t local_id, uint64_t *out, uint32_t max_out) const {
-        if (!gq_group::ENABLED || s == nullptr) return kDepsUnexpressable;
+        if (!gq_group::active() || s == nullptr) return kDepsUnexpressable;
         const TaskPayload &p = s->to_payload();
         const SharedMemoryTaskHeader &tasks = *task_view.tasks;
         const int32_t *fanin = p.fanin_data();
+        const gq_group::GroupRun run = gq_group::run_of(local_id);
         uint32_t n = 0;
         for (int32_t k = 0; k < p.fanin_count; ++k) {
             const int32_t prod = fanin[k];
             if (tasks.is_completed(prod)) continue;  // retired: nothing to wait on
-            if (!gq_group::same_group(prod, local_id)) {
+            if (!run.holds(prod)) {
                 g_gq_deps_bailed.fetch_add(1, std::memory_order_relaxed);
                 int32_t none = -1;
                 g_gq_bail_task.compare_exchange_strong(none, local_id, std::memory_order_relaxed);
@@ -782,6 +782,8 @@ struct SchedulerState {
         const int32_t *fanin = p.fanin_data();
         const int32_t self_id = s->to_descriptor().task_id.local_id();
         const int32_t start = s->wake_scan_cursor < p.fanin_count ? s->wake_scan_cursor : p.fanin_count - 1;
+        const gq_group::GroupRun self_run = gq_group::run_of(self_id);
+        const bool self_claimed = gq_group::group_owner(self_run.group) != gq_group::NO_OWNER;
         for (int32_t i = start; i >= 0; i--) {
             // An unmet producer in this task's own group does not hold it back: the
             // controller holding both will place this one when that one retires on
@@ -789,8 +791,8 @@ struct SchedulerState {
             // name, which under forward-ordered ids it always does by the time a
             // consumer is classified -- checked rather than assumed, because a task
             // submitted naming a position that does not exist would wait forever.
-            if (gq_group::ENABLED && !tasks.is_completed(fanin[i]) && gq_group::same_group(fanin[i], self_id)) {
-                const bool claimed = gq_group::group_owner(gq_group::group_of(self_id)) != gq_group::NO_OWNER;
+            if (gq_group::active() && !tasks.is_completed(fanin[i]) && self_run.holds(fanin[i])) {
+                const bool claimed = self_claimed;
                 const bool positioned = task_position(fanin[i]) != kNoPosition;
                 if (claimed && positioned) {
                     g_gq_skip_fired.fetch_add(1, std::memory_order_relaxed);
@@ -854,9 +856,9 @@ struct SchedulerState {
             // this edge and completing here releases nothing -- but only tasks the
             // group queue actually delivers. One with no logical block never reaches
             // a core and is not fed, so it still needs releasing from here.
-            const int32_t waiter_id = waiter->to_descriptor().task_id.local_id();
-            if (gq_group::ENABLED && group_queue_delivers(*waiter) &&
-                gq_group::group_is_opened(gq_group::group_of(waiter_id))) {
+            const TaskDescriptor &waiter_desc = waiter->to_descriptor();
+            if (gq_group::active() && group_queue_delivers(*waiter) &&
+                gq_group::group_is_opened(gq_group::group_of(waiter_desc))) {
                 waiter = next;
                 continue;
             }

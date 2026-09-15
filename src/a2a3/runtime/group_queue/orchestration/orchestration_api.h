@@ -260,6 +260,36 @@ static inline void rt_scope_end() {
     rt->ops->scope_end(rt);
 }
 
+/**
+ * Declare a task group: every task submitted between begin and end is a member.
+ *
+ * The declaration is a contract the graph makes. A member's producers must be
+ * either already retired or members of the same group, so that one controller can
+ * resolve the group's internal edges without any completion leaving it -- only a
+ * task with a consumer outside the group has to be visible chip-wide. A graph that
+ * declares a group whose members depend on a task outside it, submitted later,
+ * waits on a completion no controller will ever see.
+ *
+ * Groups do not nest and are not required: an undeclared task is its own group,
+ * which is what a graph carrying no declaration at all gets. A runtime that does
+ * not schedule by group ignores the declaration.
+ */
+static inline void rt_group_begin() {
+    RuntimeContext *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->group_begin == nullptr) {
+        return;
+    }
+    rt->ops->group_begin(rt);
+}
+
+static inline void rt_group_end() {
+    RuntimeContext *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->group_end == nullptr) {
+        return;
+    }
+    rt->ops->group_end(rt);
+}
+
 static inline void rt_orchestration_done() {
     rt_graph_commit();
     rt_submit_phase_state() = RtSubmitPhaseState{};

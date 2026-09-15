@@ -78,6 +78,24 @@ struct OrchestratorState {
     int32_t scope_stack_top{-1};  // Current top of stack (-1 = no scope open)
     int32_t manual_begin_depth{CHIP_MAX_SCOPE_DEPTH};
 
+    // === TASK GROUPING (Private) ===
+    // The group declaration currently open, as the graph states it. A declaration
+    // names the run of tasks submitted while it is open, so a submit stamps its
+    // descriptor with `open_group` and `open_group_first`, and the close back-fills
+    // the run's extent over the members it turned out to cover.
+    //
+    // Nothing here is derived: a graph that declares no group leaves every task
+    // ungrouped, which is the behaviour of a scheduler with no grouping at all.
+    int32_t open_group{NO_TASK_GROUP};
+    int32_t open_group_first{0};
+    int32_t declared_group_count{0};
+
+    // Groups do not nest: a declaration inside an open one is absorbed by it. The
+    // depth is what makes that hold for a nested emitter, where the inner close
+    // would otherwise end the outer group and leave the rest of its tasks
+    // ungrouped. Only the outermost pair opens and closes a group.
+    int32_t group_depth{0};
+
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -154,6 +172,9 @@ struct OrchestratorState {
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();
+    void begin_group();
+    void end_group();
+
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);

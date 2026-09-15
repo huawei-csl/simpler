@@ -235,7 +235,8 @@ private:
     struct GroupFeed {
         int32_t group = -1;     // -1 when this thread holds no group
         int32_t id = 0;         // task being fed
-        int32_t end = 0;        // one past the group's last task
+        int32_t mi = 0;         // its position in the group's member list
+        int32_t members = 0;    // how many the group holds
         int32_t block = 0;      // logical block within the task
         int32_t sub = 0;        // subtask slot within the block
         bool accounted = false; // this task's blocks are counted for publication
@@ -253,7 +254,7 @@ private:
         // waited on: blocking the cursor would hold every later task in the group,
         // and the group gates every later group. The lowest one passed over is where
         // the next sweep of this group restarts.
-        int32_t retry_from = -1;
+        int32_t retry_from = -1;  // member index, not a task id
         bool swept_clean = true;
     };
     GroupFeed group_feed_[PLATFORM_MAX_AICPU_THREADS];
@@ -352,7 +353,7 @@ private:
         const GqIndexSpace::Owner owner{
             h.slot, static_cast<int32_t>(h.reg_task_id), h.subslot, h.core_offset, h.core_offset
         };
-        const bool from_group = gq_group::ENABLED && h.local_id >= 0 &&
+        const bool from_group = gq_group::active() && h.local_id >= 0 &&
                                 gq_group::group_is_opened(gq_group::group_of(h.local_id));
         // An opened group reserved this position when it was queued, ascending
         // over its members; taking a fresh one here would put the consumer ahead

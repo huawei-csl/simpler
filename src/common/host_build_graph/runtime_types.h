@@ -248,6 +248,10 @@ struct TaskPayload;        // Forward declaration (defined below)
 // Task Descriptor
 // =============================================================================
 
+// A task no declaration covers. Such a task is its own group: nothing may assume
+// its producers are held by one controller.
+constexpr int32_t NO_TASK_GROUP = -1;
+
 /**
  * Task descriptor structure (shared memory)
  *
@@ -269,9 +273,23 @@ struct alignas(64) TaskDescriptor {
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 
+    // The group this task belongs to, as the graph declares it, and that group's
+    // extent in task ids. A group's internal edges are resolved by one controller,
+    // so the annotation is a contract: every producer of a member is either retired
+    // or a member of the same group. `group` is NO_TASK_GROUP for an undeclared
+    // task, which is then its own group.
+    //
+    // A declaration names a run of consecutive submissions, so a group's members are
+    // `group_first .. group_first + group_extent`. Carrying the run on every member
+    // is what lets a scheduler that claims a group by any one of its tasks feed the
+    // rest without a table built per run.
+    int32_t group;
+    int32_t group_first;
+    int32_t group_extent;
+
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[24];
+    uint8_t reserved[12];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();

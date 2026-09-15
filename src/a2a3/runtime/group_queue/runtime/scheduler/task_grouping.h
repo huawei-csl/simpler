@@ -4,6 +4,8 @@
 
 #include <atomic>
 
+#include "host_build_graph/shared_memory.h"
+
 // =============================================================================
 // Task grouping: the contract between whoever builds the graph and the
 // GroupQueue that runs it.
@@ -22,39 +24,31 @@
 // completion reaches the chip-wide flags that every manager reads; an internal
 // task finishing is a fact local to one controller and its manager.
 //
-// Provenance of the numbers below: derived from the case's own dependency graph
-// (`--enable-dep-gen`), not guessed. paged_attention Case1 is 65,536 tasks in 256
-// weakly-connected components of exactly 257, contiguous in local id, with zero
-// edges between them -- one group per batch element, holding a 64-block
-// QK->PV->SF->UP fan plus the reduction tree over its results.
+// The grouping is *declared*, never inferred. `rt_group_begin` / `rt_group_end`
+// around a run of submissions names that run a group, and the orchestrator stamps
+// each member's descriptor with the group and the run it covers. Nothing here
+// derives a group from a task id, a component walk, or any other property of the
+// graph: a scheduler cannot tell whether an edge it sees stays inside a group, so
+// only whoever builds the graph can say. Today the declaration is written by hand
+// in the orchestration source; a compiler that knows the graph's structure emits
+// the same two calls.
 //
-// Contiguity is what lets the annotation be two integers rather than a table:
-// group(local_id) = local_id / GROUP_SIZE. A graph whose groups are not
-// contiguous needs a real per-task annotation, which is where a compiler-emitted
-// one belongs.
+// Because a declaration covers consecutive submissions, a group's members are the
+// id run `group_first .. group_first + group_extent`, and every member carries it.
+// That is what lets a thread claiming a group by any one of its tasks feed the rest
+// without a per-run table: the annotation is already in the descriptor it holds.
 // =============================================================================
 
-// Tasks per group, or 0 when the graph carries no grouping and every task is its
-// own group -- which is exactly the behaviour before any of this existed.
-#ifndef SIMPLER_GQ_GROUP_SIZE
-#define SIMPLER_GQ_GROUP_SIZE 0
+// Whether the grouping path is compiled in at all. 0 leaves every task ungrouped
+// however the graph is annotated, which is the scheduler before any of this
+// existed and the baseline the grouped runs are measured against.
+#ifndef SIMPLER_GQ_GROUPING
+#define SIMPLER_GQ_GROUPING 1
 #endif
 
 namespace gq_group {
 
-constexpr int32_t GROUP_SIZE = SIMPLER_GQ_GROUP_SIZE;
-constexpr bool ENABLED = GROUP_SIZE > 0;
-
-// GROUP_SIZE as a divisor. Arithmetic over group extents is compiled even in an
-// ungrouped build, where it is never reached but must still not divide by zero.
-constexpr int32_t GROUP_EXTENT = GROUP_SIZE > 0 ? GROUP_SIZE : 1;
-
-// Which group a task belongs to. Ungrouped graphs put every task in its own
-// group, so a controller resolves nothing locally and the behaviour is unchanged.
-inline int32_t group_of(int32_t local_id) { return ENABLED ? local_id / GROUP_EXTENT : local_id; }
-
-// Whether two tasks are resolved by the same controller.
-inline bool same_group(int32_t a, int32_t b) { return group_of(a) == group_of(b); }
+constexpr bool ENABLED = SIMPLER_GQ_GROUPING != 0;
 
 // The ready queue this contract is heading for holds *groups*, not tasks: a group
 // becomes ready when the edges entering it are met -- which, since only a sink's
@@ -118,7 +112,103 @@ inline bool is_delivered(int32_t id) {
     return (g_delivered[id >> 6] & (1ULL << (id & 63))) != 0;
 }
 
+// The declaration, as the orchestrator stamped it onto every task. A run reaches it
+// through one pointer, latched before any thread is released into its dispatch loop,
+// because the descriptor the annotation rides on is the one the scheduler already
+// holds whenever it asks -- which is what keeps a lookup off any table of its own.
+constexpr int32_t NO_GROUP = NO_TASK_GROUP;
+
+inline const SharedMemoryTaskHeader *g_tasks;
 inline int32_t g_group_count;
+
+// Whether this run's graph declared any group. A graph that declares none is run
+// exactly as a scheduler without grouping runs it: every group-aware path is a
+// decision about a group, and there are none to decide about. ENABLED alone is not
+// that test -- it only says the path is compiled in.
+inline bool active() { return ENABLED && g_group_count > 0; }
+
+inline void bind_declaration(const SharedMemoryTaskHeader *tasks) {
+    g_tasks = tasks;
+    g_group_count = 0;
+}
+
+inline const TaskDescriptor *descriptor_of(int32_t local_id) {
+    if (!ENABLED || g_tasks == nullptr) return nullptr;
+    if (local_id < 0 || local_id >= g_tasks->total_tasks) return nullptr;
+    return &const_cast<SharedMemoryTaskHeader *>(g_tasks)->get_task_by_task_id(local_id);
+}
+
+// The annotation off a descriptor already in hand, which is where a caller holding
+// the task should ask: reaching it by id costs the load a second time.
+inline int32_t group_of(const TaskDescriptor &d) { return ENABLED ? d.group : NO_GROUP; }
+
+inline int32_t group_of(int32_t local_id) {
+    const TaskDescriptor *d = descriptor_of(local_id);
+    return d != nullptr ? d->group : NO_GROUP;
+}
+
+// A group's members are the id run its declaration covers, so membership is a range
+// test -- and the run is carried by every member. A consumer asking which of its
+// producers its own controller holds therefore reads its own descriptor once and
+// answers for every fanin without touching theirs, which is what keeps a per-fanin
+// question off the producers' cache lines.
+struct GroupRun {
+    int32_t group = NO_GROUP;
+    int32_t first = 0;
+    int32_t end = 0;
+
+    bool holds(int32_t local_id) const { return group != NO_GROUP && local_id >= first && local_id < end; }
+};
+
+inline GroupRun run_of(int32_t local_id) {
+    const TaskDescriptor *d = descriptor_of(local_id);
+    if (d == nullptr || d->group == NO_GROUP || d->group_extent <= 0) return GroupRun{};
+    return GroupRun{d->group, d->group_first, d->group_first + d->group_extent};
+}
+
+// Whether two tasks are resolved by the same controller.
+inline bool same_group(int32_t a, int32_t b) {
+    const int32_t ga = group_of(a);
+    return ga != NO_GROUP && ga == group_of(b);
+}
+
+// A group's member run, indexed by group. Built by walking the declaration rather
+// than the tasks: each step reads one member's descriptor and jumps the whole run it
+// names, so the walk costs one iteration per group, not per task.
+inline int32_t g_group_first[MAX_GROUPS];
+inline int32_t g_group_extent[MAX_GROUPS];
+
+inline int32_t index_declaration() {
+    if (!ENABLED || g_tasks == nullptr) return 0;
+    const int32_t total = g_tasks->total_tasks;
+    int32_t groups = 0;
+    for (int32_t id = 0; id < total;) {
+        const TaskDescriptor *d = descriptor_of(id);
+        if (d == nullptr) break;
+        const int32_t g = d->group;
+        if (g < 0 || g >= MAX_GROUPS || d->group_extent <= 0) {
+            ++id;  // undeclared: its own group, and it owns no run to skip
+            continue;
+        }
+        g_group_first[g] = d->group_first;
+        g_group_extent[g] = d->group_extent;
+        if (g >= groups) groups = g + 1;
+        id = d->group_first + d->group_extent;
+    }
+    g_group_count = groups;
+    return groups;
+}
+
+inline int32_t group_member_count(int32_t group) {
+    if (!ENABLED || group < 0 || group >= g_group_count) return 0;
+    return g_group_extent[group];
+}
+
+inline int32_t group_member(int32_t group, int32_t index) {
+    if (!ENABLED || group < 0 || group >= g_group_count) return -1;
+    if (index < 0 || index >= g_group_extent[group]) return -1;
+    return g_group_first[group] + index;
+}
 
 // Where to start looking for a group to take. Groups are handed out to whichever
 // thread finds one ready, not in order: a graph whose groups depend on each other

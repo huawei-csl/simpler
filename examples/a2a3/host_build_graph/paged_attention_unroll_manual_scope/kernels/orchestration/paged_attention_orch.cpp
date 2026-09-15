@@ -154,6 +154,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 #endif
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+        // One batch element is one group. Its QK -> SF -> PV -> UP chain and the
+        // reduction over its blocks depend only on each other and on the query and
+        // block-table tensors the host staged, so nothing in it waits on another
+        // batch element: the whole run is resolvable by a single controller.
+        rt_group_begin();
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
@@ -305,6 +310,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             }
             CYCLE_COUNT_LAP(prof_scope_and_loop);
         }
+        rt_group_end();
     }
     CYCLE_COUNT_LAP(prof_scope_and_loop);
 

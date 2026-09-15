@@ -365,17 +365,19 @@ void SchedulerContext::log_shutdown_stall_snapshot(
 // completion path would otherwise have to maintain -- under polling a producer
 // does not enumerate its consumers, so there is no edge list to decrement along.
 bool SchedulerContext::group_externals_met(int32_t group) const {
-    if (!gq_group::ENABLED || sched_->task_view.tasks == nullptr) return false;
+    if (!gq_group::active() || sched_->task_view.tasks == nullptr) return false;
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
-    const int32_t lo = group * gq_group::GROUP_EXTENT;
-    const int32_t hi = lo + gq_group::GROUP_EXTENT;
     const int32_t submitted = total_tasks_;
-    for (int32_t id = lo; id < hi && id < submitted; ++id) {
+    const int32_t members = gq_group::group_member_count(group);
+    const gq_group::GroupRun run{group, gq_group::group_member(group, 0), gq_group::group_member(group, 0) + members};
+    for (int32_t mi = 0; mi < members; ++mi) {
+        const int32_t id = run.first + mi;
+        if (id < 0 || id >= submitted) continue;
         const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
         const int32_t *fanin = p.fanin_data();
         for (int32_t k = 0; k < p.fanin_count; ++k) {
             const int32_t prod = fanin[k];
-            if (gq_group::group_of(prod) == group) continue;
+            if (run.holds(prod)) continue;
             if (!tasks.is_completed(prod)) return false;
         }
     }
@@ -391,7 +393,7 @@ bool SchedulerContext::group_externals_met(int32_t group) const {
 // completions as a contiguous prefix, so a position reserved now and submitted
 // later stops that prefix at itself and nothing behind it is ever retired.
 bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
-    if (!gq_group::ENABLED || sched_->task_view.tasks == nullptr) return false;
+    if (!gq_group::active() || sched_->task_view.tasks == nullptr) return false;
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     GqIndexSpace &space = gq_index_[thread_idx];
     GroupFeed &f = group_feed_[thread_idx];
@@ -436,20 +438,20 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             if (taken < 0) return progress;
             f.group = taken;
             gq_group::mark_group_opened(f.group);
+            f.mi = 0;
+            f.members = gq_group::group_member_count(taken);
             f.retry_from = -1;
             f.swept_clean = true;
             f.probe_skips = 0;
-            f.id = f.group * gq_group::GROUP_EXTENT;
-            f.end = f.id + gq_group::GROUP_EXTENT;
             f.block = 0;
             f.sub = 0;
             f.accounted = false;
         }
-        if (f.id >= f.end || f.id >= submitted) {
+        if (f.mi >= f.members) {
             if (!f.swept_clean && f.retry_from >= 0) {
                 // Something was passed over; go round again from the lowest of them.
                 // Returning here rather than looping keeps one pass bounded.
-                f.id = f.retry_from;
+                f.mi = f.retry_from;
                 f.block = 0;
                 f.sub = 0;
                 f.accounted = false;
@@ -460,6 +462,14 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             f.group = -1;
             continue;
         }
+        f.id = gq_group::group_member(f.group, f.mi);
+        if (f.id < 0 || f.id >= submitted) {
+            ++f.mi;
+            f.block = 0;
+            f.sub = 0;
+            f.accounted = false;
+            continue;
+        }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(f.id);
         // A sweep that had to pass something over restarts at the lowest of them, so
         // it revisits tasks it already emitted. Emitting one twice would count its
@@ -467,12 +477,12 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
         // that nothing is waiting for permanently unpublished. A position is the
         // record that it went out.
         if (f.block == 0 && f.sub == 0 && !f.accounted && task_position(f.id) != kNoPosition) {
-            ++f.id;
+            ++f.mi;
             continue;
         }
         if (tasks.is_completed(f.id) || !group_queue_delivers(slot)) {
             // Not this queue's to deliver; classify left it on the ordinary path.
-            ++f.id;
+            ++f.mi;
             f.block = 0;
             f.sub = 0;
             f.accounted = false;
@@ -483,9 +493,9 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             // answer is a property of the task, and a task must be emitted whole.
             uint64_t probe[asimgq::SIM_HELD_MAX_DEPS];
             if (sched_->group_deps(&slot, f.id, probe, asimgq::SIM_HELD_MAX_DEPS) < 0) {
-                if (f.retry_from < 0) f.retry_from = f.id;
+                if (f.retry_from < 0) f.retry_from = f.mi;
                 f.swept_clean = false;
-                ++f.id;
+                ++f.mi;
                 f.block = 0;
                 f.sub = 0;
                 continue;
@@ -502,7 +512,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             f.sub = 0;
             ++f.block;
             if (f.block >= slot.logical_block_num) {
-                ++f.id;
+                ++f.mi;
                 f.block = 0;
                 f.accounted = false;
             }
@@ -557,14 +567,21 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
 // out and arrives task by task, because its entry tasks wait on producers no
 // controller here holds.
 void SchedulerContext::seed_ready_groups() {
+    // The compile-time test, not active(): whether the run is grouped is the
+    // question this function answers, so it cannot be its own precondition.
     if (!gq_group::ENABLED || sched_->task_view.tasks == nullptr) return;
-    // Only the extent of the queue. Whether a group has edges entering it, and
-    // whether a task is one the queue delivers, are both asked where the task slot
-    // is already in hand -- a pre-scan of the whole graph would cost a pass over
-    // every task and every edge, once per run, inside the window being measured.
-    const int32_t groups = (total_tasks_ + gq_group::GROUP_EXTENT - 1) / gq_group::GROUP_EXTENT;
-    gq_group::g_group_count = groups < gq_group::MAX_GROUPS ? groups : gq_group::MAX_GROUPS;
-    LOG_INFO("[GQ_GROUP] groups=%d (%d tasks)", gq_group::g_group_count, total_tasks_);
+    // The grouping is already in the task records the orchestrator wrote; all that
+    // is left is to point at them and index the declaration's runs. Whether a group
+    // has edges entering it, and whether a task is one the queue delivers, are both
+    // asked where the task slot is already in hand -- a pre-scan of the whole graph
+    // would cost a pass over every task and every edge, once per run, inside the
+    // window being measured.
+    gq_group::bind_declaration(sched_->task_view.tasks);
+    const int32_t groups = gq_group::index_declaration();
+    LOG_INFO(
+        "[GQ_GROUP] groups=%d declared (%d tasks, first group holds %d)", groups, total_tasks_,
+        gq_group::group_member_count(0)
+    );
 }
 
 // Everything the GroupQueue carries that is scoped to one run. Positions and
@@ -579,8 +596,10 @@ void SchedulerContext::gq_prepare_run() {
     }
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
-    partition_ready_queues_by_owner();
+    // Seeding first: the partition below applies only to a run that declared
+    // groups, and that is what seeding determines.
     seed_ready_groups();
+    partition_ready_queues_by_owner();
 #endif
 }
 
@@ -590,7 +609,7 @@ void SchedulerContext::gq_prepare_run() {
 // arena already reserved. Each span is re-seeded to its own empty ramp because
 // the ramp a queue's push tests against is a function of its capacity.
 void SchedulerContext::partition_ready_queues_by_owner() {
-    if (!gq_group::ENABLED) return;
+    if (!gq_group::active()) return;
     const int32_t threads = active_sched_threads_ > 0 ? active_sched_threads_ : 1;
     for (int32_t shape = 0; shape < NUM_RESOURCE_SHAPES; ++shape) {
         ChipReadyQueue &whole = sched_->ready_queues[shape];
@@ -654,8 +673,8 @@ int32_t SchedulerContext::handle_timeout_exit(
             // the group sitting there that has not retired, and say what it is.
             SharedMemoryTaskHeader &tk = *sched_->task_view.tasks;
             const int32_t g = gq_group::g_scan_from.load(std::memory_order_relaxed);
-            const int32_t lo = g * gq_group::GROUP_EXTENT;
-            const int32_t hi = lo + gq_group::GROUP_EXTENT;
+            const int32_t lo = gq_group::group_member(g, 0);
+            const int32_t hi = lo + gq_group::group_member_count(g);
             bool named = false;
             for (int32_t id = lo; id < hi && id < total_tasks_ && !named; ++id) {
                 const TaskPayload &pp = tk.get_slot_state_by_task_id(id).to_payload();
@@ -1526,7 +1545,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         // at a time. It delivers only those: a task with no logical block never
         // reaches a core, so it keeps the ordinary path, which is what completes it
         // and releases the consumers that name it.
-        if (gq_group::ENABLED && group_queue_delivers(slot)) {
+        if (gq_group::active() && group_queue_delivers(slot)) {
             continue;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
