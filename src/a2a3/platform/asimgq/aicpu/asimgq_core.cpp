@@ -1201,7 +1201,7 @@ void init() {
     // idle fabric. Nothing reads these afterwards.
     for (uint32_t i = 0; i < g_num_cores; ++i) {
         *reinterpret_cast<uint32_t *>(
-            g_reg_base + static_cast<uint64_t>(i) * SIM_REG_BLOCK_SIZE + reg_offset(RegId::COND)
+            g_reg_base + static_cast<uint64_t>(i) * ASIMGQ_REG_BLOCK_SIZE + reg_offset(RegId::COND)
         ) = static_cast<uint32_t>(AICORE_IDLE_VALUE);
     }
 }

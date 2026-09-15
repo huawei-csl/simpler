@@ -88,9 +88,14 @@ void wait_until(uint64_t deadline) {
     }
 }
 
+// Every register the simulated device touches has to fall inside the stride, or a
+// core's write would land in its neighbour's block.
+static_assert(ASIM_REG_BLOCK_SIZE > reg_offset(RegId::COND), "aSim block must hold COND");
+static_assert(ASIM_REG_BLOCK_SIZE > reg_offset(RegId::DATA_MAIN_BASE), "aSim block must hold DATA_MAIN_BASE");
+
 uint32_t *cond_slot(uint32_t core_idx) {
     return reinterpret_cast<uint32_t *>(
-        g_reg_base + static_cast<uint64_t>(core_idx) * SIM_REG_BLOCK_SIZE + reg_offset(RegId::COND)
+        g_reg_base + static_cast<uint64_t>(core_idx) * ASIM_REG_BLOCK_SIZE + reg_offset(RegId::COND)
     );
 }
 
@@ -112,6 +117,9 @@ uint64_t next_rand(SimCore &c) {
 // batches, collapsing the scheduler's dispatch/complete phase count well below
 // the real one.
 uint64_t g_func_hist[16] = {};
+// One past the highest func_id the current table sets, so the next run clears
+// exactly what this one wrote.
+uint32_t g_func_table_high = 0;
 uint64_t g_func_other = 0;
 int32_t g_func_max = -1;
 
@@ -195,7 +203,11 @@ void advance(SimCore &c, uint64_t now) {
 
 void configure(uint64_t reg_base, uint32_t num_cores) {
     g_reg_base = reg_base;
-    g_cores.assign(num_cores, SimCore{});
+    // Sizing only: init() resets every core, so assigning fresh SimCores here
+    // would write the same state twice on every run.
+    if (g_cores.size() != num_cores) {
+        g_cores.assign(num_cores, SimCore{});
+    }
 }
 
 void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint64_t notice_ns) {
@@ -209,11 +221,31 @@ void set_compute_ns_table(
     const uint64_t *ns_by_func, const uint64_t *sigma_ns_by_func, uint32_t n, uint64_t default_ns
 ) {
     g_default_compute_ticks = ns_to_ticks(default_ns);
-    g_func_compute_ticks.assign(n, 0);
-    g_func_compute_sigma_ticks.assign(n, 0);
+    // The table spans every func_id the runtime can name (1024) while a graph uses
+    // a few dozen, so it is cleared over the span a previous run actually set
+    // rather than rewritten whole.
+    if (g_func_compute_ticks.size() != n) {
+        g_func_compute_ticks.assign(n, 0);
+        g_func_compute_sigma_ticks.assign(n, 0);
+        g_func_table_high = 0;
+    } else {
+        for (uint32_t i = 0; i < g_func_table_high; ++i) {
+            g_func_compute_ticks[i] = 0;
+            g_func_compute_sigma_ticks[i] = 0;
+        }
+        g_func_table_high = 0;
+    }
+    // The table spans every func_id the runtime can name, of which a graph uses a
+    // few dozen; an unused entry is 0 ns and converts to 0 ticks, so converting it
+    // is a divide whose answer the assign above already wrote.
     for (uint32_t i = 0; i < n; ++i) {
-        g_func_compute_ticks[i] = ns_to_ticks(ns_by_func[i]);
-        if (sigma_ns_by_func != nullptr) {
+        const uint64_t mean_ns = ns_by_func[i];
+        if (mean_ns == 0) {
+            continue;
+        }
+        g_func_compute_ticks[i] = ns_to_ticks(mean_ns);
+        if (i + 1 > g_func_table_high) g_func_table_high = i + 1;
+        if (sigma_ns_by_func != nullptr && sigma_ns_by_func[i] != 0) {
             g_func_compute_sigma_ticks[i] = ns_to_ticks(sigma_ns_by_func[i]);
         }
     }
@@ -230,7 +262,7 @@ void init() {
 }
 
 uint32_t core_index_for_addr(uint64_t reg_addr) {
-    return static_cast<uint32_t>((reg_addr - g_reg_base) / SIM_REG_BLOCK_SIZE);
+    return static_cast<uint32_t>((reg_addr - g_reg_base) / ASIM_REG_BLOCK_SIZE);
 }
 
 // Both calls follow the same shape so aSim's own work is *absorbed inside* the
@@ -308,14 +340,24 @@ void asim_busy_ticks(const int32_t *core_ids, uint32_t n_cores, uint64_t *total,
     *dispatches = n;
 }
 
-void asim_poll_overrun(uint32_t first_core, uint32_t n_cores, uint64_t *total_us, uint64_t *calls) {
-    uint64_t total = 0, count = 0;
-    for (uint32_t i = first_core; i < first_core + n_cores && i < g_cores.size(); ++i) {
+void asim_poll_overrun(
+    const int32_t *core_ids, uint32_t n_cores, uint64_t *total_us, uint64_t *calls, uint64_t *poll_calls,
+    uint64_t *poll_work_us
+) {
+    uint64_t total = 0, count = 0, pc = 0, pw = 0;
+    for (uint32_t k = 0; k < n_cores; ++k) {
+        const int32_t i = core_ids[k];
+        if (i < 0 || static_cast<size_t>(i) >= g_cores.size()) continue;
         total += g_cores[i].poll_overrun_total;
         count += g_cores[i].poll_overrun_calls;
+        pc += g_cores[i].poll_work_calls;
+        pw += g_cores[i].poll_work_total;
     }
+    const uint64_t hz = get_sys_cnt_aicpu_frequency_hz();
     *calls = count;
-    *total_us = total * 1000000ULL / get_sys_cnt_aicpu_frequency_hz();
+    *total_us = total * 1000000ULL / hz;
+    *poll_calls = pc;
+    *poll_work_us = pw * 1000000ULL / hz;
 }
 
 void asim_poll_work(uint32_t first_core, uint32_t n_cores, uint64_t *mean_ns, uint64_t *total_us, uint64_t *calls) {

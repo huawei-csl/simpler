@@ -58,7 +58,15 @@ namespace asimgq {
 
 // Configure the aSim device before bring-up. `reg_base` is the base address of
 // the aSim-owned per-core register backing; core i lives at
-// reg_base + i * SIM_REG_BLOCK_SIZE. `num_cores` is how many are modeled.
+// reg_base + i * ASIMGQ_REG_BLOCK_SIZE. `num_cores` is how many are modeled.
+//
+// The stride is sized for the registers the simulated device touches --
+// DATA_MAIN_BASE (0xA0) on dispatch and COND (0x4C8) on poll -- not for the PMU
+// window SIM_REG_BLOCK_SIZE covers, which it does not model. Striding by the
+// larger block puts every core's COND on its own page, so seeding the cores costs
+// one first-touch fault each inside the first run's device_wall: work real silicon
+// does at power-on and never again.
+constexpr uint32_t ASIMGQ_REG_BLOCK_SIZE = 0x500;
 void configure(uint64_t reg_base, uint32_t num_cores);
 
 // Set the injected MMIO / handshake latencies, in nanoseconds. Converted to

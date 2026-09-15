@@ -550,9 +550,14 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         // skip-golden run cannot.
         uint64_t busy = 0, dispatches = 0;
         asim::asim_busy_ticks(cores, static_cast<uint32_t>(core_num), &busy, &dispatches);
+        uint64_t overrun_us = 0, overrun_calls = 0, poll_calls = 0, poll_work_us = 0;
+        asim::asim_poll_overrun(
+            cores, static_cast<uint32_t>(core_num), &overrun_us, &overrun_calls, &poll_calls, &poll_work_us
+        );
         LOG_INFO(
-            "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d", thread_idx, cycles_to_us(busy),
-            dispatches, core_num
+            "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d overrun_us=%" PRIu64
+            " polls=%" PRIu64 " poll_work_us=%" PRIu64,
+            thread_idx, cycles_to_us(busy), dispatches, core_num, overrun_us, poll_calls, poll_work_us
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};

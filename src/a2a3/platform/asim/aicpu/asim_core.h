@@ -33,7 +33,15 @@ namespace asim {
 
 // Configure the aSim device before bring-up. `reg_base` is the base address of
 // the aSim-owned per-core register backing; core i lives at
-// reg_base + i * SIM_REG_BLOCK_SIZE. `num_cores` is how many are modeled.
+// reg_base + i * ASIM_REG_BLOCK_SIZE. `num_cores` is how many are modeled.
+// Per-core stride of the simulated register file. SIM_REG_BLOCK_SIZE is sized for
+// the PMU window (highest offset 0x12A0), which the simulated device does not
+// model: it touches DATA_MAIN_BASE (0xA0) on dispatch and COND (0x4C8) on poll,
+// and nothing else. Striding by the PMU-sized block would put every core's COND on
+// its own page, so seeding 72 cores would take 72 first-touch faults inside the
+// first run's device_wall -- a cost real silicon pays at power-on and never again.
+constexpr uint32_t ASIM_REG_BLOCK_SIZE = 0x500;
+
 void configure(uint64_t reg_base, uint32_t num_cores);
 
 // Set the injected MMIO / handshake latencies, in nanoseconds. Converted to
@@ -79,7 +87,12 @@ uint32_t asim_read_status(uint32_t core_idx);
 // [first_core, first_core + n_cores), and how many reads overran. Only this
 // inflates a measurement, so it is what a delta against the GroupQueue arm must be
 // corrected by -- measured here rather than assumed to be zero.
-void asim_poll_overrun(uint32_t first_core, uint32_t n_cores, uint64_t *total_us, uint64_t *calls);
+// Cores are handed to a thread round-robin, so the caller names them explicitly:
+// a contiguous window would report some other thread's cores.
+void asim_poll_overrun(
+    const int32_t *core_ids, uint32_t n_cores, uint64_t *total_us, uint64_t *calls, uint64_t *poll_calls,
+    uint64_t *poll_work_us
+);
 
 // Compute issued to a core range, in ticks -- the A/B work-equivalence check.
 void asim_busy_ticks(const int32_t *core_ids, uint32_t n_cores, uint64_t *total, uint64_t *dispatches);

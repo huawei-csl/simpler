@@ -30,6 +30,7 @@
 #include "utils/thread_completion_gate.h"
 
 #ifdef __SIMULATED_DEVICE__
+#include <memory>
 #include <vector>
 
 #include "aicpu/asimgq_core.h"
@@ -127,19 +128,22 @@ void asim_bringup(Runtime *runtime, int32_t nthreads) {
     (void)nthreads;
     const int32_t num_cores = runtime->get_worker_count();
     // AICPU-local backing (no GM / no AICore); persists for the process.
-    static std::vector<uint8_t> reg_backing;
+    // Held as an array rather than a vector because the file must not be zeroed:
+    // init() re-seeds every core's COND, and no other register in the block is read
+    // before the scheduler writes it, so zeroing it is dead work the first run of a
+    // process would pay inside its own device_wall.
+    static std::unique_ptr<uint8_t[]> reg_backing;
+    static size_t reg_backing_size = 0;
     static std::vector<uint64_t> reg_bases;
-    // Grown, never re-zeroed: asim::init() below re-seeds every core's COND, and
-    // no other register in the block is read before the scheduler writes it, so
-    // a per-run memset of the whole table would be dead work on the bring-up path.
-    const size_t need = static_cast<size_t>(num_cores) * SIM_REG_BLOCK_SIZE;
-    if (reg_backing.size() < need) {
-        reg_backing.resize(need, 0);
+    const size_t need = static_cast<size_t>(num_cores) * asimgq::ASIMGQ_REG_BLOCK_SIZE;
+    if (reg_backing_size < need) {
+        reg_backing = std::unique_ptr<uint8_t[]>(new uint8_t[need]);  // default-init: no memset
+        reg_backing_size = need;
     }
     reg_bases.resize(static_cast<size_t>(num_cores));
-    const uint64_t base = reinterpret_cast<uint64_t>(reg_backing.data());
+    const uint64_t base = reinterpret_cast<uint64_t>(reg_backing.get());
     for (int32_t i = 0; i < num_cores; ++i) {
-        reg_bases[i] = base + static_cast<uint64_t>(i) * SIM_REG_BLOCK_SIZE;
+        reg_bases[i] = base + static_cast<uint64_t>(i) * asimgq::ASIMGQ_REG_BLOCK_SIZE;
     }
 
     // Configure + seed the simulated device (COND = idle) before publishing

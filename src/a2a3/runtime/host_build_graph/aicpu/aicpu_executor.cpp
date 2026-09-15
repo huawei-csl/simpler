@@ -30,6 +30,7 @@
 #include "utils/thread_completion_gate.h"
 
 #ifdef __SIMULATED_DEVICE__
+#include <memory>
 #include <vector>
 
 #include "aicpu/asim_core.h"
@@ -121,23 +122,40 @@ namespace {
 // readiness flag the handshake spins on), and seeds each COND to idle. It is the
 // sole writer of the register table (kernel.cpp skips set_platform_regs under
 // __SIMULATED_DEVICE__), so pre_handshake_init captures the aSim registers.
+// The simulated device's register file, sized once per process. Allocating and
+// zeroing it is what a real chip does at power-on, not per dispatch, so it is
+// provisioned outside any run: 72 cores x ASIM_REG_BLOCK_SIZE, and
+// zeroing that on the AICPU costs ~370 us -- charged, before this split, to the
+// first run's device_wall and to nothing on real silicon.
+// Held as an array rather than a vector because the file must not be zeroed:
+// asim::init() re-seeds every core's COND, and no other register in the block is
+// read before the scheduler writes it. Zeroing it is therefore dead work -- and
+// not cheap dead work, since it is ~360 KB on the AICPU, which the first run of a
+// process pays inside its own device_wall and real silicon pays never.
+std::unique_ptr<uint8_t[]> g_reg_backing;
+size_t g_reg_backing_size = 0;
+std::vector<uint64_t> g_reg_bases;
+
+void asim_provision(Runtime *runtime) {
+    const int32_t num_cores = runtime->get_worker_count();
+    const size_t need = static_cast<size_t>(num_cores) * asim::ASIM_REG_BLOCK_SIZE;
+    if (g_reg_backing_size < need) {
+        g_reg_backing = std::unique_ptr<uint8_t[]>(new uint8_t[need]);  // default-init: no memset
+        g_reg_backing_size = need;
+    }
+    g_reg_bases.resize(static_cast<size_t>(num_cores));
+    const uint64_t base = reinterpret_cast<uint64_t>(g_reg_backing.get());
+    for (int32_t i = 0; i < num_cores; ++i) {
+        g_reg_bases[i] = base + static_cast<uint64_t>(i) * asim::ASIM_REG_BLOCK_SIZE;
+    }
+}
+
 void asim_bringup(Runtime *runtime) {
     const int32_t num_cores = runtime->get_worker_count();
-    // AICPU-local backing (no GM / no AICore); persists for the process.
-    static std::vector<uint8_t> reg_backing;
-    static std::vector<uint64_t> reg_bases;
-    // Grown, never re-zeroed: asim::init() below re-seeds every core's COND, and
-    // no other register in the block is read before the scheduler writes it, so
-    // a per-run memset of the whole table would be dead work on the bring-up path.
-    const size_t need = static_cast<size_t>(num_cores) * SIM_REG_BLOCK_SIZE;
-    if (reg_backing.size() < need) {
-        reg_backing.resize(need, 0);
-    }
-    reg_bases.resize(static_cast<size_t>(num_cores));
-    const uint64_t base = reinterpret_cast<uint64_t>(reg_backing.data());
-    for (int32_t i = 0; i < num_cores; ++i) {
-        reg_bases[i] = base + static_cast<uint64_t>(i) * SIM_REG_BLOCK_SIZE;
-    }
+    // Idempotent: a no-op when prewarm already provisioned the file, and the
+    // fallback for any path that reaches a run without prewarming.
+    asim_provision(runtime);
+    const uint64_t base = reinterpret_cast<uint64_t>(g_reg_backing.get());
 
     // Configure + seed the simulated device (COND = idle) before publishing
     // aicore_done, so a peer that observes the readiness flag finds a coherent
@@ -170,7 +188,7 @@ void asim_bringup(Runtime *runtime) {
         workers[i].aicore_done = static_cast<uint32_t>(i + 1);
     }
 
-    set_platform_regs(reinterpret_cast<uint64_t>(reg_bases.data()));
+    set_platform_regs(reinterpret_cast<uint64_t>(g_reg_bases.data()));
 }
 
 }  // namespace
