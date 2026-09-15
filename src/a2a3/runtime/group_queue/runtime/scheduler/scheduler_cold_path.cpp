@@ -1542,10 +1542,12 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
             if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
         }
         // The ready group queue delivers a group's dispatchable tasks, whole group
-        // at a time. It delivers only those: a task with no logical block never
-        // reaches a core, so it keeps the ordinary path, which is what completes it
-        // and releases the consumers that name it.
-        if (gq_group::active() && group_queue_delivers(slot)) {
+        // at a time, and only a task some group actually holds may rely on it. A
+        // task the graph left undeclared is its own group: nothing will ever queue
+        // it wholesale, so skipping the per-task path here would strand it and
+        // every consumer that names it. The same is true of a task with no logical
+        // block, which never reaches a core.
+        if (gq_group::active() && gq_group::group_of(id) != gq_group::NO_GROUP && group_queue_delivers(slot)) {
             continue;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
