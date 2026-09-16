@@ -92,6 +92,9 @@ void rt_orchestration_done(RuntimeContext *rt) {
     // final synchronization point for its asynchronous recording and deferred
     // outer shells even when no later non-Graph task forced an earlier commit.
     rt->orchestrator->graph_commit();
+    // The declaration set is complete only now, and whether it is worth honouring
+    // is a property of the set rather than of any one group.
+    rt->orchestrator->finish_groups();
     rt->orchestrator->mark_done();
     // The orchestrator itself never crosses to the device, so the count of tasks
     // it completed inline is published into the header that does.

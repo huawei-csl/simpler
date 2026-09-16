@@ -90,6 +90,14 @@ struct OrchestratorState {
     int32_t open_group_first{0};
     int32_t declared_group_count{0};
 
+    // How many declarations held an edge of their own. A group exists so one
+    // controller can resolve the edges between its members, so a graph whose
+    // declarations hold none between them is run ungrouped -- decided once, over
+    // the whole graph, because honouring only the edgeful ones would split the
+    // tasks across two ready paths whose capacities are each sized for carrying
+    // the graph alone.
+    int32_t edgeful_group_count{0};
+
     // Groups do not nest: a declaration inside an open one is absorbed by it. The
     // depth is what makes that hold for a nested emitter, where the inner close
     // would otherwise end the outer group and leave the rest of its tasks
@@ -174,6 +182,9 @@ struct OrchestratorState {
     void end_scope();
     void begin_group();
     void end_group();
+
+    // Called once orchestration is over, when the whole declaration set is known.
+    void finish_groups();
 
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);

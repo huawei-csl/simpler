@@ -2842,7 +2842,26 @@ void OrchestratorState::end_group() {
     if (open_group == NO_TASK_GROUP) return;
     const int32_t first = open_group_first;
     const int32_t end = task_allocator.active_count();
+    // A group exists so that one controller can resolve the edges between its
+    // members. A declared run with no edge of its own -- every member's producers
+    // lie outside it -- gives the controller nothing to resolve, while still making
+    // its members wait to be fed as a unit. Such a run is dropped here rather than
+    // honoured: the graph is free to over-declare, and this is where that costs
+    // nothing. Checked over the run's own fanin lists, on the host, while the graph
+    // is still being built.
+    bool holds_an_edge = false;
+    for (int32_t id = first; id < end && !holds_an_edge; ++id) {
+        const TaskPayload &p = sm_header->tasks.get_slot_state_by_task_id(id).to_payload();
+        const int32_t *fanin = p.fanin_data();
+        for (int32_t k = 0; k < p.fanin_count; ++k) {
+            if (fanin[k] >= first && fanin[k] < id) {
+                holds_an_edge = true;
+                break;
+            }
+        }
+    }
     if (end > first) {
+        if (holds_an_edge) ++edgeful_group_count;
         const int32_t extent = end - first;
         for (int32_t id = first; id < end; ++id) {
             sm_header->tasks.get_task_by_task_id(id).group_extent = extent;
@@ -2851,6 +2870,21 @@ void OrchestratorState::end_group() {
     }
     open_group = NO_TASK_GROUP;
     open_group_first = end;
+}
+
+// Decide the declaration set as a whole. Every group here holds only edges that
+// enter it from outside, so no controller has anything to resolve and the grouping
+// is cost without benefit -- it is dropped, and the graph runs exactly as an
+// undeclared one. A single edgeful group is enough to keep the set.
+void OrchestratorState::finish_groups() {
+    if (declared_group_count == 0 || edgeful_group_count > 0) return;
+    const int32_t total = task_allocator.active_count();
+    for (int32_t id = 0; id < total; ++id) {
+        TaskDescriptor &t = sm_header->tasks.get_task_by_task_id(id);
+        t.group = NO_TASK_GROUP;
+        t.group_extent = 0;
+    }
+    declared_group_count = 0;
 }
 
 TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
