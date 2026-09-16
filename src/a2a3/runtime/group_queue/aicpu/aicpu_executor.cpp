@@ -216,6 +216,13 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // rest), so the counter yields a gap-free [0, nthreads).
     int32_t tidx = platform_aicpu_affinity_thread_idx();
     if (tidx < 0) tidx = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
+    // Publish the resolved index so every per-thread reader inside this .so agrees
+    // on it. Sim's gate assigns no exec index, so without this the affinity TLS
+    // stays -1 and two things silently do nothing: the per-thread phase-record slot
+    // and, on a simulated device, the correction that removes the model's own cost
+    // from the window it is measuring. Onboard the gate already assigned it, so
+    // this stores the same value.
+    platform_aicpu_affinity_set_thread_idx(tidx);
     // A thread whose index still falls outside [0, nthreads) owns no core slice:
     // handshake_partition would compute lo/hi past cores_total_num_ and index
     // all_handshakes[]/core_exec_states_ out of bounds. Reject it here (mirrors
