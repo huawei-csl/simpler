@@ -1494,13 +1494,13 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
 #if ASIMGQ_SELF_PROFILE
     q.poll_status_ticks += get_sys_cnt_aicpu() - t_status0;
 #endif
-    // The list is a contiguous block in memory the manager can read, not a device
-    // register it must walk one word at a time: the whole of it arrives together,
-    // so it is charged once. Charging per word instead made a status read cost up
-    // to 18 x 30 ns on top of its own 30 ns -- several times the MMIO core poll the
-    // GroupQueue exists to replace, which is the opposite of what the design says,
-    // and it landed on the manager thread rather than on any task's latency.
-    deadline += g_ahead_word_ticks;
+    // The watermark read and the live look-ahead entries behind it. The accesses
+    // pipeline, so the poll latency above covers the first and each further word
+    // adds only its issue cost -- a full list of 18 costs 5 + 17 x 2 ns, not the
+    // 18 serial accesses that once made this read dearer than the MMIO core poll
+    // the GroupQueue exists to replace.
+    const uint32_t words = q.ahead_count < SIM_LOOKAHEAD ? q.ahead_count + 1 : SIM_LOOKAHEAD;
+    deadline += (words > 1 ? words - 1 : 0) * g_ahead_word_ticks;
     record_poll_work(q, entered_at);
     {
         const uint64_t now = get_sys_cnt_aicpu();
