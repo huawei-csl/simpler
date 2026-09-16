@@ -481,7 +481,7 @@ flowchart LR
     AICK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     AIVK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     CTRL -- "update · 80–140 ns<br/><i>across the die into the AICPU package</i>" --> STAT
-    STAT -- "<b>read_queue_status&#40;&#41; · 30 ns</b><br/><b>+ 30 ns per look-ahead word</b><br/><i>local to the package</i>" --> MGR
+    STAT -- "<b>read_queue_status&#40;&#41; · 5 ns</b><br/><b>+ 2 ns per further look-ahead word</b><br/><i>local to the package · reads pipeline</i>" --> MGR
 ```
 
 | Path | ns | Anchor | Who pays |
@@ -495,14 +495,21 @@ flowchart LR
 | controller ↔ AIC/AIV, cancellation | 30 each way | the same controller-to-core message | a core that has gone idle, waiting on the answer |
 | AIC/AIV → controller, FIN | 80 (Case1) / 140 (qwen) raised, + 30 link | the calibrated `notice` is what raising a FIN costs the core; the signal then crosses the same link every other controller-core message takes | nobody — device-internal |
 | controller → status register, update | 80 (Case1) / 140 (qwen) | the calibrated `notice`: the write crosses the die into the AICPU package, so it costs what an AICPU↔AICPU hop costs | nobody — the controller writes it |
-| status register → manager, `read_queue_status()` | **30** | the register lives in this package, so the manager reads it locally | **the AICPU** — with the next row, the only occupancy on the completion path |
-| status register → manager, each look-ahead word | **30 each** | one read per word, still serial | **the AICPU**; a list of *n* live entries costs *n+1* reads, the extra being the stale terminator that ends the scan |
+| status register → manager, `read_queue_status()` | **5** | an MMIO-class access to a register in this package, so the manager reads it locally | **the AICPU** — with the next row, the only occupancy on the completion path |
+| status register → manager, each further look-ahead word | **2 each** | the reads pipeline, so a word behind one already in flight costs its issue slot, not another access latency | **the AICPU**; a list of *n* live entries costs 5 + *n* × 2 ns, the extra word being the stale terminator that ends the scan |
 
 The watermark and the look-ahead buffer are **not** on the queue's side of the
 die. They sit in the AICPU package, and the controller pays the cross-die cost to
 update them. That is what makes the completion path cheap for the manager: it
-reads its own package, at 30 ns, however far away the cores that produced the
-finishes are.
+reads its own package, at 5 ns and 2 ns a word thereafter, however far away the
+cores that produced the finishes are.
+
+Charging each word a full access instead — 30 ns apiece, taken one at a time —
+put a full list at 570 ns, which is about three times the 195 ns MMIO core poll
+the GroupQueue exists to replace. It cost the manager thread its dispatch time
+rather than any task its latency, so it showed up as idle cores: against M0,
+expert_routed moved from +33% to +4.4% and paged_attention from −52% to −59.0%
+once the reads were modelled as pipelined.
 
 Compute duration is not a latency between structures: it is drawn per `func_id`
 from the calibration table, with a per-`func_id` sigma so cores finish scattered
@@ -550,9 +557,10 @@ The completion path is where the structural difference is large.
 `scan_and_claim` reads **one core per 195 ns access**, so learning what finished
 costs the manager 195 ns × cores. (195 is the in-situ poll cost, the model's one
 fitted parameter; the raw nGnRE LDR measures 92 ns.) The GroupQueue reads a
-watermark **once** for 30 ns, from a register in its own package, and retires
-everything it covers — plus 30 ns per look-ahead word for positions that
-finished out of order.
+watermark **once** for 5 ns, from a register in its own package, and retires
+everything it covers — plus 2 ns for each further look-ahead word naming a
+position that finished out of order, the reads riding behind the first rather
+than each paying its own access.
 
 That is why the saving is a collapse in *poll count* rather than a cheaper poll:
 on qwen a manager reads its queue once per ~19 retirements where the per-core
