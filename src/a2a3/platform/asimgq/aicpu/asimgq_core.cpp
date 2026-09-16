@@ -1494,10 +1494,13 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
 #if ASIMGQ_SELF_PROFILE
     q.poll_status_ticks += get_sys_cnt_aicpu() - t_status0;
 #endif
-    // The manager reads the live entries plus the stale one that ends the scan,
-    // serially. A full list has no terminator to read.
-    const uint32_t words = q.ahead_count < SIM_LOOKAHEAD ? q.ahead_count + 1 : SIM_LOOKAHEAD;
-    deadline += words * g_ahead_word_ticks;
+    // The list is a contiguous block in memory the manager can read, not a device
+    // register it must walk one word at a time: the whole of it arrives together,
+    // so it is charged once. Charging per word instead made a status read cost up
+    // to 18 x 30 ns on top of its own 30 ns -- several times the MMIO core poll the
+    // GroupQueue exists to replace, which is the opposite of what the design says,
+    // and it landed on the manager thread rather than on any task's latency.
+    deadline += g_ahead_word_ticks;
     record_poll_work(q, entered_at);
     {
         const uint64_t now = get_sys_cnt_aicpu();

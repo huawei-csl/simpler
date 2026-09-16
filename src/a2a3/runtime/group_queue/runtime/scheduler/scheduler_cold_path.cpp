@@ -900,8 +900,12 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         // what says both legs ran the same graph, which a skip-golden run cannot.
         uint64_t aic = 0, aiv = 0;
         asimgq::queue_busy_ticks(static_cast<uint32_t>(thread_idx), &aic, &aiv);
+        uint32_t ahead_hw = 0;
+        uint64_t ahead_dropped = 0;
+        asimgq::queue_ahead_stats(static_cast<uint32_t>(thread_idx), &ahead_hw, &ahead_dropped);
         LOG_INFO(
-            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f", thread_idx, cycles_to_us(aic), cycles_to_us(aiv)
+            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f ahead_high=%u ahead_dropped=%llu", thread_idx,
+            cycles_to_us(aic), cycles_to_us(aiv), ahead_hw, (unsigned long long)ahead_dropped
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};
