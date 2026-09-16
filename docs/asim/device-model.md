@@ -385,13 +385,15 @@ A group lands on a package **every one of whose cores has a slot**. The halves
 then start as each core frees, one behind whatever is running there, so a mix does
 not wait for a wholly idle package. A package with all three cores idle takes it
 first; failing that, the one whose last half would start earliest. The controller
-pushes the entries one at a time, so they do not start at the same instant: each
-is a push behind the one before it and pays its own trip to the core.
+issues the entries one at a time, so they do not start at the same instant: each
+is one issue slot -- 5 ns -- behind the one before it. The trip to the core is a
+message, not a stall: the controller is free the moment it has issued, and the
+entries fly concurrently.
 
 | path | ns |
 | ---- | -- |
-| controller's push, per entry | 5 |
-| controller → core, per entry | 60 |
+| controller's issue, per entry | 5 |
+| controller → core, the link | 30 |
 
 Placement follows an entry's own type rather than its position in the group, so a
 group carrying only one vector half still puts its cube on the cube core.
@@ -491,7 +493,7 @@ flowchart LR
 | controller → AIC/AIV, push | 30 | one-way controller-to-core message; the controller places on its own reading of core state, so nothing is asked first | the task, not the AICPU; **0 for a pipelined task**, already at its core when the one ahead ends |
 | core entry poll (inside the core, both arms) | 318 | the 633 ns core-observed reading less the 310 ns barrier-forced store: the core's own spin loop, the one row in the microbenchmark with real jitter | any task landing on an idle core, in either arm; **0 for a pipelined task**, whose value is already there when the loop comes round |
 | core pick-up (inside the core, both arms) | 491 (Case1) / 581 (qwen) | `receive_to_start_cycles`, stamped after the poll that noticed: dcci and ack before the kernel begins, which `compute` excludes by construction | the core, between noticing a task and starting it; **0 for a pipelined task** |
-| controller → one package's AIC+AIV0+AIV1, mix group | 30 per half | the same controller-to-core message, sent per half | the group's halves, which start staggered rather than together |
+| controller → one package's AIC+AIV0+AIV1, mix group | 5 per part, then the 30 link once | the controller issues the three entries one at a time — an issue slot each, not a link traversal each — and they then share the flight | the group's parts, which start 5 ns apart rather than together; the controller is not held for any of it |
 | controller ↔ AIC/AIV, cancellation | 30 each way | the same controller-to-core message | a core that has gone idle, waiting on the answer |
 | AIC/AIV → controller, FIN | 80 (Case1) / 140 (qwen) raised, + 30 link | the calibrated `notice` is what raising a FIN costs the core; the signal then crosses the same link every other controller-core message takes | nobody — device-internal |
 | controller → status register, update | 80 (Case1) / 140 (qwen) | the calibrated `notice`: the write crosses the die into the AICPU package, so it costs what an AICPU↔AICPU hop costs | nobody — the controller writes it |
