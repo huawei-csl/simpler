@@ -261,10 +261,9 @@ constexpr uint32_t SIM_LOOKAHEAD = 18;
 // The queue's own sorted insert is not charged: it happens when a core finishes,
 // inside the queue, with the manager uninvolved, and a shift network over 18
 // entries fits well inside the report path already modelled.
-// One further look-ahead word, once a read is already in flight. The reads
-// pipeline, so a word past the first costs its issue slot rather than another
-// access latency.
-constexpr uint64_t SIM_AHEAD_WORD_NS = 2;
+// One further look-ahead word. Each 64-bit read is its own access and costs the
+// same as the first, so a scan of N words costs N times this.
+constexpr uint64_t SIM_AHEAD_WORD_NS = 10;
 
 struct SimQueueStatus {
     uint64_t watermark;       // contiguous completed prefix

@@ -173,7 +173,7 @@ void asim_bringup(Runtime *runtime, int32_t nthreads) {
     // cross-die cost of updating them, which is the calibrated `notice`.
     // The manager's read of the watermark is an MMIO-class access: one latency,
     // and further words of the look-ahead list ride behind it.
-    asimgq::set_queue_latencies_ns(/*report_ns=*/notice_ns, /*poll_ns=*/5);
+    asimgq::set_queue_latencies_ns(/*report_ns=*/notice_ns, /*poll_ns=*/10);
     asimgq::init();
 
     Handshake *workers = runtime->get_workers();

@@ -57,6 +57,40 @@ private:
 
 }  // namespace
 
+// Declares one group every QWEN_GROUP_SIZE submissions, in submission order. 0
+// declares nothing, leaving the graph undeclared -- which is not the same
+// baseline as compiling the grouping path out of the runtime.
+//
+// The chunk is a fixed count rather than a semantic boundary because what it
+// exists to vary is the size of the unit a single controller serialises.
+#define QWEN_GROUP_SIZE 0
+
+namespace {
+int g_group_seq = 0;
+
+// Opens a group on the first member of each chunk and closes the previous one.
+// The run's last group stays open here and is closed at the end of the entry.
+inline void group_tick() {
+    if (QWEN_GROUP_SIZE <= 0) {
+        return;
+    }
+    if (g_group_seq % QWEN_GROUP_SIZE == 0) {
+        if (g_group_seq > 0) {
+            rt_group_end();
+        }
+        rt_group_begin();
+    }
+    ++g_group_seq;
+}
+}  // namespace
+
+// A function-like macro does not expand its own name, so each wrapper still calls
+// the real entry point after counting the submission.
+#define rt_submit_aic_task(...) (group_tick(), rt_submit_aic_task(__VA_ARGS__))
+#define rt_submit_aiv_task(...) (group_tick(), rt_submit_aiv_task(__VA_ARGS__))
+#define rt_submit_dummy_task(...) (group_tick(), rt_submit_dummy_task(__VA_ARGS__))
+#define rt_submit_task(...) (group_tick(), rt_submit_task(__VA_ARGS__))
+
 extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
@@ -67,6 +101,7 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
+    g_group_seq = 0;
     // External tensors
     const simpler::hbg::Tensor &ext_hidden_states = orch_args.tensor(0).ref();
     const simpler::hbg::Tensor &ext_input_rms_weight = orch_args.tensor(1).ref();
@@ -2087,6 +2122,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 rt_submit_aiv_task(36, params_t35);
             }
         }
+    }
+    if (QWEN_GROUP_SIZE > 0 && g_group_seq > 0) {
+        rt_group_end();
     }
 }
 

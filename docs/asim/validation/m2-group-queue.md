@@ -1,4 +1,4 @@
-# M2 campaign — the ready group queue (2026-09-14)
+# M2 campaign — the ready group queue (2026-09-14, qwen sweep re-measured 2026-09-17)
 
 What the task-grouping contract is worth, measured as **`device_wall`** against an
 M0 of `host_build_graph` + simulated cores (`a2a3asim`). Method and fidelity:
@@ -37,23 +37,38 @@ its group, which is fed in order.
 
 | config | PA `device_wall` | vs M0 |
 | ------ | ---------------- | ----- |
-| M0 (`a2a3asim`) | 21.907 ms | — |
-| M2, grouping off | 18.200 ms | −16.9 % |
-| M2 ready group queue, unlimited | 7.794 ms | −64.4 % |
-| **M2 ready group queue, 32 slots / 4 deps** | **9.87 ms** | **−55 %** |
+| M0 (`a2a3asim`) | 22.236 ms | — |
+| M2, grouping off | 18.640 ms | −16.2 % |
+| M2 ready group queue, unlimited | 9.634 ms | −56.7 % |
+| **M2 ready group queue, 32 slots / 4 deps** | **10.377 ms** | **−53.3 %** |
+
+Both arms run the same 65,792-task graph: `tests/st/a2a3/host_build_graph/paged_attention`
+Case1 on `a2a3asim` against its `group_queue` copy on `a2a3asimgq`. "Unlimited"
+lifts the controller's two hardware limits (`SIM_HELD_CAP` 32 to 4096,
+`SIM_HELD_MAX_DEPS` 4 to 64); "grouping off" compiles `SIMPLER_GQ_GROUPING` to 0,
+which is the scheduler before the contract existed.
 
 The 32/4 figure moved from 9.453 ms as the queue was made correct on a graph of
 chained groups (see qwen below): removing a whole-graph pre-scan from seeding took
-it to 8.575 ms, covering the position table properly put it back to 9.35 ms, and
-handing groups out concurrently costs the rest.
+it to 8.575 ms, covering the position table properly put it back to 9.35 ms, then
+9.87 ms once groups are handed out concurrently, and 10.377 ms is where the
+current tree sits.
+
+Re-measured 2026-09-17, the table moved less than qwen's did: M0 +1.5 %, grouping
+off +2.4 %, 32/4 +5.1 %, unlimited +23.6 %. The pipelined status-read correction
+that is worth -23.6 % on ungrouped qwen is worth almost nothing here, and that is
+the expected sign — PA's 256 groups are disjoint, so a controller resolves them
+internally and the manager polls comparatively little. What is left is the
+correctness work listed above rather than the read model, so these rows are not a
+clean before/after of any single change.
 
 **Same work, verified.** A skip-golden run proves only that nothing deadlocked,
 so work equivalence is measured rather than assumed: compute issued by the
 controller, dispatches charged, and tasks completed, all at `--rounds 1` so no
 counter's reset semantics can be mistaken for a difference.
 
-| | compute/round | dispatches | completed |
-| - | ------------- | ---------- | --------- |
+| arm | compute/round | dispatches | completed |
+| --- | ------------- | ---------- | --------- |
 | M0 | 97 030.0 µs | 63 701 | 65 792 / 65 792 |
 | M2 grouping off | 97 005.7 µs | 62 923 | 65 792 / 65 792 |
 | M2 group queue, 32/4 | 96 982.1 µs | 63 898 | 65 792 / 65 792 |
@@ -90,25 +105,68 @@ outer nodes rather than tasks. Expanded (`decode_fwd_layers_expanded.cpp`) it is
 against paged_attention's 256 disjoint ones. Its critical path is 33 levels, so
 the parallelism is there; the grouping is what fails to use it.
 
-| group size | qwen `device_wall` | internal edges |
-| ---------- | ------------------ | -------------- |
-| ungrouped | **31.93 ms** | — |
-| 277 (one layer) | 91.5 ms | 84.4 % |
-| 64 | 75.1 ms | 32.2 % |
-| 32 | 62.7 ms | ~20 % |
-| 16 | 51.9 ms | ~12 % |
+Every size is one fixed chunk of the submission order — the run is bracketed by
+`rt_group_begin` / `rt_group_end` every N submissions — because what the sweep
+varies is the size of the unit a single controller serialises, not where a
+semantic boundary falls. The internal-edge column is computed from the recorded
+graph rather than reported by the device: the share of the 23,601 edges whose
+endpoints land in the same chunk.
+
+| group size | qwen `device_wall` | vs ungrouped | internal edges |
+| ---------- | ------------------ | ------------ | -------------- |
+| undeclared | **21.79 ms** | — | — |
+| 16 | 42.34 ms | 1.94x | 7.0 % |
+| 32 | 48.02 ms | 2.20x | 16.8 % |
+| 64 | 57.71 ms | 2.65x | 32.5 % |
+| 277 (one layer) | 67.13 ms | 3.08x | 84.4 % |
 
 **Grouping loses at every size, and gets better as it does less.** Performance
-improves monotonically as internal-edge capture collapses from 84 % to 12 %, which
+improves monotonically as internal-edge capture collapses from 84 % to 7 %, which
 says none of the gain comes from the controller resolving edges — only from
 shrinking the unit of serialisation. Extrapolated, the best group size is 1, which
 is not grouping.
 
+The M0 this sits against is 32.41 ms, so undeclared M2 is **-32.8 %** against it
+while every grouped size is worse than M0 outright.
+
+**"Undeclared" and "grouping off" are not the same baseline**, and the gap between
+them is large enough that using either word loosely misreads the table. Compiling
+`SIMPLER_GQ_GROUPING` to 0 selects the pre-contract scheduler; leaving it at 1 on a
+graph carrying no declaration keeps the contract's machinery and routes the graph
+to the per-task ready path. On qwen those measure 29.33 ms and 21.79 ms — the
+machinery is worth **-25.7 %** with nothing declared at all, so a share of what the
+group queue looks worth is the ready-queue restructuring rather than grouping.
+
+| qwen arm | `device_wall` | vs M0 |
+| -------- | ------------- | ----- |
+| M0 (`a2a3asim`) | 32.36 ms | — |
+| M2, grouping compiled out (pre-contract scheduler) | 29.33 ms | -9.4 % |
+| M2, grouping compiled in, nothing declared | 21.79 ms | -32.7 % |
+
+The rows in the sweep above are the third of these.
+
+> **Superseded numbers.** An earlier pass of this sweep read ungrouped 31.93 ms
+> and 51.9 / 62.7 / 75.1 / 91.5 ms for 16 / 32 / 64 / 277. Those were taken
+> before the manager's status read was brought down from 30 ns per word. That
+> correction is worth
+> **-23.6 %** of ungrouped M2 on its own -- 28.50 ms to 21.79 ms measured as a
+> single A/B -- and it is why the ungrouped arm moved furthest: it is the arm
+> that polls most. The ordering and the conclusion are unchanged; the ratios
+> against ungrouped widen, so grouping looks worse under the corrected model,
+> not better. The two entries previously given as ~20 % and ~12 % internal edges
+> are 16.8 % and 7.0 % when counted rather than estimated.
+>
+> The table's rows were taken at 5 ns for the first word and 2 ns per word after
+> it; the model now charges a flat 10 ns per 64-bit read, which is 2-3x more per
+> poll and measures 21.82 ms against the 21.79 ms above. qwen is insensitive to
+> the read cost across that whole range -- what moved it was 30 ns *per word*,
+> about 300 ns on a ten-deep scan.
+
 The mechanism is the inverse of the one that wins on paged_attention. Per-thread
 compute spread, ungrouped against grouped:
 
-| case | ungrouped | grouped | |
-| ---- | --------- | ------- | - |
+| case | ungrouped | grouped | effect |
+| ---- | --------- | ------- | ------ |
 | paged_attention | 5.6 % | **0.1 %** | grouping balances |
 | qwen decode (G=16) | 0.5 % | **35.2 %** | grouping unbalances |
 

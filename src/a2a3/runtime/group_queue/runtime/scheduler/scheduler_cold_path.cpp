@@ -903,9 +903,25 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         uint32_t ahead_hw = 0;
         uint64_t ahead_dropped = 0;
         asimgq::queue_ahead_stats(static_cast<uint32_t>(thread_idx), &ahead_hw, &ahead_dropped);
+        // The simulator's own work overruns a modelled deadline when it costs more
+        // than the access it stands for, and that excess lands in the measured
+        // window. Reported here so an A/B against ASIM_WORK compares like for like.
+        uint64_t poll_over_us = 0, poll_over_calls = 0;
+        asimgq::queue_poll_overrun(static_cast<uint32_t>(thread_idx), &poll_over_us, &poll_over_calls);
+        uint64_t work_total = 0, work_max = 0, work_calls = 0;
+        asimgq::queue_poll_work(static_cast<uint32_t>(thread_idx), &work_total, &work_max, &work_calls);
+        uint64_t push_over_us = 0, push_over_calls = 0, push_mean_ns = 0;
+        asimgq::queue_push_overrun(
+            static_cast<uint32_t>(thread_idx), &push_over_us, &push_over_calls, &push_mean_ns
+        );
         LOG_INFO(
-            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f ahead_high=%u ahead_dropped=%llu", thread_idx,
-            cycles_to_us(aic), cycles_to_us(aiv), ahead_hw, (unsigned long long)ahead_dropped
+            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f ahead_high=%u ahead_dropped=%llu "
+            "poll_overrun_us=%" PRIu64 " push_overrun_us=%" PRIu64 " polls=%" PRIu64
+            " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64,
+            thread_idx, cycles_to_us(aic), cycles_to_us(aiv), ahead_hw, (unsigned long long)ahead_dropped,
+            poll_over_us, push_over_us, work_calls,
+            work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
+            (uint64_t)(cycles_to_us(work_max) * 1000.0)
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};
