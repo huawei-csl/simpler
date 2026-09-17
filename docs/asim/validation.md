@@ -98,6 +98,29 @@ setup that was missing from the model entirely — both in
    future regression should be re-checked the same way, because a bias that
    varies with configuration does not cancel in an M0-vs-M2 delta.
 
+## What the GroupQueue is worth, by graph size (2026-09-17)
+
+Four cases on one model and one card, each arm run back to back. The two the
+GroupQueue loses are the two smallest, and the margin grows with the graph:
+
+| case | tasks | M0 | M2 | vs M0 |
+| ---- | ----- | -- | -- | ----- |
+| paged_attention Case1 | 65,792 | 22.24 ms | 10.38 ms | **-53.3 %** |
+| qwen3-14b decode, expanded 40 layers | 11,085 | 32.36 ms | 21.79 ms | **-32.6 %** |
+| qwen3-14b `decode_fwd` (pypto-lib) | small | 823.6 us | 885.6 us | +7.5 % |
+| deepseek v4 `expert_routed` (pypto-lib) | ~250 | 615.5 us | 646.3 us | +5.0 % |
+
+A controller earns its keep by keeping work away from the manager, so a graph
+with little work to keep away pays the extra hop and the ring without getting
+anything back. The two regressions are stable across checkpoints (+6.4 % and
++4.4 % previously), so they are a property of the shape, not drift. The M2 arm
+is also the less repeatable one on the small cases -- deepseek spreads 10 %
+round to round against M0's 1.5 %.
+
+These sit against the campaign tables in
+[validation/m2-group-queue.md](validation/m2-group-queue.md), which vary the
+grouping contract rather than the case.
+
 ## Is an M0-vs-M2 delta an artefact? (audit, 2026-09-17)
 
 The M2 wins are large enough that the burden is on the simulator to show it is
