@@ -124,6 +124,52 @@ comparator limit never fires on paged_attention and fires in the hundreds on qwe
 but even a controller with no limits would not fix a graph whose groups cannot run
 at the same time.
 
+## qwen on the real multi-layer graph (2026-09-17)
+
+The section above ran a hand-expanded orchestration because the shipped one
+submits each layer as a Graph. The JIT path runs now: `--validate-fwd
+--fwd-layers N` compiles once the sampling kernel is bypassed, `pl.arange`
+lowering to a two-operand `pto.tci` the pinned ptoas cannot parse being the only
+thing that blocked it. 16 layers is 4,503 tasks; 40 layers is 11,223 and reports
+`argmax match 16/16 | logits 100.0000% within 5e-2`, so the graph is the real one
+and it is numerically right.
+
+Declarations tried, with `deps_named` — how often a controller was handed a member
+whose in-group producer was still live, i.e. the thing grouping exists to do:
+
+| declaration | groups | `deps_named` | result |
+| ----------- | ------ | ------------ | ------ |
+| per `pl.parallel` iteration | 61 | 0 | dropped as edgeless; runs ungrouped |
+| per sequential loop (all) | 140 | 0 | edgeless |
+| per outermost sequential loop (1 layer) | 0 | 0 | all dropped |
+| whole body | 1 | 294 | runs, one thread of four |
+| chunked every 8 call sites | 21 | 132 | **2.4x worse** |
+| **per layer, 16 layers** | **16** | **5,524** | **1.7-2.1x worse** |
+
+Per-layer grouping expresses *by far* the most internal edges of anything measured
+-- 5,524, against paged_attention's whole-graph total -- and is 1.7-2.1x slower
+than M0 (18.5-24.1 ms against 10.9-11.5 ms). **Expressing more edges to a
+controller is not the lever.** That sharpens the discriminator above from a
+comparison into a direct result: a grouping can maximise internal-edge capture and
+still lose, because what decides the outcome is whether groups can run at the same
+time. Thread compute spread was 7:1 (110 ms against 15.7 ms), `deps_bailed`
+12,445, and the look-ahead list saturated on every thread.
+
+### qwen is not starved of parallelism, and grouping cannot reach what it has
+
+Level width measured in *tasks* says 22 on average and 1 at its narrowest, which
+reads as a graph with nothing to schedule. Measured in **blocks** -- cores a level
+can occupy, since a task with `block_num > 1` puts one block on each -- it is 39
+on average, and only **2 of 197 levels** fall below 4 cores. The narrow levels are
+the widest tasks: one is `paged_attention_cce_aic` at 32 blocks, the next
+`paged_attention_cce_aiv` + `out_proj` at 24.
+
+So qwen's parallelism is real and sits *inside* multi-block tasks. A task goes to
+one manager's controller whole, and a manager owns 18 of 72 cores, so no way of
+drawing group boundaries reaches it -- grouping operates on tasks, and the work is
+one level below. The 51 of 197 width-1 levels are genuine joins (`copy_out` has
+fanin 87) or the fused CANN attention extern, which cannot be split by anyone.
+
 ## What this result does not cover
 
 - **Nothing is numerically verified.** Every figure here is `--skip-golden`.
@@ -135,4 +181,8 @@ at the same time.
 - The bookkeeping core id handed to `complete_slot_task` is the thread's first
   core, not the controller's actual placement. Inert here (aSim writes no deferred
   slabs) but wrong for swimlane attribution; `queue_entry_core()` exists to fix it.
-- **qwen does not run this yet** — see `KNOWN_ISSUES.md`.
+- **qwen runs now** (see the 2026-09-17 section), but only with its sampling
+  kernel bypassed; that bypass lives in a pypto-lib clone, not in any repository.
+- The grouping declarations come from a pypto codegen patch kept at
+  `docs/asim/patches/`. Without it applied pypto emits none, every graph arrives
+  undeclared, and M2 silently measures an ungrouped run.
