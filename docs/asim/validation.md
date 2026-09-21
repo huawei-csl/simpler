@@ -98,28 +98,52 @@ setup that was missing from the model entirely — both in
    future regression should be re-checked the same way, because a bias that
    varies with configuration does not cancel in an M0-vs-M2 delta.
 
-## What the GroupQueue is worth, by graph size (2026-09-17)
+## What the GroupQueue is worth (2026-09-21)
 
-Four cases on one model and one card, each arm run back to back. The two the
-GroupQueue loses are the two smallest, and the margin grows with the graph:
+Two cases carry the campaign. Both arms of each pair run back to back in one
+submission on one held card, so the delta is free of the ~3 % session drift.
 
-| case | tasks | M0 | M2 | vs M0 |
-| ---- | ----- | -- | -- | ----- |
-| paged_attention Case1 | 65,792 | 22.24 ms | 10.38 ms | **-53.3 %** |
-| qwen3-14b decode, expanded 40 layers | 11,085 | 32.36 ms | 21.79 ms | **-32.6 %** |
-| qwen3-14b `decode_fwd` (pypto-lib) | small | 823.6 us | 885.6 us | +7.5 % |
-| deepseek v4 `expert_routed` (pypto-lib) | ~250 | 615.5 us | 646.3 us | +5.0 % |
+| case | M0 | M2 | vs M0 |
+| ---- | -- | -- | ----- |
+| paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.239 ms | 9.918 ms | **-55.4 %** |
+| qwen3-14b `decode_fwd`, 40 layers (pypto-lib) | 28.423 ms | 18.989 ms | **-33.2 %** |
 
-A controller earns its keep by keeping work away from the manager, so a graph
-with little work to keep away pays the extra hop and the ring without getting
-anything back. The two regressions are stable across checkpoints (+6.4 % and
-+4.4 % previously), so they are a property of the shape, not drift. The M2 arm
-is also the less repeatable one on the small cases -- deepseek spreads 10 %
-round to round against M0's 1.5 %.
+The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
+independently measures -32.6 %, so the qwen figure reproduces across two
+codegen paths.
 
-These sit against the campaign tables in
-[validation/m2-group-queue.md](validation/m2-group-queue.md), which vary the
-grouping contract rather than the case.
+**-33 % is the throughput gain; PA's extra -22 points are what declared grouping
+adds on top.** Sweeping `--fwd-layers` on the qwen case gives a flat per-layer
+cost in each arm -- M0 ~710 us, M2 ~475 us -- so the ratio is a property of the
+runtime rather than of the graph, and it asymptotes at 0.668 once there is
+enough work to reach it.
+
+### The break-even is about 1 ms of device work
+
+M2 carries a fixed setup cost, so below roughly 1 ms it loses. Measured on one
+case and one code path, varying only the work:
+
+| qwen `--fwd-layers` | M0 | M2 vs M0 |
+| ------------------- | -- | -------- |
+| 1 | 841 us | +4.3 % |
+| 2 | 1.55 ms | -13.4 % |
+| 4 | 2.97 ms | -23.3 % |
+| 16 | 11.4 ms | -32.7 % |
+| 40 | 28.4 ms | -33.2 % |
+
+Everything the campaign measured falls on this curve, including the two cases
+dropped from scope on 2026-09-21 for being too small to matter: deepseek v4
+`expert_routed` (615 us, +5.0 %) and the bare qwen invocation (824 us, +7.5 %).
+Their regressions are the threshold, not a defect peculiar to them.
+
+Two earlier readings of the same data were wrong and are recorded here so they
+are not re-derived. **Graph size does not predict the sign** -- qwen at
+`--fwd-layers 2` is ~1,100 tasks and wins, while the 4,470-task bare invocation
+loses. **Width does not predict it either** -- the 16-layer graph is 195 levels
+deep and 22.8 wide, with only 15 % of its work at levels able to fill 72 cores,
+and it wins -32.7 % all the same. Width still describes *how* the two in-scope
+cases differ (PA's 256 disjoint groups against qwen's long thin chain), which is
+why PA is the one that rewards grouping; it just does not set the sign.
 
 ## Is an M0-vs-M2 delta an artefact? (audit, 2026-09-17)
 
