@@ -908,6 +908,11 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         // window. Reported here so an A/B against ASIM_WORK compares like for like.
         uint64_t poll_over_us = 0, poll_over_calls = 0;
         asimgq::queue_poll_overrun(static_cast<uint32_t>(thread_idx), &poll_over_us, &poll_over_calls);
+        uint64_t steals_tried = 0, steals_won = 0;
+        int64_t steal_gain_us = 0;
+        asimgq::queue_steal_stats(
+            static_cast<uint32_t>(thread_idx), &steals_tried, &steals_won, &steal_gain_us
+        );
         uint64_t work_total = 0, work_max = 0, work_calls = 0;
         asimgq::queue_poll_work(static_cast<uint32_t>(thread_idx), &work_total, &work_max, &work_calls);
         uint64_t push_over_us = 0, push_over_calls = 0, push_mean_ns = 0;
@@ -917,11 +922,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         LOG_INFO(
             "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f ahead_high=%u ahead_dropped=%llu "
             "poll_overrun_us=%" PRIu64 " push_overrun_us=%" PRIu64 " polls=%" PRIu64
-            " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64,
+            " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
+            " steals_tried=%" PRIu64 " steals_won=%" PRIu64 " steal_gain_us=%" PRId64,
             thread_idx, cycles_to_us(aic), cycles_to_us(aiv), ahead_hw, (unsigned long long)ahead_dropped,
             poll_over_us, push_over_us, work_calls,
             work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
-            (uint64_t)(cycles_to_us(work_max) * 1000.0)
+            (uint64_t)(cycles_to_us(work_max) * 1000.0),
+            steals_tried, steals_won, steal_gain_us
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};
