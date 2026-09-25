@@ -34,7 +34,7 @@ exact same 32-bit `COND` word the real AICore writes, and decode the same
 | Field | Bits | Mask |
 | ----- | ---- | ---- |
 | task_id | 0–30 | `TASK_ID_MASK = 0x7FFFFFFF` |
-| state   | 31   | `TASK_STATE_MASK = 0x80000000` |
+| state | 31 | `TASK_STATE_MASK = 0x80000000` |
 
 - state = 0 → **ACK** (task received), state = 1 → **FIN** (task completed).
 - `MAKE_ACK_VALUE(id) = id & 0x7FFFFFFF`
@@ -47,8 +47,8 @@ exact same 32-bit `COND` word the real AICore writes, and decode the same
 | ---- | ----- | ------- |
 | `AICPU_IDLE_TASK_ID` | `0x7FFFFFFD` | AICPU writes to `DATA_MAIN_BASE` to *open the window* (core may start) |
 | `AICORE_EXIT_SIGNAL` | `0x7FFFFFF0` | AICPU writes to `DATA_MAIN_BASE` to tell the core to exit |
-| `AICORE_IDLE_VALUE`  | `MAKE_FIN_VALUE(0x7FFFFFFF)` = `0xFFFFFFFF` | core writes to `COND` at init: initialized / idle |
-| `AICORE_EXITED_VALUE`| `MAKE_FIN_VALUE(0x7FFFFFFE)` = `0xFFFFFFFE` | core writes to `COND`: has exited |
+| `AICORE_IDLE_VALUE` | `MAKE_FIN_VALUE(0x7FFFFFFF)` = `0xFFFFFFFF` | core writes to `COND` at init: initialized / idle |
+| `AICORE_EXITED_VALUE` | `MAKE_FIN_VALUE(0x7FFFFFFE)` = `0xFFFFFFFE` | core writes to `COND`: has exited |
 
 **Push register (`DATA_MAIN_BASE`)**, 64-bit. Low 32 carry the dispatched task
 id (or a sentinel above); `0` means the window is closed (core waits). The
@@ -186,6 +186,7 @@ Mapped from the a2a3 tree:
   returns. `device_wall` is a host wall-clock delta.
 
 **Consequence:** aSim is the sim backend plus two changes —
+
 1. the per-core executor thread **spins the sampled compute duration** (cntvct
    deadline) instead of calling the real kernel (this thread is the concurrent
    core "deadline" of §4-pillar-1, correctly on the core's own thread);
@@ -252,6 +253,7 @@ This is the piece that replaces the real AICore's launch-time self-report;
 without it the AICPU hangs in the preamble (→ op-execute-timeout kill).
 
 **Bring-up deltas, concretely:**
+
 1. Host (`asim/host/device_runner.cpp`): **skip `launch_aicore_kernel`**;
    provision aSim reg backing instead of `init_aicore_register_addresses`’ MMIO
    map; still launch the AICPU kernel.
@@ -275,6 +277,7 @@ source + `__ASIM_DEVICE__`). Its binaries still land in `build/lib/a2a3/asim/`
 (variant = `asim`), so onboard is never clobbered.
 
 Build wiring (`simpler_setup/`):
+
 - `platform_info.py`: `"a2a3asim": ("a2a3", "asim")`.
 - `runtime_compiler.py`: map `a2a3asim` → platform dir `src/a2a3/platform/
   onboard`, add `_init_a2a3asim` mirroring **`_init_a2a3`** but passing
@@ -292,7 +295,6 @@ the robust variant-equality form `parse_platform(p)[1] == "sim"` (already used i
 `build_runtimes.py:155`); fix the fragile `endswith("sim")` site in
 `kernel_compiler.py:271`, and add `a2a3asim` to the explicit
 `in ("a2a3","a2a3sim")` tuples that select a2a3 handling.
-
 
 ## 5. The GroupQueue (the M2 structure)
 
@@ -329,9 +331,10 @@ whole job, just moves the cost into a serial bottleneck.
 ### The device is an event schedule, not a machine that is advanced
 
 A task's end is computed once, at the instant it is pushed to a core: the core is a
-sequential server with a two-deep intake, so `end = max(core free, entry arrived)
-+ ack + compute` is known then and never revisited. A poll compares the clock
-against the soonest end it holds. Nothing is simulated in between.
+sequential server with a two-deep intake, so
+`end = max(core free, entry arrived) + ack + compute` is known then and never
+revisited. A poll compares the clock against the soonest end it holds. Nothing is
+simulated in between.
 
 This is what keeps aSim's own cost inside the latency it models. Advancing a
 state machine on every access instead costs work proportional to the machine
@@ -398,6 +401,32 @@ entries fly concurrently.
 Placement follows an entry's own type rather than its position in the group, so a
 group carrying only one vector half still puts its cube on the cube core.
 
+### What stealing is worth
+
+A core that goes idle with an empty ring asks a core holding an unstarted
+pipelined entry to give it up. Measured by building the arm with `try_steal`
+short-circuited and swapping the two binaries inside one submission:
+
+| case | steal on | steal off | worth | attempts |
+| ---- | -------- | --------- | ----- | -------- |
+| paged_attention Case1 | 9.863 ms | 9.952 ms | noise | **1**, whole run |
+| qwen3-14B 40L | 18.847 ms | 19.365 ms | **2.67 %** | many |
+
+**paged_attention never triggers it.** Its 256 disjoint groups keep every ring
+backlogged, and the steal fires only for a core the queue cannot feed — so the
+precondition essentially never holds, and its MIX tasks are excluded anyway. One
+attempt across a 65,792-task run makes its 0.89 % arm-to-arm spread a reading of
+the noise floor rather than of the mechanism.
+
+**qwen gains 2.67 %**, over three interleaved on/off pairs (+2.62, +2.80, +2.60)
+with every on run faster than every off run and 0.3–0.5 % spread inside each arm.
+
+The split follows the graph: stealing pays where the graph is too narrow to keep
+the cores fed, and idles where there is always queued work to place instead —
+which is also where the GroupQueue's own margin is thinnest. It is a refinement
+worth about a twelfth of the structure's headline gain, not a load-bearing part
+of it.
+
 ### Completion
 
 A core finishing sets its position's bit in the queue; the queue publishes the
@@ -441,9 +470,16 @@ at the poll that noticed, not at the poll loop's start.
 
 **The entry poll is core-intrinsic and both arms pay it.** It belongs to the
 AICore's own loop, so moving the sender from across the die to beside the package
-does not remove it. What the GroupQueue buys on this path is the arrival term
-alone: 310 → 30, a saving of 280 ns, not 598. The totals still reconcile with the
-calibration — 310 + 318 + 491 = 1119, and 310 + 318 + 581 = 1209.
+does not remove it. The totals reconcile with the calibration —
+310 + 318 + 491 = 1119, and 310 + 318 + 581 = 1209.
+
+**The GroupQueue does not save the arrival term; it adds to it.** The 30 ns link
+replaces the 310 ns arrival only on the *controller-to-core* leg, and a submit
+still crosses the die to reach the controller first — `SIM_QUEUE_ARRIVAL_NS` is
+that same 310 ns. So the dispatch path is 5 + 310 + 30 + 318 + 375 against
+5 + 310 + 318 + 375: **about 30 ns longer, not 280 ns shorter.** Measured by
+nulling the term, it moves the workload 0.37 %, inside run spread. Dispatch
+latency is not where this structure earns anything; the completion path is.
 
 ```mermaid
 flowchart LR
@@ -550,10 +586,11 @@ flowchart LR
     COND -- "<b>asim_read_status&#40;&#41; · 195 ns</b><br/><b>once per core, strictly serial</b>" --> M0MGR
 ```
 
-The two arms differ on the dispatch path by one term only — the 280 ns of
-transport the controller saves by sitting beside the packages instead of across
-the die. Both cores then run the same two internal stages — the 318 ns entry poll and the
-491–581 ns pick-up — identically.
+The two arms differ on the dispatch path by one term only, and it runs against
+the GroupQueue: the extra 30 ns hop from controller to core, on top of the same
+310 ns die crossing the manager pays to reach either. Both cores then run the
+same two internal stages — the 318 ns entry poll and the 491–581 ns pick-up —
+identically.
 
 The completion path is where the structural difference is large.
 `scan_and_claim` reads **one core per 195 ns access**, so learning what finished

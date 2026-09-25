@@ -21,6 +21,9 @@ host logger).
 
 ## Procedure
 
+Build and run commands for both in-scope cases, and the discipline the numbers
+depend on, are in [running.md](running.md).
+
 ```bash
 # calibrate (one cold round; swimlane is gated on --rounds <= 1)
 pytest <case> --platform a2a3 --skip-golden --rounds 1 --enable-chip-swimlane 3
@@ -117,6 +120,39 @@ adds on top.** Sweeping `--fwd-layers` on the qwen case gives a flat per-layer
 cost in each arm -- M0 ~710 us, M2 ~475 us -- so the ratio is a property of the
 runtime rather than of the graph, and it asymptotes at 0.668 once there is
 enough work to reach it.
+
+### The two cases are opposite graph shapes
+
+Both are recorded by dep-gen and profiled the same way: level = longest path in
+edges, width = tasks at that level, "fillable" = a level wide enough to occupy
+all 72 cores.
+
+| property | paged_attention Case1 | qwen3-14B decode |
+| -------- | --------------------- | ---------------- |
+| tasks | 65,792 | 11,085 |
+| components | **256, disjoint** | **1** |
+| critical path | 33 levels | 195 levels (pypto path) |
+| mean width | — | 22.7 |
+| work at fillable levels | — | 15 % |
+| maximum fan-in | **3** | **86** |
+
+paged_attention is wide and shallow, in 256 pieces that share no edge. qwen is a
+single long thin chain. Nearly every difference between the two — which one
+rewards grouping, which one triggers the steal path, which one can be expressed
+with four dependency comparators — follows from that one contrast, so it is worth
+checking a new case's shape before predicting how it will behave.
+
+**Width does not predict the sign of the M0-vs-M2 delta**, which was tested and
+falsified: the 16-layer qwen graph is 195 levels deep and 22.8 wide with only 15 %
+of its work at fillable levels, and it still wins 32.7 %. What width predicts is
+*which mechanism* pays.
+
+One caveat on the recorded graphs. The in-repo expanded qwen orchestration emits
+40 layers in a loop, yet its recorded longest path is 32 — and forty chained
+layers cannot have a path shorter than 40. So dep-gen under-records some
+cross-layer edges, and a width read off `deps.json` is an upper bound. It does
+not affect any timing here: both arms execute the runtime's real dependencies,
+not the recording.
 
 ### The break-even is about 1 ms of device work
 
