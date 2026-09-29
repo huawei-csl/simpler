@@ -11502,10 +11502,13 @@ class Worker:
         log_directory = getattr(cfg, "output_prefix", "")
         if log_directory:
             _native_set_host_log_directory(log_directory)
-        # Host-side L3 scheduling markers run on this (orchestrator main) thread;
-        # start() is idempotent and safe here because init() has completed all
-        # forks (a PyTraCR proc created before a fork would be COW-inherited).
-        _tracr.start()
+        # The host L3 scheduling lane is deliberately not started. Its markers
+        # span from init() to teardown, ~20 s, while the device work they bracket
+        # is ~10 ms, so merging the host proc stretched the shared timeline by
+        # ~1900x and left device activity at 0.05% of the trace width. Every
+        # _tracr.* call below is a no-op while no proc is started, so the call
+        # sites stay put; re-enable by calling _tracr.start() here and
+        # _tracr.end() in close().
         run_id = self._orch._begin_run()
         resources = _RunResources()
         handle = RunHandle(self, run_id, (callable, args, cfg), resources)
@@ -11959,11 +11962,6 @@ class Worker:
                                 "native segment past every cooperative cancellation point"
                             )
                         self._hierarchical_start_cv.wait(timeout=min(_remaining, _CLOSE_JOIN_RECHECK_S))
-                # Flush the host L3 scheduling trace once, on this (main) thread,
-                # before teardown. No-op unless start() ran; the per-chip dispatch
-                # threads finalize during each run, so the main thread is the only
-                # PyTraCR-initialized thread here.
-                _tracr.end()
                 # A caller that WAITS on an in-flight attempt must always resolve
                 # against THAT attempt — never re-read _close_completion (a
                 # successor may already be installed) and never start a retry
