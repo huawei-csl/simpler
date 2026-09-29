@@ -1,0 +1,31 @@
+diff --git a/models/qwen3/14b/decode_fwd.py b/models/qwen3/14b/decode_fwd.py
+index ddb74d4..40a8905 100644
+--- a/models/qwen3/14b/decode_fwd.py
++++ b/models/qwen3/14b/decode_fwd.py
+@@ -1009,6 +1009,16 @@ def _token_embed_inline(
+     return next_hidden
+ 
+ 
++# EXPERIMENT: the sampling kernel is bypassed so the multi-layer graph compiles.
++# pl.arange lowers to a two-operand pto.tci that the pinned pto-isa's ptoas does not
++# parse ("expected ':'"), which is the only thing blocking --validate-fwd. Sampling
++# contributes no scheduling structure -- one CORE_GROUP per batch row at the very
++# end -- so dropping it leaves the N-layer + LM-head graph intact, which is what a
++# grouping study needs. The sampled ids are left untouched and so are wrong by
++# construction; aSim computes nothing anyway.
++_BYPASS_SAMPLING = True
++
++
+ @pl.jit.inline
+ def _greedy_sample_inline(
+     logits: pl.Tensor[[BATCH, VOCAB], pl.FP32],
+@@ -1221,7 +1231,8 @@ def decode_fwd(  # noqa: PLR0913 — device-side fused NUM_LAYERS decode + LM he
+         )
+         normed = next_normed
+     out = rms_lm_head_fp32(cur, final_norm_weight, lm_head_weight, seq_lens, out)
+-    sampled_ids_out = _greedy_sample_inline(out, sampled_ids_out)
++    if not _BYPASS_SAMPLING:
++        sampled_ids_out = _greedy_sample_inline(out, sampled_ids_out)
+     return out, sampled_ids_out, next_hidden
+ 
+ 

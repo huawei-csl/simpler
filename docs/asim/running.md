@@ -62,21 +62,46 @@ cross-repo setup in
 [multi-repo-setup](../../.claude/skills/multi-repo-setup/SKILL.md) — pypto and
 pypto-lib cloned, and this worktree's simpler installed against them.
 
+It also needs three things that live outside this repository: pypto's codegen
+patch, pypto-lib's sampling bypass, and the wrapper that actually redirects the
+run onto the simulated platform. **The measured revisions, all four patches, and
+why `_platform_string` alone is not enough are in
+[patches/README.md](patches/README.md).** The invocation below is the one the
+wrapper builds; running `decode_fwd.py` directly reaches the onboard binaries
+instead, with no error.
+
 ```bash
-export SIMPLER_ASIM_CALIB=$PWD/docs/asim/calib/qwen_decode_fwd.calib
-export PTO2_MANUAL_MAX_SEQ=3338 PYPTO_TASK_WINDOW=65536
-python models/qwen3/14b/decode_fwd.py -p a2a3 -d $TASK_DEVICE \
-    --validate-fwd --fwd-layers 40 --max-seq
+export SIMPLER_ASIM_CALIB=<simpler>/docs/asim/calib/qwen_decode_fwd.calib
+export PYPTO_TASK_WINDOW=65536 PYPTO_ROUNDS=10 PTO2_MANUAL_MAX_SEQ=3338
+export PYPTO_RUNTIME=host_build_graph
+
+# M0
+PYPTO_SIMPLER_PLATFORM=a2a3asim \
+  python pypto_run_wrapper.py lib:models/qwen3/14b/decode_fwd.py \
+      --validate-fwd --fwd-layers 40 --max-seq
+
+# M2
+PYPTO_SIMPLER_PLATFORM=a2a3asimgq PYPTO_RUNTIME_NAME=group_queue \
+  python pypto_run_wrapper.py lib:models/qwen3/14b/decode_fwd.py \
+      --validate-fwd --fwd-layers 40 --max-seq
 ```
+
+`GQ_THREADS` is unset and defaults to 4. The case's own argparse never sees the
+simulated platform — `PA_SUPPORTED_PLATFORMS` would reject it — so the wrapper
+carries it in `PYPTO_SIMPLER_PLATFORM` and forces it onto the `RunConfig`.
 
 Two things the pypto path does not do for itself:
 
 - **It passes its own platform** to the executor, so patching `_platform_string`
   is not enough to reach the simulated build — the executor call has to be
-  wrapped. Without that the run silently uses the onboard binaries.
-- **It does not raise the device-side log level**, so `[GQ_WORK]` and the other
-  device counters never appear. Host-side `configure_logging` does not reach
-  them.
+  wrapped. Without that the run silently uses the onboard binaries, with no
+  error. This is what `pypto_run_wrapper.py` exists for.
+- **It does not raise the device-side log level**, so `[GQ_WORK]`, `[GQ_GROUP]`
+  and the other device counters never appear. `ChipWorker.init()` forwards a
+  snapshot of the `simpler` logger's level, and neither `configure_logging` nor
+  setting that logger directly has been made to reach it. **Consequence: the
+  work-equivalence and grouping counters below are unavailable on this path** —
+  only the scene-test path (case 1) produces them.
 
 The in-repo `examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode` with
 `decode_fwd_layers_expanded.cpp` is a second, independent path to the same model
@@ -109,7 +134,8 @@ log lands in a directory shared with every other user on the box.
 | `[GQ_CALIB]` | M2 | share of tasks whose duration came from the calibration rather than a default |
 
 Compare compute issued across the arms before trusting any delta. On the two
-cases it matches to 0.08 % and 0.005 %.
+cases it matches to 0.08 % and 0.005 % — though for qwen those figures come from
+the in-repo expanded orchestration, since the pypto path emits no counters.
 
 ## Measurement discipline
 

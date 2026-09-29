@@ -115,11 +115,26 @@ The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
 independently measures -32.6 %, so the qwen figure reproduces across two
 codegen paths.
 
-**-33 % is the throughput gain; PA's extra -22 points are what declared grouping
-adds on top.** Sweeping `--fwd-layers` on the qwen case gives a flat per-layer
-cost in each arm -- M0 ~710 us, M2 ~475 us -- so the ratio is a property of the
-runtime rather than of the graph, and it asymptotes at 0.668 once there is
-enough work to reach it.
+Sweeping `--fwd-layers` on the qwen case gives a flat per-layer cost in each arm
+-- M0 ~710 us, M2 ~475 us -- so the ratio is a property of the runtime rather
+than of the graph, and it asymptotes at 0.668 once there is enough work to reach
+it.
+
+> **The qwen arm is not established as ungrouped, so -33 % must not be read as
+> the bare throughput gain.** An earlier version of this section split the two
+> results that way, attributing PA's further -22 points to declared grouping.
+> The pypto codegen patch was live for these runs and the generated qwen
+> orchestration carries **6 `rt_group_begin()` calls**, so the graph reached the
+> runtime with declarations on it. Whether the runtime resolved them or dropped
+> them -- it drops a declaration that holds no internal edge, and earlier qwen
+> declarations measured `deps_named=0`, so dropping is likely -- is unverified,
+> because the `[GQ_GROUP]` counter that would settle it is not readable on the
+> pypto path (see [patches/README.md](patches/README.md)). Until it is read,
+> -33.2 % is "qwen-40L with declarations emitted, resolution status unknown",
+> and the grouping-versus-throughput split is an open question rather than a
+> result. The in-repo expanded orchestration is a separate path whose
+> declarations are controlled directly, and it is the cleaner place to settle
+> the split.
 
 ### The two cases are opposite graph shapes
 
