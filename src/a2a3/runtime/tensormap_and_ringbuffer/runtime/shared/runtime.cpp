@@ -17,7 +17,6 @@
 
 #include "runtime.h"
 
-#include "common/unified_log.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
 
@@ -33,7 +32,6 @@ Runtime::Runtime() {
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;
-    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
@@ -43,9 +41,11 @@ Runtime::Runtime() {
     dev.prebuilt_arena_base_ = nullptr;
     dev.prebuilt_runtime_offset_ = 0;
     dev.active_callable_id_ = -1;
-    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        dev.func_id_to_addr_[i] = 0;
-    }
+    dev.entry_tensor_count_ = 0;
+    dev.entry_scalar_count_ = 0;
+    dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::Descriptor);
+    dev.callable_table_addr_ = 0;
+    dev.callable_table_len_ = 0;
 }
 
 // =============================================================================
@@ -68,6 +68,19 @@ void Runtime::set_orch_args(const ChipStorageTaskArgs &args) {
     }
 }
 
+EntryArgsSource Runtime::get_entry_args_source() const { return static_cast<EntryArgsSource>(dev.entry_args_source_); }
+uint32_t Runtime::get_entry_tensor_count() const { return dev.entry_tensor_count_; }
+uint32_t Runtime::get_entry_scalar_count() const { return dev.entry_scalar_count_; }
+
+// The counts are checked against the descriptor's own before the payload is
+// read, so a launch package and a descriptor that disagree are rejected rather
+// than reconciled in favour of whichever arrived. Capacity is the storage's own
+// gate, inside load_from_wire.
+bool Runtime::adopt_entry_args_from_launch(const void *payload, uint32_t tensor_count, uint32_t scalar_count) {
+    if (tensor_count != dev.entry_tensor_count_ || scalar_count != dev.entry_scalar_count_) return false;
+    return dev.orch_args_storage_.load_from_wire(payload, tensor_count, scalar_count);
+}
+
 void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
     dev.prebuilt_arena_base_ = arena_base;
     dev.prebuilt_runtime_offset_ = runtime_off;
@@ -80,24 +93,111 @@ void Runtime::set_active_callable_id(int32_t callable_id) { dev.active_callable_
 int32_t Runtime::get_active_callable_id() const { return dev.active_callable_id_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
-    return dev.func_id_to_addr_[func_id];
+    if (callable_table_host_ == nullptr || func_id < 0 || static_cast<uint32_t>(func_id) >= dev.callable_table_len_) {
+        return 0;
+    }
+    return callable_table_host_[func_id];
 }
 
-void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
+void Runtime::set_callable_tables(
+    const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len
+) {
+    if (host_view == nullptr || object_table_addr == 0 || len == 0) {
+        clear_callable_tables();
         return;
     }
-    dev.func_id_to_addr_[func_id] = addr;
+    callable_table_host_ = host_view;
+    callable_entry_table_addr_ = entry_table_addr;
+    dev.callable_table_addr_ = object_table_addr;
+    dev.callable_table_len_ = len;
 }
 
-void Runtime::clear_function_bin_addrs() {
-    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        dev.func_id_to_addr_[i] = 0;
+void Runtime::clear_callable_tables() {
+    callable_table_host_ = nullptr;
+    callable_entry_table_addr_ = 0;
+    dev.callable_table_addr_ = 0;
+    dev.callable_table_len_ = 0;
+}
+
+uint64_t Runtime::callable_entry_table_addr() const { return callable_entry_table_addr_; }
+
+uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
+
+// A steady-state trb run uploads the `dev` descriptor before the handshake
+// region (the rest of Runtime is host-only). Neither that region nor the gate
+// tail carries a host value the device consumes: the AICore publishes its
+// report, the AICPU writes the task pointer it answers with, and the AICPU
+// zeroes the active gates and executes wmb() before publishing hs_setup_done_,
+// with no register window open before that.
+//
+// The length stops inside the entry args, after the tensor slots this run
+// filled, which is why it is the one length that depends on the run rather than
+// only on the runtime: `orch_args_storage_` is the last uploaded member and its
+// tensor array is the last thing in it. At capacity this is exactly
+// offsetof(workers); with no tensors it is 1,280 bytes on both arches. Slots the
+// length leaves out keep whatever an earlier run of the same allocation wrote,
+// so every consumer reads through the counts — see
+// ChipTaskArgs::create_from_entry_storage.
+size_t runtime_device_copy_size(const Runtime &rt) {
+    return offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + rt.get_orch_args().used_prefix_bytes();
+}
+
+// The routing facts, read while `rt` is still this run's. Deliberately a
+// snapshot of values rather than a pointer into the descriptor: the launch side
+// consumes it after a successor's prepare may already have refilled the source.
+LaunchEntryArgsVerdict classify_launch_entry_args(
+    const Runtime &rt, uint32_t source, uint32_t offset, uint32_t tensor_count, uint32_t scalar_count
+) {
+    if (source != static_cast<uint32_t>(EntryArgsSource::Descriptor) &&
+        source != static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)) {
+        return LaunchEntryArgsVerdict::UndefinedSource;
     }
+    if (source != static_cast<uint32_t>(rt.get_entry_args_source())) return LaunchEntryArgsVerdict::SourceMismatch;
+    if (source == static_cast<uint32_t>(EntryArgsSource::Descriptor)) return LaunchEntryArgsVerdict::Descriptor;
+    if (offset != LAUNCH_ENVELOPE_HEADER_BYTES) return LaunchEntryArgsVerdict::UnexpectedOffset;
+    if (tensor_count > CHIP_MAX_TENSOR_ARGS || scalar_count > CHIP_MAX_SCALAR_ARGS) {
+        return LaunchEntryArgsVerdict::CountsPastCapacity;
+    }
+    if (tensor_count != rt.get_entry_tensor_count() || scalar_count != rt.get_entry_scalar_count()) {
+        return LaunchEntryArgsVerdict::CountsMismatch;
+    }
+    return LaunchEntryArgsVerdict::Adopt;
 }
 
-// trb's device image is just the `dev` descriptor (the rest of Runtime is
-// host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt) {
+    const simpler::tmr::EntryArgsStorage &entry = rt.get_orch_args();
+    const int32_t tensors = entry.tensor_count();
+    const int32_t scalars = entry.scalar_count();
+    LaunchEntryArgsPlan plan;
+    plan.supported = true;
+    // A count neither builder can produce — ChipStorageTaskArgs and
+    // EntryArgsStorage both throw at capacity — so reaching this means the
+    // descriptor was written past those. Reported as invalid rather than as an
+    // absent route, because the two call for opposite handling: one publishes
+    // through the descriptor, the other must not publish at all.
+    if (tensors < 0 || static_cast<size_t>(tensors) > CHIP_MAX_TENSOR_ARGS || scalars < 0 ||
+        static_cast<size_t>(scalars) > CHIP_MAX_SCALAR_ARGS) {
+        plan.counts_valid = false;
+        return plan;
+    }
+    plan.tensor_count = static_cast<uint32_t>(tensors);
+    plan.scalar_count = static_cast<uint32_t>(scalars);
+    plan.control_offset = offsetof(DeviceRuntimeLaunchDesc, entry_tensor_count_);
+    plan.tensor_offset =
+        offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + offsetof(simpler::tmr::EntryArgsStorage, tensors_);
+    plan.scalar_offset =
+        offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_) + offsetof(simpler::tmr::EntryArgsStorage, scalars_);
+    plan.payload_bytes = simpler::tmr::EntryArgsStorage::wire_bytes(plan.tensor_count, plan.scalar_count);
+    plan.descriptor_bytes_when_launched = offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_);
+    return plan;
+}
+
+// The first publication onto an allocation adds the handshake region, so it
+// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
+// left. It stops before the gates, whose host storage `Runtime()` never
+// initializes.
+size_t runtime_device_initialized_prefix_size(const Runtime &) {
+    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
+}
+
+size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType, scalar_to_uint64
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import (
     _FRAME_STAGED,
     _OFF_ACCEPTED,
@@ -58,6 +58,10 @@ def _rebase_callable(callable_spec: dict, kernels_dir: str) -> dict:
 
 _CHAIN_LENGTH = 512
 _DEVICE_SPIN_ITERS = 200_000_000
+# Two ranks only need a short overlap window to observe both prepared mailbox
+# frames; using the single-rank stress duration concurrently is unnecessarily
+# close to the device scheduler's stalled-kernel detector on some cards.
+_MULTI_RANK_DEVICE_SPIN_ITERS = 20_000_000
 _SIZE = 128 * 128
 
 _DIR_TAGS = {
@@ -73,7 +77,7 @@ def _chip_args(handles, orch_signature, *scalars):
     for handle, direction in zip(handles, orch_signature):
         args.add_tensor(handle.tensor((_SIZE,), DataType.FLOAT32), _DIR_TAGS[direction])
     for value in scalars:
-        args.add_scalar(scalar_to_uint64(value))
+        args.add_scalar(value)
     return args
 
 
@@ -118,34 +122,50 @@ def _wait_for_release(_args):
         raise RuntimeError("whole-run FIFO test timed out waiting for the release fence")
 
 
-def _wait_for_backend_prepared_successor(worker, timeout: float) -> None:
-    shm_buf = worker._chip_shms[0].buf  # noqa: SLF001 -- white-box backend-prepare observation
-    assert shm_buf is not None
-    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-    state_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)]
-    accepted_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_ACCEPTED for index in range(2)]
+def _wait_for_backend_prepared_successor(worker, timeout: float, worker_indices=(0,)) -> None:
+    mailboxes = []
+    for worker_index in worker_indices:
+        shm_buf = worker._chip_shms[worker_index].buf  # noqa: SLF001 -- white-box backend-prepare observation
+        assert shm_buf is not None
+        mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
+        state_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)]
+        accepted_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_ACCEPTED for index in range(2)]
+        mailboxes.append((state_addrs, accepted_addrs))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        states = [_mailbox_load_i32(addr) for addr in state_addrs]
-        for index, state in enumerate(states):
-            if state == _FRAME_STAGED and states[1 - index] == _TASK_LAUNCHED:
-                assert _mailbox_load_i32(accepted_addrs[index]) == 0
-                return
-        time.sleep(0.001)
-    raise AssertionError("the successor did not finish backend preparation while its predecessor was launched")
-
-
-def _wait_for_active_device_run(worker, timeout: float) -> None:
-    shm_buf = worker._chip_shms[0].buf  # noqa: SLF001 -- white-box device-launch observation
-    assert shm_buf is not None
-    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-    state_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)]
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if any(_mailbox_load_i32(addr) == _TASK_LAUNCHED for addr in state_addrs):
+        all_prepared = True
+        for state_addrs, accepted_addrs in mailboxes:
+            states = [_mailbox_load_i32(addr) for addr in state_addrs]
+            staged_indices = [
+                index
+                for index, state in enumerate(states)
+                if state == _FRAME_STAGED and states[1 - index] == _TASK_LAUNCHED
+            ]
+            if not staged_indices:
+                all_prepared = False
+                break
+            assert _mailbox_load_i32(accepted_addrs[staged_indices[0]]) == 0
+        if all_prepared:
             return
         time.sleep(0.001)
-    raise AssertionError("the predecessor did not reach its device launch fence")
+    raise AssertionError("every successor rank did not finish backend preparation while its predecessor was launched")
+
+
+def _wait_for_active_device_run(worker, timeout: float, worker_indices=(0,)) -> None:
+    all_state_addrs = []
+    for worker_index in worker_indices:
+        shm_buf = worker._chip_shms[worker_index].buf  # noqa: SLF001 -- white-box device-launch observation
+        assert shm_buf is not None
+        mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
+        all_state_addrs.append([mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(
+            any(_mailbox_load_i32(addr) == _TASK_LAUNCHED for addr in state_addrs) for state_addrs in all_state_addrs
+        ):
+            return
+        time.sleep(0.001)
+    raise AssertionError("every predecessor rank did not reach its device launch fence")
 
 
 @scene_test(level=3, runtime="host_build_graph")
@@ -235,7 +255,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
         assert platform in case["platforms"]
         self.test_prepared_run_device_control_waits_for_the_active_run(platform, worker)
         self.test_a_run_whose_cleanup_touches_the_device_degrades_to_depth_one(platform, worker)
-        self.test_run(platform, worker)
+        for shared_control in (False, True):
+            self.test_run(platform, worker, shared_control)
 
     def test_prepared_run_device_control_waits_for_the_active_run(self, st_platform, st_worker):
         """A prepared run's malloc/free/copy must not overtake the active run.
@@ -391,7 +412,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                     with suppress(Exception):
                         handle.wait(30.0)
 
-    def test_run(self, st_platform, st_worker):
+    @pytest.mark.parametrize("shared_control", [False, True], ids=["independent-input", "shared-read-only-input"])
+    def test_run(self, st_platform, st_worker, shared_control):
         if st_platform != "a2a3":
             pytest.skip("whole-run FIFO leases require an a2a3 onboard worker")
 
@@ -411,6 +433,9 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 tensors.append(tensor)
             first_a, first_b, first_out, second_a, second_b, second_out = tensors
             first_bufs, second_bufs = buffers[:3], buffers[3:]
+            if shared_control:
+                second_bufs[1] = first_bufs[1]
+                second_b = first_b
             vector_handle = type(self)._st_chip_handles["vector"]
             vector_signature = type(self)._st_chip_handles["vector_sig"]
             sub_handle = type(self)._st_sub_handles["wait_for_release"]
@@ -424,7 +449,10 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
             first = st_worker.submit(
                 lambda orch, _args, _cfg: submit_vector(orch, first_bufs, spin_iters=_DEVICE_SPIN_ITERS, hold_open=True)
             )
-            first_expected = first_a + first_b + _CHAIN_LENGTH
+            # HBG reads the scalar from b during native host construction;
+            # TMR's device orchestration uses its constant step increment.
+            first_scalar = first_b[0] if self._st_runtime == "host_build_graph" else 1
+            first_expected = first_a + first_b + _CHAIN_LENGTH * first_scalar
             # Run-level acceptance also includes the intentionally blocked SUB
             # task, whose compatibility endpoint acknowledges only on return.
             # Observe the chip frame directly so that fence cannot postpone the
@@ -477,7 +505,8 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 raise third_result["error"]
             assert third_callback.is_set(), "the third submission did not enter after the first run freed its slot"
             second.wait(10.0)
-            second_expected = second_a + second_b + _CHAIN_LENGTH
+            second_scalar = second_b[0] if self._st_runtime == "host_build_graph" else 1
+            second_expected = second_a + second_b + _CHAIN_LENGTH * second_scalar
             assert torch.allclose(first_out, first_expected), "the first run did not execute correctly on the NPU"
             assert torch.allclose(second_out, second_expected), "the prepared run did not execute correctly on the NPU"
             third_result["handle"].wait(10.0)
@@ -566,6 +595,139 @@ class TestWorkerAsyncWholeRunFifoTmr(TestWorkerAsyncWholeRunFifo):
             tensors.clear()
             tensor = None
             first_a = first_b = first_out = second_a = second_b = second_out = None
+            if all(handle is None or handle.done for handle in (first, second)):
+                for buffer in buffers:
+                    buffer.close()
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestWorkerAsyncWholeRunFifoTmrMultiRank(SceneTestCase):
+    """Every rank of a prepared run stages before the active run retires."""
+
+    CALLABLE = {
+        "callables": [
+            {
+                "name": "vector",
+                "orchestration": {
+                    "source": f"{_TMR_KERNELS}/orchestration/single_delayed_add_orch.cpp",
+                    "function_name": "aicpu_orchestration_entry",
+                    "signature": [D.IN, D.IN, D.OUT],
+                },
+                "incores": [
+                    {
+                        "func_id": 0,
+                        "source": f"{_TMR_KERNELS}/aiv/delayed_add.cpp",
+                        "core_type": "aiv",
+                        "signature": [D.IN, D.IN, D.OUT],
+                    },
+                ],
+            },
+            {"name": "wait_for_release", "callable": _wait_for_release},
+        ],
+    }
+    CASES = [
+        {
+            "name": "whole_run_fifo_multi_rank",
+            "platforms": ["a2a3"],
+            "config": {"device_count": 2, "num_sub_workers": 1},
+            "params": {},
+        },
+    ]
+
+    _tensor_from_host_buffer = staticmethod(TestWorkerAsyncWholeRunFifo._tensor_from_host_buffer)
+
+    def _run_and_validate_l3(  # noqa: PLR0913 -- mirror the scene-test runner hook
+        self,
+        worker,
+        compiled_callables,
+        sub_handles,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_chip_swimlane=0,
+        enable_dump_args=False,
+        enable_pmu=0,
+        enable_dep_gen=False,
+        enable_scope_stats=False,
+        output_prefix="",
+    ):
+        del (
+            rounds,
+            skip_golden,
+            enable_chip_swimlane,
+            enable_dump_args,
+            enable_pmu,
+            enable_dep_gen,
+            enable_scope_stats,
+            output_prefix,
+        )
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        platform = str(worker._config["platform"])  # noqa: SLF001 -- scene-test white-box validation
+        assert platform in case["platforms"]
+        self._validate_all_ranks_prepare_successor_while_predecessor_active(platform, worker)
+
+    def _validate_all_ranks_prepare_successor_while_predecessor_active(self, st_platform, st_worker):
+        if st_platform != "a2a3":
+            pytest.skip("multi-rank prepared-state validation requires an a2a3 onboard worker")
+
+        _SUB_ENTERED.clear()
+        _SUB_RELEASE.clear()
+        worker_indices = (0, 1)
+        buffers = []
+        tensors = []
+        first = None
+        second = None
+        try:
+            for rank in worker_indices:
+                for value in (2.0 + rank, 3.0 + rank, 0.0, 5.0 + rank, 7.0 + rank, 0.0):
+                    buffer, tensor = self._tensor_from_host_buffer(st_worker, value)
+                    buffers.append(buffer)
+                    tensors.append(tensor)
+
+            vector_handle = type(self)._st_chip_handles["vector"]
+            vector_signature = type(self)._st_chip_handles["vector_sig"]
+            sub_handle = type(self)._st_sub_handles["wait_for_release"]
+            config = self._build_config(self.CASES[0]["config"])
+
+            def submit_rank_vectors(orch, run_offset, *, spin_iters=0, hold_open=False):
+                for rank in worker_indices:
+                    tensor_offset = rank * 6 + run_offset
+                    chip_args = _chip_args(buffers[tensor_offset : tensor_offset + 3], vector_signature, spin_iters)
+                    orch.submit_next_level(vector_handle, chip_args, config, worker=rank)
+                if hold_open:
+                    orch.submit_sub(sub_handle)
+
+            first = st_worker.submit(
+                lambda orch, _args, _cfg: submit_rank_vectors(
+                    orch, 0, spin_iters=_MULTI_RANK_DEVICE_SPIN_ITERS, hold_open=True
+                )
+            )
+            _wait_for_active_device_run(st_worker, 10.0, worker_indices)
+            assert _SUB_ENTERED.wait(10.0), "the first run's SubTask did not start"
+
+            second = st_worker.submit(lambda orch, _args, _cfg: submit_rank_vectors(orch, 3))
+            _wait_for_backend_prepared_successor(st_worker, 10.0, worker_indices)
+            for rank in worker_indices:
+                assert torch.count_nonzero(tensors[rank * 6 + 5]).item() == 0, (
+                    f"rank {rank}'s prepared successor dispatched before the active run ended"
+                )
+
+            _SUB_RELEASE.set()
+            first.wait(30.0)
+            second.wait(30.0)
+            for rank in worker_indices:
+                offset = rank * 6
+                assert torch.allclose(tensors[offset + 2], tensors[offset] + tensors[offset + 1])
+                assert torch.allclose(tensors[offset + 5], tensors[offset + 3] + tensors[offset + 4])
+        finally:
+            _SUB_RELEASE.set()
+            for handle in (first, second):
+                if handle is not None:
+                    with suppress(Exception):
+                        handle.wait(30.0)
+            tensors.clear()
+            tensor = None
             if all(handle is None or handle.done for handle in (first, second)):
                 for buffer in buffers:
                     buffer.close()

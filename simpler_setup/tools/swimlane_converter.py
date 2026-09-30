@@ -29,19 +29,26 @@ import argparse
 import bisect
 import importlib.util
 import json
+import math
+import os
 import re
 import sys
+import tempfile
 import traceback
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from simpler_setup.tools.clock_correlation import build_clock_alignment
-from simpler_setup.tools.scheduler_phase_records import (
-    canonical_sched_phase,
-    nested_resolve_record_ids,
-    scheduler_thread_role,
+from simpler_setup.tools import containment
+from simpler_setup.tools._runtime_dispatch import (
+    LaneContext,
+    WorkerLaneContext,
+    get,
+    normalize_task_id_int,
+    resolve_runtime,
 )
+from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
 
 
 def _func_id_to_letter(func_id):
@@ -65,15 +72,15 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
     """Build the swimlane event label for a task.
 
     Naming, in priority order:
-      - ``func_id < 0`` (unresolved): ``task(rXtY)``. This is the no-deps.json
+      - ``func_id < 0`` (unresolved): ``task(<task-id>)``. This is the no-deps.json
         case — without a dep_gen capture the host never carries func_id, so
         every lane is an anonymous ``task(...)`` distinguished only by id.
-      - a name mapping exists for the func_id: ``<name>(rXtY)``.
-      - otherwise: ``func_<letter>(rXtY)`` (resolved id, but no name map entry).
+      - a name mapping exists for the func_id: ``<name>(<task-id>)``.
+      - otherwise: ``func_<letter>(<task-id>)`` (resolved id, but no name map entry).
 
-    SPMD logical tasks append ``_spmd`` before the ``(rXtY)`` suffix unless the
-    name already contains ``spmd`` (case-insensitive), e.g.
-    ``fa_fused_aic_spmd(r2t18)``.
+    The caller supplies the runtime-specific task-id label. SPMD logical tasks
+    append ``_spmd`` before that suffix unless the name already contains ``spmd``
+    (case-insensitive), e.g. ``fa_fused_aic_spmd(r2t18)``.
     """
     try:
         resolved = int(func_id) >= 0
@@ -92,147 +99,401 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
     return label
 
 
-def normalize_task_id_int(v):
-    """Unsigned 64-bit task id (matches host JSON / device ``task_id.raw``).
+def _scheduler_task_key(row):
+    """Join key for a ``scheduler_tasks.records`` row: ``(run_epoch, core_id, reg_task_id)``.
 
-    Normalizes signed values to unsigned so the high field decodes correctly.
-    Returns None if ``v`` is not convertible to int.
+    A five-column row carries ``run_epoch`` last. A four-column row is a capture
+    written before run identity existed; its epoch is reported as ``None`` rather
+    than 0, because 0 is an epoch a device can really be given and coercing to it
+    would let such a capture collide with a real run.
     """
-    try:
-        t = int(v)
-    except (TypeError, ValueError):
-        return None
-    if t < 0:
-        t &= (1 << 64) - 1
-    return t
+    return (int(row[4]) if len(row) > 4 else None, int(row[0]), int(row[1]))
 
 
-def format_task_display(task_id):
-    """Format a task_id for human-readable labels.
+# A scheduler thread index has to fit the runtime's `int8_t core_to_thread[]`,
+# and an AICore scheduler index is bounded by the cluster capacity, so no real
+# producer emits an id anywhere near this. It exists only so a corrupt artifact
+# cannot turn one large id into a multi-gigabyte list.
+_MAX_SCHEDULER_ID = 256
 
-    The high 32 bits are a ring index under ``tensormap_and_ringbuffer`` (any ring in
-    ``0..CHIP_MAX_RING_DEPTH-1``) and an id space under ``host_build_graph``
-    (0 = GLOBAL, 1 = IN_GRAPH). The short form below therefore covers tmr ring 0 and
-    every hbg GLOBAL task; a tmr task on ring 2 is equally ordinary and gets the long
-    form.
 
-    Returns:
-        ``r{high}t{local}`` when the high field != 0 (e.g. r2t100), else ``t{local}``.
+def _place_streams_by_scheduler_id(streams_records, streams_metadata):
+    """Return the stream lists re-indexed so each stream sits at its own
+    ``scheduler_id``, with the omitted ids left as empty slots.
 
-    For invalid or non-numeric values, returns str(task_id).
+    The position in these lists *is* the scheduler thread index to every
+    consumer: `sched_overhead_analysis.compute_dag_stats_from_deps` keys its
+    per-thread accumulators on the values in ``core_to_thread`` (which the AICPU
+    fills with its own thread indices), and the scene tests compare list
+    positions against the same table. The writer omits a stream that recorded
+    nothing, so appending the survivors in encounter order would renumber every
+    stream above the gap and charge their work to a thread that does not exist.
+
+    Falls back to the encounter order when any id is missing, negative, out of
+    range, or repeated — the invariant cannot be restored from those, and
+    keeping the previous shape beats raising on an artifact that is merely odd.
     """
-    tid = normalize_task_id_int(task_id)
-    if tid is None:
-        return str(task_id)
-    ring = (tid >> 32) & 0xFF
-    local = tid & 0xFFFFFFFF
-    if ring == 0:
-        return f"t{local}"
-    return f"r{ring}t{local}"
+    ids = [metadata.get("scheduler_id") for metadata in streams_metadata]
+    if not all(isinstance(sid, int) and not isinstance(sid, bool) and 0 <= sid < _MAX_SCHEDULER_ID for sid in ids):
+        return streams_records, streams_metadata
+    if len(set(ids)) != len(ids):
+        return streams_records, streams_metadata
+
+    # Every real producer shares one producer per artifact, so a gap inherits it
+    # and keeps lane naming consistent with the streams around it.
+    producers = {metadata.get("producer") for metadata in streams_metadata if metadata.get("producer")}
+    gap_producer = producers.pop() if len(producers) == 1 else None
+
+    placed_records = [[] for _ in range(max(ids) + 1)] if ids else []
+    placed_metadata = [
+        {
+            "platform": None,
+            "producer": gap_producer,
+            "scheduler_id": index,
+            "worker_id": index,
+            "core_type": None,
+            "physical_core_id": None,
+            "capture": None,
+        }
+        for index in range(len(placed_records))
+    ]
+    for sid, records, metadata in zip(ids, streams_records, streams_metadata):
+        placed_records[sid] = records
+        placed_metadata[sid] = metadata
+    return placed_records, placed_metadata
 
 
-def _decode_in_graph_task_id(task_id):
-    """Decode Scheduler-owned in-graph task ids.
-
-    ``host_build_graph`` puts a materialized in-graph task in id space 1 (IN_GRAPH) with
-    ``local=(graph_task_id << 10) | in_graph_local_id``; the stream-visible outer Graph task
-    stays in space 0 (GLOBAL). See src/common/host_build_graph/task_id.h.
-    """
-    tid = normalize_task_id_int(task_id)
-    if tid is None or ((tid >> 32) & 0xFFFFFFFF) != 1:
-        return None
-    local = tid & 0xFFFFFFFF
-    return local >> 10, local & 0x3FF
+_CLOCK_ALIGNMENT_FIELDS = (
+    "status",
+    "device_anchor_cycles",
+    "host_anchor_ns",
+    "host_anchor_min_ns",
+    "host_anchor_max_ns",
+)
 
 
-def _collect_graph_execution_instances(tasks, scheduler_phases):  # noqa: PLR0912
-    """Join in-graph task rows to their outer GraphPrepare records."""
-    prepare_by_outer = defaultdict(list)
-    dummy_rows = []
-    for thread_idx, records in enumerate(scheduler_phases or []):
-        for record in records:
-            phase = record.get("phase")
-            if phase == "graph_prepare":
-                outer_task_id = normalize_task_id_int(record.get("task_id"))
-                if outer_task_id is not None and (outer_task_id >> 32) == 0:
-                    prepare_by_outer[outer_task_id].append(record)
-            elif phase == "dummy_task":
-                dummy_rows.append((record, thread_idx))
+def _capture_without_alignment(raw):
+    """Compare capture data independently of the saved mapping."""
+    document = dict(raw)
+    metadata = dict(document.get("metadata") or {})
+    metadata.pop("clock_alignment", None)
+    document["metadata"] = metadata
+    return document
 
-    rows_by_outer = defaultdict(list)
-    for task in tasks:
-        decoded = _decode_in_graph_task_id(task.get("task_id"))
-        if decoded is not None:
-            outer_task_id, task_index = decoded
-            rows_by_outer[outer_task_id].append((task, task_index))
 
-    dummy_by_outer = defaultdict(list)
-    for record, thread_idx in dummy_rows:
-        decoded = _decode_in_graph_task_id(record.get("task_id"))
-        if decoded is not None:
-            outer_task_id, task_index = decoded
-            dummy_by_outer[outer_task_id].append((record, task_index, thread_idx))
+@dataclass(frozen=True)
+class _StoredClockAlignment:
+    """A saved device-to-Host mapping, using the capture's counter frequency."""
 
-    instances = []
-    for outer_task_id, prepare_records in prepare_by_outer.items():
-        rows = rows_by_outer.get(outer_task_id, [])
-        aicpu_rows = dummy_by_outer.get(outer_task_id, [])
-        if not rows and not aicpu_rows:
-            continue
-        task_indices = {task_index for _, task_index in rows}
-        task_indices.update(task_index for _, task_index, _ in aicpu_rows)
-        starts = [
-            task.get("dispatch_time_us", _task_slice_start_us(task))
-            if task.get("dispatch_time_us", -1) >= 0
-            else _task_slice_start_us(task)
-            for task, _ in rows
-        ]
-        starts.extend(record["start_time_us"] for record, _, _ in aicpu_rows)
-        ends = [
-            task.get("finish_time_us", 0) if task.get("finish_time_us", 0) > 0 else task["end_time_us"]
-            for task, _ in rows
-        ]
-        ends.extend(record["end_time_us"] for record, _, _ in aicpu_rows)
-        prepare_start_us = min(record["start_time_us"] for record in prepare_records)
-        instances.append(
-            {
-                "outer_task_id": outer_task_id,
-                "rows": rows,
-                "aicpu_rows": aicpu_rows,
-                "visible_task_indices": sorted(task_indices),
-                "execution_start_us": min(starts),
-                "execution_end_us": max(ends),
-                "prepare_start_us": prepare_start_us,
-                "prepare_end_us": max(record["end_time_us"] for record in prepare_records),
-                "prepare_duration_us": sum(
-                    record["end_time_us"] - record["start_time_us"] for record in prepare_records
-                ),
-                "prepare_slice_count": len(prepare_records),
-            }
+    record: dict
+    frequency_hz: int
+
+    @property
+    def place_lo_ns(self):
+        return self.record["host_anchor_min_ns"]
+
+    def map_cycles_to_host_ns(self, cycles):
+        return self.record["host_anchor_ns"] + (
+            (cycles - self.record["device_anchor_cycles"]) * 1_000_000_000 / self.frequency_hz
         )
 
-    instances.sort(key=lambda instance: instance["prepare_start_us"])
-    lane_finish_us = []
-    for instance_idx, instance in enumerate(instances):
-        start_us = instance["prepare_start_us"]
-        lane_idx = next((idx for idx, finish_us in enumerate(lane_finish_us) if finish_us <= start_us), -1)
-        if lane_idx < 0:
-            lane_idx = len(lane_finish_us)
-            lane_finish_us.append(0.0)
-        lane_finish_us[lane_idx] = instance["execution_end_us"]
-        instance["instance_idx"] = instance_idx
-        instance["lane_idx"] = lane_idx
-    return instances
+
+def _read_clock_alignment(raw):
+    """Validate saved anchors, bounds, and the capture counter frequency."""
+    metadata = raw.get("metadata") or {}
+    record = metadata.get("clock_alignment")
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        raise ValueError("clock_alignment must be an object")
+    if record.get("status") == "unavailable":
+        return None
+    if record.get("status") != "bounded":
+        raise ValueError("unsupported clock_alignment status")
+    if any(type(record.get(key)) is not int for key in _CLOCK_ALIGNMENT_FIELDS[1:]):
+        raise ValueError("clock_alignment anchors and bounds must be integers")
+    frequency_hz = metadata.get("clock_freq_hz")
+    if type(frequency_hz) is not int or frequency_hz <= 0:
+        raise ValueError("capture metadata has no usable clock_freq_hz")
+    lo, hi = record["host_anchor_min_ns"], record["host_anchor_max_ns"]
+    if record["device_anchor_cycles"] <= 0 or not 0 < lo <= record["host_anchor_ns"] <= hi:
+        raise ValueError("invalid clock_alignment bounds")
+    return _StoredClockAlignment(record, frequency_hz)
 
 
-def read_perf_data(filepath, *, timeline_origin_ns=None):
+def _clock_alignment_record(placement):
+    """Serialize one mapping, bounding both window slack and phase-join freedom."""
+    if placement.capture is None or placement.join is None:
+        raise ValueError("clock alignment requires device records")
+    anchor = placement.capture.extent[0]
+    candidates = [
+        containment.place(
+            placement.host,
+            placement.capture,
+            containment.Join(origin, placement.join.interval_cycles, placement.join.sources),
+        )
+        for origin in placement.join.interval_cycles
+    ]
+    lo = math.floor(min(item.map_cycles_to_host_ns(anchor) for item in candidates))
+    hi = math.ceil(max(item.map_cycles_to_host_ns(anchor) + item.slack_ns for item in candidates))
+    return {
+        "status": "bounded",
+        "device_anchor_cycles": anchor,
+        "host_anchor_ns": int(round(placement.map_cycles_to_host_ns(anchor))),
+        "host_anchor_min_ns": lo,
+        "host_anchor_max_ns": hi,
+    }
+
+
+def _json_object_members(text, start):
+    """Locate value spans without reformatting the surrounding JSON."""
+    decoder = json.JSONDecoder()
+
+    def skip_space(position):
+        while text[position] in " \t\r\n":
+            position += 1
+        return position
+
+    cursor = skip_space(start + 1)
+    while text[cursor] != "}":
+        key, cursor = decoder.raw_decode(text, cursor)
+        cursor = skip_space(cursor)
+        if text[cursor] != ":":
+            raise ValueError("invalid JSON object member")
+        value_start = skip_space(cursor + 1)
+        _value, value_end = decoder.raw_decode(text, value_start)
+        yield key, value_start, value_end
+        cursor = skip_space(value_end)
+        if text[cursor] == ",":
+            cursor = skip_space(cursor + 1)
+        elif text[cursor] != "}":
+            raise ValueError("invalid JSON object separator")
+
+
+def _replace_alignment_text(text, record):
+    """Only the alignment value is rewritten; compact task rows stay compact."""
+    root_start = len(text) - len(text.lstrip())
+    metadata_start = next(
+        (start for key, start, _end in _json_object_members(text, root_start) if key == "metadata"),
+        None,
+    )
+    if metadata_start is None or text[metadata_start] != "{":
+        raise ValueError("capture metadata must be an object")
+    encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
+    members = list(_json_object_members(text, metadata_start))
+    for key, start, end in members:
+        if key == "clock_alignment":
+            return text[:start] + encoded + text[end:]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    insertion = members[-1][2] if members else metadata_start + 1
+    addition = ("," if members else "") + newline + '    "clock_alignment": ' + encoded
+    return text[:insertion] + addition + text[insertion:]
+
+
+def _write_clock_alignment_record(path, raw, record):
+    """Replace the complete JSON atomically, preserving its data and permissions."""
+    metadata = raw.setdefault("metadata", {})
+    if metadata.get("clock_alignment") == record:
+        return
+    # Conversion must use the mapping calculated for this run even when the
+    # source is read-only or changes before the best-effort writeback.
+    metadata["clock_alignment"] = record
+    path = Path(path).resolve()
+    # The writeback source must still contain the same raw capture.
+    source_text = path.read_bytes().decode("utf-8")
+    current = json.loads(source_text)
+    if _capture_without_alignment(current) != _capture_without_alignment(raw):
+        raise ValueError("capture changed during clock alignment")
+    updated_text = _replace_alignment_text(source_text, record)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            os.fchmod(output.fileno(), path.stat().st_mode & 0o777)
+            output.write(updated_text)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _host_record_bounds(raw):
+    values = []
+    # These are Host-clock records, and only they bound the invocation.
+    for name in ("host_orchestrator_phases", "host_device_uploads"):
+        for record in containment._phase_records(raw.get(name)):
+            values.extend(int(record[field]) for field in ("start_host_ns", "end_host_ns") if record.get(field, 0) > 0)
+    return (min(values), max(values)) if values else None
+
+
+def _capture_run_epoch(raw):
+    """The run a background-collected capture names, or ``None`` for any other.
+
+    ``metadata.collection`` is written only for a capture the collector kept
+    past its own run boundary, so its absence is what a single-run capture
+    looks like and not a defect.
+    """
+    collection = (raw.get("metadata") or {}).get("collection")
+    if not isinstance(collection, dict):
+        return None
+    epoch = collection.get("run_epoch")
+    return epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch > 0 else None
+
+
+def _span_run_epoch(span):
+    """``run_epoch`` off a root ``chip.run`` span's attrs, or ``None``.
+
+    The same number the capture carries, written by the run that produced both.
+    Read on its own rather than through ``containment._host_identity``, whose
+    four-field key is absent for a synchronous launch that still has an epoch.
+    """
+    if span is None:
+        return None
+    for item in span.attrs.split():
+        key, separator, value = item.partition("=")
+        if separator and key == "run_epoch":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _matching_capture_host_windows(raw, spans, sidecar):
+    windows = containment.host_windows(spans)
+    by_name = {(span.pid, span.inv, span.name): span for span in spans}
+    windows = [
+        window
+        for window in windows
+        if not by_name[(window.pid, window.inv, containment.RUNNER_SPAN)].is_device
+        and by_name[(window.pid, window.inv, containment.DEVICE_WALL_SPAN)].is_device
+    ]
+    roots = {(span.pid, span.inv): span for span in spans if span.name == containment.RUN_SPAN and not span.is_device}
+    identity = containment.capture_identity(sidecar)
+    pid = (sidecar or {}).get("host_pid")
+    if pid is not None:
+        windows = [window for window in windows if window.pid == int(pid)]
+    if identity is not None:
+        windows = [window for window in windows if window.identity is None or window.identity == identity]
+    host_bounds = _host_record_bounds(raw)
+    if host_bounds is not None:
+        windows = [
+            window
+            for window in windows
+            if (root := roots.get((window.pid, window.inv))) is not None
+            and root.ts <= host_bounds[0] <= host_bounds[1] <= root.ts + root.dur
+        ]
+    windows = [
+        window for window in windows if window.start_ns > 0 and window.duration_ns > 0 and window.device_wall_ns > 0
+    ]
+    # A background-collected capture names its run, and that run's root
+    # `chip.run` span carries the same number. Adjacent runs overlap on the Host
+    # clock — a predecessor's root span is still open while its successor binds
+    # — so containment alone can leave one candidate per overlapping run.
+    #
+    # The number is per process and nothing in a capture names its own process,
+    # so a candidate set the pid and identity filters did not collapse carries
+    # no comparable identity. Where the logs identify runs, this capture's run
+    # must be among them; logs carrying no `run_epoch` predate it, and absence
+    # is not contradiction.
+    epoch = _capture_run_epoch(raw)
+    if epoch is not None and windows:
+        if len({window.pid for window in windows}) > 1:
+            raise ValueError("candidate Host invocations span processes, and a run_epoch is per process")
+        identified = [(window, _span_run_epoch(roots.get((window.pid, window.inv)))) for window in windows]
+        if any(found is not None for _, found in identified):
+            matched = [window for window, found in identified if found == epoch]
+            if len(matched) != 1:
+                raise ValueError(f"no single Host invocation carries this capture's run_epoch {epoch}")
+            windows = matched
+    if not windows:
+        raise ValueError("no matching Host runner_run/device_wall windows")
+    return windows
+
+
+def _is_host_orchestrated_capture(raw):
+    """Whether a level-3/4 capture carries host-side orchestration data to align.
+
+    Clock alignment maps a host-orchestrated capture's device cycles onto the host
+    CLOCK_MONOTONIC axis, so what decides it is whether the capture holds host
+    orchestration records -- a property of the data, not of the runtime name. Every
+    field tested below is written only when the collector received host phase records
+    (chip_swimlane_collector.cpp), and only host_build_graph produces those today, so
+    naming that runtime here would restate what these fields already say and would
+    silently exclude any future runtime that grows the same capture.
+    """
+    if raw.get("chip_swimlane_level") not in (3, 4):
+        return False
+    metadata = raw.get("metadata") or {}
+    return (
+        metadata.get("orchestrator_source") == "host"
+        or bool(raw.get("host_orchestrator_phases"))
+        or bool(raw.get("host_device_uploads"))
+        or isinstance(metadata.get("host_capture"), dict)
+    )
+
+
+def _prepare_capture_clock_alignment(path, host_logs=None):
+    """Return an enriched host-orchestrated capture and any available placement diagnostics.
+
+    Explicit logs request a fresh calculation. With no override, a valid saved
+    mapping is sufficient and no log or sidecar is read.
+    """
+    path = Path(path)
+    raw = json.loads(path.read_text())
+    if not _is_host_orchestrated_capture(raw):
+        return raw, None
+    try:
+        saved = _read_clock_alignment(raw) if host_logs is None else None
+        if saved is not None:
+            return raw, saved
+    except ValueError as error:
+        print(f"Warning: ignoring saved clock alignment: {error}", file=sys.stderr)
+
+    placement = None
+    try:
+        logs = (
+            [Path(log) for log in host_logs]
+            if host_logs is not None
+            else (sorted(path.parent.glob("host_clock_alignment.*.log")) or sorted(path.parent.glob("host.*.log")))
+        )
+        if not logs:
+            raise ValueError("no Host log available")
+        spans = []
+        for log in logs:
+            with log.open() as input_file:
+                spans.extend(parse_spans(input_file))
+        sidecar_path = path.parent / "dispatch_identity.json"
+        sidecar = json.loads(sidecar_path.read_text()) if sidecar_path.is_file() else None
+        windows = _matching_capture_host_windows(raw, spans, sidecar)
+        if len(windows) != 1:
+            raise ValueError("capture does not uniquely identify a Host invocation")
+        capture = containment.capture_windows(raw)
+        placement = containment.place(windows[0], capture)
+        record = _clock_alignment_record(placement)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        placement = None
+        record = {"status": "unavailable", "reason": str(error)}
+        print(f"Warning: clock alignment skipped: {error}", file=sys.stderr)
+    try:
+        _write_clock_alignment_record(path, raw, record)
+    except (OSError, ValueError) as error:
+        # A read-only source can still be converted with the computed mapping.
+        raw.setdefault("metadata", {})["clock_alignment"] = record
+        print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
+    return raw, placement
+
+
+def read_perf_data(filepath, *, timeline_origin_ns=None, placement=None):
     """Read and decode performance data from a swimlane JSON file."""
     with open(filepath) as file:
         data = json.load(file)
-    return _decode_perf_data(data, timeline_origin_ns=timeline_origin_ns)
+    return _decode_perf_data(data, timeline_origin_ns=timeline_origin_ns, placement=placement, source=str(filepath))
 
 
-def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR0915
+def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=None):  # noqa: PLR0912, PLR0915
     """Decode performance data from an already-loaded swimlane document.
 
     Host dumps raw cycle-domain per-stream records plus metadata; this
@@ -246,41 +507,64 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
           },
-          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
-                            end_cycles, receive_to_start_cycles], ...],
+          "aicore_tasks": [[core_id, task_token, reg_task_id, start_cycles,
+                            end_cycles, receive_to_start_cycles, run_epoch], ...],
           "scheduler_tasks": {
-            "schema_version": 1,
             "producer": "<aicpu|aicore>",
-            "records": [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...]
+            "records": [[core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch], ...]
           },
-          "scheduler_records": {"schema_version": 1, "streams": [...]},
-          "aicpu_lifecycle_records": [{worker_id, aicpu_thread_id, ..._cycles}, ...],
-          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ],
+          "scheduler_records": {"streams": [...]},
+          "aicpu_lifecycle_records": [{aicpu_thread_id, ..._cycles}, ...],
+          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles, run_epoch}, ... ], ... ],
           "host_orchestrator_phases":   [ [ {submit_idx, task_id, start_host_ns, end_host_ns}, ... ], ... ]
         }
 
-    aicore_tasks columns (v3 schema): the trailing receive_to_start_cycles
-    is a uint32 delta = AICore-side `start_time - receive_time`, where
-    receive_time is captured immediately after AICore's
-    `read_reg(DATA_MAIN_BASE)` returns the new task_id (before the per-task
-    dcci + ack pair). Lets DFX split per-task head_OH into the
-    AICPU→AICore NoC propagation (dispatch_ts → receive_time, hardware-
-    bound) and the AICore-local dcci + ack cost (receive_time → start_time,
-    software-tunable). Archived v2 JSON without this column still parses;
-    the field is exposed as 0 for those.
+    Run identity. Per-task tokens are per-run: reg_task_id restarts at 0 every
+    run, and a graph's task ids repeat whenever it is re-executed. So the join
+    key is (run_epoch, core_id, reg_task_id) — the epoch is not decoration, it
+    is what makes the key unique once one file holds more than one run. Task
+    rows and graph execution instances carry it for the same reason.
+
+    Every row carries it: aicore_tasks rows are seven columns, scheduler_tasks
+    rows five, and each phase record has a ``run_epoch`` field. A row of any
+    other width is a producer this module does not read.
+
+    Shape is read from the data, not from a version field: these artifacts are
+    written by platform C++ in this repo and read by this module from the same
+    checkout and the same build, so a declared version can never disagree with
+    the rows it describes, and a producer wrong about its own rows would be
+    wrong about the number too. Consistency *within* a stream is what is
+    enforced instead — a row of the wrong width is rejected.
+
+    aicore_tasks columns: the trailing receive_to_start_cycles is a uint32
+    delta = AICore-side `start_time - receive_time`, where receive_time is
+    captured immediately after AICore's `read_reg(DATA_MAIN_BASE)` returns the
+    new task_id (before the per-task dcci + ack pair). Lets DFX split per-task
+    head_OH into the AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+    hardware-bound) and the AICore-local dcci + ack cost (receive_time →
+    start_time, software-tunable).
+
+    ``placement`` optionally supplies a ``containment.Placement`` — where this
+    capture's device clock sits on the Host CLOCK_MONOTONIC axis, derived from
+    the Host span that brackets it (see ``containment``). With one, device
+    records are emitted on the Host timeline. Placement diagnostics report
+    block-start slack and separate phase-join freedom; saved anchor bounds
+    include both. With no explicit placement, a valid saved
+    ``metadata.clock_alignment`` is reused. If neither is available, device
+    records remain relative and the HBG composite only preserves causal order.
 
     ``timeline_origin_ns`` optionally supplies a Host CLOCK_MONOTONIC origin
-    shared by several same-host Rank files. The default preserves the existing
-    single-file origin.
+    shared by several same-host Rank files. It requires an explicit or saved
+    placement: a Host origin is meaningless on a relative device timeline.
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
-    `scheduler_records` (plus the legacy internal alias), `aicpu_orchestrator_phases`,
+    `scheduler_records`, `aicpu_orchestrator_phases`,
     `core_to_thread`.
 
     The join logic that used to live in `export_swimlane_json` (host C++):
 
-      - per-core `reg_task_id → (task_token_raw, start_cycles, end_cycles)` map
+      - per-core `reg_task_id → (task_token, start_cycles, end_cycles)` map
         from `aicore_tasks` (the AICore is the canonical identity producer)
       - `base_time_cycles` = min non-zero timestamp across all streams (task,
         phase, orch)
@@ -288,10 +572,9 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
         the freq MUST come from the host, never be hardcoded here)
       - join `scheduler_tasks.records` by `(core_id, reg_task_id)`; unmatched rows are
         dropped and counted
-      - archived JSON with `aicpu_tasks` is accepted as an AICPU-produced stream
       - level 1 accepts AICore-only task records; higher levels require Scheduler
         dispatch/finish timing for every emitted task
-      - sort joined `tasks` by `task_id` (= task_token_raw)
+      - sort joined `tasks` by `task_id` (= task_token)
       - convert phase records from `*_cycles` → `*_time_us`
 
     Raises:
@@ -302,6 +585,13 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
         raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
 
     metadata = data.get("metadata") or {}
+    saved_alignment = metadata.get("clock_alignment")
+    if placement is None:
+        try:
+            placement = _read_clock_alignment(data)
+        except ValueError as error:
+            print(f"Warning: ignoring saved clock alignment: {error}", file=sys.stderr)
+            saved_alignment = {"status": "unavailable", "reason": str(error)}
     clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
     if clock_freq_hz <= 0:
         raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
@@ -310,26 +600,25 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
 
     aicore_rows = data.get("aicore_tasks") or []
     scheduler_task_section = data.get("scheduler_tasks")
-    legacy_aicpu_rows = data.get("aicpu_tasks")
     if scheduler_task_section is not None:
-        if legacy_aicpu_rows is not None:
-            raise ValueError("both scheduler_tasks and legacy aicpu_tasks are present")
         if not isinstance(scheduler_task_section, dict):
             raise ValueError("scheduler_tasks must be an object")
-        scheduler_task_schema_version = int(scheduler_task_section.get("schema_version") or 0)
-        if scheduler_task_schema_version != 1:
-            raise ValueError(f"Unsupported scheduler_tasks schema_version: {scheduler_task_schema_version}")
         scheduler_task_producer = scheduler_task_section.get("producer")
         if scheduler_task_producer not in ("aicpu", "aicore"):
             raise ValueError("scheduler_tasks.producer must be 'aicpu' or 'aicore'")
         scheduler_task_rows = scheduler_task_section.get("records")
+        # Width is checked per row rather than against a version field: a writer
+        # that is wrong about its own rows would be wrong about the number too,
+        # and one row of the wrong width is enough to say so.
         if not isinstance(scheduler_task_rows, list) or any(
-            not isinstance(row, list) or len(row) != 4 for row in scheduler_task_rows
+            not isinstance(row, list) or len(row) != 5 for row in scheduler_task_rows
         ):
-            raise ValueError("scheduler_tasks.records must contain four-column arrays")
+            raise ValueError("scheduler_tasks.records must contain five-column arrays")
     else:
-        scheduler_task_rows = legacy_aicpu_rows or []
-        scheduler_task_producer = "aicpu" if legacy_aicpu_rows is not None else None
+        # No scheduler_tasks section: a level-1 capture, which times AICore
+        # execution and nothing that dispatched it.
+        scheduler_task_rows = []
+        scheduler_task_producer = None
     lifecycle_raw = data.get("aicpu_lifecycle_records") or []
     if not isinstance(lifecycle_raw, list) or any(not isinstance(record, dict) for record in lifecycle_raw):
         raise ValueError("aicpu_lifecycle_records must be an array of objects")
@@ -338,9 +627,6 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
     if scheduler_section is not None:
         if not isinstance(scheduler_section, dict):
             raise ValueError("scheduler_records must be an object")
-        scheduler_schema_version = int(scheduler_section.get("schema_version") or 0)
-        if scheduler_schema_version != 1:
-            raise ValueError(f"Unsupported scheduler_records schema_version: {scheduler_schema_version}")
         scheduler_streams = scheduler_section.get("streams")
         if not isinstance(scheduler_streams, list):
             raise ValueError("scheduler_records.streams must be an array")
@@ -352,9 +638,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             metrics = stream.get("metrics") or []
             if not isinstance(records, list) or not isinstance(metrics, list):
                 raise ValueError(f"scheduler stream {stream_index} records/metrics must be arrays")
+            # Exact-match on purpose: an unexpected or missing key is producer
+            # drift, and this is the only place that would catch it.
             record_fields = {
                 "start_cycles",
                 "end_cycles",
+                "run_epoch",
                 "loop_iter",
                 "kind",
                 "tasks_processed",
@@ -392,7 +681,6 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
                     key: stream.get(key)
                     for key in (
                         "platform",
-                        "runtime",
                         "producer",
                         "scheduler_id",
                         "worker_id",
@@ -402,21 +690,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
                     )
                 }
             )
+        sched_phases_raw, scheduler_stream_metadata = _place_streams_by_scheduler_id(
+            sched_phases_raw, scheduler_stream_metadata
+        )
     else:
-        sched_phases_raw = data.get("aicpu_scheduler_phases") or []
-        scheduler_stream_metadata = [
-            {
-                "platform": None,
-                "runtime": None,
-                "producer": "aicpu",
-                "scheduler_id": index,
-                "worker_id": index,
-                "core_type": "aicpu",
-                "physical_core_id": None,
-                "capture": None,
-            }
-            for index in range(len(sched_phases_raw))
-        ]
+        # No scheduler_records section: the capture is below the level that
+        # records phases, so there are no streams to describe.
+        sched_phases_raw = []
+        scheduler_stream_metadata = []
     orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
     host_orch_phases_raw = data.get("host_orchestrator_phases") or []
     raw_host_capture = metadata.get("host_capture")
@@ -425,9 +706,34 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
         or bool(host_orch_phases_raw)
         or isinstance(raw_host_capture, dict)
     )
-    clock_anchor_mode = isinstance(metadata.get("clock_anchors"), dict)
     if orch_phases_raw and host_mode:
         raise ValueError("both AICPU and host orchestrator phases are present; clock-domain source is ambiguous")
+
+    # Which TaskId layout the records in this document carry. Resolved once here, and
+    # strictly: nothing in a task_id value says which runtime minted it, so an absent or
+    # unrecognised name is refused rather than guessed at. The file is named in the error
+    # because a merged multi-rank run decodes several, and "metadata.runtime is missing"
+    # alone does not say which one to re-capture.
+    runtime_name = resolve_runtime(
+        metadata.get("runtime"),
+        source=f"{source}: metadata.runtime" if source else "metadata.runtime",
+    )
+    decode_task_id_fields = get(runtime_name).task_id_fields
+
+    def task_id_fields(task_token, core_id, run_epoch):
+        """This id's layout-dependent row fields, naming the row if it will not decode.
+
+        A corrupt id space raises from the owning runtime's TaskId rather than
+        rendering a plausible-looking field set (see hbg.TaskId.space). The raw value
+        is in that message; which row carried it is not, and a capture holds
+        thousands, so the row's join key is added here.
+        """
+        try:
+            return decode_task_id_fields(task_token)
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc} -- carried by an aicore_tasks row with core_id={core_id}, run_epoch={run_epoch}"
+            ) from exc
 
     actual_host_record_count = sum(len(records) for records in host_orch_phases_raw)
     if isinstance(raw_host_capture, dict):
@@ -480,24 +786,34 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
     if host_timestamps and source_host_origin_ns == 0:
         source_host_origin_ns = min(host_timestamps)
     host_origin_ns = source_host_origin_ns
-    host_composite_end_us = (max(host_timestamps) - host_origin_ns) / 1000.0 if host_timestamps else 0.0
+    composite_timestamps = host_timestamps + [
+        int(record[field])
+        for record in data.get("host_device_uploads") or []
+        for field in ("start_host_ns", "end_host_ns")
+    ]
+    # The unaligned composite preserves upload-before-dispatch causality only;
+    # its seam is not a measurement of cross-domain latency.
+    host_composite_end_us = (max(composite_timestamps) - host_origin_ns) / 1000.0 if composite_timestamps else 0.0
 
-    # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
-    # same task_token_raw to the same core (SPMD over-subscription, MIX
-    # cluster spread) each get their own reg_task_id, so this key is unique
-    # per dispatch even when task_token_raw collides.
+    # AICore lookup keyed by (run_epoch, core_id, reg_task_id). Two dispatches of
+    # the same task_token to the same core (SPMD over-subscription, MIX
+    # cluster spread) each get their own reg_task_id, so core+reg_task_id is
+    # unique per dispatch *within one run* even when task_token collides.
+    # It is not unique across runs: reg_task_id restarts at 0 every run, so a
+    # file holding two runs has the same core+reg_task_id twice. run_epoch is
+    # what separates them, which is why it leads the key.
     #
-    # `*rest` makes v2 rows (5 cols, no receive_to_start_cycles) and v3 rows
-    # (6 cols) both parse — archived JSON from before the receive_time split
-    # still loads with r2s_cycles defaulting to 0.
-    aicore_lookup: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    # Key is (run_epoch, core_id, reg_task_id). Spelled loosely because this
+    # module has no `from __future__ import annotations` and pyright targets 3.9.
+    aicore_lookup: dict[tuple, tuple[int, int, int, int]] = {}
     for row_index, row in enumerate(aicore_rows):
-        if not isinstance(row, list) or len(row) not in (5, 6):
-            raise ValueError(f"aicore_tasks[{row_index}] must contain five or six columns")
-        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, *rest = row
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError(f"aicore_tasks[{row_index}] must contain seven columns")
+        core_id, task_token, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
         start_cycles = int(start_cycles)
         end_cycles = int(end_cycles)
-        r2s_cycles = int(rest[0]) if rest else 0
+        r2s_cycles = int(r2s_cycles)
+        run_epoch = int(run_epoch)
         if not (0 < start_cycles <= end_cycles):
             raise ValueError(f"aicore_tasks[{row_index}] has invalid timing: expected 0 < start_cycles <= end_cycles")
         if not (0 <= r2s_cycles < start_cycles):
@@ -505,19 +821,19 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
                 f"aicore_tasks[{row_index}] has invalid receive_to_start_cycles: "
                 "expected 0 <= receive_to_start_cycles < start_cycles"
             )
-        key = (int(core_id), int(reg_task_id))
+        key = (run_epoch, int(core_id), int(reg_task_id))
         if key in aicore_lookup:
             raise ValueError(f"duplicate aicore_tasks join key: {key}")
         aicore_lookup[key] = (
-            int(task_token_raw),
+            int(task_token),
             start_cycles,
             end_cycles,
             r2s_cycles,
         )
 
-    scheduler_task_keys = [(int(row[0]), int(row[1])) for row in scheduler_task_rows]
+    scheduler_task_keys = [_scheduler_task_key(row) for row in scheduler_task_rows]
     if len(scheduler_task_keys) != len(set(scheduler_task_keys)):
-        raise ValueError("scheduler_tasks contains duplicate (core_id, reg_task_id) join keys")
+        raise ValueError("scheduler_tasks contains duplicate (run_epoch, core_id, reg_task_id) join keys")
     for row_index, row in enumerate(scheduler_task_rows):
         dispatch_cycles = int(row[2])
         finish_cycles = int(row[3])
@@ -545,17 +861,17 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             base_time_cycles = v
 
     for row in aicore_rows:
-        # Column count varies (v2: 5, v3: 6); only the timing columns matter
-        # for base_time tracking. For v3, the per-task receive_time =
-        # start_cycles - receive_to_start_cycles is earlier than start_cycles
-        # itself; track it so Worker View task bars that start at receive_time
-        # don't land at a negative offset relative to the kernel start.
+        # Only the timing columns matter for base_time tracking. The per-task
+        # receive_time = start_cycles - receive_to_start_cycles is earlier than
+        # start_cycles itself; track it so Worker View task bars that start at
+        # receive_time don't land at a negative offset relative to the kernel
+        # start.
         start_c = int(row[3])
         end_c = int(row[4])
-        r2s_c = int(row[5]) if len(row) > 5 else 0
+        r2s_c = int(row[5])
         _track(start_c - r2s_c)
         _track(end_c)
-    for _, _, d, f in scheduler_task_rows:
+    for _, _, d, f, _epoch in scheduler_task_rows:
         _track(int(d))
         _track(int(f))
     for thread_records in sched_phases_raw:
@@ -567,16 +883,20 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             _track(int(pr.get("start_cycles", 0)))
             _track(int(pr.get("end_cycles", 0)))
     lifecycle_cycle_fields = (
-        "handshake_observed_cycles",
-        "handshake_partition_complete_cycles",
+        "handshake_start_cycles",
+        "handshake_complete_cycles",
         "config_start_cycles",
         "topology_complete_cycles",
+        "context_publish_start_cycles",
         "context_publish_complete_cycles",
         "bootstrap_wait_start_cycles",
         "bootstrap_complete_cycles",
-        "register_release_cycles",
-        "exit_signal_cycles",
-        "exit_ack_cycles",
+        "register_release_start_cycles",
+        "register_release_end_cycles",
+        "exit_signal_start_cycles",
+        "exit_signal_end_cycles",
+        "exit_wait_start_cycles",
+        "exit_wait_end_cycles",
     )
     for record in lifecycle_raw:
         for field in lifecycle_cycle_fields:
@@ -585,35 +905,15 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
     if base_time_cycles is None:
         base_time_cycles = 0
 
-    device_timestamps = []
-    for row in aicore_rows:
-        start_cycles = int(row[3])
-        receive_to_start_cycles = int(row[5]) if len(row) > 5 else 0
-        device_timestamps.extend((start_cycles - receive_to_start_cycles, start_cycles, int(row[4])))
-    for _, _, dispatch_cycles, finish_cycles in scheduler_task_rows:
-        device_timestamps.extend((int(dispatch_cycles), int(finish_cycles)))
-    for phase_threads in (sched_phases_raw, orch_phases_raw):
-        for thread_records in phase_threads:
-            for phase in thread_records:
-                device_timestamps.extend((int(phase.get("start_cycles", 0)), int(phase.get("end_cycles", 0))))
-    for record in lifecycle_raw:
-        device_timestamps.extend(int(record.get(field, 0)) for field in lifecycle_cycle_fields)
-
-    clock_alignment = None
-    if host_mode or clock_anchor_mode:
-        clock_alignment = build_clock_alignment(
-            metadata.get("clock_anchors"),
-            clock_freq_hz,
-            device_timestamps,
-            metadata.get("host_timestamp_quantization_ns", 0),
-        )
-        if host_origin_ns == 0 and clock_alignment.start is not None:
-            host_origin_ns = clock_alignment.start.host_mid_ns
-
     source_host_origin_ns = host_origin_ns
+    if placement is not None and host_origin_ns == 0:
+        # A capture with no Host records of its own still gets a Host origin
+        # from the window it is placed in, so its lane starts where the run did
+        # rather than at an arbitrary first record.
+        host_origin_ns = int(placement.place_lo_ns)
     if timeline_origin_ns is not None:
-        if clock_alignment is None or clock_alignment.status != "calibrated":
-            raise ValueError("a shared timeline origin requires calibrated Host/Device clock anchors")
+        if placement is None:
+            raise ValueError("a shared timeline origin requires a containment placement for this capture")
         host_origin_ns = int(timeline_origin_ns)
         if host_origin_ns <= 0:
             raise ValueError(f"invalid shared timeline origin: {host_origin_ns}")
@@ -623,8 +923,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
     def _to_us(cycles):
         if cycles <= 0:
             return 0.0
-        if clock_alignment is not None and clock_alignment.status == "calibrated":
-            return (clock_alignment.map_cycles_to_host_ns(cycles) - host_origin_ns) / 1000.0
+        if placement is not None:
+            return (placement.map_cycles_to_host_ns(cycles) - host_origin_ns) / 1000.0
         relative_device_us = (cycles - base_time_cycles) * cycles_to_us_factor
         if host_mode:
             # Fail-soft diagnostic layout: preserve both clock domains and only
@@ -643,14 +943,15 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
 
     if scheduler_task_rows:
         for row in scheduler_task_rows:
-            core_id, reg_task_id, dispatch_cycles, finish_cycles = row
+            core_id, reg_task_id, dispatch_cycles, finish_cycles, run_epoch = row
             core_id = int(core_id)
             reg_task_id = int(reg_task_id)
-            ac = aicore_lookup.get((core_id, reg_task_id))
+            run_epoch = int(run_epoch)
+            ac = aicore_lookup.get((run_epoch, core_id, reg_task_id))
             if ac is None:
                 unmatched_per_core[core_id] += 1
                 continue
-            task_token_raw, start_cycles, end_cycles, r2s_cycles = ac
+            task_token, start_cycles, end_cycles, r2s_cycles = ac
             dispatch_cycles = int(dispatch_cycles)
             finish_cycles = int(finish_cycles)
             start_us = _to_us(start_cycles)
@@ -660,11 +961,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
-                    "task_id": task_token_raw,
+                    "task_id": task_token,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    **task_id_fields(task_token, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
@@ -673,37 +974,42 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
                     "receive_time_us": receive_us,
                     "local_setup_us": local_setup_us,
                     "propagation_us": receive_us - dispatch_us,
+                    "run_epoch": run_epoch,
                 }
             )
     elif aicore_rows and level == 1:
         for row in aicore_rows:
-            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, *rest = row
-            r2s_cycles = int(rest[0]) if rest else 0
+            core_id, task_token, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+            r2s_cycles = int(r2s_cycles)
+            run_epoch = int(run_epoch)
             core_id = int(core_id)
-            task_token_raw = int(task_token_raw)
+            task_token = int(task_token)
             start_us = _to_us(int(start_cycles))
             end_us = _to_us(int(end_cycles))
             receive_us = _to_us(int(start_cycles) - r2s_cycles)
             local_setup_us = start_us - receive_us
             tasks.append(
                 {
-                    "task_id": task_token_raw,
+                    "task_id": task_token,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
-                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    **task_id_fields(task_token, core_id, run_epoch),
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
                     "receive_time_us": receive_us,
                     "local_setup_us": local_setup_us,
+                    "run_epoch": run_epoch,
                     # propagation_us requires a Scheduler dispatch timestamp.
                 }
             )
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
-    tasks.sort(key=lambda t: int(t["task_id"]))
+    # Sorting by task_id alone would interleave two runs' executions of the same
+    # task. Epoch leads so each run's tasks stay contiguous.
+    tasks.sort(key=lambda t: (t["run_epoch"], int(t["task_id"])))
 
     total_unmatched = sum(unmatched_per_core.values())
     if total_unmatched > 0:
@@ -727,7 +1033,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
         out.pop("end_cycles", None)
         return out
 
-    aicpu_scheduler_phases = []
+    scheduler_records = []
     for thread_records in sched_phases_raw:
         converted = []
         for pr in thread_records:
@@ -738,7 +1044,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             out["phase"] = kind
             out.pop("kind", None)
             converted.append(out)
-        aicpu_scheduler_phases.append(converted)
+        scheduler_records.append(converted)
 
     aicpu_orchestrator_phases = []
     for thread_records in orch_phases_raw:
@@ -798,11 +1104,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
         "chip_swimlane_level": level,
         "tasks": tasks,
     }
+    # Carried through so every downstream stage picks the same TaskId layout this
+    # decode did, rather than re-deriving it from something that only correlates.
+    # Unconditional: resolve_runtime above already refused a document without it.
+    out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
-    if aicpu_scheduler_phases:
-        out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
-        out["scheduler_records"] = aicpu_scheduler_phases
+    if scheduler_records:
+        out["scheduler_records"] = scheduler_records
         out["scheduler_streams"] = scheduler_stream_metadata
     if aicpu_orchestrator_phases:
         out["aicpu_orchestrator_phases"] = aicpu_orchestrator_phases
@@ -812,26 +1121,21 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
     if host_device_uploads:
         out["host_device_uploads"] = host_device_uploads
     if host_mode:
-        if clock_alignment is None:
-            raise RuntimeError("host timeline is missing its clock-alignment result")
         out["orchestrator_source"] = "host"
-        calibrated = clock_alignment.status == "calibrated"
         trace_status = "complete" if host_capture_complete else "partial"
         out["timeline_metadata"] = {
-            "layout": "clock_aligned" if calibrated else "causal_composite",
+            "layout": "containment_spliced" if placement is not None else "causal_composite",
             "trace_status": trace_status,
             "relation": metadata.get("timeline_relation", "host_orchestration_precedes_device"),
-            "clock_alignment": clock_alignment.metadata(),
             "host_capture": host_capture,
             "host_records_complete": host_capture_complete,
-            "cross_domain_latency_available": calibrated and host_capture_complete,
+            # Cross-domain gaps retain placement and phase-join uncertainty,
+            # represented together by saved anchor bounds when available.
+            "cross_domain_latency_available": placement is not None and host_capture_complete,
             "source_timeline_origin_ns": source_host_origin_ns,
             "timeline_origin_ns": host_origin_ns,
         }
-        host_clock_domain_id = metadata.get("host_clock_domain_id")
-        if host_clock_domain_id:
-            out["timeline_metadata"]["host_clock_domain_id"] = str(host_clock_domain_id)
-        if not calibrated:
+        if placement is None:
             out["timeline_metadata"].update(
                 {
                     "cross_domain_gap_unknown": True,
@@ -842,19 +1146,25 @@ def _decode_perf_data(data, *, timeline_origin_ns=None):  # noqa: PLR0912, PLR09
             out["aicpu_orchestrator_phases"] = host_orchestrator_phases
         else:
             out["timeline_metadata"]["host_records_missing"] = True
-    elif clock_anchor_mode:
-        if clock_alignment is None:
-            raise RuntimeError("clock anchors are missing their alignment result")
-        calibrated = clock_alignment.status == "calibrated"
+    elif placement is not None:
         out["timeline_metadata"] = {
-            "layout": "clock_aligned" if calibrated else "device_relative",
-            "trace_status": "complete" if calibrated else "partial",
-            "clock_alignment": clock_alignment.metadata(),
+            "layout": "containment_spliced",
+            # The placement is what makes the capture readable on the Host axis;
+            # whether the capture itself is whole is `host_capture`'s business,
+            # and a capture with no Host records of its own has none to lose.
+            "trace_status": "complete",
             "host_records_complete": False,
-            "cross_domain_latency_available": False,
+            "cross_domain_latency_available": True,
             "source_timeline_origin_ns": source_host_origin_ns,
             "timeline_origin_ns": host_origin_ns,
         }
+    if saved_alignment is not None and "timeline_metadata" not in out:
+        out["timeline_metadata"] = {"layout": "device_relative", "cross_domain_latency_available": False}
+    if "timeline_metadata" in out:
+        if saved_alignment is not None:
+            out["timeline_metadata"]["clock_alignment"] = saved_alignment
+        if isinstance(placement, containment.Placement):
+            out["timeline_metadata"]["placement"] = placement.metadata()
         host_clock_domain_id = metadata.get("host_clock_domain_id")
         if host_clock_domain_id:
             out["timeline_metadata"]["host_clock_domain_id"] = str(host_clock_domain_id)
@@ -924,7 +1234,7 @@ def load_deps_kernel_map(deps_path):
     (deps.json is the offline-joined identity source).
 
     Returns:
-        dict[int, list[int]] mapping ``task_id_raw → [aic, aiv0, aiv1]``,
+        dict[int, list[int]] mapping ``task_id → [aic, aiv0, aiv1]``,
         or ``None`` if the file is missing / unreadable / lacks the field.
         Entries without ``kernel_ids`` (pre-schema deps.json from older
         runs) are silently skipped — the caller treats a missing map as
@@ -957,7 +1267,7 @@ def load_deps_block_map(deps_path):
     """Build a ``task_id → block_num`` map from deps.json's ``tasks[]``.
 
     Returns:
-        dict[int, int] mapping ``task_id_raw → block_num``, or ``None`` if
+        dict[int, int] mapping ``task_id → block_num``, or ``None`` if
         the file is missing / unreadable / lacks the field. Entries without
         ``block_num`` default to 1 (non-SPMD).
     """
@@ -988,21 +1298,33 @@ def load_deps_block_map(deps_path):
     return bmap if bmap else None
 
 
-def _identify_spmd_task_ids(task_map, deps_block_map=None):
-    """Return task_ids whose dependency flow endpoints collapse to one subtask row."""
+def _identify_spmd_task_ids(task_maps_by_run, deps_block_map=None):
+    """Return task_ids whose dependency flow endpoints collapse to one subtask row.
+
+    Multiplicity is counted **within a single run**. A task that executes once
+    per run is not SPMD, however many runs a capture holds: counting rows in a
+    map merged across runs turns every repeated single-core task into a
+    spurious SPMD task, which both mislabels it and makes its dependency fan
+    count the number of runs.
+
+    ``deps_block_map`` stays authoritative where present, in both directions —
+    ``block_num > 1`` marks SPMD outright, and ``block_num == 1`` is not
+    second-guessed by observation.
+    """
     spmd_ids: set[int] = set()
     if deps_block_map:
         for tid, block_num in deps_block_map.items():
             if block_num > 1:
                 spmd_ids.add(tid)
-    for tid, recs in task_map.items():
-        if tid in spmd_ids or len(recs) <= 1:
-            continue
-        if deps_block_map and tid in deps_block_map:
-            continue  # authoritative — don't second-guess block_num==1
-        core_types = {r.get("core_type") for r in recs}
-        if len(core_types) == 1:
-            spmd_ids.add(tid)
+    for task_map in task_maps_by_run.values():
+        for tid, recs in task_map.items():
+            if tid in spmd_ids or len(recs) <= 1:
+                continue
+            if deps_block_map and tid in deps_block_map:
+                continue  # authoritative — don't second-guess block_num==1
+            core_types = {r.get("core_type") for r in recs}
+            if len(core_types) == 1:
+                spmd_ids.add(tid)
     return spmd_ids
 
 
@@ -1021,6 +1343,88 @@ def _scheduler_slice_start_us(task):
     return dispatch_time_us
 
 
+def _with_run_epoch(args, row):
+    """Stamp an event's args with the run its record belongs to, where it has one.
+
+    Every device-side record carries one: it is the trailing column on a task
+    row and a field on every scheduler phase record. Host-side records do not
+    and never will -- a submit or an upload is timed on the Host clock, which
+    no device run bounds -- so the field is absent rather than unknown, and an
+    event drawn from one is stamped with nothing.
+    """
+    if "run_epoch" in row:
+        args["run_epoch"] = row["run_epoch"]
+    return args
+
+
+# An absent (thread, run) bucket: no phases, and therefore no starts.
+_NO_COMPLETES: tuple = ((), ())
+
+
+def _build_complete_index(scheduler_phases):
+    """Per-thread complete-phase lookup, built once for the whole conversion.
+
+    Each entry carries the thread's completes in start order (``all``) and the
+    same records bucketed by run, each bucket paired with its start times
+    (``by_run``). The starts are cached next to the phases because every finish
+    bisects them: rebuilding that list per query turns an indexed lookup into a
+    full scan of the run's phases, and both the finish counter and the
+    completion arrows query once per task.
+    """
+    index = []
+    for thread_records in scheduler_phases:
+        sorted_completes = sorted(
+            (r for r in thread_records if r.get("phase") == "complete"),
+            key=lambda r: r["start_time_us"],
+        )
+        by_run: dict = defaultdict(list)
+        for record in sorted_completes:
+            by_run[record.get("run_epoch")].append(record)
+        index.append(
+            {
+                "all": sorted_completes,
+                "by_run": {epoch: (phases, [c["start_time_us"] for c in phases]) for epoch, phases in by_run.items()},
+            }
+        )
+    return index
+
+
+def _select_complete_for_finish(indexed_phases, finish_us):
+    """The complete phase containing ``finish_us``, else the next one to start.
+
+    ``indexed_phases`` is one run's ``(phases, starts)`` pair from
+    :func:`_build_complete_index`. Complete phases on one thread do not overlap,
+    so the only candidate that can contain the timestamp is the last one
+    starting at or before it. The next-start fallback covers a finish the
+    scheduler had not yet drained — and is exactly why the pair has to be one
+    run's: across runs it would step forward into a phase that executed in a
+    different execution of the graph.
+    """
+    phases, starts = indexed_phases
+    if not phases:
+        return None
+    idx = bisect.bisect_right(starts, finish_us)
+    if idx > 0:
+        prev_c = phases[idx - 1]
+        if prev_c["start_time_us"] <= finish_us <= prev_c["end_time_us"]:
+            return prev_c
+    if idx < len(phases):
+        return phases[idx]
+    return None
+
+
+def _execution_key(row):
+    """Identity of one execution instance: ``(run_epoch, task_id, core_id)``.
+
+    Task ids and core ids both repeat across runs, so an index keyed on that
+    pair alone is overwritten by whichever run is emitted last, and every
+    earlier run's flow then binds to a slice belonging to the later one. The
+    static graph in deps.json is run-independent and stays keyed by bare
+    task_id; this key is only for per-execution indexes.
+    """
+    return (row["run_epoch"], row["task_id"], row["core_id"])
+
+
 def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worker_anchor_map=None):
     """Flow anchor rows selected by one view's visible slice start.
 
@@ -1028,6 +1432,12 @@ def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worke
     ``(func_id, task_id)`` and keeps the earliest visible slice in each group,
     so MIX tasks with shared task_id but distinct AIC/AIV func_id values remain
     visible as separate dependency endpoints.
+
+    Both ``task_map`` and ``aicpu_worker_anchor_map`` must already be scoped to
+    a single run. Task ids repeat across runs, so a map spanning two of them
+    returns anchors from both: either mixed endpoints, or — when the merged rows
+    make one task's two executions look like two SPMD subtasks — the earliest
+    run's row standing in for every run.
     """
     recs = task_map.get(task_id, [])
     if not recs and aicpu_worker_anchor_map:
@@ -1068,11 +1478,17 @@ def _flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids, anchor_rows, aicp
 
 
 def _dependency_task_fan_count(task_id, spmd_task_ids, task_map, deps_block_map=None):
-    """Logical subtask count for dependency metadata (SPMD block_num, else 1)."""
+    """Logical subtask count for dependency metadata (SPMD block_num, else 1).
+
+    ``task_map`` is this run's. A task the run never executed on AICore — a
+    dummy, predicated-skip or alloc node anchored on an AICPU slice — has no row
+    here and contributes one logical endpoint, so the count is defined without
+    dereferencing a row that does not exist.
+    """
     if task_id in spmd_task_ids:
         if deps_block_map and task_id in deps_block_map:
             return deps_block_map[task_id]
-        return len(task_map[task_id])
+        return len(task_map.get(task_id) or ()) or 1
     return 1
 
 
@@ -1260,7 +1676,7 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             "propagations": [],  # dispatch_ts → AICore receive_time (NoC + FFTS)
             "local_setups": [],  # receive_time → start_time (dcci + ack on AICore)
             "latencies": [],
-            "total_exec_time": 0.0,
+            "valid_timing_exec_time": 0.0,
             "total_latency": 0.0,
         }
     )
@@ -1285,8 +1701,8 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         if "local_setup_us" in task:
             func_stats[func_id]["local_setups"].append(task["local_setup_us"])
 
-        # Calculate new metrics if dispatch_time_us and finish_time_us are available
-        if has_scheduler_timing and "dispatch_time_us" in task and "finish_time_us" in task:
+        # Scheduler metrics require valid timestamps for this task.
+        if task.get("dispatch_time_us", -1) >= 0 and task.get("finish_time_us", 0) > 0:
             dispatch_time = task["dispatch_time_us"]
             finish_time = task["finish_time_us"]
 
@@ -1298,8 +1714,8 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             tail_overhead = finish_time - end_time
             func_stats[func_id]["tail_overheads"].append(tail_overhead)
 
-            # Head OH split (v3 schema only — falls back to absent when the
-            # AICore record came from a pre-receive_time build).
+            # Head OH split, which needs a dispatch timestamp to measure the
+            # AICPU→AICore propagation against; a level-1 capture has none.
             if "propagation_us" in task:
                 func_stats[func_id]["propagations"].append(task["propagation_us"])
 
@@ -1308,7 +1724,7 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
             func_stats[func_id]["latencies"].append(latency)
 
             # Accumulate execution time and latency for ratio calculation
-            func_stats[func_id]["total_exec_time"] += duration
+            func_stats[func_id]["valid_timing_exec_time"] += duration
             func_stats[func_id]["total_latency"] += latency
 
             # Track global times
@@ -1369,20 +1785,23 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         avg_tail_overhead = (
             sum(stats["tail_overheads"]) / len(stats["tail_overheads"]) if stats["tail_overheads"] else 0
         )
-        avg_latency = stats["total_latency"] / count if count > 0 else 0
+        valid_timing_count = len(stats["latencies"])
+        avg_latency = stats["total_latency"] / valid_timing_count if valid_timing_count else 0
         # `None` (not NaN) signals "no v3 receive_time data on this func" so
         # the print line below renders a dash. NaN would force ruff's
         # PLR0124 self-compare idiom.
         avg_propagation = sum(stats["propagations"]) / len(stats["propagations"]) if stats["propagations"] else None
         avg_local_setup = sum(stats["local_setups"]) / len(stats["local_setups"]) if stats["local_setups"] else None
 
-        # Calculate execution ratio: total_exec_time / total_latency
-        exec_ratio = (stats["total_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
+        # Execution and latency use the same valid scheduler timing samples.
+        exec_ratio = (
+            (stats["valid_timing_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
+        )
 
-        latency_str = f"{avg_latency:.2f}" if has_scheduler_timing else "-"
-        exec_ratio_str = f"{exec_ratio:.1f}%" if has_scheduler_timing else "-"
-        head_str = f"{avg_head_overhead:.2f}" if has_scheduler_timing else "-"
-        tail_str = f"{avg_tail_overhead:.2f}" if has_scheduler_timing else "-"
+        latency_str = f"{avg_latency:.2f}" if valid_timing_count else "-"
+        exec_ratio_str = f"{exec_ratio:.1f}%" if valid_timing_count else "-"
+        head_str = f"{avg_head_overhead:.2f}" if valid_timing_count else "-"
+        tail_str = f"{avg_tail_overhead:.2f}" if valid_timing_count else "-"
         prop_str = f"{avg_propagation:>12.2f}" if avg_propagation is not None else f"{'-':>12}"
         local_str = f"{avg_local_setup:>13.2f}" if avg_local_setup is not None else f"{'-':>13}"
         print(
@@ -1410,17 +1829,25 @@ def print_task_statistics(tasks, func_id_to_name=None, chip_swimlane_level=None)
         )
 
     # Task execution vs Scheduler overhead summary
-    if has_scheduler_timing and total_count > 0 and total_latency_sum > 0:
-        avg_exec_us = total_duration / total_count
-        avg_latency_us = total_latency_sum / total_count
-        exec_latency_ratio_pct = total_duration / total_latency_sum * 100
+    valid_timing_count = sum(len(stats["latencies"]) for stats in func_stats.values())
+    valid_timing_exec_time = sum(stats["valid_timing_exec_time"] for stats in func_stats.values())
+    if valid_timing_count > 0 and total_latency_sum > 0:
+        avg_exec_us = valid_timing_exec_time / valid_timing_count
+        avg_latency_us = total_latency_sum / valid_timing_count
+        exec_latency_ratio_pct = valid_timing_exec_time / total_latency_sum * 100
         print("\n--- Task execution vs Scheduler overhead ---")
         print(
-            f"  Per-task (all):  Avg Exec = {avg_exec_us:.2f} us,  "
+            f"  Per-task (valid scheduler timing):  Avg Exec = {avg_exec_us:.2f} us,  "
             f"Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  "
             f"Exec/Latency = {exec_latency_ratio_pct:.2f}%"
         )
         print("  (Latency = dispatch→finish; Exec = AICore kernel time per task)")
+        handoff_delays = [delay for stats in func_stats.values() for delay in stats["head_overheads"]]
+        if handoff_delays:
+            print(
+                f"  Dispatch→kernel start (Host-computed): Total = {sum(handoff_delays):.2f} us, "
+                f"Max = {max(handoff_delays):.2f} us"
+            )
 
     print("=" * 110)
 
@@ -1473,9 +1900,13 @@ def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
         tid = _u64(t.get("task_id"))
         if tid is None:
             continue
-        types_of[tid].add(t.get("core_type"))
-        disp[tid] = min(disp.get(tid, t["dispatch_time_us"]), t["dispatch_time_us"])
-        end[tid] = max(end.get(tid, t["end_time_us"]), t["end_time_us"])
+        # Keyed by (run_epoch, task_id): the same task id in two runs is two
+        # executions. Keying on the id alone would take min(dispatch) from one
+        # run and max(end) from the other, producing a span covering both.
+        key = (t.get("run_epoch"), tid)
+        types_of[key].add(t.get("core_type"))
+        disp[key] = min(disp.get(key, t["dispatch_time_us"]), t["dispatch_time_us"])
+        end[key] = max(end.get(key, t["end_time_us"]), t["end_time_us"])
 
     preds = defaultdict(set)
     for pred, succs in deps_edges.items():
@@ -1485,9 +1916,12 @@ def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
             if p is not None and ss is not None and p != ss:
                 preds[ss].add(p)
     ready = {}
-    for tid, dp in disp.items():
-        in_perf = [p for p in preds.get(tid, ()) if p in end]
-        ready[tid] = max(end[p] for p in in_perf) if in_perf else dp
+    for (epoch, tid), dp in disp.items():
+        # deps_edges is the run-independent static graph, so it is looked up by
+        # bare task id — but the predecessor *execution* must be the one from
+        # this same run, or a run-2 successor would wait on a run-1 producer.
+        in_perf = [p for p in preds.get(tid, ()) if (epoch, p) in end]
+        ready[(epoch, tid)] = max(end[(epoch, p)] for p in in_perf) if in_perf else dp
 
     w0 = min(t["start_time_us"] for t in tasks)
     w1 = max(t["end_time_us"] for t in tasks)
@@ -1504,11 +1938,11 @@ def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
             run[ty][s] += 1
             run[ty][e] -= 1
             times.update((s, e))
-    for tid, dp in disp.items():
-        r = max(w0, min(ready[tid], w1))
+    for key, dp in disp.items():
+        r = max(w0, min(ready[key], w1))
         dd = max(w0, min(dp, w1))
         if dd > r:
-            for ty in types_of[tid]:  # MIX -> credit both engines
+            for ty in types_of[key]:  # MIX -> credit both engines
                 if ty in rw:
                     rw[ty][r] += 1
                     rw[ty][dd] -= 1
@@ -1576,6 +2010,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     core_to_thread=None,
     orchestrator_name=None,
     orchestrator_source=None,
+    runtime_name=None,
     timeline_metadata=None,
     deps_edges=None,
     deps_kernel_map=None,
@@ -1626,6 +2061,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
 
+    # The runtime whose DFX vocabulary this whole trace follows -- its TaskId layout,
+    # its phase names and colours, the lanes it draws. Resolved once, from the runtime
+    # the document names, because nothing in a task_id value or a phase name says which
+    # runtime produced it.
+    runtime = get(runtime_name)
+    task_display = runtime.display
+
     # Recover func_id for TASK_TIMING (level=1) records, which the host
     # emits as func_id=-1. Resolve once here against dep_gen's per-task
     # kernel_ids[3] (picking the subslot by core_type) and write it back onto
@@ -1640,8 +2082,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if resolved >= 0:
                     task["func_id"] = resolved
 
-    graph_instances = _collect_graph_execution_instances(tasks, scheduler_phases)
-
     # Step 2: Generate JSON events
     events = []
 
@@ -1653,19 +2093,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 6}
         )
         lifecycle_intervals = (
-            ("handshake_partition", "handshake_observed_time_us", "handshake_partition_complete_time_us"),
+            ("handshake_partition", "handshake_start_time_us", "handshake_complete_time_us"),
             ("topology_config", "config_start_time_us", "topology_complete_time_us"),
-            ("context_publish", "topology_complete_time_us", "context_publish_complete_time_us"),
+            ("context_publish", "context_publish_start_time_us", "context_publish_complete_time_us"),
             ("bootstrap_wait", "bootstrap_wait_start_time_us", "bootstrap_complete_time_us"),
-            ("exit_wait", "exit_signal_time_us", "exit_ack_time_us"),
+            ("register_release", "register_release_start_time_us", "register_release_end_time_us"),
+            ("exit_signal", "exit_signal_start_time_us", "exit_signal_end_time_us"),
+            ("exit_wait", "exit_wait_start_time_us", "exit_wait_end_time_us"),
         )
         for record in aicpu_lifecycle_records:
-            worker_id = int(record.get("worker_id", record.get("record_index", 0)))
-            thread_id = int(record.get("aicpu_thread_id", -1))
-            tid = 60000 + worker_id
+            thread_id = int(record.get("aicpu_thread_id", record.get("record_index", 0)))
+            tid = 60000 + thread_id
             events.append(
                 {
-                    "args": {"name": f"worker_{worker_id} (AICPU thread {thread_id})"},
+                    "args": {"name": f"AICPU Thread {thread_id}"},
                     "cat": "__metadata",
                     "name": "thread_name",
                     "ph": "M",
@@ -1673,12 +2114,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "tid": tid,
                 }
             )
-            identity = {
-                "worker_id": worker_id,
-                "aicpu_thread_id": thread_id,
-                "core_type": record.get("core_type"),
-                "physical_core_id": record.get("physical_core_id"),
-            }
+            identity = {"aicpu_thread_id": thread_id}
             for name, start_field, end_field in lifecycle_intervals:
                 start = float(record.get(start_field, 0.0))
                 end = float(record.get(end_field, 0.0))
@@ -1696,20 +2132,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "dur": end - start,
                     }
                 )
-            if "register_release_time_us" in record:
-                register_release = float(record["register_release_time_us"])
-                events.append(
-                    {
-                        "args": identity,
-                        "cat": "aicpu_lifecycle",
-                        "name": "register_release",
-                        "ph": "i",
-                        "s": "t",
-                        "pid": 6,
-                        "tid": tid,
-                        "ts": register_release,
-                    }
-                )
 
     # Metadata event: Process names and sort order.
     # pid is renumbered in pipeline order (top → bottom in Perfetto):
@@ -1722,52 +2144,50 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     task_map: dict[int, list] = defaultdict(list)
     for t in tasks:
         task_map[t["task_id"]].append(t)
-    spmd_task_ids = _identify_spmd_task_ids(task_map, deps_block_map)
+    # Per-run view of the same grouping. Dependency rendering must use this one:
+    # deps.json is the run-independent static graph, so two runs of the same
+    # graph share every edge, and pairing predecessor rows with successor rows
+    # out of the merged map would draw arrows from one run's producer to the
+    # other's consumer.
+    task_maps_by_run: dict[object, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    for t in tasks:
+        task_maps_by_run[t.get("run_epoch")][t["task_id"]].append(t)
+    if not task_maps_by_run:
+        # A capture can legitimately have no AICore task rows and still have
+        # dependency arrows, anchored on AICPU dummy/alloc slices. Keep one
+        # (empty) run so the edge loops below still execute for that path.
+        task_maps_by_run[None] = defaultdict(list)
+    # Whether a task is SPMD is a property of the task, so the result is one set
+    # for the whole capture — but it is *observed* per run, because row count in
+    # a merged map is the number of runs rather than a block count. Every
+    # consumer that then looks rows up does so in that run's own map.
+    spmd_task_ids = _identify_spmd_task_ids(task_maps_by_run, deps_block_map)
 
-    if graph_instances:
-        events.append(
-            {"args": {"name": "Graph Execution"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 5}
+    def _marker_event_name(task_id, task_label):
+        """The label a task-bearing marker carries, resolved the same way a task bar's is.
+
+        Handed to a contributor so it does not have to know how a func_id is
+        recovered from the kernel map, nor what makes a task SPMD.
+        """
+        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
+        return _task_display_name(func_id, func_id_to_name, task_label, spmd=task_id in spmd_task_ids)
+
+    # The lane this runtime draws for itself, if it draws one. pid 5 and the tid
+    # block above 5000 are reserved here rather than in the contributor, so the
+    # numbering of the whole trace stays owned by one place.
+    events.extend(
+        runtime.contribute_events(
+            tasks,
+            scheduler_phases,
+            LaneContext(
+                pid=5,
+                tid_base=5000,
+                display=task_display,
+                with_run_epoch=_with_run_epoch,
+                task_slice_start_us=_task_slice_start_us,
+            ),
         )
-        events.append(
-            {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 5}
-        )
-        for lane_idx in sorted({instance["lane_idx"] for instance in graph_instances}):
-            events.append(
-                {
-                    "args": {"name": f"Graph_{lane_idx}"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 5,
-                    "tid": 5000 + lane_idx,
-                }
-            )
-        for instance in graph_instances:
-            outer_display = format_task_display(instance["outer_task_id"])
-            task_indices = instance["visible_task_indices"]
-            events.append(
-                {
-                    "args": {
-                        "outer_task_id": instance["outer_task_id"],
-                        "visible_in_graph_task_count": len(task_indices),
-                        "visible_in_graph_local_id_min": min(task_indices),
-                        "visible_in_graph_local_id_max": max(task_indices),
-                        "prepare_slice_count": instance["prepare_slice_count"],
-                        "prepare_duration_us": instance["prepare_duration_us"],
-                        "execution_start_us": instance["execution_start_us"],
-                        "execution_duration_us": instance["execution_end_us"] - instance["execution_start_us"],
-                        "synthetic_id_layout": "ring1:(outer_task_id << 10) | in_graph_local_id",
-                    },
-                    "cat": "graph_execution",
-                    "cname": "rail_animation",
-                    "name": f"GraphExecution({outer_display}, {len(task_indices)} visible in-graph tasks)",
-                    "ph": "X",
-                    "pid": 5,
-                    "tid": 5000 + instance["lane_idx"],
-                    "ts": instance["prepare_start_us"],
-                    "dur": instance["execution_end_us"] - instance["prepare_start_us"],
-                }
-            )
+    )
 
     events.append({"args": {"name": "Worker View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4})
     events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4})
@@ -1803,11 +2223,27 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
-    task_to_event_id: dict[tuple[int, int], int] = {}
-    task_to_scheduler_event_id: dict[tuple[int, int], int] = {}
-    task_to_scheduler_tid: dict[tuple[int, int], int] = {}
-    aicpu_worker_anchor_map: dict[int, list[dict]] = defaultdict(list)
+    task_to_event_id: dict[tuple, int] = {}
+    task_to_scheduler_event_id: dict[tuple, int] = {}
+    task_to_scheduler_tid: dict[tuple, int] = {}
+    # Dummy / predicated-skip / alloc DAG nodes have no AICore kernel row, so
+    # their dependency arrows anchor on the AICPU worker slice instead. Kept per
+    # run for the same reason the task map is: these task ids repeat every run,
+    # and a map spanning runs hands a producer from one run to a consumer in
+    # another.
+    aicpu_anchor_maps_by_run: dict[object, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
     event_id = 0
+
+    def _next_event_id():
+        """Hand out the next flow-event id, keeping one counter for the whole trace.
+
+        Flow arrows bind by this id, so a second source of them would collide
+        with the task bars numbered below.
+        """
+        nonlocal event_id
+        assigned = event_id
+        event_id += 1
+        return assigned
 
     AICPU_TID_BASE = 19000  # noqa: N806
     scheduler_thread_indices = {int(thread_idx) for thread_idx in (core_to_thread or []) if int(thread_idx) >= 0}
@@ -1839,7 +2275,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         event_id_key = row.get("event_id")
         if "trace_tid" in row:
             return row["trace_tid"], event_id_key
-        return core_to_tid[row["core_id"]], task_to_event_id.get((row["task_id"], row["core_id"]))
+        return core_to_tid[row["core_id"]], task_to_event_id.get(_execution_key(row))
 
     # Invert deps (pred -> [succ]) into a fanin map (succ -> [pred]) so each task
     # bar can show both its consumers (fanout) and producers (fanin) with counts.
@@ -1857,9 +2293,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
         # func_id is already resolved (level=1 records recovered from
         # dep_gen's kernel_ids up front; see the pre-pass above). Without a
-        # deps.json the id stays -1 and the lane is named task(rXtY).
+        # deps.json the id stays -1 and the lane is named task(<task-id>).
         func_id = task["func_id"]
-        tdisp = format_task_display(task["task_id"])
+        tdisp = task_display(task["task_id"])
         task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
 
         # fanout (consumers) / fanin (producers) hints from deps.json — the device
@@ -1867,20 +2303,23 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # broadcast / reduction nodes are obvious without expanding the list.
         fanout_ids = deps_edges.get(task["task_id"], []) if deps_edges else []
         fanin_ids = fanin_map.get(task["task_id"], [])
-        fanout_str = f"{len(fanout_ids)}: [" + ", ".join(format_task_display(x) for x in fanout_ids) + "]"
-        fanin_str = f"{len(fanin_ids)}: [" + ", ".join(format_task_display(x) for x in fanin_ids) + "]"
+        fanout_str = f"{len(fanout_ids)}: [" + ", ".join(task_display(x) for x in fanout_ids) + "]"
+        fanin_str = f"{len(fanin_ids)}: [" + ", ".join(task_display(x) for x in fanin_ids) + "]"
 
         events.append(
             {
-                "args": {
-                    "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
-                    "fanout-hint": fanout_str,
-                    "fanin-hint": fanin_str,
-                    "duration-us": dur,
-                    "kernel-duration-us": task["duration_us"],
-                    "local_setup_us": local_setup_us,
-                    "taskId": task["task_id"],
-                },
+                "args": _with_run_epoch(
+                    {
+                        "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                        "fanout-hint": fanout_str,
+                        "fanin-hint": fanin_str,
+                        "duration-us": dur,
+                        "kernel-duration-us": task["duration_us"],
+                        "local_setup_us": local_setup_us,
+                        "taskId": task["task_id"],
+                    },
+                    task,
+                ),
                 "cat": "event",
                 "id": event_id,
                 "name": task_name,
@@ -1893,7 +2332,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         )
 
         # Record mapping for flow events
-        task_to_event_id[(task["task_id"], task["core_id"])] = event_id
+        task_to_event_id[_execution_key(task)] = event_id
         event_id += 1
 
     # Scheduler View duration events (dispatch_time to finish_time)
@@ -1929,7 +2368,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     lane_finish.append(0.0)
                 lane_finish[assigned] = task["finish_time_us"]
                 tid = base_tid if assigned == 0 else base_tid + assigned
-                task_to_scheduler_tid[(task["task_id"], task["core_id"])] = tid
+                task_to_scheduler_tid[_execution_key(task)] = tid
                 scheduler_tid_set.add(tid)
 
         # Thread name metadata for Scheduler View (one entry per unique tid used)
@@ -1970,24 +2409,27 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if dispatch_us < 0 or finish_us <= 0:
                 continue
 
-            tid = task_to_scheduler_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
+            tid = task_to_scheduler_tid.get(_execution_key(task), core_to_tid[task["core_id"]])
             scheduler_duration_us = finish_us - dispatch_us
 
-            # Get function name if available (task(rXtY) when no deps.json
+            # Get function name if available (task(<task-id>) when no deps.json
             # resolved the func_id; see _task_display_name).
             func_id = task["func_id"]
-            tdisp = format_task_display(task["task_id"])
+            tdisp = task_display(task["task_id"])
             task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
 
             events.append(
                 {
-                    "args": {
-                        "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
-                        "dispatch-time-us": dispatch_us,
-                        "finish-time-us": finish_us,
-                        "scheduler-duration-us": scheduler_duration_us,
-                        "taskId": task["task_id"],
-                    },
+                    "args": _with_run_epoch(
+                        {
+                            "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                            "dispatch-time-us": dispatch_us,
+                            "finish-time-us": finish_us,
+                            "scheduler-duration-us": scheduler_duration_us,
+                            "taskId": task["task_id"],
+                        },
+                        task,
+                    ),
                     "cat": "event",
                     "id": event_id,
                     "name": task_name,
@@ -1998,7 +2440,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "dur": scheduler_duration_us,
                 }
             )
-            task_to_scheduler_event_id[(task["task_id"], task["core_id"])] = event_id
+            task_to_scheduler_event_id[_execution_key(task)] = event_id
             event_id += 1
 
     flow_id = 0
@@ -2022,70 +2464,37 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 2}
         )
 
-        # Phase color mapping. The Perfetto sched lane only renders the
-        # two work phases (complete, dispatch). Idle is the wall-clock gap
-        # between consecutive work bars — Perfetto's empty-track regions
-        # already convey that visually, so we don't paint a synthetic bar
-        # for it. (Idle is still tallied numerically by
-        # sched_overhead_analysis.py Part 2 via gap reconstruction.)
-        phase_colors = {
-            # Outer phases — mutually time-exclusive within an iter
-            "complete": "good",  # green
-            "dispatch": "terrible",  # red
-            "async_poll": "yellow",  # async-wait completion polling (split from complete)
-            "release": "olive",  # deferred-release drain (on_task_release work)
-            "dummy": "grey",  # dummy_drain pass (TMR Resolve nests inside; HBG P bar is standalone)
-            "early_dispatch": "rail_animation",  # speculative early-dispatch staging
-            # sync_start stop-the-world drain: outer bar time-contains the two
-            # inner staging passes, so Perfetto nests them by depth on the track.
-            "drain": "cq_build_running",  # handle_drain_mode outer
-            "drain_prepare": "cq_build_attempt_runnable",  # inner: cluster scan + build_payload
-            "drain_publish": "cq_build_attempt_passed",  # inner: MMIO write_reg per subtask (the cohort launch)
-            "graph_prepare": "rail_animation",  # bounded Scheduler-side Definition expansion
-            "bootstrap": "rail_animation",
-            "fanin": "cq_build_running",
-            "ready_claim": "cq_build_attempt_runnable",
-            "ready_steal": "cq_build_attempt_failed",
-            "direct_refill": "cq_build_attempt_passed",
-            "idle": "grey",
-            # Inner in TMR; standalone on HBG's dedicated P thread.
-            "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
-            # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
-            "dummy_task": "grey",
-        }
+        # Phase colour mapping, and which phases the scheduler track draws as a
+        # bar. Both come whole from the runtime the document names: a phase two
+        # runtimes both emit is still two phases, and the owning runtime's entry is
+        # the one that describes it.
+        #
+        # A phase needs a colour because it is drawn, so the colour table already
+        # states the bar set; the only phases it over-states are the ones a runtime
+        # draws on another track, and each runtime names its own.
+        #
+        # `idle` is a drawn bar wherever a producer publishes one. hbg's AICore
+        # scheduler does (a SchedulerIdleRecord per spin), so that stream's idle is
+        # measured and rendered; tmr publishes none, and the idle a report shows for
+        # it is reconstructed from gaps by sched_overhead_analysis rather than drawn
+        # here.
+        phase_colors = runtime.PHASE_COLORS
+        # Only the AICore scheduler renames its phases for display, and only hbg
+        # has one -- a runtime without that producer supplies an empty mapping
+        # and every phase shows the name it was recorded with.
+        phase_display_names = runtime.PHASE_DISPLAY_NAMES
+        sched_lane_phases = frozenset(phase_colors) - runtime.MARKER_PHASES
 
         # Per-complete task-finish rows are retained as an attribution check.
         # The runtime's Complete `tasks_processed` field is the authoritative
         # number of AICore FIN/retire events in the phase (including non-final
         # SPMD sub-block retires), not necessarily a logical-task count.
-        complete_phases_by_thread_pre = []
-        complete_starts_by_thread_pre = []
-        for thread_records in scheduler_phases:
-            sorted_completes = sorted(
-                (r for r in thread_records if r.get("phase") == "complete"),
-                key=lambda r: r["start_time_us"],
-            )
-            complete_phases_by_thread_pre.append(sorted_completes)
-            complete_starts_by_thread_pre.append([c["start_time_us"] for c in sorted_completes])
-
-        def _find_containing_complete(thread_idx: int, finish_us: float):
-            # Bisect into the per-thread sorted start_time_us list. Complete
-            # phases on a thread don't overlap, so the only complete that can
-            # CONTAIN finish_us is the last one whose start is <= finish_us
-            # (= entry at idx-1 after bisect_right). Fall back to the next
-            # starting complete (entry at idx) if it doesn't contain.
-            phases = complete_phases_by_thread_pre[thread_idx]
-            starts = complete_starts_by_thread_pre[thread_idx]
-            if not phases:
-                return None
-            idx = bisect.bisect_right(starts, finish_us)
-            if idx > 0:
-                prev_c = phases[idx - 1]
-                if prev_c["start_time_us"] <= finish_us <= prev_c["end_time_us"]:
-                    return prev_c
-            if idx < len(phases):
-                return phases[idx]
-            return None
+        # Bucketed per (thread, run): a finish belongs to a complete phase of
+        # its own run. Attributing across runs inflates the receiving phase's
+        # count with finishes it never drained, and that count is displayed —
+        # and, for a record carrying no raw `tasks_processed`, becomes the
+        # displayed count outright.
+        complete_index = _build_complete_index(scheduler_phases)
 
         finishes_per_complete: dict[int, int] = defaultdict(int)
         if core_to_thread:
@@ -2097,16 +2506,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if t_cid >= len(core_to_thread):
                     continue
                 t_thr = core_to_thread[t_cid]
-                if t_thr < 0 or t_thr >= len(complete_phases_by_thread_pre):
+                if t_thr < 0 or t_thr >= len(complete_index):
                     continue
-                t_comp = _find_containing_complete(t_thr, f_us)
+                t_comp = _select_complete_for_finish(
+                    complete_index[t_thr]["by_run"].get(t.get("run_epoch"), _NO_COMPLETES), f_us
+                )
                 if t_comp is None:
                     continue
                 finishes_per_complete[id(t_comp)] += 1
-
-        # AICPU worker-marker width — start/end on the device coincide; render
-        # as a 0.02 us sliver so Perfetto does not collapse it to a hairline.
-        AICPU_WORKER_MARKER_MIN_DUR_US = 0.02  # noqa: N806
 
         assigned_thread_indices = {
             assigned for assigned in (core_to_thread or []) if isinstance(assigned, int) and assigned >= 0
@@ -2114,21 +2521,21 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
             resolve_tid = sched_lane_tid(thread_idx, 1)
-            nested_resolve_ids = nested_resolve_record_ids(thread_records)
+            nested_resolve_ids = runtime.nested_resolve_record_ids(thread_records)
             is_resolution_thread = (
-                scheduler_thread_role(thread_records, assigned_thread_indices, thread_idx, nested_resolve_ids)
+                runtime.scheduler_thread_role(thread_records, assigned_thread_indices, thread_idx, nested_resolve_ids)
                 == "resolution"
             )
 
             # Thread name metadata
             stream = scheduler_streams[thread_idx] if scheduler_streams and thread_idx < len(scheduler_streams) else {}
+            is_aicore_scheduler = stream.get("producer") == "aicore"
             scheduler_id = stream.get("scheduler_id", thread_idx)
             worker_id = stream.get("worker_id")
-            core_type = stream.get("core_type")
-            physical_core_id = stream.get("physical_core_id")
             lane_name = f"Sched_{scheduler_id}"
-            if stream.get("producer") == "aicore":
-                lane_name = f"Scheduler_{scheduler_id} ({core_type}_{physical_core_id}, worker {worker_id})"
+            if is_aicore_scheduler:
+                display_id = worker_id if worker_id is not None else scheduler_id
+                lane_name = f"Scheduler_{display_id}"
             events.append(
                 {
                     "args": {"name": lane_name},
@@ -2139,7 +2546,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "tid": tid,
                 }
             )
-            if nested_resolve_ids:
+            if nested_resolve_ids and not is_aicore_scheduler:
                 events.append(
                     {
                         "args": {"name": f"Sched_{thread_idx}"},
@@ -2160,79 +2567,30 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # they represent DAG nodes briefly inhabiting the AICPU as a
             # virtual worker, so we route them to Worker View (pid=4) AICPU_N
             # (where N = the AICPU id of the sched thread that drained them).
+            # Dependency-only task markers do NOT live on the sched track —
+            # whether this runtime has any, and what they look like, is its own
+            # to say. They land on Worker View (pid=4) AICPU_N, so the
+            # contributor is given the tid for this thread rather than choosing
+            # one.
+            marker_events, marker_anchors = runtime.contribute_worker_lane_events(
+                thread_records,
+                thread_idx,
+                WorkerLaneContext(
+                    display=task_display,
+                    with_run_epoch=_with_run_epoch,
+                    event_name=_marker_event_name,
+                    tid=lambda idx: AICPU_TID_BASE + idx,
+                    next_event_id=_next_event_id,
+                ),
+            )
+            events.extend(marker_events)
+            for run_epoch, task_id, row in marker_anchors:
+                aicpu_anchor_maps_by_run[run_epoch][task_id].append(row)
+
             for record in thread_records:
                 raw_phase = record.get("phase", "unknown")
-                phase = canonical_sched_phase(raw_phase)
-                if phase in ("dummy_task", "predicated_skip"):
-                    start_us = record["start_time_us"]
-                    end_us = record["end_time_us"]
-                    dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
-                    task_id = normalize_task_id_int(record.get("task_id"))
-                    task_label = format_task_display(task_id) if task_id is not None else "unknown"
-                    if phase == "dummy_task":
-                        event_name = f"dummy({task_label})"
-                    else:
-                        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
-                        event_name = _task_display_name(
-                            func_id,
-                            func_id_to_name,
-                            task_label,
-                            spmd=task_id in spmd_task_ids,
-                        )
-                    event_args = {
-                        "loop_iter": record.get("loop_iter", 0),
-                        "task_id": task_id,
-                        "event-hint": event_name,
-                    }
-                    if phase == "dummy_task":
-                        event_args["phase"] = phase
-                    else:
-                        event_args["predicated_pass"] = False
-                    events.append(
-                        {
-                            "args": event_args,
-                            "cat": "event",
-                            "id": event_id,
-                            "name": event_name,
-                            "ph": "X",
-                            "pid": 4,
-                            "tid": AICPU_TID_BASE + thread_idx,
-                            "ts": start_us,
-                            "dur": dur,
-                        }
-                    )
-                    if task_id is not None:
-                        aicpu_worker_anchor_map[task_id].append(
-                            {
-                                "task_id": task_id,
-                                "start_time_us": start_us,
-                                "end_time_us": start_us + dur,
-                                "receive_time_us": start_us,
-                                "trace_tid": AICPU_TID_BASE + thread_idx,
-                                "event_id": event_id,
-                            }
-                        )
-                    event_id += 1
-                    continue
-                if phase not in (
-                    "complete",
-                    "async_poll",
-                    "dispatch",
-                    "release",
-                    "resolve",
-                    "early_dispatch",
-                    "dummy",
-                    "drain",
-                    "drain_prepare",
-                    "drain_publish",
-                    "graph_prepare",
-                    "bootstrap",
-                    "fanin",
-                    "ready_claim",
-                    "ready_steal",
-                    "direct_refill",
-                    "idle",
-                ):
+                phase = runtime.canonical_sched_phase(raw_phase)
+                if phase not in sched_lane_phases:
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -2253,11 +2611,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # Phase block. When queue depths are present, fold them into
                 # args so hover on a complete/dispatch bar surfaces the
                 # before/after queue state alongside the phase metadata.
-                phase_args = {
-                    "phase": phase,
-                    "loop_iter": record.get("loop_iter", 0),
-                    "tasks_processed": tasks_processed,
-                }
+                phase_args = _with_run_epoch(
+                    {
+                        "phase": phase,
+                        "loop_iter": record.get("loop_iter", 0),
+                        "tasks_processed": tasks_processed,
+                    },
+                    record,
+                )
+                task_id = normalize_task_id_int(record.get("task_id"))
+                if is_aicore_scheduler and task_id is not None:
+                    phase_args["task_id"] = task_id
                 if depths_valid:
                     # Perfetto's args SQL parses key names; `[...]` looks like
                     # an array-index op and crashes the details-panel query.
@@ -2282,8 +2646,18 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         phase_args["finishes_processed"] = matched_finish_rows
                         tasks_processed = matched_finish_rows
                         phase_args["tasks_processed"] = tasks_processed
-                display_name = f"{phase}({tasks_processed})"
-                event_tid = resolve_tid if raw_phase == "resolve" and id(record) in nested_resolve_ids else tid
+                display_phase = phase_display_names.get(phase, phase) if is_aicore_scheduler else phase
+                if not is_aicore_scheduler:
+                    display_name = f"{display_phase}({tasks_processed})"
+                elif task_id is not None:
+                    display_name = f"{display_phase}({task_display(task_id)})"
+                else:
+                    display_name = display_phase
+                event_tid = (
+                    resolve_tid
+                    if not is_aicore_scheduler and raw_phase == "resolve" and id(record) in nested_resolve_ids
+                    else tid
+                )
                 events.append(
                     {
                         "args": phase_args,
@@ -2409,38 +2783,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 1, "tid": tid}
             )
 
-        # Per-task orchestrator phase bars. As of PR-X the device folds
-        # all 6 sub-step phases into one ORCH_SUBMIT record covering the
-        # submit's entire [start, end] window. Legacy per-sub-step phase
-        # strings remain in the color map so old captures still render.
+        # Per-task orchestrator phase bars. One ORCH_SUBMIT record covers a
+        # submit's entire [start, end] window; the device does not break it
+        # into sub-steps.
         orch_phase_colors = {
             "orch_submit": "rail_animation",  # purple — primary
-            # Legacy per-sub-step phases (old captures only):
-            "orch_sync": "thread_state_iowait",
-            "orch_alloc": "terrible",
-            "orch_params": "good",
-            "orch_lookup": "thread_state_running",
-            "orch_insert": "olive",
-            "orch_fanin": "rail_animation",
         }
 
         # Build the runtime task-id sets so the orch-phase loop can distinguish
         # alloc_tensors() calls from submitted tasks. deps.json remains the
         # identity source when a runtime timing record is missing.
         regular_task_ids = {int(t.get("task_id", -1)) for t in tasks}
-        dummy_task_ids = set()
-        predicated_skip_task_ids = set()
-        if scheduler_phases:
-            for thread_records in scheduler_phases:
-                for rec in thread_records:
-                    phase = rec.get("phase")
-                    if phase in ("dummy_task", "predicated_skip"):
-                        task_id = normalize_task_id_int(rec.get("task_id"))
-                        if task_id is not None:
-                            if phase == "dummy_task":
-                                dummy_task_ids.add(task_id)
-                            else:
-                                predicated_skip_task_ids.add(task_id)
+        # Which ids this runtime marked as dependency-only or predicate-skipped;
+        # a runtime that marks neither reports both as empty.
+        marker_ids = runtime.marker_task_ids(scheduler_phases)
+        dummy_task_ids = marker_ids["dummy_task"]
+        predicated_skip_task_ids = marker_ids["predicated_skip"]
         deps_dummy_task_ids = {
             task_id
             for task_id, kernel_ids in (deps_kernel_map or {}).items()
@@ -2462,14 +2820,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # Strip "orch_" prefix for display name
                 display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
-                # Full TaskId in JSON (device uses task_id.raw, same as TensorMap) → rXtY / tY
+                # The document runtime selects how the full encoded task id is displayed.
                 if task_id >= 0:
-                    label = f"{display_name}({format_task_display(task_id)})"
+                    label = f"{display_name}({task_display(task_id)})"
                 else:
                     label = f"{display_name}({submit_idx})"
 
                 event = {
-                    "args": {"phase": phase, "submit_idx": submit_idx, "task_id": task_id},
+                    "args": _with_run_epoch({"phase": phase, "submit_idx": submit_idx, "task_id": task_id}, record),
                     "cat": "orchestrator",
                     "cname": orch_phase_colors.get(phase, "generic_work"),
                     "name": label,
@@ -2490,7 +2848,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         is_regular = not is_dummy
                         if is_dummy and task_id not in dummy_task_ids and task_id not in missing_dummy_record_warnings:
                             print(
-                                f"Warning: dummy({format_task_display(task_id)}) has no dummy_task scheduler record; "
+                                f"Warning: dummy({task_display(task_id)}) has no dummy_task scheduler record; "
                                 "its Worker View bar cannot be rendered.",
                                 file=sys.stderr,
                             )
@@ -2502,15 +2860,18 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     if not is_regular and not is_dummy and not is_predicated_skip:
                         events.append(
                             {
-                                "args": {
-                                    "phase": "alloc",
-                                    "task_id": task_id,
-                                    "event-hint": f"alloc({format_task_display(task_id)})",
-                                },
+                                "args": _with_run_epoch(
+                                    {
+                                        "phase": "alloc",
+                                        "task_id": task_id,
+                                        "event-hint": f"alloc({task_display(task_id)})",
+                                    },
+                                    record,
+                                ),
                                 "cat": "event",
                                 "cname": "olive",
                                 "id": event_id,
-                                "name": f"alloc({format_task_display(task_id)})",
+                                "name": f"alloc({task_display(task_id)})",
                                 "ph": "X",
                                 "pid": 4,
                                 "tid": AICPU_TID_BASE + orch_worker_thread_idx,
@@ -2518,9 +2879,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                                 "dur": max(dur, 0.02),
                             }
                         )
-                        aicpu_worker_anchor_map[task_id].append(
+                        aicpu_anchor_maps_by_run[record.get("run_epoch")][task_id].append(
                             {
                                 "task_id": task_id,
+                                "run_epoch": record.get("run_epoch"),
                                 "start_time_us": start_us,
                                 "end_time_us": start_us + max(dur, 0.02),
                                 "receive_time_us": start_us,
@@ -2536,32 +2898,43 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # SPMD logical tasks anchor Worker View dependency arrows on the earliest
     # visible kernel slice per (func_id, task_id). Dummy/alloc DAG nodes have no
     # kernel row, so their arrows anchor on the AICPU worker slice emitted above.
-    for pred_id, succ_ids in edges_by_pred.items():
-        if pred_id not in task_map and pred_id not in aicpu_worker_anchor_map:
+    # The runs to walk come from the union of both identity sources: a run can
+    # contribute only AICPU phases (dummy / alloc nodes and no AICore kernel
+    # row at all), and iterating the task map alone would skip it entirely.
+    dependency_run_keys = sorted(
+        set(task_maps_by_run) | set(aicpu_anchor_maps_by_run),
+        key=lambda epoch: (epoch is not None, epoch or 0),
+    ) or [None]
+    for run_epoch, pred_id, succ_ids in (
+        (_e, _p, _s) for _e in dependency_run_keys for _p, _s in edges_by_pred.items()
+    ):
+        run_task_map = task_maps_by_run.get(run_epoch) or {}
+        run_anchor_map = aicpu_anchor_maps_by_run.get(run_epoch) or {}
+        if pred_id not in run_task_map and pred_id not in run_anchor_map:
             continue
 
         for succ_id in succ_ids:
-            if succ_id not in task_map and succ_id not in aicpu_worker_anchor_map:
+            if succ_id not in run_task_map and succ_id not in run_anchor_map:
                 if verbose:
                     print(
-                        f"Warning: Task {format_task_display(pred_id)} (raw {pred_id}) "
-                        f"references non-existent successor {format_task_display(succ_id)} (raw {succ_id})"
+                        f"Warning: Task {task_display(pred_id)} (raw {pred_id}) "
+                        f"references non-existent successor {task_display(succ_id)} (raw {succ_id})"
                     )
                 continue
 
             row_pairs = _flow_row_pairs(
                 pred_id,
                 succ_id,
-                task_map,
+                run_task_map,
                 spmd_task_ids,
                 _worker_flow_anchor_rows,
-                aicpu_worker_anchor_map,
+                run_anchor_map,
             )
             if not row_pairs:
                 continue
 
-            output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
-            input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
+            output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, run_task_map, deps_block_map)
+            input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, run_task_map, deps_block_map)
             for pred_row, succ_row in row_pairs:
                 src_bar_start_us = _task_slice_start_us(pred_row)
                 src_end_us = pred_row["end_time_us"]
@@ -2605,26 +2978,28 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Scheduler View dependency mirror (Scheduler timestamps).
     if has_scheduler_task_data:
-        for pred_id, succ_ids in edges_by_pred.items():
-            if pred_id not in task_map:
+        for run_task_map, pred_id, succ_ids in (
+            (_m, _p, _s) for _m in task_maps_by_run.values() for _p, _s in edges_by_pred.items()
+        ):
+            if pred_id not in run_task_map:
                 continue
 
             for succ_id in succ_ids:
-                if succ_id not in task_map:
+                if succ_id not in run_task_map:
                     continue
 
                 row_pairs = _flow_row_pairs(
                     pred_id,
                     succ_id,
-                    task_map,
+                    run_task_map,
                     spmd_task_ids,
                     _scheduler_flow_anchor_rows,
                 )
                 if not row_pairs:
                     continue
 
-                output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
-                input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
+                output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, run_task_map, deps_block_map)
+                input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, run_task_map, deps_block_map)
                 for pred_row, succ_row in row_pairs:
                     src_dispatch_us = pred_row.get("dispatch_time_us", 0)
                     src_finish_us = pred_row.get("finish_time_us", 0)
@@ -2641,17 +3016,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         flow_id,
                         scheduler_flow_name,
                         3,
-                        task_to_scheduler_tid.get(
-                            (pred_row["task_id"], pred_row["core_id"]), core_to_tid[pred_row["core_id"]]
-                        ),
+                        task_to_scheduler_tid.get(_execution_key(pred_row), core_to_tid[pred_row["core_id"]]),
                         src_dispatch_us,
-                        task_to_scheduler_event_id.get((pred_row["task_id"], pred_row["core_id"])),
+                        task_to_scheduler_event_id.get(_execution_key(pred_row)),
                         3,
-                        task_to_scheduler_tid.get(
-                            (succ_row["task_id"], succ_row["core_id"]), core_to_tid[succ_row["core_id"]]
-                        ),
+                        task_to_scheduler_tid.get(_execution_key(succ_row), core_to_tid[succ_row["core_id"]]),
                         dst_dispatch_us,
-                        task_to_scheduler_event_id.get((succ_row["task_id"], succ_row["core_id"])),
+                        task_to_scheduler_event_id.get(_execution_key(succ_row)),
                         input_task_count=input_task_count,
                         output_task_count=output_task_count,
                     )
@@ -2685,20 +3056,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # phases in temporal order and tracking each consumer's satisfied
     # fanin count.
     if scheduler_phases and core_to_thread:
-        complete_phases_by_thread = []
-        complete_starts_by_thread = []
-        for thread_records in scheduler_phases:
-            sorted_completes = sorted(
-                (r for r in thread_records if r.get("phase") == "complete"),
-                key=lambda r: r["start_time_us"],
-            )
-            complete_phases_by_thread.append(sorted_completes)
-            complete_starts_by_thread.append([c["start_time_us"] for c in sorted_completes])
+        # `complete_index` was built once in the pre-pass above, which runs
+        # under the weaker `if scheduler_phases:` guard and therefore always
+        # precedes this block. Rebuilding it here would sort and bucket the same
+        # records a second time.
 
         # Group subtask records by task_id; SPMD tasks have multiple rows.
-        tasks_by_id: dict[int, list[dict]] = defaultdict(list)
+        # Keyed by (run_epoch, task_id): completion attribution and fanin
+        # release describe one execution, so two runs of the same task are two
+        # entries. Merging them would let run 2's complete satisfy run 1's
+        # consumer and push its fanin past its total.
+        tasks_by_id: dict[tuple, list[dict]] = defaultdict(list)
         for t in tasks:
-            tasks_by_id[t["task_id"]].append(t)
+            tasks_by_id[(t.get("run_epoch"), t["task_id"])].append(t)
 
         # For each task: completion = LAST subtask's finish observation.
         # The owning thread is determined by core_to_thread of that last
@@ -2706,46 +3076,44 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # earlier subtasks too, but we don't assume. Each task view selects its
         # own earliest visible subtask slice; both flows end at the LAST
         # subtask's Scheduler finish timestamp, preserving completion attribution.
-        task_to_complete: dict[int, dict] = {}
-        task_last_subtask: dict[int, tuple[float, float, int]] = {}  # tid -> (last_end_us, last_finish_us, core_id)
-        task_worker_anchors: dict[int, list[dict]] = {}
-        task_scheduler_anchors: dict[int, list[dict]] = {}
-        for tid, recs in tasks_by_id.items():
+        task_to_complete: dict[tuple, dict] = {}
+        # (run_epoch, task_id) -> (last_end_us, last_finish_us, core_id)
+        task_last_subtask: dict[tuple, tuple[float, float, int]] = {}
+        task_worker_anchors: dict[tuple, list[dict]] = {}
+        task_scheduler_anchors: dict[tuple, list[dict]] = {}
+        for task_key, recs in tasks_by_id.items():
+            run_epoch, tid = task_key
+            # This run's rows only: the merged map either returns both runs'
+            # rows, or — when they look like two SPMD subtasks of one task —
+            # collapses to the earliest run's row for every run.
+            run_task_map = task_maps_by_run.get(run_epoch) or {}
             valid_finishes = [
                 (r.get("finish_time_us"), r.get("end_time_us"), r["core_id"])
                 for r in recs
                 if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
             ]
-            worker_anchors = _worker_flow_anchor_rows(tid, task_map, spmd_task_ids)
-            scheduler_anchors = _scheduler_flow_anchor_rows(tid, task_map, spmd_task_ids)
+            worker_anchors = _worker_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
+            scheduler_anchors = _scheduler_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
             if not valid_finishes or not worker_anchors:
                 continue
             last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
             if last_cid >= len(core_to_thread):
                 continue
             owning_thread = core_to_thread[last_cid]
-            if owning_thread < 0 or owning_thread >= len(complete_phases_by_thread):
+            if owning_thread < 0 or owning_thread >= len(complete_index):
                 continue
-            task_last_subtask[tid] = (last_end_us, last_finish_us, last_cid)
-            task_worker_anchors[tid] = worker_anchors
-            task_scheduler_anchors[tid] = scheduler_anchors
+            task_last_subtask[task_key] = (last_end_us, last_finish_us, last_cid)
+            task_worker_anchors[task_key] = worker_anchors
+            task_scheduler_anchors[task_key] = scheduler_anchors
             # Find the complete phase that CONTAINS this last_finish_us.
             # Fall back to the next-starting complete if none contains
             # (rare: AICore reported the finish but the scheduler hadn't
             # entered its next complete phase by run end). Bisect for O(log N).
-            chosen = None
-            phases = complete_phases_by_thread[owning_thread]
-            starts = complete_starts_by_thread[owning_thread]
-            if phases:
-                idx = bisect.bisect_right(starts, last_finish_us)
-                if idx > 0:
-                    prev_c = phases[idx - 1]
-                    if prev_c["start_time_us"] <= last_finish_us <= prev_c["end_time_us"]:
-                        chosen = prev_c
-                if chosen is None and idx < len(phases):
-                    chosen = phases[idx]
+            chosen = _select_complete_for_finish(
+                complete_index[owning_thread]["by_run"].get(run_epoch, _NO_COMPLETES), last_finish_us
+            )
             if chosen is not None:
-                task_to_complete[tid] = chosen
+                task_to_complete[task_key] = chosen
 
         # ---- Inbound: one arrow per independently selected view anchor ----
         # Source ts = <bar end> - epsilon so it lands INSIDE the task X event
@@ -2754,17 +3122,18 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # The pid=2 endpoint (thread + ts) is identical for both views, so
         # completion attribution is unchanged; only the visual source differs.
         FLOW_EPSILON_US = 0.01
-        for tid, comp in task_to_complete.items():
-            _last_end_us, last_finish_us, last_cid = task_last_subtask[tid]
+        for task_key, comp in task_to_complete.items():
+            run_epoch, tid = task_key
+            _last_end_us, last_finish_us, last_cid = task_last_subtask[task_key]
             owning_thread = core_to_thread[last_cid]
             dst_tid = sched_lane_tid(owning_thread, 0)
             dst_ts = comp["start_time_us"]
             if comp["start_time_us"] <= last_finish_us <= comp["end_time_us"]:
                 dst_ts = last_finish_us
-            for anchor in task_worker_anchors[tid]:
+            for anchor in task_worker_anchors[task_key]:
                 # Worker View (pid=4): anchor on the kernel slice (end_time_us).
                 src_tid = core_to_tid[anchor["core_id"]]
-                src_event_id = task_to_event_id.get((tid, anchor["core_id"]))
+                src_event_id = task_to_event_id.get((run_epoch, tid, anchor["core_id"]))
                 events.append(
                     {
                         "cat": "flow",
@@ -2791,15 +3160,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 )
                 flow_id += 1
 
-            for anchor in task_scheduler_anchors[tid]:
+            for anchor in task_scheduler_anchors[task_key]:
                 # Scheduler View (pid=3): anchor on the Scheduler dispatch→finish
                 # bar (source ts = finish_time_us). Skip when the anchor has
                 # no Scheduler finish — its pid=3 bar doesn't exist to bind to.
                 anchor_finish_us = anchor.get("finish_time_us")
                 if anchor_finish_us is None or anchor_finish_us <= 0:
                     continue
-                sched_src_tid = task_to_scheduler_tid.get((tid, anchor["core_id"]), core_to_tid[anchor["core_id"]])
-                sched_src_event_id = task_to_scheduler_event_id.get((tid, anchor["core_id"]))
+                sched_src_tid = task_to_scheduler_tid.get(
+                    (run_epoch, tid, anchor["core_id"]), core_to_tid[anchor["core_id"]]
+                )
+                sched_src_event_id = task_to_scheduler_event_id.get((run_epoch, tid, anchor["core_id"]))
                 events.append(
                     {
                         "cat": "flow",
@@ -2834,12 +3205,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 for succ in succs:
                     preds_for_consumer[succ].append(pred)
             fanin_total = {c: len(preds) for c, preds in preds_for_consumer.items()}
-            fanin_satisfied: dict[int, int] = defaultdict(int)
+            # Satisfied counts are per (run_epoch, consumer): deps.json is the
+            # run-independent graph, so without the epoch a second run's
+            # completions would keep incrementing the first run's consumers.
+            fanin_satisfied: dict[tuple, int] = defaultdict(int)
 
-            # Reverse map: complete_phase id → list of task_ids it completed.
-            complete_to_tasks: dict[int, list[int]] = defaultdict(list)
-            for tid, comp in task_to_complete.items():
-                complete_to_tasks[id(comp)].append(tid)
+            # Reverse map: complete_phase id → the executions it completed.
+            complete_to_tasks: dict[int, list[tuple]] = defaultdict(list)
+            for task_key, comp in task_to_complete.items():
+                complete_to_tasks[id(comp)].append(task_key)
 
             # Walk completes in temporal order (by end_time). Within each,
             # walk the tasks it completed; for each completed task, bump
@@ -2847,7 +3221,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # consumer's satisfied count to its total is the one that
             # released that consumer.
             all_completes = []
-            for thr_idx, phases in enumerate(complete_phases_by_thread):
+            for thr_idx, entry in enumerate(complete_index):
+                phases = entry["all"]
                 for p in phases:
                     all_completes.append((p["end_time_us"], thr_idx, p))
             # Explicit key restricts the comparison to (end_time_us, thr_idx).
@@ -2856,8 +3231,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             all_completes.sort(key=lambda x: (x[0], x[1]))
 
             # Earliest dispatch per task_id (for arrow target).
-            earliest_dispatch_us: dict[int, tuple[float, int]] = {}
-            for tid, recs in tasks_by_id.items():
+            earliest_dispatch_us: dict[tuple, tuple[float, int]] = {}
+            for task_key, recs in tasks_by_id.items():
                 valid = [
                     (r.get("dispatch_time_us"), r["core_id"])
                     for r in recs
@@ -2871,25 +3246,28 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 d_thr = core_to_thread[d_cid]
                 if d_thr < 0:
                     continue
-                earliest_dispatch_us[tid] = (d_us, d_thr)
+                earliest_dispatch_us[task_key] = (d_us, d_thr)
 
             for end_us, comp_thr, comp in all_completes:
-                completed_tids = complete_to_tasks.get(id(comp), ())
-                if not completed_tids:
+                completed_keys = complete_to_tasks.get(id(comp), ())
+                if not completed_keys:
                     continue
-                triggered: list[int] = []
-                for completed_tid in completed_tids:
+                triggered: list[tuple] = []
+                for completed_epoch, completed_tid in completed_keys:
+                    # Static graph looked up by bare id; the consumer it
+                    # releases is the one in the same run.
                     for consumer in deps_edges.get(completed_tid, ()):
-                        fanin_satisfied[consumer] += 1
-                        if fanin_satisfied[consumer] == fanin_total.get(consumer, 0):
-                            triggered.append(consumer)
+                        consumer_key = (completed_epoch, consumer)
+                        fanin_satisfied[consumer_key] += 1
+                        if fanin_satisfied[consumer_key] == fanin_total.get(consumer, 0):
+                            triggered.append(consumer_key)
                 if not triggered:
                     continue
                 src_tid = sched_lane_tid(comp_thr, 0)
-                for consumer in triggered:
-                    if consumer not in earliest_dispatch_us:
+                for consumer_key in triggered:
+                    if consumer_key not in earliest_dispatch_us:
                         continue
-                    d_us, d_thr = earliest_dispatch_us[consumer]
+                    d_us, d_thr = earliest_dispatch_us[consumer_key]
                     # Skip degenerate "dispatched before complete ended" —
                     # the consumer was popped/dispatched off a still-in-flight
                     # release path while the complete was still running;
@@ -2971,7 +3349,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if matched_thread is not None:
                 sched_tid = sched_lane_tid(matched_thread, 0)
                 core_tid = core_to_tid[task["core_id"]]
-                scheduler_view_tid = task_to_scheduler_tid.get((task["task_id"], task["core_id"]), core_tid)
+                scheduler_view_tid = task_to_scheduler_tid.get(_execution_key(task), core_tid)
 
                 # Flow: scheduler DISPATCH → Worker View task start
                 events.append(
@@ -3000,7 +3378,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 flow_id += 1
 
                 # Flow: scheduler DISPATCH → Scheduler View task start
-                scheduler_event_id = task_to_scheduler_event_id.get((task["task_id"], task["core_id"]))
+                scheduler_event_id = task_to_scheduler_event_id.get(_execution_key(task))
                 events.append(
                     {
                         "cat": "flow",
@@ -3028,9 +3406,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 flow_id += 1
 
     # Orchestrator → scheduler dispatch:
-    # Anchor each task's dispatch arrow on the end of its orch_submit record
-    # (covers the entire submit_task() span). Legacy captures with the older
-    # per-sub-step phases (orch_fanin / orch_params) are accepted as fallbacks.
+    # Anchor each task's dispatch arrow on the end of its orch_submit record,
+    # which covers the entire submit_task() span.
     cross_domain_aligned = not (
         orchestrator_source == "host"
         and timeline_metadata
@@ -3047,18 +3424,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 tid_k = normalize_task_id_int(task_id)
                 if tid_k is None:
                     continue
-                # First-seen orch_submit wins; legacy orch_fanin / orch_params
-                # only fill in when no orch_submit exists for that task. The
-                # explicit "not already submit→dispatch" guard preserves first-
-                # seen semantics even if a (defensive) duplicate orch_submit
-                # ever appears for the same task.
-                existing = orch_anchor_by_task.get(tid_k)
-                if phase == "orch_submit" and (existing is None or existing[2] != "submit→dispatch"):
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "submit→dispatch")
-                elif existing is None and phase == "orch_fanin":
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "fanin→dispatch")
-                elif existing is None and phase == "orch_params":
-                    orch_anchor_by_task[tid_k] = (record, orch_idx, "params→dispatch")
+                # First-seen orch_submit wins, so a (defensive) duplicate for
+                # the same task cannot move the anchor.
+                if phase == "orch_submit" and tid_k not in orch_anchor_by_task:
+                    orch_anchor_by_task[tid_k] = (record, orch_idx)
 
         if has_scheduler_task_data and orch_anchor_by_task:
             for task in tasks:
@@ -3080,7 +3449,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if anchor is None:
                     continue
 
-                anchor_rec, orch_idx, flow_name = anchor
+                anchor_rec, orch_idx = anchor
                 anchor_us = anchor_rec["end_time_us"]
 
                 orch_tid = 4000 + orch_idx
@@ -3089,7 +3458,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": flow_name,
+                        "name": "submit→dispatch",
                         "ph": "s",
                         "pid": 1,
                         "tid": orch_tid,
@@ -3100,7 +3469,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     {
                         "cat": "flow",
                         "id": flow_id,
-                        "name": flow_name,
+                        "name": "submit→dispatch",
                         "ph": "f",
                         "pid": 2,
                         "tid": sched_tid,
@@ -3121,9 +3490,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    trace = {"traceEvents": events}
-    if timeline_metadata:
-        trace["metadata"] = timeline_metadata
+    trace: dict[str, object] = {"traceEvents": events}
+    metadata = dict(timeline_metadata) if timeline_metadata else {}
+    # Downstream tools (critical_path) re-format task ids from this trace alone, so it
+    # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
+    # resolve_runtime above already refused a caller that named none.
+    metadata["runtime"] = resolve_runtime(runtime_name)
+    if metadata:
+        trace["metadata"] = metadata
     if output_path is not None:
         with open(output_path, "w") as f:
             json.dump(trace, f, indent=2)
@@ -3190,6 +3564,22 @@ Examples:
         help="Parent dispatch identity to merge for directory input, formatted as RUN_ID:TASK_SLOT",
     )
     parser.add_argument(
+        "--host-log",
+        action="append",
+        help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
+        "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log. "
+        "Directory input reads both at the root and rank*/d*/host_clock_alignment.*.log. "
+        "A single capture with no matching logs remains unaligned; valid saved alignment needs no logs.",
+    )
+    parser.add_argument(
+        "--rank-pid",
+        action="append",
+        metavar="RANK=PID[:INV]",
+        help="Pin one Rank's capture to the Host invocation that ran it (repeatable). Only needed when the "
+        "captures carry no dispatch_identity.json and Ranks running the same shape cannot be told apart by "
+        "their device windows. Give :INV when the process ran more than once.",
+    )
+    parser.add_argument(
         "--overhead",
         action="store_true",
         help="Add an 'Overhead Analysis' track (8 counter lines: per-engine "
@@ -3248,7 +3638,7 @@ def _print_verbose_data_info(data, verbose):
         max_time = max(end_times)
         print(f"  Time Range: {min_time:.3f} us - {max_time:.3f} us (span: {max_time - min_time:.3f} us)")
     print()
-    scheduler_phases = data.get("aicpu_scheduler_phases")
+    scheduler_phases = data.get("scheduler_records")
     orchestrator_phases = data.get("aicpu_orchestrator_phases")
     core_to_thread = data.get("core_to_thread")
     if scheduler_phases:
@@ -3258,10 +3648,7 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Orchestrator threads: {len(orchestrator_phases)}")
         print(f"  Total orchestrator phase records: {sum(len(t) for t in orchestrator_phases)}")
         # submit_count is derivable as the number of orch_submit records (one per submit).
-        # Legacy captures fall back to orch_fanin (was last phase of submit pre-fold).
         submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_submit")
-        if submit_count == 0:
-            submit_count = sum(1 for thread in orchestrator_phases for r in thread if r.get("phase") == "orch_fanin")
         if submit_count:
             print(f"  Orchestrator: {submit_count} tasks submitted")
     if core_to_thread:
@@ -3325,6 +3712,21 @@ _RANK_DIR_PATTERN = re.compile(r"rank([0-9]+)")
 _DISPATCH_DIR_PATTERN = re.compile(r"d[0-9]+")
 _DISPATCH_ID_PATTERN = re.compile(r"([0-9]+):([0-9]+)")
 _RANK_PID_STRIDE = 100
+# Perfetto orders process groups by pid, so the pid *is* the layout: the two
+# clock domains read as two blocks only if every Host-domain pid sorts below
+# every Chip one. The Host block takes the first stride, and the Chip views
+# start at the stride above it.
+#
+# Inside the Host block the dispatching processes come first, one pid each —
+# the L3 scheduler that sent the work, and whatever level sent to it — because
+# they are what the Ranks below them are a consequence of.
+_DISPATCHER_PID_BASE = 1
+_DISPATCHER_PID_LIMIT = 10
+# Then one run of pids per Rank, which keeps its three lanes adjacent.
+_HOST_BLOCK_PID_BASE = _DISPATCHER_PID_BASE + _DISPATCHER_PID_LIMIT
+# Lanes one Rank contributes to the Host block: its own call tree, the device
+# phases the Host log carries, and the window they are placed in.
+_HOST_LANES_PER_RANK = 3
 
 
 def _l3_rank_dirs(root):
@@ -3381,6 +3783,11 @@ def _load_dispatch_identity(capture_dir):
         raise ValueError(f"dispatch identity has invalid endpoint diagnostics: {path}")
     if identity["group_size"] <= 0 or not 0 <= identity["group_index"] < identity["group_size"]:
         raise ValueError(f"dispatch identity has invalid group membership: {path}")
+    # Optional: a sidecar written before the field existed carries no host pid,
+    # and its capture is then paired by how well the device windows fit.
+    host_pid = identity.get("host_pid")
+    if host_pid is not None and (isinstance(host_pid, bool) or not isinstance(host_pid, int) or host_pid <= 0):
+        raise ValueError(f"dispatch identity host_pid must be a positive integer: {path}")
     if not re.fullmatch(r"[0-9a-f]{64}", identity.get("callable_digest", "")):
         raise ValueError(f"dispatch identity has an invalid callable digest: {path}")
 
@@ -3584,23 +3991,358 @@ def discover_l3_conversion_targets(root):
     return targets
 
 
-def _validate_l3_rank_data(rank, records_path, data):
-    if data.get("chip_swimlane_level") != 4:
-        raise ValueError(f"rank{rank} must use chip_swimlane_level 4: {records_path}")
-    timeline = data.get("timeline_metadata") or {}
-    alignment = timeline.get("clock_alignment") or {}
-    if alignment.get("status") != "calibrated":
-        reason = alignment.get("reason", "unknown")
-        raise ValueError(f"rank{rank} clock calibration failed ({reason}): {records_path}")
-    clock_domain = timeline.get("host_clock_domain_id")
+def _rank_clock_domain(rank, records_path, raw):
+    """The Host clock the Rank's own process timestamps on.
+
+    Containment places a Rank inside a window read from that Host's
+    CLOCK_MONOTONIC, so two Ranks are comparable exactly when they name the same
+    clock. A capture from before the field existed is accepted with a warning:
+    the merge it is asked for is same-host by construction, and refusing an old
+    capture buys no correctness a reader could act on.
+    """
+    clock_domain = (raw.get("metadata") or {}).get("host_clock_domain_id")
     if not clock_domain:
-        raise ValueError(
-            f"rank{rank} is missing metadata.host_clock_domain_id; old captures remain usable only in single-file mode"
+        print(
+            f"Warning: rank{rank} predates metadata.host_clock_domain_id ({records_path}); "
+            "the merge assumes every Rank ran against one Host clock",
+            file=sys.stderr,
         )
-    origin_ns = int(timeline.get("source_timeline_origin_ns") or 0)
-    if origin_ns <= 0:
-        raise ValueError(f"rank{rank} has no valid Host timeline origin: {records_path}")
-    return str(clock_domain), origin_ns
+        return None
+    return str(clock_domain)
+
+
+def _discover_host_logs(root, explicit):
+    """The `[STRACE]` logs that hold the outer windows for these captures.
+
+    Persistent ``host.<pid>.log`` files live at the case/level output root;
+    ``host_clock_alignment.<pid>.log`` holds capture-local timing spans.
+    See ``docs/dfx/host-trace.md``.
+    """
+    if explicit:
+        paths = [Path(item) for item in explicit]
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise ValueError(f"--host-log names a file that does not exist: {', '.join(missing)}")
+        return paths
+    paths = sorted(
+        {
+            *Path(root).glob("host_clock_alignment.*.log"),
+            *Path(root).glob("host.*.log"),
+            *Path(root).glob("rank*/d*/host_clock_alignment.*.log"),
+        }
+    )
+    if not paths:
+        raise ValueError(
+            f"no host_clock_alignment.*.log or host.*.log under {root}: cross-Rank placement reads "
+            "each Rank's device work out of the "
+            f"{containment.RUNNER_SPAN} window that contains it. Pass --host-log, or re-run with a Host log "
+            f"threshold of TIMING or finer."
+        )
+    return paths
+
+
+def _parse_rank_pid_pins(values):
+    """Read ``--rank-pid RANK=PID`` / ``RANK=PID:INV`` into what containment takes.
+
+    The invocation form exists because a process runs many invocations and the
+    bare pid only identifies one of them when the run had exactly one.
+    """
+    pins = {}
+    for item in values or []:
+        rank, separator, target = item.partition("=")
+        pid, _, inv = target.partition(":")
+        if not separator or not rank.strip().isdigit() or not pid.strip().isdigit():
+            raise ValueError(f"--rank-pid must be RANK=PID or RANK=PID:INV (for example, 0=4242), not {item!r}")
+        if inv and not inv.strip().isdigit():
+            raise ValueError(f"--rank-pid invocation must be a number, as RANK=PID:INV, not {item!r}")
+        pins[int(rank)] = (int(pid), int(inv)) if inv else int(pid)
+    return pins
+
+
+def _place_rank_captures(host_log_paths, raw_inputs, identities, host_pids, pins):
+    """Bound where each Rank's device records sit on the Host timeline.
+
+    Returns the spans as well: the same Host log that supplies the outer window
+    also holds that process's own call tree, which the merged trace draws beside
+    the Rank it belongs to.
+    """
+    spans = []
+    for path in host_log_paths:
+        with path.open(errors="replace") as log:
+            spans.extend(parse_spans(log))
+    windows = containment.host_windows(spans)
+    if not windows:
+        raise ValueError(
+            f"the Host logs hold no {containment.RUNNER_SPAN} / {containment.DEVICE_WALL_SPAN} pair; "
+            "nothing brackets the device work"
+        )
+    captures = {rank: containment.capture_windows(raw) for rank, raw in raw_inputs.items()}
+    pins = dict(pins)
+    for rank, raw in raw_inputs.items():
+        if rank in pins or host_pids.get(rank) is None or not _is_host_orchestrated_capture(raw):
+            continue
+        # Host orchestration records fall within their own chip.run invocation.
+        # They disambiguate synchronous launches, whose dispatch IDs are zero.
+        try:
+            matches = _matching_capture_host_windows(raw, spans, {"host_pid": host_pids[rank]})
+        except ValueError:
+            # Logs without a chip.run root cannot use the Host-record bounds.
+            continue
+        identity = identities.get(rank)
+        matches = [window for window in matches if identity is None or window.identity in (None, identity)]
+        if len(matches) == 1:
+            pins[rank] = (matches[0].pid, matches[0].inv)
+    pairs, pairing = containment.pair_captures(
+        windows, captures, forced=pins, identities=identities, host_pids=host_pids
+    )
+    placements = {rank: containment.place(pairs[rank], captures[rank]) for rank in captures}
+    return placements, pairing, spans
+
+
+def _host_block_lane(rank, lane_index, label):
+    """Metadata for one lane of a Rank's Host block.
+
+    Perfetto orders process groups by pid, so the Host block has to keep every
+    one of its pids below the first Chip view. Each Rank owns a fixed run of
+    them, which keeps its three lanes adjacent.
+    """
+    pid = _HOST_BLOCK_PID_BASE + rank * _HOST_LANES_PER_RANK + lane_index
+    # rank0's Chip views start at one stride, so the whole Host block has to fit
+    # below it: past that the two blocks interleave and lanes silently merge.
+    if pid >= _RANK_PID_STRIDE:
+        raise ValueError(
+            f"rank{rank} needs Host-block pid {pid}, which does not fit below the per-Rank stride "
+            f"{_RANK_PID_STRIDE}; the merge supports at most "
+            f"{(_RANK_PID_STRIDE - _HOST_BLOCK_PID_BASE) // _HOST_LANES_PER_RANK} Ranks"
+        )
+    return pid, [
+        {"args": {"name": f"rank{rank} / {label}"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": pid},
+        {"args": {"sort_index": pid}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": pid},
+    ]
+
+
+def _dispatcher_spans(spans, chip_pids, window_ns):
+    """The dispatching processes' spans that belong to the merged dispatch.
+
+    Their logs cover the whole run while the merge covers one dispatch, so the
+    Ranks' own span on the Host axis selects what to keep — in two passes,
+    because the level above the chip emits spans of two different scopes.
+
+    A span with an invocation is kept or dropped with its whole invocation:
+    `node.submit` runs to completion before the Rank it dispatched to starts,
+    so an overlap test applied span by span would draw the dispatch and drop
+    what led to it.
+
+    ``inv=0`` says the span belongs to a thread rather than to one run —
+    `node.scheduler_loop` is emitted that way (`Scheduler::…`, run id 0), so
+    its "invocation" is every loop the process ever ran and cannot be the unit.
+    Those are taken span by span, against the story the first pass selected: a
+    loop is drawn when it overlaps what the dispatch did, which is wider than
+    the Ranks' own windows at both ends.
+    """
+    window_lo, window_hi = window_ns
+    # By family, not only by pid: a chip child that no placement paired with is
+    # still a chip child, and labelling it a dispatcher would be a lie.
+    host_spans = [
+        span for span in spans if span.pid not in chip_pids and not span.is_device and span_family(span.name) != "chip"
+    ]
+
+    def overlaps(span, lo, hi):
+        return span.ts < hi and span.ts + span.dur > lo
+
+    concurrent = {(span.pid, span.inv) for span in host_spans if span.inv and overlaps(span, window_lo, window_hi)}
+    selected = [span for span in host_spans if span.inv and (span.pid, span.inv) in concurrent]
+
+    story_lo = min([window_lo] + [span.ts for span in selected])
+    story_hi = max([window_hi] + [span.ts + span.dur for span in selected])
+    selected += [span for span in host_spans if not span.inv and overlaps(span, story_lo, story_hi)]
+    return selected
+
+
+def _dispatcher_block_events(spans, global_origin_ns):
+    """The processes that dispatched to these Ranks, drawn above them.
+
+    Each process writes its `host.<pid>.log` at the root of the level
+    namespace it owns, so a direct L3 run supplies the scheduler's own `node.*`
+    spans — and an L4's `network1.*` above them — from the persistent logs.
+    Under a parent-assigned `nodeN` namespace the levels above it write one
+    directory up, outside the root this merge reads, so only that namespace's
+    own levels reach here. They are Host CLOCK_MONOTONIC and same-host
+    cross-process comparable, so they go straight onto the axis: no
+    containment, no slack. Containment is only ever needed for the device
+    clock, which is why nothing in this block carries a bound.
+    """
+    processes = host_process_lanes(spans)
+    if len(processes) > _DISPATCHER_PID_LIMIT:
+        raise ValueError(
+            f"{len(processes)} dispatching processes is more than the {_DISPATCHER_PID_LIMIT} the Host block "
+            "reserves pids for"
+        )
+
+    events = []
+    for index, (pid, process) in enumerate(sorted(processes.items())):
+        block_pid = _DISPATCHER_PID_BASE + index
+        events += [
+            {
+                "args": {"name": process["label"]},
+                "cat": "__metadata",
+                "name": "process_name",
+                "ph": "M",
+                "pid": block_pid,
+            },
+            {
+                "args": {"sort_index": block_pid},
+                "cat": "__metadata",
+                "name": "process_sort_index",
+                "ph": "M",
+                "pid": block_pid,
+            },
+        ]
+        events += [
+            {
+                "args": {"name": name},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": block_pid,
+                "tid": tid,
+            }
+            for tid, name in process["lanes"].items()
+        ]
+        for span, attrs, tid in process["spans"]:
+            events.append(
+                {
+                    "name": span.name,
+                    "cat": "host",
+                    "ph": "X",
+                    "pid": block_pid,
+                    "tid": tid,
+                    "ts": (span.ts - global_origin_ns) / 1000.0,
+                    "dur": span.dur / 1000.0,
+                    "args": {"inv": span.inv, "os_pid": span.pid, "os_tid": span.tid, "depth": span.depth, **attrs},
+                }
+            )
+    return events
+
+
+def _host_call_tree_events(rank, placement, spans, global_origin_ns):
+    """The Rank's own Host call tree — `chip.run` and everything under it.
+
+    Drawn on the Host axis directly, since that is the clock it was recorded
+    on: this lane carries no placement error at all, unlike the two below it.
+    They nest by timestamp on one track because they are one thread's call
+    tree, which is what `depth` already says.
+    """
+    pid, events = _host_block_lane(rank, 0, "Host")
+    events.append(
+        {
+            "args": {"name": f"pid {placement.host.pid}"},
+            "cat": "__metadata",
+            "name": "thread_name",
+            "ph": "M",
+            "pid": pid,
+            "tid": 0,
+        }
+    )
+    for span in sorted(spans, key=lambda item: (item.ts, -item.dur)):
+        events.append(
+            {
+                "name": span.name,
+                "cat": "host",
+                "ph": "X",
+                "pid": pid,
+                "tid": 0,
+                "ts": (span.ts - global_origin_ns) / 1000.0,
+                "dur": span.dur / 1000.0,
+                "args": {"rank": rank, "inv": span.inv, "os_pid": span.pid, "depth": span.depth},
+            }
+        )
+    return events
+
+
+def _host_device_phase_events(rank, placement, spans, global_origin_ns):
+    """The `clk=dev` spans the Host log carries, placed by containment.
+
+    These cover the head of the run that the capture does not record at all —
+    preamble, SO load and graph build produce no swimlane record — so they are
+    drawn beside the capture rather than instead of it. One lane per phase
+    name: the phases are reduced across AICPU threads, so two of them can
+    overlap without either containing the other, which one track cannot show.
+    """
+    pid, events = _host_block_lane(rank, 1, "Device phases (placed)")
+    slack_ns = int(round(placement.slack_ns))
+    lane_of = {}
+    for span in sorted(spans, key=lambda item: (item.ts, -item.dur)):
+        if span.name not in lane_of:
+            lane_of[span.name] = len(lane_of)
+            events.append(
+                {
+                    "args": {"name": span.name.rpartition(".")[2]},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": pid,
+                    "tid": lane_of[span.name],
+                }
+            )
+        events.append(
+            {
+                "name": span.name,
+                "cat": "host.device",
+                "ph": "X",
+                "pid": pid,
+                "tid": lane_of[span.name],
+                "ts": (placement.phase_ns_to_host_ns(span.ts) - global_origin_ns) / 1000.0,
+                "dur": span.dur / 1000.0,
+                "args": {"rank": rank, "device_ts_ns": span.ts, "slack_ns": slack_ns},
+            }
+        )
+    return events
+
+
+def _placement_bound_events(rank, placement, global_origin_ns):
+    """Draw each Rank's error bound as slices, not only as metadata.
+
+    The lane says two things a reader needs before comparing Ranks: the outer
+    window the device work provably sits in, and the interval its start can
+    fall in for the selected phase join. The lane shows placement slack;
+    phase-join freedom is reported separately in the join metadata.
+    """
+    pid, events = _host_block_lane(rank, 2, "Placement Bound")
+    outer_start_us = (placement.host.start_ns - global_origin_ns) / 1000.0
+    args = placement.metadata()
+    events += [
+        {"args": {"name": "outer window"}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": pid, "tid": 0},
+        {
+            "args": {"name": "placement slack"},
+            "cat": "__metadata",
+            "name": "thread_name",
+            "ph": "M",
+            "pid": pid,
+            "tid": 1,
+        },
+        {
+            "name": f"{containment.RUNNER_SPAN} (rank{rank})",
+            "cat": "containment",
+            "ph": "X",
+            "pid": pid,
+            "tid": 0,
+            "ts": outer_start_us,
+            "dur": placement.host.duration_ns / 1000.0,
+            "args": args,
+        },
+        {
+            "name": f"slack {placement.slack_ns / 1000.0:.1f} us",
+            "cat": "containment",
+            "ph": "X",
+            "pid": pid,
+            "tid": 1,
+            "ts": outer_start_us,
+            "dur": placement.slack_ns / 1000.0,
+            "args": args,
+        },
+    ]
+    return events
 
 
 def _load_rank_local_artifacts(records_path):
@@ -3622,8 +4364,10 @@ def _load_rank_local_artifacts(records_path):
     }
 
 
-def _namespace_rank_trace(trace, rank):
-    pid_base = rank * _RANK_PID_STRIDE
+def _namespace_rank_trace(trace, rank, slack_ns):
+    # One stride above the Host block, so `rank0 / Worker View` still sorts
+    # below every Rank's placement window.
+    pid_base = (rank + 1) * _RANK_PID_STRIDE
     for event in trace.get("traceEvents", []):
         if "pid" in event:
             # Every single-Rank view pid must fit inside one stride, or two Ranks
@@ -3637,6 +4381,7 @@ def _namespace_rank_trace(trace, rank):
             if name:
                 event["args"]["name"] = f"rank{rank} / {name}"
         elif event.get("ph") == "M" and event.get("name") == "process_sort_index":
+            # Mirrors the pid, which is what actually orders the groups.
             sort_index = int(event.get("args", {}).get("sort_index", 0))
             event["args"]["sort_index"] = pid_base + sort_index
         for id_field in ("id", "bind_id"):
@@ -3646,7 +4391,13 @@ def _namespace_rank_trace(trace, rank):
         # identity is already encoded in the PID, so adding it to ``ph: C``
         # would create a bogus constant counter alongside the real values.
         if event.get("ph") not in ("M", "C"):
-            event.setdefault("args", {})["rank"] = rank
+            args = event.setdefault("args", {})
+            args["rank"] = rank
+            # The bound belongs on the slice a reader clicks, not only in the
+            # document's metadata: it is what separates a real displacement
+            # between two Ranks from the width of their placement. The full
+            # record stays in `metadata.ranks[]`, which this keys into by rank.
+            args["slack_ns"] = slack_ns
     return trace
 
 
@@ -3656,24 +4407,81 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
 
     rank_inputs, pairing_metadata = _discover_l3_rank_inputs(root, args.dispatch, args.dispatch_id)
     raw_inputs = {}
+    rank_identities = {}
+    rank_host_pids = {}
     clock_domains = set()
-    origins = []
     for rank, records_path in rank_inputs:
         with records_path.open() as f:
             raw_inputs[rank] = json.load(f)
-        data = _decode_perf_data(raw_inputs[rank])
-        clock_domain, origin_ns = _validate_l3_rank_data(rank, records_path, data)
-        clock_domains.add(clock_domain)
-        origins.append(origin_ns)
-    if len(clock_domains) != 1:
-        raise ValueError(f"Rank inputs use different Host clock domains: {sorted(clock_domains)}")
+        # The sidecar names both halves of the pairing: `host_pid` is the
+        # ChipWorker child that served this capture, and the dispatch key is
+        # which of that child's invocations it was. The Host log's root
+        # `chip.run` span names the second, and its filename the first, so the
+        # two artifacts pair exactly instead of by how well their device
+        # windows happen to fit.
+        sidecar = _load_dispatch_identity(records_path.parent)
+        identity = containment.capture_identity(sidecar)
+        if identity is not None:
+            rank_identities[rank] = identity
+        host_pid = (sidecar or {}).get("host_pid")
+        if host_pid is not None:
+            rank_host_pids[rank] = int(host_pid)
+        clock_domain = _rank_clock_domain(rank, records_path, raw_inputs[rank])
+        if clock_domain is not None:
+            clock_domains.add(clock_domain)
+    if len(clock_domains) > 1:
+        raise ValueError(
+            f"Rank inputs come from different Host clocks ({sorted(clock_domains)}), so their windows are not "
+            "comparable. Placing them on one axis needs the window of the level that dispatched to both — the "
+            "cross-host splice is not implemented."
+        )
 
-    global_origin_ns = min(origins)
-    all_events = []
+    host_logs = _discover_host_logs(root, args.host_log)
+    placements, host_pairing, host_spans = _place_rank_captures(
+        host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
+    )
+    # The Host log holds several processes; each Rank draws only the spans of
+    # the invocation its capture was paired with.
+    spans_by_invocation = defaultdict(list)
+    for span in host_spans:
+        spans_by_invocation[(span.pid, span.inv)].append(span)
+
+    # What the Ranks occupy on the Host axis. It bounds the origin below and
+    # selects which of the dispatching processes' spans belong to this merge.
+    rank_spans = [
+        span
+        for placement in placements.values()
+        for span in spans_by_invocation[(placement.host.pid, placement.host.inv)]
+        if not span.is_device
+    ]
+    # The axis starts at the earliest thing drawn on it. That is not always a
+    # placement: a Rank's `chip.run` opens before the `runner_run` window
+    # inside it, and the scheduler's `node.dispatch` opens before that again,
+    # so an origin taken from the windows alone would put both at a negative
+    # timestamp.
+    window_lo = min([int(placement.place_lo_ns) for placement in placements.values()] + [s.ts for s in rank_spans])
+    window_hi = max(
+        [int(placement.host.end_ns) for placement in placements.values()] + [s.ts + s.dur for s in rank_spans]
+    )
+    chip_pids = {placement.host.pid for placement in placements.values()}
+    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi))
+    global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
+    all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
     rank_metadata = []
-    pre_group_durations = []
+    # Every Rank of one L3 run is the same runtime, so the merged trace names it for
+    # downstream tools. A set rather than a scalar so a mixed input is refused below
+    # instead of silently taking whichever Rank came last.
+    rank_runtimes = set()
     for rank, records_path in rank_inputs:
-        data = _decode_perf_data(raw_inputs[rank], timeline_origin_ns=global_origin_ns)
+        placement = placements[rank]
+        raw = raw_inputs[rank]
+        if _is_host_orchestrated_capture(raw):
+            record = _clock_alignment_record(placement)
+            try:
+                _write_clock_alignment_record(records_path, raw, record)
+            except (OSError, ValueError) as error:
+                print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
+        data = _decode_perf_data(raw, timeline_origin_ns=global_origin_ns, placement=placement)
         artifacts = _load_rank_local_artifacts(records_path)
         dispatch_identity = artifacts["dispatch_identity"]
         trace = generate_chrome_trace_json(
@@ -3682,10 +4490,11 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             artifacts["func_names"],
             args.verbose,
             orchestrator_name=artifacts["orchestrator_name"],
-            scheduler_phases=data.get("aicpu_scheduler_phases"),
+            scheduler_phases=data.get("scheduler_records"),
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
+            runtime_name=data.get("runtime"),
             timeline_metadata=data.get("timeline_metadata"),
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
@@ -3695,51 +4504,65 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             deps_block_map=artifacts["deps_block_map"],
             emit_overhead=args.overhead,
         )
-        _namespace_rank_trace(trace, rank)
+        _namespace_rank_trace(trace, rank, int(round(placement.slack_ns)))
         all_events.extend(trace["traceEvents"])
+        invocation = spans_by_invocation[(placement.host.pid, placement.host.inv)]
+        all_events.extend(
+            _host_call_tree_events(
+                rank, placement, [span for span in invocation if not span.is_device], global_origin_ns
+            )
+        )
+        all_events.extend(
+            _host_device_phase_events(
+                rank, placement, [span for span in invocation if span.is_device], global_origin_ns
+            )
+        )
+        all_events.extend(_placement_bound_events(rank, placement, global_origin_ns))
 
         timeline = data["timeline_metadata"]
-        alignment = timeline["clock_alignment"]
-        durations = alignment.get("anchor_group_duration_ns") or {}
-        pre_duration = durations.get("pre_host_orchestration")
-        if pre_duration is not None:
-            pre_group_durations.append(int(pre_duration))
+        rank_runtimes.add(data.get("runtime"))
         rank_metadata.append(
             {
                 "rank": rank,
                 "input": str(records_path),
                 "trace_status": timeline["trace_status"],
                 "source_timeline_origin_ns": timeline["source_timeline_origin_ns"],
-                "clock_alignment": alignment,
+                "placement": placement.metadata(),
+                "host_pairing": host_pairing[rank],
                 "host_capture": timeline.get("host_capture"),
                 "dispatch_identity": dispatch_identity,
             }
         )
 
-    # Worst case for an interval read between two Ranks: each end carries its
-    # own Rank's alignment error, so the two largest bound any pair. null means
-    # the bound is unknown — fewer than two Ranks reported one — never that the
-    # comparison is exact.
-    uncertainties = sorted(
-        int(rank["clock_alignment"]["max_uncertainty_ns"])
-        for rank in rank_metadata
-        if rank["clock_alignment"].get("max_uncertainty_ns") is not None
-    )
+    # One merged trace carries one TaskId layout, so Ranks naming different runtimes
+    # have no single answer. Refused rather than left unnamed: an unnamed trace would
+    # push the same guess onto every downstream label instead of stopping here.
+    if len(rank_runtimes) > 1:
+        raise ValueError(
+            "Ranks of this run name different runtimes "
+            f"({', '.join(sorted(str(name) for name in rank_runtimes))}); one merged trace "
+            "carries one TaskId layout, so these captures cannot be spliced together."
+        )
+
     metadata = {
-        "layout": "same_host_multi_rank",
+        "layout": "containment_spliced_multi_rank",
+        "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
         "dispatch": args.dispatch,
         "dispatch_id": args.dispatch_id,
-        "host_clock_domain_id": next(iter(clock_domains)),
+        "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
+        "host_logs": [str(path) for path in host_logs],
         "global_origin_ns": global_origin_ns,
+        # The processes that dispatched to these Ranks, drawn on the Host clock
+        # directly — no containment, so no slack applies to their lanes.
+        "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
         "rank_count": len(rank_metadata),
         **pairing_metadata,
         "trace_status": "partial" if any(rank["trace_status"] != "complete" for rank in rank_metadata) else "complete",
         "ranks": rank_metadata,
-        "cross_rank_uncertainty_ns": sum(uncertainties[-2:]) if len(uncertainties) >= 2 else None,
-        "pre_anchor_group_duration_spread_ns": (
-            max(pre_group_durations) - min(pre_group_durations) if len(pre_group_durations) >= 2 else 0
-        ),
-        "pre_anchor_group_duration_max_ns": max(pre_group_durations) if pre_group_durations else None,
+        # Worst case for an interval read between two Ranks: each end carries
+        # its own Rank's slack, so the two largest bound any pair. null means
+        # fewer than two Ranks were placed, never that the comparison is exact.
+        "cross_rank_uncertainty_ns": containment.cross_uncertainty_ns(placements.values()),
     }
     output_path = _resolve_output_path(args, Path(root))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3761,6 +4584,22 @@ def main():
             print("\n✓ Multi-Rank conversion complete")
             print(f"  Input:  {input_path}")
             print(f"  Ranks:  {', '.join('rank' + str(item['rank']) for item in rank_metadata)}")
+            # The bound belongs next to the output, not only inside it: a
+            # reader who compares two Ranks needs to know it before they look.
+            slacks = [item["placement"]["slack_ns"] for item in rank_metadata]
+            width = (
+                f"{min(slacks) / 1000.0:.1f}"
+                if min(slacks) == max(slacks)
+                else (f"{min(slacks) / 1000.0:.1f}–{max(slacks) / 1000.0:.1f}")
+            )
+            bound = f"  Bound:  each Rank placed within {width} us of its {containment.RUNNER_SPAN} window"
+            # Same rule the document publishes as `cross_rank_uncertainty_ns`,
+            # so a one-Rank merge cannot print a threshold the document calls
+            # unknown — one capture's own slack bounds nothing across Ranks.
+            cross_ns = containment.sum_two_widest_slacks(slacks)
+            if cross_ns is not None:
+                bound += f"; a cross-Rank gap under {cross_ns / 1000.0:.1f} us is undecided"
+            print(bound)
             print(f"  Output: {output_path}")
             print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
             return 0
@@ -3768,7 +4607,8 @@ def main():
             raise ValueError("--dispatch and --dispatch-id are only valid when input is a dfx_outputs directory")
         if args.verbose:
             print(f"Reading performance data from: {input_path}")
-        data = read_perf_data(input_path)
+        raw, placement = _prepare_capture_clock_alignment(input_path, args.host_log)
+        data = _decode_perf_data(raw, placement=placement)
         _print_verbose_data_info(data, args.verbose)
 
         func_names, orchestrator_name = _load_func_names(args, input_path)
@@ -3801,10 +4641,11 @@ def main():
             func_names,
             args.verbose,
             orchestrator_name=orchestrator_name,
-            scheduler_phases=data.get("aicpu_scheduler_phases"),
+            scheduler_phases=data.get("scheduler_records"),
             scheduler_streams=data.get("scheduler_streams"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
+            runtime_name=data.get("runtime"),
             timeline_metadata=data.get("timeline_metadata"),
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),

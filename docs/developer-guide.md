@@ -214,6 +214,11 @@ A `pto_isa.pin` bump changes the SDMA headers embedded by
 `host_runtime.so`. Install-time runtime builds and run-time kernel compilation
 both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
+The a5 RDMA workspace is an explicit opt-in overlay enabled with
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`. It requires a `pto_isa.pin` revision
+that provides the PTO-ISA RDMA/HNS1825 headers and is mutually exclusive with
+the SDMA and URMA workspace overlays.
+
 ### Runtime binary lookup
 
 Scene tests load pre-built runtime binaries from `build/lib/`. These are produced
@@ -251,12 +256,19 @@ kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
-child `CoreCallable`) and uploaded as a single blob via
+child `CoreCallable`) and registered once via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
-child's `resolved_addr_`, H2Ds once, and returns the device address of the
-ChipCallable header. The caller then derives each child's device address
-from that header plus the child's recorded offset and writes it into
-`Runtime::func_id_to_addr_[]` for AICPU dispatch.
+child's `resolved_addr_` and returns the address of the ChipCallable header.
+The same call derives each child's address from that header plus the child's
+recorded offset and builds the callable's func_id-indexed function tables, so
+every run that binds the callable references them instead of rebuilding them.
+
+Where those tables live is backend-specific. **Onboard** places them in the
+`CALLABLE_ALIGN`-aligned tail of the same device allocation and delivers them in
+the same single H2D as the code, so registration still makes one allocation and
+one copy. **Sim** issues no H2D at all — its "upload" is a host scratch — and
+keeps the object and entry tables in separate host vectors that the pooled
+registration owns; a run references those vectors' own addresses.
 
 ## Features
 

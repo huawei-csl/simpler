@@ -204,7 +204,7 @@ void SchedulerContext::complete_slot_task(
 
 #if SIMPLER_DFX
     // Level gate: at TASK_TIMING (level=1) the AICore record alone carries
-    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // {start, end, task_token}, host resolves func_id/core_type from
     // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
     // SCHEDULE_TIMING (level=2) and above does AICPU contribute dispatch/finish
     // timestamps via complete_task. Bypassing here saves the per-completion
@@ -220,7 +220,7 @@ void SchedulerContext::complete_slot_task(
             ) != 0) {
             LOG_ERROR(
                 "Core %d: chip_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
-                static_cast<uint64_t>(slot_state.to_descriptor().task_id.raw)
+                TaskId::to_uint64(slot_state.to_descriptor().task_id)
             );
         }
 #if SIMPLER_SCHED_PROFILING
@@ -230,7 +230,7 @@ void SchedulerContext::complete_slot_task(
 
     if (is_pmu_enabled()) {
         pmu_aicpu_record_task(
-            core_id, thread_idx, slot_state.to_descriptor().task_id.raw,
+            core_id, thread_idx, slot_state.to_descriptor().task_id,
             slot_state.to_descriptor().kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
         );
     }
@@ -545,7 +545,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 // DrainPrepare bar: cluster scan happened before this lambda, so this covers the
                 // build_payload work for `claim` blocks (handle_count subtasks).
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
+                    thread_idx, SchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }
@@ -579,7 +579,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
             if (sub_prof) {
                 // DrainPublish bar: the MMIO write_reg per subtask (+ gated doorbell/mask record).
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, ChipSwimlaneSchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
+                    thread_idx, SchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
                     sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
                 );
             }

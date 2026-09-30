@@ -44,6 +44,7 @@
 #include "../task_interface/buffer.h"
 #include "../task_interface/call_config.h"
 #include "../worker/device_memory_info.h"
+#include "../worker/runtime_c_api.h"
 #include "remote_wire.h"
 #include "types.h"
 
@@ -95,11 +96,11 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 // static_assert after MAILBOX_ARGS_CAPACITY). At the 256-tensor cap, wire tensors
 // occupy 36 KiB of the 64 KiB frame and leave room for scalars and protocol metadata.
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
-static constexpr size_t MAILBOX_TASK_FRAME_COUNT = 2;
+static constexpr size_t MAILBOX_TASK_FRAME_COUNT = PTO_PIPELINE_MAX_DEPTH;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
 static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 4;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 6;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -163,6 +164,18 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_SIZE = MAILBOX_OFF_ACCEPTED -
 // matter what state word a concurrent control command leaves behind.
 static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ACCEPTED - 72;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
+// The chip child's teardown observation, published once on the control frame
+// after its device teardown returns. Reserved on every frame for the same
+// reason the shutdown word is: a task-args blob must not be able to reach it.
+//
+// It is a record rather than a state word because its fields are only
+// meaningful together, and `schema` at offset 0 is what makes that safe: the
+// producer fills the payload first and releases `schema` last, so a reader
+// that acquire-loads TEARDOWN_REPORT_SCHEMA has the whole record and a reader
+// that finds anything else has none of it.
+static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT =
+    MAILBOX_OFF_SHUTDOWN - static_cast<ptrdiff_t>(SIMPLER_TEARDOWN_REPORT_BYTES) - 8;
+static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT_SCHEMA = MAILBOX_OFF_TEARDOWN_REPORT;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
     MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
@@ -170,13 +183,19 @@ static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
     MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
 static_assert(
-    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_SHUTDOWN,
-    "mailbox task-args region must precede the shutdown word and the frame protocol trailer"
+    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_TEARDOWN_REPORT,
+    "mailbox task-args region must precede the teardown record, the shutdown word and the frame "
+    "protocol trailer"
 );
-// The shutdown word is reserved on every frame, not just the control frame, so
-// the args region a task frame accepts can never reach it.
+static_assert(
+    MAILBOX_OFF_TEARDOWN_REPORT % 8 == 0,
+    "the teardown record starts 8-aligned so its schema word is atomically storable"
+);
+// The teardown record and the shutdown word are reserved on every frame, not
+// just the control frame, so the args region a task frame accepts can never
+// reach either.
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
-    static_cast<size_t>(MAILBOX_OFF_SHUTDOWN) - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
+    static_cast<size_t>(MAILBOX_OFF_TEARDOWN_REPORT) - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
 // The blob's element is the wire `Tensor` (144 B), not the device `ChipTensor` (128 B), so a frozen
 // descriptor size and a frame size that cannot hold CHIP_MAX_TENSOR_ARGS of them fail the build
 // rather than the first 256-tensor task.
@@ -227,6 +246,10 @@ static constexpr uint64_t CTRL_COMMITTED_DEVICE_MEMORY = 18;
 // L4-to-local-L3 envelope. Query a chip child's device-wide ACL_HBM_MEM
 // snapshot; the child writes one DeviceMemoryInfo at CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
+// 26 is reserved by the Python delegated-region control (below). Publish every
+// diagnostic run this chip child has closed, and report what it published. The
+// child writes one DfxFlushReport at CTRL_OFF_RESULT.
+static constexpr uint64_t CTRL_DFX_FLUSH = 27;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.
@@ -236,6 +259,21 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 //   offset 40: uint64 result (returned ptr from malloc)
 static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+
+/**
+ * CTRL_DFX_FLUSH result, written by the child at CTRL_OFF_RESULT.
+ *
+ * Fixed width and small enough to share the control frame's existing result
+ * slot, so the mailbox gains no bytes. `published` counts runs whose artifact
+ * exists, which includes a partial one — an incomplete receipt that is
+ * represented in a published file is a verdict, not a missing output.
+ */
+struct DfxFlushReport {
+    uint64_t session_id;
+    uint64_t watermark_epoch;
+    uint64_t published;
+    uint64_t failed;
+};
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS,
 // the exact staged blob size at CTRL_OFF_ARG0, and the callable digest
@@ -387,6 +425,15 @@ public:
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();
     virtual DeviceMemoryInfo control_device_memory_info();
+    /**
+     * Publish every diagnostic run this child has closed, and report.
+     *
+     * `timeout_s` bounds only the waits it is passed to; the mailbox mutex and
+     * the caller-side leases are not timed, so the call can exceed it in
+     * wall-clock terms. A timeout poisons this endpoint — see
+     * run_control_command — after which no control command may reuse it.
+     */
+    virtual DfxFlushReport control_dfx_flush(double timeout_s);
     virtual void control_free(uint64_t ptr);
     virtual void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
     virtual void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
@@ -450,6 +497,7 @@ public:
     uint64_t control_malloc(size_t size) override;
     uint64_t control_committed_device_memory() override;
     DeviceMemoryInfo control_device_memory_info() override;
+    DfxFlushReport control_dfx_flush(double timeout_s) override;
     void control_free(uint64_t ptr) override;
     void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
     void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span) override;
@@ -524,6 +572,12 @@ private:
         bool accepted_reported{false};
         bool activation_requested{false};
         bool activation_published{false};
+        // The disposition this frame was last reported with. A staged run may be
+        // prepared later than it was staged — its own predecessor had not
+        // launched yet when it arrived — and that promotion is published by the
+        // child into the same frame. Remembering what was reported is what lets
+        // the change be reported once more instead of being lost.
+        MailboxPreparationDisposition reported_disposition{MailboxPreparationDisposition::NONE};
         WorkerDispatch dispatch{};
         RunId run_id{INVALID_RUN_ID};
         uint64_t slot_id{0};
@@ -568,8 +622,16 @@ public:
     // on_complete(completion) is called after each endpoint run.
     void start(
         Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
-        const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+        const std::function<void(WorkerDispatch)> &on_accept, const std::function<void(WorkerDispatch)> &on_staged,
+        std::unique_ptr<WorkerEndpoint> endpoint
     );
+    /** No staging announcement: for a caller that cannot launch a staged run early. */
+    void start(
+        Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
+        const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+    ) {
+        start(ring, on_complete, on_accept, {}, std::move(endpoint));
+    }
 
     // Submit a dispatch to the endpoint. Non-blocking.
     void dispatch(WorkerDispatch d);
@@ -580,6 +642,18 @@ public:
     void complete_unpublished(WorkerDispatch d, const std::string &error_message);
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared(RunId run_id);
+
+    /**
+     * Authorize the staged run to launch its device work now, without moving it
+     * out of the staged lane.
+     *
+     * Distinct from `activate_prepared`, which promotes a staged run into the
+     * active lane and therefore requires that lane to be free. Here the
+     * predecessor is still executing and still owns the active lane and its
+     * identity; only the staged run's own activation is requested. Reports
+     * whether this call is the one that requested it.
+     */
+    bool authorize_staged_launch(RunId run_id);
     void progress();
 
     // The active lane and staged-successor lane are intentionally distinct.
@@ -604,6 +678,7 @@ public:
     uint64_t control_malloc(size_t size);
     uint64_t control_committed_device_memory();
     DeviceMemoryInfo control_device_memory_info();
+    DfxFlushReport control_dfx_flush(double timeout_s);
     void control_free(uint64_t ptr);
     void control_copy_to(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
     void control_copy_from(const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span);
@@ -683,27 +758,72 @@ private:
         bool activation_requested{false};
         RunId run_id{INVALID_RUN_ID};
         uint64_t dispatch_id{0};
+        // What the child reported it did with the staged frame. Staging admits
+        // both dispositions, and only a natively prepared one holds work that
+        // can be ordered behind another run — a validated-only frame fell back
+        // to depth one and has nothing to launch early. Recorded when the
+        // staging event arrives, so the authorization can refuse rather than
+        // spend an activation the child will decline.
+        MailboxPreparationDisposition preparation_disposition{MailboxPreparationDisposition::NONE};
     };
 
     Ring *ring_{nullptr};
     std::unique_ptr<WorkerEndpoint> endpoint_;
     std::function<void(WorkerCompletion)> on_complete_;
     std::function<void(WorkerDispatch)> on_accept_;
+    // A run's dispatch was staged at its child. Non-throwing by contract, like
+    // the two above: it runs on the progress driver.
+    std::function<void(WorkerDispatch)> on_staged_;
     std::atomic<bool> shutdown_{false};
     std::atomic<uint32_t> inflight_{0};
     uint64_t next_dispatch_id_{1};
     // Linearizes stop with endpoint publication and prepared activation.
     std::mutex admission_mu_;
     mutable std::mutex lane_mu_;
-    std::array<LaneState, 2> lanes_{};
+    // Index 0 is the active lane; the rest are staged lanes, one per run this
+    // endpoint may hold beyond the active one. A staged lane is found by the
+    // identity it carries rather than by position — the endpoint picks a mailbox
+    // frame from the run's own pipeline lease, so which staged lane a run
+    // occupies says nothing about where its frame is.
+    std::array<LaneState, PTO_PIPELINE_MAX_DEPTH> lanes_{};
     std::unordered_set<uint64_t> accepted_dispatch_ids_;
     std::unordered_map<uint64_t, std::string> accept_errors_;
 
-    SubmitDispatchResult submit_dispatch(WorkerDispatch d, LaneKind lane, RunId expected_run_id = INVALID_RUN_ID);
+    SubmitDispatchResult submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expected_run_id = INVALID_RUN_ID);
+    static constexpr size_t kActiveLane = 0;
+    static constexpr size_t kFirstStagedLane = 1;
     LaneState &lane(LaneKind kind) { return lanes_[static_cast<size_t>(kind)]; }
     const LaneState &lane(LaneKind kind) const { return lanes_[static_cast<size_t>(kind)]; }
-    void release_lane(LaneKind kind, uint64_t dispatch_id);
-    void release_lane_unconditional(LaneKind kind);
+    LaneState &lane_at(size_t index) { return lanes_[index]; }
+    /** How many staged lanes this endpoint may use, bounded by what it admits at once. */
+    size_t staged_lane_count() const {
+        const uint32_t inflight_cap = caps().max_inflight_tasks;
+        const size_t usable = inflight_cap > 1 ? static_cast<size_t>(inflight_cap) : 1;
+        return (usable < lanes_.size() ? usable : lanes_.size()) - 1;
+    }
+    /** The staged lane holding `run_id`, or `lanes_.size()` when none does. */
+    size_t staged_lane_of_locked(RunId run_id) const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (lanes_[index].occupied && lanes_[index].run_id == run_id) return index;
+        }
+        return lanes_.size();
+    }
+    /** The staged lane holding `dispatch_id`, or `lanes_.size()` when none does. */
+    size_t staged_lane_for_dispatch_locked(uint64_t dispatch_id) const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (lanes_[index].occupied && lanes_[index].dispatch_id == dispatch_id) return index;
+        }
+        return lanes_.size();
+    }
+    /** A free staged lane, or `lanes_.size()` when every one is taken. */
+    size_t free_staged_lane_locked() const {
+        for (size_t index = kFirstStagedLane; index < kFirstStagedLane + staged_lane_count(); ++index) {
+            if (!lanes_[index].occupied) return index;
+        }
+        return lanes_.size();
+    }
+    void release_lane(size_t lane_index, uint64_t dispatch_id);
+    void release_lane_unconditional(size_t lane_index);
     void finish_progress_dispatch(const WorkerEndpointProgress &progress);
     void fail_submission(const WorkerDispatch &dispatch, const std::string &reason);
     void fail_progress_driver(const std::string &reason) noexcept;
@@ -717,6 +837,7 @@ class WorkerManager {
 public:
     using OnCompleteFn = std::function<void(WorkerCompletion)>;
     using OnAcceptFn = std::function<void(WorkerDispatch)>;
+    using OnStagedFn = std::function<void(WorkerDispatch)>;
 
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
@@ -734,7 +855,11 @@ public:
     // launch fence; pass an empty function only when nothing waits on that
     // fence, since an omitted callback leaves pending_accepts non-zero forever.
     // No default: the choice is the caller's.
-    void start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept);
+    // `on_staged` is optional: it announces that a child holds a prepared
+    // frame, which only a caller that can launch a staged run early has any use
+    // for. Non-throwing on the same terms as the other two.
+    void
+    start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged = {});
     void stop_workers();
     void stop();
     void progress();
@@ -749,6 +874,8 @@ public:
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared_run(RunId run_id);
+    /** @see WorkerThread::authorize_staged_launch. */
+    bool authorize_staged_launch(RunId run_id);
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
     // over WorkerThread::control_prepare; exposed at manager level so the

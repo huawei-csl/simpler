@@ -1,6 +1,8 @@
+INHERIT: .site-theme/docs-theme/base.yml
+
 site_name: simpler
 site_description: "Simple Runtime — make writing runtime simpler"
-site_url: https://hw-native-sys.github.io/simpler/
+site_url: https://www.pypto.ai/simpler/
 repo_url: https://github.com/hw-native-sys/simpler
 repo_name: hw-native-sys/simpler
 edit_uri: edit/main/docs/
@@ -10,22 +12,27 @@ docs_dir: docs
 exclude_docs: |
   _hooks/
   requirements.txt
+  theme-revision.txt
 
 theme:
-  name: material
+  custom_dir: .site-theme/docs-theme/overrides
+  language: en
   features:
     - navigation.instant
     - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
     - navigation.top
+    - navigation.footer
+    - content.action.edit
     - content.code.copy
     - search.suggest
-  palette:
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      toggle: { icon: material/weather-night, name: Switch to dark mode }
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      toggle: { icon: material/weather-sunny, name: Switch to light mode }
+    - search.highlight
+    - toc.follow
+
+extra:
+  pypto_project: simpler
 
 # A page absent from nav builds fine by default and only shows up as an INFO
 # line, so it silently disappears from the site's navigation. Promote it to a
@@ -109,6 +116,7 @@ nav:
       - Scheduler: scheduler.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
+      - Run completion fences: design/run-completion-fence.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md
@@ -118,6 +126,7 @@ nav:
           - CANN source references: hardware/cann-source-references.md
   - Kernels:
       - AICore Kernel Programming: aicore-kernel-programming.md
+      - L2 Cache Bypass: l2-cache-bypass.md
       - a5 SIMT Launch: simt-launch.md
       - Manual Scope: manual-scope.md
       - WAR Anti-Dependencies: war-anti-dependency.md
@@ -159,6 +168,7 @@ nav:
   - Build and test:
       - Developer Guide: developer-guide.md
       - Testing: testing.md
+      - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
       - CI Pipeline: ci.md
       - Python Packaging: python-packaging.md
       - Sanitizers: sanitizers.md
@@ -169,6 +179,8 @@ nav:
           - Overview and code reference: troubleshooting/device-error-codes.md
           - Diagnostic guide index: troubleshooting/device-error-codes/README.md
       - Local timeout defaults: troubleshooting/local-timeout-defaults.md
+      - A5 HBG SSBUF local state: troubleshooting/a5-hbg-ssbuf-local-state.md
+      - A2/A3 scheduling tails: troubleshooting/a2a3-scheduling-tails.md
       - a2a3 507899 AICPU shared-SO fault: troubleshooting/a2a3-507899-aicpu-shared-so-fault.md
       - Sim oversubscription hang: troubleshooting/sim-oversubscription-hang.md
       - macOS build: troubleshooting/macos-build.md

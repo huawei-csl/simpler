@@ -162,7 +162,7 @@ def test_l2_records_after_argument_build_before_run(monkeypatch):
     monkeypatch.setattr(
         scene_test,
         "_build_l2_ref_args",
-        lambda *_args: (events.append("args") or object(), []),
+        lambda *_args, **_kwargs: (events.append("args") or object(), []),
     )
     monkeypatch.setattr(
         _MinimalCase,
@@ -185,7 +185,10 @@ def test_l3_records_after_rehost_before_run(monkeypatch):
     events = []
 
     class _Worker:
-        def run(self, _task):
+        # `config` is what carries `output_prefix`, and at L3 that is what binds
+        # this process's own `[STRACE]` log directory, so the double takes it
+        # for the same reason `Worker.run` does.
+        def run(self, _task, *, config):
             events.append("run")
 
     class _Rehosted:

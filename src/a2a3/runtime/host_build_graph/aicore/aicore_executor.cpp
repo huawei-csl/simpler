@@ -69,17 +69,30 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  * @param core_type Core type (AIC or AIV)
  */
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[block_idx]);
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
     // this core's register window only after it observes aicore_done, so a single
     // report suffices. The host clears aicore_done before this kernel launches,
     // so the value the AICPU reads is this run's report, never a stale prior one.
+    const uint64_t report_epoch = get_aicore_report_epoch();
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
+    if (report_epoch != 0) {
+        // Native program run: `aicore_done` is payload, and `report_epoch` is
+        // the marker that commits it. The barrier separates the two, so the
+        // AICPU cannot see this run's epoch without the report it stands for.
+        my_hank->aicore_done = block_idx + 1;
+        OUT_OF_ORDER_STORE_BARRIER();
+        my_hank->report_epoch = report_epoch;
+    } else {
+        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
+        // marker, its per-run reset is what makes it meaningful, and no stamp
+        // is written.
+        OUT_OF_ORDER_STORE_BARRIER();
+        my_hank->aicore_done = block_idx + 1;
+    }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Phase 2: Wait for the AICPU to open our register window. A kernel launch
@@ -273,7 +286,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Performance profiling: record task execution.
             // Two identity fields go into the record (different roles):
-            //   - task_token_raw (the full TaskId) is pulled from the dispatch
+            //   - task_token is pulled from the dispatch
             //     payload's LocalContext.async_ctx — already in AICore cache
             //     from the just-completed task, no extra GM load. Host uses
             //     it as the canonical task identity for JSON output / task-id
@@ -284,14 +297,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             //     against the AICPU record stream. Required for correctness
             //     under SPMD (block_num > num_cores) and MIX cluster spread,
             //     where multiple dispatches of the same task share the same
-            //     task_token_raw.
+            //     task_token.
             last_reg_val = reg_val;
             write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
 
             if (chip_swimlane_enabled) {
-                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 chip_swimlane_aicore_commit_task_record(
-                    chip_swimlane_record, task_token_raw, task_id, receive_time, start_time, end_time
+                    chip_swimlane_record, exec_payload->local_context.async_ctx.task_token, task_id, receive_time,
+                    start_time, end_time
                 );
             }
         }
@@ -302,5 +315,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // EXITED acknowledges quiescence; the AICPU opens this gate only after it
     // has closed this core's fast-path window. The gate is a line of its own,
     // outside the Handshake the dcci above writes back.
-    wait_for_post_close_release(&runtime->teardown_gates[block_idx].post_close_release);
+    wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
 }

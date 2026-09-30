@@ -42,7 +42,7 @@ from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
-from .buffer import AccessMode, BackendKind, Buffer, CanonicalIdentity, wrap_fork_inherited
+from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -795,12 +795,7 @@ class Orchestrator:
         nbytes = get_element_size(dtype)
         for s in shape_t:
             nbytes *= s
-        oid, buffer_id, path = (
-            self._worker._owner_instance_id,
-            self._worker._next_buffer_id(),
-            f"L{self._worker.level}",
-        )
-        identity = CanonicalIdentity(oid, buffer_id)
+        identity = self._worker._burn_buffer_identity()
         # alloc keys the synthetic producer slot by the ref's canonical identity (not a raw VA), so a
         # consumer named via handle.tensor(...) dependency-wires to it. Same managed backing as
         # worker.alloc_shared_tensor; additionally registered as an L3-L2 orch-comm host buffer.
@@ -808,9 +803,10 @@ class Orchestrator:
         handle = wrap_fork_inherited(
             va,
             int(nbytes),
-            oid,
-            buffer_id,
-            path,
+            bytes(identity.owner_instance_id),
+            int(identity.buffer_id),
+            f"L{self._worker.level}",
+            generation=int(identity.generation),
             access=AccessMode.READWRITE,
             backend_kind=BackendKind.FORK_SHM,
         )

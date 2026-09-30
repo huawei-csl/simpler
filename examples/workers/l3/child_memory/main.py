@@ -16,8 +16,8 @@ Pattern (the "load weights once, run kernel many times" idiom):
   * ``orch.copy_to(dev_handle, host_buffer)`` — H2D upload of the weight.
   * ``Tensor.make(dev_ptr, shape, dtype, child_memory=True)`` —
     wrap the worker pointer as a tensor that the runtime treats as
-    *already on device*. ``init_runtime_impl`` skips malloc + H2D copy
-    for these and does not record them in ``tensor_pairs``, so the buffer
+    *already on device*. The runtime's bind gives these no device buffer and
+    no H2D copy-in, and keeps them out of its argument ledger, so the buffer
     is **not** freed at the end of the task — it stays live for the next
     invocation.
   * Submit two kernel tasks pinned to the same worker, both reading the
@@ -57,6 +57,7 @@ from simpler.task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -176,9 +177,9 @@ def run(platform: str, device_id: int) -> int:
 
             for out_h in (f1_h, f2_h):
                 ta = TaskArgs()
-                ta.add_tensor(a_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
-                ta.add_tensor(w_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
-                ta.add_tensor(out_h.tensor(shapes=(SIZE,), dtype=f32), TensorArgType.OUTPUT_EXISTING)
+                ta.add_tensor(Tensor(a_h, shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_tensor(Tensor(w_h, shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_tensor(Tensor(out_h, shapes=(SIZE,), dtype=f32), TensorArgType.OUTPUT_EXISTING)
                 orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 
         print("[child_memory] running DAG (1 malloc + 1 copy_to + 2 kernel tasks)...")

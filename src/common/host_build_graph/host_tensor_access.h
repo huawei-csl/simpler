@@ -20,32 +20,52 @@
  * that capability is resolved, so the orchestrator core never dereferences a
  * device address itself.
  *
- * The current bind path registers one region per staged tensor, backed by the
- * caller's host tensor buffer:
+ * The current bind path registers one region per host-memory tensor, backed by
+ * the caller's host tensor buffer, which the bind has just copied in H2D:
  *
  *   - A read observes that caller buffer.
  *   - A write mutates that caller buffer, then uses the device-copy hook so the
  *     device observes it too. This is visible even for an `IN` argument if its
  *     host orchestration calls `set_tensor_data`.
  *
+ * A child-memory tensor has no such buffer: it arrives already on the device
+ * and the bind stages nothing for it. Its region is therefore added
+ * **unresolved** (`add_child_memory`) and costs nothing until an access lands
+ * inside it, at which point one of two means is chosen for the whole
+ * allocation:
+ *
+ *   - `acquire_child_memory_host_view` returns a host mapping the platform owns
+ *     and keeps for the allocation's lifetime — reads and writes go straight
+ *     through it, coherent by construction.
+ *   - It returns null (a5 onboard has no host-map path; issue #1531 refuses
+ *     ordinary-page small allocations on 64 KiB-page hosts), and every access
+ *     is served by a device copy instead. That path holds no state, so a read
+ *     cannot observe stale bytes and a write lands on the device immediately.
+ *
+ * Resolving on access rather than at bind means the set that gets a mapping is
+ * exactly the set the orchestration touched — a tensor it never reads costs a
+ * vector entry and nothing else.
+ *
  * `add` also retains a null-fallback platform path: it asks the platform for a
  * host-readable mapping whose address may equal or differ from `dev_base`, and
  * always accesses the returned address. The current runtime-maker path cannot
- * reach it: staged tensors always have the caller buffer, while pure outputs
+ * reach it: host-memory tensors always have the caller buffer, while pure outputs
  * are deliberately left unregistered. The path remains as an explicit
  * platform-capability escape hatch in `add` and is covered directly by unit
  * tests; no current production caller reaches it.
  *
- * An address no registered region covers is a failure, never a raw
- * dereference. Pure outputs, GM-heap tensors and pass-through child-memory
- * buffers have no region, so both reads and writes resolve to nothing.
+ * An address no region covers is a failure, never a raw dereference. Pure
+ * outputs and GM-heap tensors the orchestrator created have no region, so both
+ * reads and writes resolve to nothing.
  *
  * Regions and any optional mappings are owned by one orchestration run — the
- * window between staging and the first dispatched task. A caller-buffer view
- * holds the staged bytes, and nothing has executed yet to make it stale; once
+ * window between copy-in and the first dispatched task. A caller-buffer view
+ * holds the copied-in bytes, and nothing has executed yet to make it stale; once
  * tasks run, that view would be indistinguishable from live device memory.
  * `HostTensorAccessor` bounds the window and releases its mappings on every
- * exit path.
+ * exit path. A child-memory mapping is the exception it does not own: the
+ * platform holds that one for the allocation's lifetime, so `close` leaves it
+ * alone.
  *
  * `host/host_tensor_access.cpp` holds the only definitions of the read/write
  * pair, and libhost_runtime.so links them. Nothing in the AICPU build reaches
@@ -93,15 +113,28 @@ public:
      * Register `[dev_base, dev_base + size)`, using `fallback_host_view` (the
      * caller's host tensor buffer) when available and asking the platform for a
      * host mapping otherwise. The current runtime-maker always supplies the
-     * fallback for staged tensors and skips pure outputs, so its bind path does
+     * fallback for host-memory tensors and skips pure outputs, so its bind path does
      * not install mappings.
      *
      * @return false for an empty region, a null `api`, or when neither a
      *         mapping nor a fallback view is available.
      */
     bool add(uint64_t dev_base, uint64_t size, void *fallback_host_view);
-    bool read(uint64_t dev_addr, void *dst, uint64_t bytes) const;
-    bool write(uint64_t dev_addr, const void *src, uint64_t bytes) const;
+
+    /**
+     * Register `[dev_base, dev_base + size)` as a child-memory region, with no
+     * means of access yet.
+     *
+     * A plain push: the platform is not consulted and nothing is mapped. The
+     * first read or write landing inside the region resolves it, so an
+     * orchestration that never touches this tensor pays nothing for it.
+     *
+     * @return false for an empty region or a null `api`.
+     */
+    bool add_child_memory(uint64_t dev_base, uint64_t size);
+
+    bool read(uint64_t dev_addr, void *dst, uint64_t bytes);
+    bool write(uint64_t dev_addr, const void *src, uint64_t bytes);
 
     /** Drop every region and unregister every mapping this accessor installed. */
     void close() noexcept;
@@ -109,8 +142,53 @@ public:
     /** Mappings installed by `add` and not yet dropped by `close`. */
     size_t mapping_count() const noexcept;
 
-    /** Total bytes covered by those mappings; excludes fallback staging views. */
+    /** Total bytes covered by those mappings; excludes caller-buffer views. */
     uint64_t mapped_bytes() const noexcept;
+
+    /**
+     * Accesses served by a device copy because no host mapping was available.
+     *
+     * One PCIe round trip each, so this is the number to look at when a host
+     * that cannot map (a5, or a 64 KiB-page host per issue #1531) orchestrates
+     * more slowly than one that can.
+     */
+    uint64_t device_copy_count() const noexcept;
+
+    /**
+     * Whether this run stopped because a graph build needed bytes another run has not produced.
+     *
+     * A child-memory tensor arrives already on the device, and a run that has declared it produces
+     * those bytes may not have written them, so the access is refused rather than served — no
+     * value nobody has produced reaches the graph, and no mapping of a buffer under active device
+     * writes is installed. Merely sharing the allocation is not a reason: an immutable input two
+     * runs both name is read normally by both.
+     *
+     * This is the run's *cause*, not a record that some access was refused: it is published by the
+     * one access whose own fatal report latched the orchestration's fatal field, so it and the
+     * status the caller sees are the same event. Nothing else sets it and nothing clears it — see
+     * `note_dependency_wait_cause`. So an orchestration that failed for a reason of its own keeps
+     * that reason, and a wait one refused access established is not undone by a second one that
+     * lost the same exchange.
+     *
+     * **A caller must check this before it interprets its orchestration's status.** The refusal
+     * reaches the orchestrator as an ordinary failed access, which latches a fatal and stops the
+     * run. This cause is what separates that stop from a genuine bad address, so the failure can
+     * name it and be reported as the wait it is rather than as a bad argument; an address no
+     * region covers never reaches it, and stays an invalid argument. `close` does not clear it.
+     */
+    bool dependency_wait_is_this_runs_cause() const noexcept;
+
+    /**
+     * Publish the dependency wait as this run's cause, once.
+     *
+     * Called only by the access whose own fatal report latched the fatal field, and only when
+     * *that* access was the one refused for a dependency. One-shot: a later reporter — an
+     * unrelated failure, or another refused access that lost the same exchange — neither
+     * overwrites nor withdraws it. That is what keeps a valid wait from degrading into a hard
+     * failure on a scheduling accident, and what keeps an unrelated failure from inheriting
+     * another thread's refusal.
+     */
+    void note_dependency_wait_cause() noexcept;
 
 private:
     struct Impl;
@@ -120,8 +198,9 @@ private:
 /**
  * Read `bytes` at device address `dev_addr` into `dst`.
  *
- * @return false when no registered region covers the whole span; `dst` is
- *         untouched.
+ * @return false when no registered region covers the whole span, or when the bytes have no
+ *         readable content yet; `dst` is untouched. `host_tensor_refusal_was_dependency` is which
+ *         of the two it was.
  */
 bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst, uint64_t bytes);
 
@@ -133,3 +212,17 @@ bool host_tensor_read(HostTensorAccessor *accessor, uint64_t dev_addr, void *dst
  *         push-back to the device fails.
  */
 bool host_tensor_write(HostTensorAccessor *accessor, uint64_t dev_addr, const void *src, uint64_t bytes);
+
+/**
+ * Why this thread's most recent refused access was refused: true for a dependency wait, false for
+ * an address no region covers.
+ *
+ * Per access and per thread, and meaningful only immediately after a `read` or `write` that
+ * returned false on this thread. The reason belongs to that one access, because the entry which
+ * made it is the only one that may judge its own failure — two threads can be inside the
+ * orchestration API at once, and neither may inherit the other's reason.
+ */
+bool host_tensor_refusal_was_dependency() noexcept;
+
+/** `note_dependency_wait_cause` on `accessor`, tolerating the null one a runtime with no window has. */
+void host_tensor_note_dependency_wait_cause(HostTensorAccessor *accessor) noexcept;

@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -111,6 +113,19 @@ std::string trace_lease_attrs(Ring *ring, TaskSlot task_slot) {
 // so an iteration count would not map to a bounded wall time.
 constexpr std::chrono::milliseconds kChildLivenessPollPeriod{10};
 
+// Held back from a flush budget so the child has time to pack its report and
+// this side to observe CONTROL_DONE. It shortens the child's wait relative to
+// the parent's; it is not an ordering guarantee — the child's scheduling and
+// reply can exceed it, and a request smaller than the margin leaves the child
+// 1 ms. The parent's own timeout, poisoning and late-response ownership are
+// what remain load-bearing when that happens.
+constexpr uint64_t kChildFlushReplyMarginMs = 250;
+
+// The child's stand-in for an unbounded wait. Its own budget is a millisecond
+// count in an `int`, so "no deadline" is the largest count that fits rather
+// than a sentinel the child would have to special-case.
+constexpr uint64_t kUnboundedChildFlushBudgetMs = static_cast<uint64_t>(std::numeric_limits<int>::max());
+
 std::string child_status_message(int child_pid, int status) {
     std::string msg = "child process pid=" + std::to_string(child_pid) + " exited before mailbox completion";
     if (WIFEXITED(status)) {
@@ -140,6 +155,7 @@ uint64_t WorkerEndpoint::control_committed_device_memory() {
 DeviceMemoryInfo WorkerEndpoint::control_device_memory_info() {
     throw_unsupported_control("control_device_memory_info");
 }
+DfxFlushReport WorkerEndpoint::control_dfx_flush(double) { throw_unsupported_control("control_dfx_flush"); }
 void WorkerEndpoint::control_free(uint64_t) { throw_unsupported_control("control_free"); }
 void WorkerEndpoint::control_copy_to(const BufferDescriptor &, const BufferDescriptor &, const CopySpan &) {
     throw_unsupported_control("control_copy_to");
@@ -329,12 +345,14 @@ char *LocalMailboxEndpoint::task_frame(size_t index) const {
 
 void WorkerThread::start(
     Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
-    const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
+    const std::function<void(WorkerDispatch)> &on_accept, const std::function<void(WorkerDispatch)> &on_staged,
+    std::unique_ptr<WorkerEndpoint> endpoint
 ) {
     if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
     on_complete_ = on_complete;
     on_accept_ = on_accept;
+    on_staged_ = on_staged;
     endpoint_ = std::move(endpoint);
     shutdown_ = false;
     if (endpoint_->caps().max_inflight_tasks == 0) {
@@ -365,18 +383,18 @@ void WorkerThread::dispatch(WorkerDispatch d) {
     }
     SubmitDispatchResult result;
     try {
-        result = submit_dispatch(d, LaneKind::ACTIVE);
+        result = submit_dispatch(d, kActiveLane);
     } catch (const std::exception &e) {
-        release_lane_unconditional(LaneKind::ACTIVE);
+        release_lane_unconditional(kActiveLane);
         complete_unpublished(d, std::string("WorkerThread::dispatch: submit failed: ") + e.what());
         return;
     } catch (...) {
-        release_lane_unconditional(LaneKind::ACTIVE);
+        release_lane_unconditional(kActiveLane);
         complete_unpublished(d, "WorkerThread::dispatch: submit failed");
         return;
     }
     if (result == SubmitDispatchResult::SUBMITTED) return;
-    release_lane_unconditional(LaneKind::ACTIVE);
+    release_lane_unconditional(kActiveLane);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch: worker is stopping");
     } else {
@@ -399,35 +417,34 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: dispatch has no run identity");
         return;
     }
-    bool staged_lane_occupied = false;
+    size_t staged_index = 0;
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-        LaneState &staged = lane(LaneKind::STAGED);
-        if (staged.occupied) {
-            staged_lane_occupied = true;
-        } else {
+        staged_index = free_staged_lane_locked();
+        if (staged_index < lanes_.size()) {
+            LaneState &staged = lane_at(staged_index);
             staged.occupied = true;
             staged.run_id = slot->run_id;
         }
     }
-    if (staged_lane_occupied) {
-        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker already owns a staged run");
+    if (staged_index >= lanes_.size()) {
+        complete_unpublished(d, "WorkerThread::dispatch_prepared: worker has no free staged lane");
         return;
     }
     SubmitDispatchResult result;
     try {
-        result = submit_dispatch(d, LaneKind::STAGED, slot->run_id);
+        result = submit_dispatch(d, staged_index, slot->run_id);
     } catch (const std::exception &e) {
-        release_lane_unconditional(LaneKind::STAGED);
+        release_lane_unconditional(staged_index);
         complete_unpublished(d, std::string("WorkerThread::dispatch_prepared: submit failed: ") + e.what());
         return;
     } catch (...) {
-        release_lane_unconditional(LaneKind::STAGED);
+        release_lane_unconditional(staged_index);
         complete_unpublished(d, "WorkerThread::dispatch_prepared: submit failed");
         return;
     }
     if (result == SubmitDispatchResult::SUBMITTED) return;
-    release_lane_unconditional(LaneKind::STAGED);
+    release_lane_unconditional(staged_index);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: worker is stopping");
     } else if (result == SubmitDispatchResult::CAPACITY_EXCEEDED) {
@@ -438,7 +455,7 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
 }
 
 WorkerThread::SubmitDispatchResult
-WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expected_run_id) {
+WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expected_run_id) {
 #if SIMPLER_HOST_STRACE
     const bool trace_enabled = simpler::host_trace::enabled();
     const int64_t trace_start_ns = trace_enabled ? simpler::host_trace::now_ns() : 0;
@@ -453,7 +470,7 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
     d.dispatch_id = next_dispatch_id_;
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-        LaneState &dispatch_lane = lane(lane_kind);
+        LaneState &dispatch_lane = lane_at(lane_index);
         if (!dispatch_lane.occupied || dispatch_lane.dispatch_id != 0 ||
             (expected_run_id != INVALID_RUN_ID && dispatch_lane.run_id != expected_run_id)) {
             return SubmitDispatchResult::STAGED_IDENTITY_CHANGED;
@@ -500,25 +517,45 @@ bool WorkerThread::activate_prepared(RunId run_id) {
     if (shutdown_.load(std::memory_order_acquire)) return false;
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     LaneState &active = lane(LaneKind::ACTIVE);
-    LaneState &staged = lane(LaneKind::STAGED);
-    if (!staged.occupied || staged.run_id != run_id || staged.dispatch_id == 0 || active.occupied) {
-        return false;
-    }
+    const size_t staged_index = staged_lane_of_locked(run_id);
+    if (staged_index >= lanes_.size() || active.occupied) return false;
+    LaneState &staged = lane_at(staged_index);
+    if (staged.dispatch_id == 0) return false;
     active = staged;
     active.activation_requested = true;
     staged = {};
     return true;
 }
 
+bool WorkerThread::authorize_staged_launch(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return false;
+    std::lock_guard<std::mutex> admission_lk(admission_mu_);
+    if (shutdown_.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> lane_lk(lane_mu_);
+    const size_t staged_index = staged_lane_of_locked(run_id);
+    if (staged_index >= lanes_.size()) return false;
+    LaneState &staged = lane_at(staged_index);
+    if (staged.dispatch_id == 0) return false;
+    // Only a natively prepared frame holds work that can be ordered behind
+    // another run. A validated-only one fell back to depth one at the child, and
+    // a frame whose staging has not been observed yet has said nothing at all;
+    // both take the ordinary path when they reach the front.
+    if (staged.preparation_disposition != MailboxPreparationDisposition::NATIVE_PREPARED) return false;
+    if (staged.activation_requested) return false;
+    staged.activation_requested = true;
+    return true;
+}
+
 bool WorkerThread::has_staged_run(RunId run_id) const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    const LaneState &staged = lane(LaneKind::STAGED);
-    return staged.occupied && staged.run_id == run_id;
+    return staged_lane_of_locked(run_id) < lanes_.size();
 }
 
 bool WorkerThread::can_stage() const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    return caps().supports_frame_staging && !lane(LaneKind::STAGED).occupied;
+    const WorkerEndpointCaps &endpoint_caps = caps();
+    return endpoint_caps.supports_frame_staging && free_staged_lane_locked() < lanes_.size() &&
+           inflight_.load(std::memory_order_acquire) < endpoint_caps.max_inflight_tasks;
 }
 
 bool WorkerThread::idle() const {
@@ -526,15 +563,15 @@ bool WorkerThread::idle() const {
     return !lane(LaneKind::ACTIVE).occupied;
 }
 
-void WorkerThread::release_lane(LaneKind kind, uint64_t dispatch_id) {
+void WorkerThread::release_lane(size_t lane_index, uint64_t dispatch_id) {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    LaneState &dispatch_lane = lane(kind);
+    LaneState &dispatch_lane = lane_at(lane_index);
     if (dispatch_lane.dispatch_id == dispatch_id) dispatch_lane = {};
 }
 
-void WorkerThread::release_lane_unconditional(LaneKind kind) {
+void WorkerThread::release_lane_unconditional(size_t lane_index) {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
-    lane(kind) = {};
+    lane_at(lane_index) = {};
 }
 
 void WorkerThread::complete_unpublished(WorkerDispatch dispatch, const std::string &error_message) {
@@ -575,21 +612,34 @@ void WorkerThread::progress() {
         endpoint_->request_progress_stop();
     }
 
-    RunId activated = INVALID_RUN_ID;
+    // Every lane, oldest first. Only the active lane can hold an activation
+    // while the launch depth is one; above it, a staged run authorized to
+    // launch early keeps its own lane — the predecessor still owns the active
+    // one — so its activation has to be published from there, and so does the
+    // one behind it when the depth allows a third.
+    std::array<RunId, PTO_PIPELINE_MAX_DEPTH> activate{};
+    activate.fill(INVALID_RUN_ID);
     {
         std::lock_guard<std::mutex> admission_lk(admission_mu_);
         if (!shutdown_.load(std::memory_order_acquire)) {
             {
                 std::lock_guard<std::mutex> lane_lk(lane_mu_);
-                const LaneState &active = lane(LaneKind::ACTIVE);
-                if (active.occupied && active.activation_requested) activated = active.run_id;
+                for (size_t index = 0; index < lanes_.size(); ++index) {
+                    const LaneState &dispatch_lane = lanes_[index];
+                    if (dispatch_lane.occupied && dispatch_lane.activation_requested) {
+                        activate[index] = dispatch_lane.run_id;
+                    }
+                }
             }
-            if (activated != INVALID_RUN_ID) {
+            for (size_t index = 0; index < activate.size(); ++index) {
+                if (activate[index] == INVALID_RUN_ID) continue;
                 try {
-                    if (endpoint_->activate_progress(activated)) {
+                    if (endpoint_->activate_progress(activate[index])) {
                         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-                        LaneState &active = lane(LaneKind::ACTIVE);
-                        if (active.occupied && active.run_id == activated) active.activation_requested = false;
+                        LaneState &dispatch_lane = lanes_[index];
+                        if (dispatch_lane.occupied && dispatch_lane.run_id == activate[index]) {
+                            dispatch_lane.activation_requested = false;
+                        }
                     }
                 } catch (const std::exception &e) {
                     fail_progress_driver(std::string("activate_progress failed: ") + e.what());
@@ -636,6 +686,29 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         // The endpoint already owns the prepared frame. This cursor-only event
         // keeps the progress poll moving; acceptance, completion, and inflight
         // ownership intentionally remain unchanged until activation/terminal.
+        //
+        // What it does settle is whether that frame can be launched early at
+        // all. Staging admits a validated-only frame too, and such a frame fell
+        // back to depth one at the child: it holds no native preparation, so
+        // authorizing it would spend an activation the child then declines.
+        // Recording the disposition here is what lets the authorization refuse.
+        {
+            std::lock_guard<std::mutex> lane_lk(lane_mu_);
+            const size_t staged_index = staged_lane_for_dispatch_locked(dispatch.dispatch_id);
+            if (staged_index < lanes_.size()) {
+                lane_at(staged_index).preparation_disposition = progress.preparation_disposition;
+            }
+        }
+        // Announced because this is one of the two orders in which a staged run
+        // can become launchable early: the run ahead of it may already have had
+        // every dispatch accepted, and then nothing later says so. The callback
+        // is non-throwing by contract, and a throw here would take the progress
+        // driver down, so it is contained.
+        if (on_staged_) {
+            try {
+                on_staged_(dispatch);
+            } catch (...) {}
+        }
         return;
     }
 
@@ -948,16 +1021,31 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
                 (void)try_publish_activation(record, frame);
                 if (endpoint_poisoned_) break;
             }
-            if (!record.staged_reported) {
-                int32_t disposition_value = 0;
-                std::memcpy(&disposition_value, frame + MAILBOX_OFF_PREPARATION_DISPOSITION, sizeof(disposition_value));
-                const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
-                if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
-                    disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
-                    poison_progress("invalid preparation disposition at endpoint staging");
-                    break;
-                }
+            int32_t disposition_value = 0;
+            __atomic_load(
+                reinterpret_cast<const int32_t *>(frame + MAILBOX_OFF_PREPARATION_DISPOSITION), &disposition_value,
+                __ATOMIC_ACQUIRE
+            );
+            const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
+            if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
+                disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
+                poison_progress("invalid preparation disposition at endpoint staging");
+                break;
+            }
+            // Reported once when the frame stages, and once more if that staged run is *later*
+            // prepared natively: a run staged behind a predecessor that had not launched yet is
+            // validated-only at that instant and holds native preparation only after the
+            // predecessor reaches the device. The child publishes that promotion by writing this
+            // word alone — never the state word, which only this endpoint's exchange above moves
+            // out of FRAME_STAGED — so reporting the change is what keeps the run from waiting for
+            // ordinary promotion instead of the authorization it has earned. Only ever a
+            // promotion: the reverse direction would be a stale read, and is refused.
+            const bool promoted = record.staged_reported &&
+                                  record.reported_disposition == MailboxPreparationDisposition::VALIDATED_ONLY &&
+                                  disposition == MailboxPreparationDisposition::NATIVE_PREPARED;
+            if (!record.staged_reported || promoted) {
                 record.staged_reported = true;
+                record.reported_disposition = disposition;
                 progress.kind = WorkerProgressKind::FRAME_STAGED;
                 progress.dispatch = record.dispatch;
                 progress.preparation_disposition = disposition;
@@ -1081,7 +1169,9 @@ void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endp
 
 void WorkerManager::add_sub(void *mailbox, int child_pid) { sub_entries_.push_back(LocalSubEntry{mailbox, child_pid}); }
 
-void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept) {
+void WorkerManager::start(
+    Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged
+) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
     std::vector<int32_t> next_level_worker_ids;
@@ -1111,7 +1201,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnA
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
                 entry.worker_id, entry.mailbox, entry.child_pid, entry.task_frame_count
             );
-            wt->start(ring, on_complete, on_accept, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -1122,14 +1212,14 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnA
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
                 static_cast<int32_t>(i), entries[i].mailbox, entries[i].child_pid
             );
-            wt->start(ring, on_complete, on_accept, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
     make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        wt->start(ring, on_complete, on_accept, std::move(endpoint));
+        wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
@@ -1292,6 +1382,58 @@ DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
     DeviceMemoryInfo info{};
     std::memcpy(&info, mbox() + CTRL_OFF_RESULT, sizeof(info));
     return info;
+}
+
+DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    // Checked under the mutex and before any frame byte is written. The other
+    // control methods write their args first and let run_control_command throw,
+    // which leaves a poisoned endpoint's frame mutated; a flush must not, since
+    // the whole point of the poison is that this mailbox is never reused.
+    if (mailbox_control_timed_out_.load(std::memory_order_acquire)) {
+        throw std::runtime_error("control_dfx_flush failed: mailbox has an unresolved timed-out control command");
+    }
+    if (std::isnan(timeout_s)) {
+        throw std::runtime_error("control_dfx_flush: timeout is not a number");
+    }
+    // The child's own budget travels in a0, so its native flush is bounded by
+    // the caller's budget rather than by a ceiling of its own.
+    //
+    //   negative   unbounded, the convention `run_control_command` uses. The
+    //              child's half is the largest millisecond count its `int`
+    //              holds: finite, and far past any real flush.
+    //   < 1 ms     refused here, before a frame byte is written. There is no
+    //              time in which to flush, and issuing a command whose
+    //              deadline has already passed would poison an otherwise
+    //              healthy endpoint. Reachable: both callers hand out a
+    //              clamped remaining budget, and zero is one of its values.
+    //   finite     the request less `kChildFlushReplyMarginMs`, floored at
+    //              1 ms. Shorter than this thread's wait, which makes a
+    //              reported failure the likely answer and not a guaranteed
+    //              one — the wait below still times out and poisons when the
+    //              child does not answer in time, and that poison is what
+    //              keeps a late reply away from a frame somebody else owns.
+    //   huge       clamped to the same `int` ceiling, so no narrowing turns a
+    //              long budget into a short one.
+    uint64_t child_budget_ms = kUnboundedChildFlushBudgetMs;
+    if (timeout_s >= 0.0) {
+        const double requested_ms = timeout_s * 1000.0;
+        if (requested_ms < 1.0) {
+            throw std::runtime_error(
+                "control_dfx_flush: no remaining budget to flush in; the close or flush deadline is already spent"
+            );
+        }
+        const double budget_ms = requested_ms - static_cast<double>(kChildFlushReplyMarginMs);
+        const double kMaxChildBudgetMs = static_cast<double>(kUnboundedChildFlushBudgetMs);
+        child_budget_ms = budget_ms < 1.0               ? 1ULL :
+                          budget_ms > kMaxChildBudgetMs ? kUnboundedChildFlushBudgetMs :
+                                                          static_cast<uint64_t>(budget_ms);
+    }
+    write_control_args(mbox(), CTRL_DFX_FLUSH, child_budget_ms);
+    run_control_command("control_dfx_flush", timeout_s);
+    DfxFlushReport report{};
+    std::memcpy(&report, mbox() + CTRL_OFF_RESULT, sizeof(report));
+    return report;
 }
 
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
@@ -1485,6 +1627,11 @@ DeviceMemoryInfo WorkerThread::control_device_memory_info() {
     return endpoint_->control_device_memory_info();
 }
 
+DfxFlushReport WorkerThread::control_dfx_flush(double timeout_s) {
+    if (!endpoint_) throw std::runtime_error("control_dfx_flush: null endpoint");
+    return endpoint_->control_dfx_flush(timeout_s);
+}
+
 void WorkerThread::control_prepare(const uint8_t *digest) {
     if (!endpoint_) throw std::runtime_error("control_prepare: null endpoint");
     endpoint_->control_prepare(digest);
@@ -1634,6 +1781,13 @@ bool WorkerManager::activate_prepared_run(RunId run_id) {
     for (const auto &worker : next_level_threads_)
         activated = worker->activate_prepared(run_id) || activated;
     return activated;
+}
+
+bool WorkerManager::authorize_staged_launch(RunId run_id) {
+    bool authorized = false;
+    for (const auto &worker : next_level_threads_)
+        authorized = worker->authorize_staged_launch(run_id) || authorized;
+    return authorized;
 }
 
 // =============================================================================

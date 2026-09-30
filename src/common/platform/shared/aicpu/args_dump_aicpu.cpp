@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -62,17 +63,19 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
+// Both tables are open-addressed and mark a free slot with TaskId::invalid(), the
+// reserved sentinel no mint produces — so probing tells an unused slot from one
+// holding a real task apart by identity, with no value set aside for the purpose.
 struct DumpTaskMaskEntry {
-    uint64_t task_id;
+    TaskId task_id;
     ArgsDumpArgMask mask;
     ArgsDumpArgMask flags;
 };
 struct DumpTaskScalarDtypeEntry {
-    uint64_t task_id;
+    TaskId task_id;
     uint32_t scalar_count;
     uint8_t scalar_dtypes[32];
 };
-static constexpr uint64_t DUMP_TASK_MASK_EMPTY_TASK_ID = UINT64_MAX;
 static constexpr uint32_t DUMP_TASK_MASK_TABLE_CAPACITY = 32768;
 static DumpTaskMaskEntry *g_dump_mask_table = nullptr;
 static DumpTaskScalarDtypeEntry *g_dump_scalar_dtype_table = nullptr;
@@ -87,7 +90,7 @@ static bool ensure_dump_args_mask_table() {
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-        g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_mask_table[i].task_id = TaskId::invalid();
         g_dump_mask_table[i].mask = ARGS_DUMP_ARG_MASK_NONE;
         g_dump_mask_table[i].flags = ARGS_DUMP_ARG_MASK_NONE;
     }
@@ -106,7 +109,7 @@ static bool ensure_dump_args_scalar_dtype_table() {
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-        g_dump_scalar_dtype_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+        g_dump_scalar_dtype_table[i].task_id = TaskId::invalid();
         g_dump_scalar_dtype_table[i].scalar_count = 0;
         memset(g_dump_scalar_dtype_table[i].scalar_dtypes, 0, sizeof(g_dump_scalar_dtype_table[i].scalar_dtypes));
     }
@@ -116,31 +119,32 @@ static bool ensure_dump_args_scalar_dtype_table() {
 static void clear_dump_args_tables() {
     if (g_dump_mask_table != nullptr) {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-            g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+            g_dump_mask_table[i].task_id = TaskId::invalid();
             g_dump_mask_table[i].mask = ARGS_DUMP_ARG_MASK_NONE;
             g_dump_mask_table[i].flags = ARGS_DUMP_ARG_MASK_NONE;
         }
     }
     if (g_dump_scalar_dtype_table != nullptr) {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
-            g_dump_scalar_dtype_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
+            g_dump_scalar_dtype_table[i].task_id = TaskId::invalid();
             g_dump_scalar_dtype_table[i].scalar_count = 0;
             memset(g_dump_scalar_dtype_table[i].scalar_dtypes, 0, sizeof(g_dump_scalar_dtype_table[i].scalar_dtypes));
         }
     }
 }
 
-// task_id is an opaque 64-bit key (globally unique across rings); fold its two
-// halves so both the ring field (high 32) and the local id (low 32) reach the
-// table index. Any task_id maps to a slot — the pool is independent of runtime
-// ring depth.
-static uint32_t resolve_dump_args_task_slot(uint64_t task_id) {
-    uint64_t h = task_id ^ (task_id >> 32);
+// The key is opaque here: this module makes no claim about what any of its bits
+// mean, only that the whole of it identifies a task. Folding the two halves is what
+// gets both of them into the index, so a layout that varies its low bits and one
+// that varies its high bits both spread. Any handle maps to a slot — the pool's
+// size is independent of anything the runtime sizes.
+static uint32_t resolve_dump_args_task_slot(TaskId task_id) {
+    uint64_t h = TaskId::to_uint64(task_id);
+    h ^= h >> 32;
     return static_cast<uint32_t>(h) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
 }
 
-extern "C" void
-set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
+extern "C" void set_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
     if (scalar_count == 0 || scalar_dtypes == nullptr) {
         return;
     }
@@ -155,7 +159,7 @@ set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const 
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskScalarDtypeEntry &entry =
             g_dump_scalar_dtype_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
+        if (entry.task_id == TaskId::invalid() || entry.task_id == task_id) {
             entry.task_id = task_id;
             entry.scalar_count = scalar_count;
             memcpy(entry.scalar_dtypes, scalar_dtypes, scalar_count * sizeof(uint8_t));
@@ -165,7 +169,7 @@ set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const 
     LOG_ERROR("args dump scalar dtype table is full");
 }
 
-extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
+extern "C" bool get_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
     if (g_dump_scalar_dtype_table == nullptr || scalar_count == nullptr || scalar_dtypes == nullptr) {
         return false;
     }
@@ -178,7 +182,7 @@ extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *sca
             memcpy(scalar_dtypes, entry.scalar_dtypes, entry.scalar_count * sizeof(uint8_t));
             return true;
         }
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
+        if (entry.task_id == TaskId::invalid()) {
             return false;
         }
     }
@@ -214,7 +218,7 @@ extern "C" bool should_load_dump_args_task_masks() {
     return g_dump_args_level == DumpArgsLevel::PARTIAL || g_dump_args_level == DumpArgsLevel::HYBRID;
 }
 
-extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags) {
+extern "C" void set_dump_args_task_mask(TaskId task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags) {
     if (mask == ARGS_DUMP_ARG_MASK_NONE) {
         return;
     }
@@ -224,7 +228,7 @@ extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, 
     uint32_t idx = resolve_dump_args_task_slot(task_id);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
+        if (entry.task_id == TaskId::invalid() || entry.task_id == task_id) {
             entry.task_id = task_id;
             entry.mask = mask;
             entry.flags = flags;
@@ -234,7 +238,7 @@ extern "C" void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, 
     LOG_ERROR("args dump selective mask table is full");
 }
 
-extern "C" void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags) {
+extern "C" void get_dump_args_task_masks(TaskId task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags) {
     if (mask != nullptr) {
         *mask = ARGS_DUMP_ARG_MASK_NONE;
     }
@@ -256,7 +260,7 @@ extern "C" void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask
             }
             return;
         }
-        if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
+        if (entry.task_id == TaskId::invalid()) {
             return;
         }
     }
@@ -381,7 +385,11 @@ struct DumpDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
-    static void on_pop_success(Context ctx, State *, Buffer *buffer) { s_current_dump_buf[ctx.thread_idx] = buffer; }
+    static void on_pop_success(Context ctx, State *state, Buffer *buffer) {
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = state->current_buf_seq;
+        s_current_dump_buf[ctx.thread_idx] = buffer;
+    }
     static void on_current_cleared(Context ctx, State *) { s_current_dump_buf[ctx.thread_idx] = nullptr; }
     static void on_null_free_slot(Context, State *) {}
 
@@ -618,10 +626,31 @@ void dump_args_init(int num_dump_threads) {
         DumpBufferState *state = get_dump_buffer_state(dump_base, t);
         s_dump_states[t] = state;
 
+        // Keep the buffer this thread already holds, or pop the first one.
+        //
+        // A buffer is only released by a successful enqueue, so a pointer still
+        // set here means the previous run could not hand that buffer over — it
+        // had nothing to publish, or the ready queue was full. Popping a
+        // replacement would strand it: nothing returns it to the free queue,
+        // because AICPU is the queue's consumer and never its producer. Reusing
+        // it in place is the return, and re-stamping is what makes that safe —
+        // the buffer still carries the previous run's identity, and its count
+        // must start this run at zero.
         rmb();
+        uint64_t retained = state->current_buf_ptr;
         uint32_t head = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
-        if (head != tail) {
+        if (retained != 0) {
+            DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(retained);
+            buf->count = 0;
+            buf->run_epoch = get_platform_run_result_epoch();
+            buf->local_seq = 0;
+            wmb();
+            state->current_buf_seq = 0;
+            s_current_dump_buf[t] = buf;
+            LOG_DEBUG("Thread %d: reusing retained dump buffer (addr=0x%lx)", t, retained);
+        } else if (head != tail) {
+            // The engine's pop stamps identity through on_pop_success.
             (void)try_pop_dump_meta_buffer(t, state, 0);
             uint64_t buf_ptr = state->current_buf_ptr;
             LOG_DEBUG("Thread %d: popped initial dump buffer (addr=0x%lx)", t, buf_ptr);
@@ -771,19 +800,19 @@ void dump_args_flush(int thread_idx) {
             state->current_buf_ptr = 0;
             wmb();
         } else {
-            // ready_queue full at end-of-run: account the loss and clear the
-            // buffer so host reconcile sees a clean state (current_buf_ptr=0)
-            // and dropped == flush failures rather than silent wip-mismatch.
             // Bounded to one per thread per run (unlike the hot-path
             // dump_arg_record site), so no spam guard is needed here.
             LOG_ERROR(
                 "Thread %d: failed to flush args-dump buffer (ready_queue full), %u records lost!", thread_idx,
                 buf->count
             );
+            // ready_queue full at end-of-run: account the loss, but keep the
+            // buffer. Clearing the pointer would strand it — the host never saw
+            // it, so nothing returns it to the free queue. Retaining it lets the
+            // next run's init reuse it in place, which is the only return
+            // available to AICPU.
             account_dropped_records(state, buf->count);
             buf->count = 0;
-            s_current_dump_buf[thread_idx] = nullptr;
-            state->current_buf_ptr = 0;
             wmb();
         }
     }

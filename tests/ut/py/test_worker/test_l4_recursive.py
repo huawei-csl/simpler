@@ -19,6 +19,7 @@ only, and the chip-callable cascade gives them a fake chip (``_harness``).
 from __future__ import annotations
 
 import ast
+import os
 import struct
 import threading
 from multiprocessing.shared_memory import SharedMemory
@@ -390,6 +391,53 @@ class TestL4ToL3MultipleDispatches:
 
 
 # ---------------------------------------------------------------------------
+# Test: L4 → L3 — per-child capture namespace
+# ---------------------------------------------------------------------------
+
+
+class TestL4ChildCaptureNamespace:
+    def test_attached_l3_children_write_under_distinct_namespaces(self, tmp_path):
+        """Two attached L3 children never share one artifact directory.
+
+        Every diagnostic below `output_prefix` uses a fixed filename, and each
+        L3 numbers its own chips from zero, so siblings handed one prefix write
+        over each other. The probe stands in for such an artifact: it is
+        written at the prefix the child was actually handed, so both survive
+        only if the two children were handed different ones.
+        """
+
+        def l3_orch(orch, args, config):
+            os.makedirs(config.output_prefix, exist_ok=True)
+            with open(os.path.join(config.output_prefix, "probe.txt"), "w") as probe:
+                probe.write(str(os.getpid()))
+
+        first = Worker(level=3, num_sub_workers=1)
+        first.register(lambda args: None)
+        second = Worker(level=3, num_sub_workers=1)
+        second.register(lambda args: None)
+
+        w4 = Worker(level=4, num_sub_workers=0)
+        l3_handle = w4.register(l3_orch)
+        first_id = w4.add_worker(first)
+        second_id = w4.add_worker(second)
+        w4.init()
+
+        child_config = CallConfig()
+        child_config.output_prefix = str(tmp_path)
+
+        def l4_orch(orch, args, config):
+            for worker_id in (first_id, second_id):
+                orch.submit_next_level(l3_handle, TaskArgs(), child_config, worker=worker_id)
+
+        w4.run(l4_orch)
+        w4.close()
+
+        probes = {path.parent.name: path.read_text() for path in tmp_path.rglob("probe.txt")}
+        assert set(probes) == {f"node{first_id}", f"node{second_id}"}
+        assert len(set(probes.values())) == 2
+
+
+# ---------------------------------------------------------------------------
 # Test: L4 with own sub workers + L3 child
 # ---------------------------------------------------------------------------
 
@@ -634,7 +682,7 @@ class TestDelegatedRouting:
         worker._worker = native
         request = encode_request(
             _allocate_request(initiator_path=b"L3", provider_path=b"L3/L2[1]"),
-            staged_capacity=256,
+            staged_capacity=ALLOCATE_REPLY_BYTES,
         )
         envelope = parse_request(request)
         _forward_delegated_region(worker, "L3", memoryview(request))
@@ -648,6 +696,7 @@ class TestDelegatedRouting:
 
     def test_l4_to_l3_to_l2_keeps_request_bytes_and_creates_no_table(self):
         from simpler.comm_provider_control import (  # noqa: PLC0415
+            ALLOCATE_REPLY_BYTES,
             ProviderTransactionTable,
             encode_request,
             parse_request,
@@ -681,7 +730,7 @@ class TestDelegatedRouting:
             l4._delegated_control_path = "L4"
             request = encode_request(
                 _allocate_request(initiator_path=b"L4", provider_path=b"L4/L3[0]/L2[0]"),
-                staged_capacity=256,
+                staged_capacity=ALLOCATE_REPLY_BYTES,
             )
             envelope = parse_request(request)
             _forward_delegated_region(l4, "L4", memoryview(request))
@@ -697,7 +746,7 @@ class TestDelegatedRouting:
 
     def test_routing_rejects_before_control_payload(self):
         from simpler.comm_provider import RegionControlError  # noqa: PLC0415
-        from simpler.comm_provider_control import encode_request  # noqa: PLC0415
+        from simpler.comm_provider_control import ALLOCATE_REPLY_BYTES, encode_request  # noqa: PLC0415
         from simpler.worker import _forward_delegated_region  # noqa: PLC0415
 
         native = _RecordingNative(_backend_error_reply)
@@ -705,7 +754,7 @@ class TestDelegatedRouting:
         missing._worker = native
         staged = encode_request(
             _allocate_request(initiator_path=b"L3", provider_path=b"L3/L2[1]"),
-            staged_capacity=256,
+            staged_capacity=ALLOCATE_REPLY_BYTES,
         )
         with pytest.raises(RegionControlError, match="next L2 child does not exist"):
             _forward_delegated_region(missing, "L3", memoryview(staged))
@@ -720,7 +769,7 @@ class TestDelegatedRouting:
                 memoryview(
                     encode_request(
                         _allocate_request(initiator_path=b"L4", provider_path=b"L4/L3[0]/L2[0]"),
-                        staged_capacity=256,
+                        staged_capacity=ALLOCATE_REPLY_BYTES,
                     )
                 ),
             )

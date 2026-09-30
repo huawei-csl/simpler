@@ -8,8 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Owner-side ``Worker.create_buffer``: the child-topology gate and the identity it mints.
 
-``_create_buffer_locked`` reads only ``level``, the three child-shm lists, and the buffer registry
-state, so these run against a Worker built with ``__new__`` — no fork, no device, no ``init()``.
+``_create_buffer_locked`` reads ``level``, the three child-shm lists, the buffer registry,
+and the Worker's identity allocator, so these run against a Worker built with ``__new__`` —
+no fork, no device, no ``init()``.
 The gate is the point: an L3+ backing is resolved by a forked child mapping the shm by name, and
 **every** kind of forked child can do that, so counting only chip and sub children refuses an L4
 whose children are local L3 Workers.
@@ -18,10 +19,17 @@ whose children are local L3 Workers.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
-from simpler.buffer import AddressSpace, BackendKind, mint_owner_instance_id
-from simpler.worker import Worker, _NoBufferConsumerError, _SharedExclusiveLock
+from simpler.buffer import (
+    AddressSpace,
+    BackendKind,
+    BufferIdentityExhaustedError,
+    LocalEndpointBufferIdentityAllocator,
+    mint_owner_instance_id,
+)
+from simpler.worker import Worker, _Lifecycle, _NoBufferConsumerError, _SharedExclusiveLock
 
 
 def _bare_worker(level: int, *, chip: int = 0, sub: int = 0, next_level: int = 0) -> Worker:
@@ -32,7 +40,7 @@ def _bare_worker(level: int, *, chip: int = 0, sub: int = 0, next_level: int = 0
     w._next_level_shms = [object()] * next_level
     w._registry_lock = threading.Lock()
     w._owner_instance_id = mint_owner_instance_id()
-    w._buffer_id_counter = 1
+    w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
     w._buffers = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
@@ -182,3 +190,156 @@ def test_release_all_buffers_reports_the_failure_and_keeps_the_entry():
     w._buffers.clear()
     bad.shm.close()  # type: ignore[union-attr]
     bad.shm.unlink()  # type: ignore[union-attr]
+
+
+def _patch_level2_init(monkeypatch, worker: Worker) -> None:
+    monkeypatch.setattr(worker, "_init_level2", lambda: None)
+
+
+def test_pre_init_burn_retains_constructor_allocator(monkeypatch):
+    worker = Worker(level=2)
+    nonce = bytes(worker._owner_instance_id)
+    allocator = worker._buffer_identity_allocator
+    first = worker._burn_buffer_identity()
+    assert bytes(first.owner_instance_id) == nonce
+    assert int(first.buffer_id) == 1
+    _patch_level2_init(monkeypatch, worker)
+    worker.init()
+    try:
+        assert bytes(worker._owner_instance_id) == nonce
+        assert worker._buffer_identity_allocator is allocator
+        second = worker._burn_buffer_identity()
+        assert bytes(second.owner_instance_id) == nonce
+        assert int(second.buffer_id) == 2
+    finally:
+        worker.close()
+
+
+def test_root_init_without_pre_init_burn_keeps_the_constructor_allocator(monkeypatch):
+    worker = Worker(level=2)
+    constructor = bytes(worker._owner_instance_id)
+    allocator = worker._buffer_identity_allocator
+    _patch_level2_init(monkeypatch, worker)
+    worker.init()
+    try:
+        assert bytes(worker._owner_instance_id) == constructor
+        assert worker._buffer_identity_allocator is allocator
+        identity = worker._burn_buffer_identity()
+        assert bytes(identity.owner_instance_id) == constructor
+        assert int(identity.buffer_id) == 1
+        assert int(identity.generation) == 1
+    finally:
+        worker.close()
+
+
+def test_init_and_pre_init_burn_do_not_mix_nonces(monkeypatch):
+    worker = Worker(level=2)
+    constructor = bytes(worker._owner_instance_id)
+    _patch_level2_init(monkeypatch, worker)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    burned = []
+
+    def burn() -> None:
+        try:
+            barrier.wait()
+            burned.append(worker._burn_buffer_identity())
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            errors.append(exc)
+
+    def start() -> None:
+        try:
+            barrier.wait()
+            worker.init()
+        except BaseException as exc:  # noqa: BLE001 -- the test asserts the collected failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=burn), threading.Thread(target=start)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    try:
+        assert errors == []
+        identity = burned[0]
+        assert bytes(identity.owner_instance_id) == constructor
+        nxt = worker._burn_buffer_identity()
+        assert bytes(nxt.owner_instance_id) == constructor
+        assert int(nxt.buffer_id) == int(identity.buffer_id) + 1
+        assert int(nxt.buffer_id) != int(identity.buffer_id)
+    finally:
+        if worker._lifecycle is _Lifecycle.READY:
+            worker.close()
+
+
+def test_add_worker_child_keeps_constructor_identity_across_init():
+    parent = Worker(level=4)
+    child = Worker(level=3)
+    try:
+        child_nonce = bytes(child._owner_instance_id)
+        allocator = child._buffer_identity_allocator
+        first = child._burn_buffer_identity()
+        assert bytes(first.owner_instance_id) == child_nonce
+        assert int(first.buffer_id) == 1
+        parent.add_worker(child)
+        assert parent._next_level_workers == [child]
+        assert bytes(parent._owner_instance_id) != child_nonce
+        child._init_hierarchical = lambda: None  # type: ignore[method-assign]
+        child._start_hierarchical = lambda: None  # type: ignore[method-assign]
+        child.init(_startup_deadline=time.monotonic() + 30)
+        assert bytes(child._owner_instance_id) == child_nonce
+        assert child._buffer_identity_allocator is allocator
+        second = child._burn_buffer_identity()
+        assert bytes(second.owner_instance_id) == child_nonce
+        assert int(second.buffer_id) == 2
+    finally:
+        for worker in (child, parent):
+            if worker._lifecycle is _Lifecycle.READY:
+                try:
+                    worker.close()
+                except BaseException:  # noqa: BLE001 -- no-op init has no native tree to tear down
+                    worker._lifecycle = _Lifecycle.NEW
+            elif worker._lifecycle is not _Lifecycle.NEW:
+                worker._lifecycle = _Lifecycle.NEW
+
+
+class _CountingMalloc:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls = 0
+        self.fail = fail
+
+    def malloc(self, worker_id: int, nbytes: int) -> int:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("native malloc failed")
+        return 0x1000 + int(worker_id)
+
+
+def _ready_l3() -> Worker:
+    worker = Worker(level=3, num_sub_workers=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+    worker._lifecycle = _Lifecycle.READY
+    worker._chip_shms = [object()]
+    return worker
+
+
+def test_alloc_child_tensor_exhaustion_does_not_malloc():
+    worker = _ready_l3()
+    native = _CountingMalloc()
+    worker._worker = native  # type: ignore[assignment]
+    worker._buffer_identity_allocator._next_buffer_id = 1 << 64
+    with pytest.raises(BufferIdentityExhaustedError):
+        worker.alloc_child_tensor(0, (4,), 0)
+    assert native.calls == 0
+    assert len(worker._child_alloc) == 0
+
+
+def test_alloc_child_tensor_malloc_failure_consumes_the_burned_id():
+    worker = _ready_l3()
+    native = _CountingMalloc(fail=True)
+    worker._worker = native  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="native malloc failed"):
+        worker.alloc_child_tensor(0, (4,), 0)
+    assert native.calls == 1
+    assert len(worker._child_alloc) == 0
+    nxt = worker._burn_buffer_identity()
+    assert int(nxt.buffer_id) == 2

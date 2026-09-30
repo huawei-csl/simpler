@@ -47,6 +47,7 @@ from simpler.worker import RemoteCallable, RemoteWorkerSpec, RunHandle, Worker
 from ._harness import (
     CHIP_INIT_FAILURE,
     TEST_WALL_BUDGET_S,
+    FakeWorkspaceAccounting,
     TickingClock,
     chip_callable,
     fake_chip_l3,
@@ -335,7 +336,15 @@ class TestNextLevelStartupFailure:
 
     def test_failed_startup_reaps_children_no_leak(self, monkeypatch):
         """After a startup failure the forked children are killed and reaped."""
-        _install_manual_worker_clock(monkeypatch)
+        # Real clock, deliberately. This case asserts an OS-level fact about real
+        # forked pids -- that `os.waitpid` no longer knows them -- and
+        # `_abort_hierarchical` bounds its reap with a `_monotonic()` deadline it
+        # is allowed to give up on ("a survivor still alive at the deadline is
+        # left to the OS/init"). A manual clock advances that deadline in zero
+        # real time, so the budget can expire before a child has actually died
+        # and the rollback takes the give-up path while the assertion below still
+        # demands a reap. The sibling deadline tests may use one: logical elapsed
+        # time is their subject, and they assert bookkeeping rather than pids.
         l3 = _l3_child()
         l3.init = _init_hangs  # noqa: SLF001
 
@@ -1348,7 +1357,7 @@ class TestLevel2Lifecycle:
         monkeypatch.setattr(Worker, "_release_all_buffers", consume_pre_child_budget)
         captured: dict = {}
 
-        def capture_reap(groups, deadline):
+        def capture_reap(groups, deadline, report_pids=None, reports=None):
             captured["remaining"] = deadline - clock.monotonic()
 
         monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))
@@ -1663,6 +1672,11 @@ class TestLevel2Lifecycle:
         class _PausingChip:
             def __init__(self):
                 build_count["n"] += 1
+                # The owner's close() reads this chip's workspace accounting
+                # before it releases anything, so the double carries the same
+                # native handle the real one does. No budget is latched, which
+                # is the answer that lets a teardown proceed.
+                self._impl = FakeWorkspaceAccounting()
 
             def init(self, *_a, **_k):
                 entered.set()
@@ -1676,6 +1690,7 @@ class TestLevel2Lifecycle:
 
         w = self._make_l2_with_chip(monkeypatch, _PausingChip)
         errs: list = []
+        close_result: list = []
         proceed = threading.Event()
         owner_finished = threading.Event()
         state: dict = {}
@@ -1686,7 +1701,10 @@ class TestLevel2Lifecycle:
             state["build"] = build_count["n"]
             owner_finished.set()
             proceed.wait(10.0)
-            _run_catch(w.close)  # the winning (owner) thread closes
+            # The winning (owner) thread closes, and its outcome is kept: a
+            # teardown that raised here would otherwise leave the cleanup
+            # journal and the native tree unresolved while this test passed.
+            close_result.append(_run_catch(w.close))
 
         t1 = threading.Thread(target=owner_body)
         t1.start()
@@ -1702,6 +1720,13 @@ class TestLevel2Lifecycle:
                 assert errs == [None]
                 assert state["initialized"] is True
                 assert state["build"] == 1
+                # Serialization settled; now let the owner tear the one
+                # ChipWorker down and check that it did. The finally below still
+                # releases and joins the thread if anything above failed first.
+                proceed.set()
+                t1.join(10.0)
+                assert not t1.is_alive()
+                assert close_result == [None]
         finally:
             release.set()
             proceed.set()
@@ -1720,6 +1745,13 @@ class TestLevel2Lifecycle:
         finalized = {"n": 0}
 
         class _PausingChip:
+            def __init__(self):
+                # close() reads this chip's workspace accounting before it
+                # releases anything, so the double carries the same native
+                # handle the real one does. No budget is latched here, which is
+                # the answer that lets a teardown proceed.
+                self._impl = FakeWorkspaceAccounting()
+
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)
@@ -1988,10 +2020,11 @@ class TestTerminalStateContract:
     def test_add_worker_freezes_child_before_topology_publication(self):
         parent = Worker(level=4, num_sub_workers=0)
         child = Worker(level=3, num_sub_workers=0)
-        parent.add_worker(child)
+        worker_id = parent.add_worker(child)
 
         with child._hierarchical_start_cv:
             assert child._topology_parent is parent
+            assert child._topology_worker_id == worker_id == 0
         with pytest.raises(RuntimeError, match="attached as a child"):
             child.init()
 

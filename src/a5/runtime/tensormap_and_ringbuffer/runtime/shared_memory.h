@@ -159,7 +159,7 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_cnt_ready;    // tasks fanin-satisfied but not dispatched
     std::atomic<int32_t> sched_stall_cnt_waiting;  // tasks still waiting on fanin
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
-    std::atomic<int64_t> sched_stall_task_id;      // S1: stuck task_id (-1 if N/A)
+    std::atomic<TaskId> sched_stall_task_id;       // S1: stuck task_id (invalid() if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
 };
 
@@ -169,6 +169,24 @@ static_assert(offsetof(SharedMemoryHeader, orch_error_code) == 784, "SharedMemor
 static_assert(
     offsetof(SharedMemoryHeader, sched_stall_task_id) == 832, "SharedMemoryHeader sched_stall_task_id layout drift"
 );
+// A scheduler thread publishes this field and host reads it, so its atomicity has to
+// hold across two separate compilations. std::atomic guarantees lock-free only for its
+// integral specializations; TaskId is a class type, and a lock-based fallback keeps
+// sizeof(std::atomic<TaskId>) at 8 because the locks live in a global table -- so
+// neither the size nor the offset assert above can see it.
+static_assert(
+    std::atomic<TaskId>::is_always_lock_free,
+    "SharedMemoryHeader::sched_stall_task_id must be lock-free on both sides of the boundary"
+);
+
+// The error-reporting tail as one contiguous range: `orch_error_code` through
+// the end of the header. A run publishes exactly this range into its own result
+// region, and the host overlays it back at the same offset of a zeroed header,
+// so neither side enumerates the fields and adding one needs no change on
+// either. The static_assert is the guard that keeps the tail last.
+constexpr size_t SHARED_MEMORY_ERROR_TAIL_OFFSET = offsetof(SharedMemoryHeader, orch_error_code);
+constexpr size_t SHARED_MEMORY_ERROR_TAIL_BYTES = sizeof(SharedMemoryHeader) - SHARED_MEMORY_ERROR_TAIL_OFFSET;
+static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES == 112, "SharedMemoryHeader error tail is no longer the header's end");
 
 // =============================================================================
 // Shared Memory Handle

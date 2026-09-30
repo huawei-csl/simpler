@@ -18,7 +18,7 @@ from typing import cast
 
 import pytest
 from simpler import remote_l3_session, remote_l3_worker
-from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+from simpler.buffer import LocalEndpointBufferIdentityAllocator, create_host_shared_buffer, mint_owner_instance_id
 from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
 
 
@@ -359,6 +359,35 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
 
     # Forced blocking before the command loop, regardless of the inherited default.
     assert fake_conn.timeout is None
+
+
+def test_run_session_gives_remote_worker_its_parent_topology_id(monkeypatch):
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            captured["worker"] = self
+
+        def init(self, *args, **kwargs):
+            raise RuntimeError("stop after worker construction")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+
+    ready = []
+    rc = remote_l3_session.run_session(
+        _manifest(worker_id=7, startup_remaining_s=1.0),
+        None,
+        ready_writer=ready.append,
+    )
+
+    assert rc == 1
+    assert captured["worker"]._topology_worker_id == 7
+    assert ready and ready[0]["ok"] is False
 
 
 def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(monkeypatch):
@@ -952,7 +981,7 @@ def _bare_l3_worker():
     w._next_level_shms = []
     w._registry_lock = threading.Lock()
     w._owner_instance_id = mint_owner_instance_id()
-    w._buffer_id_counter = 1
+    w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
     w._buffers = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)

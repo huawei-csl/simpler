@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, Protocol
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     OWNER_INSTANCE_ID_BYTES,
@@ -40,6 +41,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CanonicalIdentity,
     DataType,
     Tensor,
+    TensorTransfer,
     read_args_from_blob,
 )
 
@@ -59,6 +61,7 @@ from .comm_endpoints import (
 __all__ = [
     "AccessMode",
     "AddressSpace",
+    "TensorTransfer",
     "BackendKind",
     "Buffer",
     "BufferCapability",
@@ -123,6 +126,50 @@ def mint_owner_instance_id() -> bytes:
     one process within one second — a routine pattern (an L4 and its L3 built back to back).
     """
     return os.urandom(OWNER_INSTANCE_ID_BYTES)
+
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+class BufferIdentityExhaustedError(RuntimeError):
+    """The owner's uint64 buffer-id space cannot mint another identity."""
+
+
+def _require_allocator_owner_nonce(nonce: object) -> bytes:
+    if not isinstance(nonce, (bytes, bytearray)):
+        raise TypeError("owner_instance_id must be bytes")
+    value = bytes(nonce)
+    if len(value) != 8 or value == b"\x00" * 8:
+        raise ValueError("owner_instance_id must be a nonzero 8-byte nonce")
+    return value
+
+
+class EndpointBufferIdentityAllocator(Protocol):
+    @property
+    def owner_instance_id(self) -> bytes: ...
+
+    def burn_identity(self) -> CanonicalIdentity: ...
+
+
+class LocalEndpointBufferIdentityAllocator:
+    """Thread-safe owner-scoped canonical Buffer identity allocator."""
+
+    def __init__(self, owner_instance_id: bytes) -> None:
+        self._owner_instance_id = _require_allocator_owner_nonce(owner_instance_id)
+        self._lock = threading.Lock()
+        self._next_buffer_id = 1
+
+    @property
+    def owner_instance_id(self) -> bytes:
+        return self._owner_instance_id
+
+    def burn_identity(self) -> CanonicalIdentity:
+        with self._lock:
+            buffer_id = self._next_buffer_id
+            if buffer_id > _UINT64_MAX:
+                raise BufferIdentityExhaustedError("buffer identity space exhausted")
+            self._next_buffer_id = buffer_id + 1
+        return CanonicalIdentity(self._owner_instance_id, buffer_id, 1)
 
 
 def _shm_base_addr(shm: SharedMemory) -> int:
@@ -194,15 +241,16 @@ class Buffer:
         strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
-        """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
+        """Compatibility forwarding to ``Tensor(self, shapes=shapes, dtype=dtype, ...)``.
 
         ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
-        ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
+        ``byte_offset`` must be a multiple of the dtype size (checked at construction).
         ``dtype`` accepts a ``DataType`` enum or its int value.
+        Transfer requests belong to ``TaskArgs.add_tensor(..., transfer=...)``.
         """
-        return self.to_descriptor().tensor(shapes, dtype, strides, byte_offset)
+        return Tensor(self, shapes=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than
@@ -450,6 +498,44 @@ def wrap_vmm_window(
         backend_kind=BackendKind.VMM_WINDOW,
         nbytes=nbytes,
         body=int(device_ptr).to_bytes(8, "little"),
+        shm=None,
+        base=int(device_ptr),
+        owner_worker_id=int(owner_worker_id),
+    )
+
+
+def _wrap_vmm_shareable(
+    device_ptr: int,
+    nbytes: int,
+    device_id: int,
+    mapping_bytes: int,
+    shareable_handle: int,
+    identity: CanonicalIdentity,
+    owner_worker_path: str = "",
+    owner_worker_id: int = 0,
+) -> Buffer:
+    """Wrap an already-exported shareable VMM mapping as a Region-private ``VMM_SHAREABLE`` ``Buffer``.
+
+    ``identity`` is the caller-supplied canonical identity; this helper does not mint a nonce or
+    buffer id. The body is the 24-byte overlay ``device_id``, reserved 0, ``shareable_handle``,
+    ``mapping_bytes``. ``nbytes`` is the logical footprint and is not replaced by the mapping span.
+    ``shm`` stays ``None``: physical VMM release stays with the caller. ``device_ptr`` is the
+    provider-local base and may be 0.
+    """
+    body = (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+    return Buffer(
+        identity=identity,
+        owner_worker_path_id=intern_worker_path(owner_worker_path),
+        address_space=AddressSpace.DEVICE,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.VMM_SHAREABLE,
+        nbytes=int(nbytes),
+        body=body,
         shm=None,
         base=int(device_ptr),
         owner_worker_id=int(owner_worker_id),

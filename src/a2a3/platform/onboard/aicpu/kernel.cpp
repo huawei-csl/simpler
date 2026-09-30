@@ -8,20 +8,24 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <atomic>
 #include <cstdio>
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_entry_args.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/thread_scheduling.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
@@ -73,6 +77,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
+    set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
     set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
@@ -100,12 +105,40 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return 0;
     }
 
+    // CANN workers retain their policy across calls; continuous RT polling
+    // can exhaust the device's real-time CPU budget.
+    const int scheduling_error = use_normal_aicpu_scheduling();
+    if (scheduling_error != 0) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARN("AICPU normal scheduling unavailable: errno=%d; retaining current policy", scheduling_error);
+        }
+    }
+
     // Publish the phase-buffer base so the finer preamble/so_load/graph_build/
     // post_orch + orch/sched phases stamped inside aicpu_execute / the scheduler
     // resolve their per-thread slot via platform_aicpu_affinity_thread_idx()
     // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
     // concurrent exec threads (same base). Run-wall is stamped here.
     set_platform_phase_base(k_args->device_wall_data_base);
+    // Publish this run's result region and the epoch its device side stamps
+    // into it, for the same reason as the phase base: AICPU receives KernelArgs
+    // as a CANN-private copy, so the runtime reaches these through the resident
+    // SO globals rather than the struct. Every concurrent exec thread stores the
+    // same pair here, which is why that storage is atomic. Both zero when the
+    // host allocated no region, which every publisher treats as "nothing to
+    // publish into".
+    set_platform_run_result(k_args->run_result_data_base, k_args->run_result_epoch);
+    // This thread's own view of the launch package, published under its gate
+    // survivor index so no other thread writes the slot and no other thread's
+    // arguments are borrowed. Base and offset stay separate: the runtime forms
+    // the payload address only after checking both against its descriptor.
+    set_platform_entry_args(
+        platform_aicpu_affinity_thread_idx(), PlatformEntryArgs{
+                                                  arg, k_args->entry_args_offset, k_args->entry_tensor_count,
+                                                  k_args->entry_scalar_count, k_args->entry_args_source
+                                              }
+    );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
     int rc = aicpu_execute(runtime);
@@ -147,6 +180,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }
+    set_dev_l2_cache_offset(init_args->l2_cache_offset);
 
     return 0;
 }

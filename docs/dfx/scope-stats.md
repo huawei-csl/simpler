@@ -76,14 +76,14 @@ The three arrays are indexed by `ring` (`0..3`) and should match the effective
 runtime configuration. Per-sample `ring` values show which scope-depth rings
 were actually touched by the run; they are scope records, not task counts.
 
-### Step 3 — Visualize with `scope_stats_plot.py`
+### Step 3 — Visualize with `scope_stats_plot`
 
 ```bash
-python simpler_setup/tools/scope_stats_plot.py "path/to/output_prefix"/scope_stats/scope_stats.jsonl
+python -m simpler_setup.tools.tmr.scope_stats_plot "path/to/output_prefix"/scope_stats/scope_stats.jsonl
 # writes "path/to/output_prefix"/scope_stats/scope_stats.html
 
 # or send the report elsewhere:
-python simpler_setup/tools/scope_stats_plot.py path/to/scope_stats.jsonl --out-dir /tmp/report
+python -m simpler_setup.tools.tmr.scope_stats_plot path/to/scope_stats.jsonl --out-dir /tmp/report
 ```
 
 | Argument | Required | Meaning |
@@ -173,8 +173,8 @@ bytes, not wrapping ring offsets:
 
 ```json
 {"fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
-{"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0}
-{"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5}
+{"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0, "run_epoch": 7, "buf_seq": 0}
+{"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5, "run_epoch": 7, "buf_seq": 0}
 ```
 
 Metadata line (line 1):
@@ -188,6 +188,54 @@ Metadata line (line 1):
 | `heap_max` | int[] | Per-ring heap-byte capacity (indexed by `ring`) |
 | `dep_pool_max` | int[] | Per-ring dependency-list pool capacity (indexed by `ring`) |
 | `tensormap_max` | int | Tensormap entry capacity (scalar) |
+
+At the counting limit these two numbers saturate rather than wrap: the device
+counters clamp at `4294967295`, and a run that reaches it is reported with
+unknown counts instead of a small wrapped number that would look complete. The
+figure is the only way a default-mode artifact differs from earlier releases.
+
+### Background mode (`collect_across_runs=True`)
+
+With `Worker(collect_across_runs=True)` on a level-3 worker, the run boundary
+keeps the receive drain and the terminal read and hands only the rendering and
+the file write to a background writer, so the next run's device work can start
+while this run's file is still being written. **`run()` returning no longer
+means `scope_stats.jsonl` exists — `Worker.flush_diagnostics()` is the barrier
+that says the files up to that point are published.** TMR only; on
+`host_build_graph` there is no producer and the boundary behaves as it always
+has. The default (`collect_across_runs=False`) path is unchanged.
+
+Four keys are added to the metadata line in this mode only, so a reader that
+ignores them sees the same shape as before:
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `collection_verdict` | string | `published`, `partial_safe` (loss, host refusal or a latched fatal, counts still known) or `partial_cut_unknown` (a saturated counter or an accounting mismatch) |
+| `counts_unknown` | bool | `true` only when the counts themselves cannot be trusted; a device fatal alone leaves this `false` |
+| `host_received_records` | uint | Records the host took delivery of, including one recovered unpublished buffer |
+| `host_retained_records` | uint | Of those, how many the 256 MiB per-collector budget kept |
+
+A run that ends without the producer handing its last buffer over leaves that
+buffer named in `current_buf_ptr` — holding whatever records the boundary has
+just recovered, possibly none, and still stamped with the run that acquired it.
+Because the producer only re-stamps a buffer it *pops*, reusing that pointer
+would make the next run append behind those records and inherit their identity.
+Admission therefore re-stamps the buffer's 64-byte header — `count`,
+`run_epoch`, `local_seq` — for the run being admitted, so each artifact holds
+only its own records. The pointer and the free queue are left alone: the drain
+shard is the sole runtime writer of the free queue, and clearing the pointer
+would orphan a pool buffer. A header that cannot be republished to the device
+fails the admission, so no artifact is written for a run whose records the
+device could misattribute.
+
+A published file is not by itself a success: loss, a fatal and unknown counts
+each make `flush_diagnostics()` raise, and the error is sticky for the runner's
+life. A file already occupying the destination is never removed or overwritten
+— the run fails instead. And a run whose device completion could not be proved
+writes **no** file at all: nothing shared is read on that path, its host copies
+are discarded once the collector threads are joined, and every later
+`flush_diagnostics()` and `close()` reports the failure. While such a run is
+held, a later run that enables scope stats is refused before it is submitted.
 
 Per-sample lines, oldest-first:
 
@@ -204,6 +252,8 @@ Per-sample lines, oldest-first:
 | `dep_pool_start` | int | Scheduler-published dependency-list pool tail at this boundary |
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |
+| `run_epoch` | uint | Which run produced this record. Copied out of the buffer the record came from, so it stays correct after that buffer is returned to the pool and reused by a later run. `0` means the producer had no run identity to stamp |
+| `buf_seq` | uint | Buffer generation within that run. Restarts per run, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
 
 `start`/`end` are the ring's tail/head pointers at that boundary — see
 the metric formulas in [§1](#reading-the-report) for how a scope's peak

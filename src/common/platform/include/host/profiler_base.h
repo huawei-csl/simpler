@@ -80,8 +80,9 @@
  *
  *   // Resolve a popped ReadyEntry into the originating BufferState's
  *   // free_queue + the partially-filled ReadyBufferInfo. Algorithm fills in
- *   // host_buffer_ptr after a resolve_host_ptr lookup. Return std::nullopt
- *   // to drop the entry (e.g. invalid index).
+ *   // host_buffer_ptr after a resolve_host_ptr lookup. Return std::nullopt to
+ *   // reject the entry (e.g. invalid index); the drain path then retires and
+ *   // counts it rather than delivering it.
  *   static std::optional<EntrySite<Module>> resolve_entry(
  *       void* shm_host, DataHeader*, int q, const ReadyEntry&);
  *
@@ -116,19 +117,40 @@
  *                          publication — which makes every free_queue
  *                          single-writer by structure, not by timing.
  *
- * The above two algorithms live in ProfilerAlgorithms<Module>; Module only
+ * These algorithms live in ProfilerAlgorithms<Module>; Module only
  * supplies the data-access traits above. Implementors must NOT zero `count`
  * (or any other AICPU-owned field) on the host side — AICPU is the sole
  * writer to those fields and resets them itself on flush/drop/pop.
  *
+ * Drain-path ownership
+ * --------------------
+ *
+ * A device ready entry is acknowledged — `queue_heads[q]` advanced — only once
+ * its payload is in the host shadow, so the device owns the slot for as long as
+ * the host might still fail to read it and a transport failure costs a retry
+ * rather than the record. Two outcomes end that retry loop:
+ *
+ *   - An entry that cannot be resolved, or whose buffer this manager never
+ *     mapped, can never be read; retrying it would block the queue forever and
+ *     quiesce() would never complete. It is acknowledged and counted.
+ *   - An entry whose copy keeps failing is acknowledged and counted once it has
+ *     held the queue head for kStalledDrainEntryTimeout.
+ *
+ * Either way `drain_dropped_buffers()` records it, so a reconcile gap is
+ * attributable to the host instead of being an anonymous silent loss, and the
+ * buffer goes back to the free_queue it came from (or to the manager's retired
+ * pool when that queue is full) so the pool does not shrink. The unresolvable
+ * entry is the exception: its indices did not validate, so its buffer is never
+ * published into a device-visible free_queue — it is parked in the retired pool
+ * when the manager can map it, and withheld entirely when it cannot.
+ *
  * Lifecycle (the only correct teardown order):
  *   1. Derived::init() — on the success path, calls set_memory_context() to
  *      stash the alloc/reg/free callbacks, shm_dev/host pointers,
- *      shm_size and device_id on the base. If init aborts before that,
+ *      shm_size and device_id on the base and bind the manager's memory
+ *      operations to that region. If init aborts before that,
  *      start(tf) becomes a no-op (shm_host_ stays nullptr).
- *   2. start(tf) — atomically: (a) assembles a MemoryOps from the stashed
- *      callbacks, (b) hands it to the manager via set_memory_context,
- *      (c) launches the mgmt thread(s), (d) launches the collector thread(s).
+ *   2. start(tf) — launches the mgmt thread(s), then the collector thread(s).
  *      Mgmt is started before collectors because mgmt is the only writer to
  *      the host ready queue shard(s) and collectors are their consumers.
  *   3. ... device execution ...
@@ -136,8 +158,9 @@
  *        a) flips mgmt_running_, joins the mgmt thread(s); the drain thread's
  *           final-drain pass pushes the last device-ring entries into the host
  *           ready queue shard(s) before exiting.
- *        b) execution_complete_ is set; each collector loop sees it on its
- *           next idle tick, drains its host ready queue shard, and exits.
+ *        b) execution_complete_ is set and the ready-queue waiters are
+ *           notified; each collector drains its host ready queue shard and
+ *           exits.
  *        c) collector thread(s) joined.
  *      Caller is then guaranteed the device-side ring and the host ready queue
  *      shard(s) are both empty and all collected data has been delivered to
@@ -195,18 +218,19 @@
  *       Used in the idle-timeout log line (e.g. "ChipSwimlane", "PMU", "ArgsDump").
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
+#pragma once
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -216,6 +240,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/buffer_pool_manager.h"
+#include "host/chip_swimlane_runs.h"
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
@@ -249,10 +274,10 @@ using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
 // `default_host_shadow_register` was previously a free function; it has been
-// folded into a lambda inside `ProfilerBase::start()` so the shadow it
-// malloc's can be registered with the manager's `malloc_shadows_` set for
+// folded into `bind_manager_memory_context()` so its malloc'd shadow can
+// be registered with the manager's `malloc_shadows_` set for
 // safe teardown via `clear_mappings()` / `release_all_owned()`. See
-// `ProfilerBase::start()` for the inline definition.
+// `ProfilerBase::bind_manager_memory_context()` for the inline definition.
 
 /**
  * RAII scope guard for collector `init()` rollback. On destruction (without
@@ -292,7 +317,10 @@ public:
         if (committed_) return;
         for (void *p : direct_ptrs_) {
             if (p != nullptr && release_fn_) {
-                release_fn_(p);
+                // The status is observed, not discarded: a rollback that could
+                // not free what it allocated leaves memory held, and the
+                // manager's paired occupancy has to keep reflecting it.
+                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
             }
         }
         // Call release_all_owned unconditionally: it also frees malloc'd
@@ -302,7 +330,7 @@ public:
         // lambda instead.
         manager_.release_all_owned([this](void *p) {
             if (p != nullptr && release_fn_) {
-                release_fn_(p);
+                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
             }
         });
     }
@@ -347,6 +375,15 @@ struct TopUpResult {
     bool filled;
 };
 
+// Outcome of one drain-path ready entry. kRetry is the only one that leaves the
+// device's consumer index where it was, so the same entry is seen again by the
+// next peek; the other two have advanced it.
+enum class EntryOutcome {
+    kDelivered,  // in the host hand-off ring, on its way to the collector
+    kRetry,      // neither acknowledged nor delivered
+    kDropped,    // acknowledged and counted as lost; never reached a collector
+};
+
 // Unified mgmt-loop algorithms parameterized on Module's data-access traits.
 // Module supplies the layout (constants + types + resolve_entry +
 // for_each_instance); ProfilerAlgorithms supplies the control flow that used
@@ -358,15 +395,14 @@ struct ProfilerAlgorithms {
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
     using FreeQueue = typename Module::FreeQueue;
 
-    // Pop one entry from the per-thread ready queue, advancing the head with
-    // the appropriate memory barriers. Returns false if the queue is empty
-    // (or the device wrote an out-of-range head/tail, which is treated as
-    // empty and reported).
+    // Read the entry at the head of the per-thread ready queue without
+    // acknowledging it. Returns false if the queue is empty (or the device wrote
+    // an out-of-range head/tail, which is treated as empty and reported).
     //
-    // a5: the head advance is written back to device immediately via
-    // `mgr.write_range_to_device(&header->queue_heads[q], ...)` so AICPU sees
-    // the consumer-side update without us bulk-mirroring the whole shm region
-    // (which would clobber AICPU-owned fields elsewhere in the shm).
+    // The device still owns the slot on return: only ack_aicpu_entry() advances
+    // the consumer index, and process_entry calls it once the entry's payload is
+    // in the host shadow. So a host-side failure between the two costs a repeat
+    // of this peek rather than the record.
     //
     // Torn-read defense: the per-tick `mirror_shm_from_device` is a single
     // bulk rtMemcpy that is not atomic w.r.t. concurrent AICPU writes. AICPU
@@ -375,11 +411,11 @@ struct ProfilerAlgorithms {
     // bulk mirror happens to scan the entry slot first and the tail counter
     // last, host can observe `head < tail` while the entry it's about to
     // read is still pre-publish (e.g. `buffer_ptr == 0`). We refresh the
-    // entry with `read_range_from_device` and skip the pop if the refreshed
+    // entry with `read_range_from_device` and skip the peek if the refreshed
     // entry still looks empty — try again next tick.
     template <typename Mgr>
     static bool
-    try_pop_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
+    try_peek_aicpu_entry(Mgr &mgr, DataHeader *header, int q, ReadyEntry &out, bool refresh_indices = false) {
         if (refresh_indices) {
             if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
                 mgr.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
@@ -412,15 +448,23 @@ struct ProfilerAlgorithms {
         }
         rmb();
         out = header->queues[q][head];
-        if (out.buffer_ptr == 0) {
-            return false;
-        }
-        uint32_t old_head = head;
-        uint32_t next_head = (head + 1) % Module::kReadyQueueSize;
-        header->queue_heads[q] = next_head;
+        return out.buffer_ptr != 0;
+    }
+
+    // Hand the slot holding ready queue q's head entry back to the device by
+    // advancing the consumer index.
+    //
+    // a5: the head advance is written back to device immediately via
+    // `mgr.write_range_to_device(&header->queue_heads[q], ...)` so AICPU sees
+    // the consumer-side update without us bulk-mirroring the whole shm region
+    // (which would clobber AICPU-owned fields elsewhere in the shm). A failed
+    // write-back leaves the host-side index where the device has it, so the
+    // entry stays unacknowledged and the next peek sees it again.
+    template <typename Mgr>
+    static bool ack_aicpu_entry(Mgr &mgr, DataHeader *header, int q) {
+        const uint32_t old_head = header->queue_heads[q];
+        header->queue_heads[q] = (old_head + 1) % Module::kReadyQueueSize;
         wmb();
-        // Push the new head value back to device. The bulk mirror_shm_to_device
-        // is intentionally not used here — see buffer_pool_manager.h.
         if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
             header->queue_heads[q] = old_head;
             LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
@@ -438,20 +482,50 @@ struct ProfilerAlgorithms {
     // starved lane could never recover, because this top-up is entry-driven and
     // a lane with no buffer has nothing left to publish.
     //
+    // `retries_exhausted` says this entry has held the queue head long enough
+    // that a still-failing copy must be retired rather than retried again; see
+    // ProfilerBase::kStalledDrainEntryTimeout.
+    //
     // a5 specifics: after resolving the popped buffer's host shadow, copy
     // the buffer contents from device to host before delivery. The host
     // shadow seen by the collector then matches what the device wrote.
     template <typename Mgr>
-    static void
-    process_entry(Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out) {
+    static EntryOutcome process_entry(
+        Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out,
+        bool retries_exhausted
+    ) {
         auto site_opt = Module::resolve_entry(mgr.shared_mem_host(), header, q, entry);
-        if (!site_opt.has_value()) return;
+        if (!site_opt.has_value()) {
+            // resolve_entry already logged which index failed to validate, and no
+            // retry can make it validate.
+            if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+            // The buffer pointer travelled in the same entry, so it is trustworthy
+            // only as far as the manager can vouch for it, and never trustworthy
+            // enough to publish into a device-visible free_queue for AICPU to
+            // dereference. A pointer inside a block this manager owns is parked in
+            // the host-only retired pool, which teardown releases; one the manager
+            // cannot map is withheld entirely, because release_pointer_for() hands
+            // an unmapped pointer to the free callback unchanged, and freeing a
+            // pointer from a corrupt entry is worse than forgetting it. The kind is
+            // unknown here and 0 is a bucket label only: the retired pools are
+            // drained by iterating every shard and kind, never selectively.
+            void *dev_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            const bool parked =
+                mgr.resolve_host_ptr(dev_ptr) != nullptr && mgr.retire_unqueued_buffer(/*kind=*/0, dev_ptr, q);
+            LOG_ERROR(
+                "%s: retired an unresolvable ready entry on thread %d; its records are lost and its buffer %p is %s",
+                Module::kSubsystemName, q, dev_ptr, parked ? "parked until teardown" : "withheld from the pool"
+            );
+            return EntryOutcome::kDropped;
+        }
         auto &site = *site_opt;
 
         site.info.host_buffer_ptr = mgr.resolve_host_ptr(site.info.dev_buffer_ptr);
         if (site.info.host_buffer_ptr == nullptr) {
-            // resolve_host_ptr already logged. Drop rather than deliver null.
-            return;
+            // resolve_host_ptr already logged. Mappings are established when a
+            // buffer is allocated, i.e. before the device can ever publish it,
+            // so an unmappable buffer will not become mappable on a retry.
+            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer is not mapped on this host");
         }
         // a5: pull buffer contents from device into the host shadow before
         // the collector reads `count` and `records[]`.
@@ -459,8 +533,15 @@ struct ProfilerAlgorithms {
             LOG_ERROR(
                 "%s: failed to copy ready buffer from device (kind=%d, thread=%d)", Module::kSubsystemName, site.kind, q
             );
-            return;
+            if (!retries_exhausted) return EntryOutcome::kRetry;
+            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer could not be copied to host");
         }
+
+        // The payload is in the host shadow, so the device's slot can go back.
+        // Doing this before the copy would put a failure between the
+        // acknowledgement and the delivery, which is exactly how a record gets
+        // lost without anything counting it.
+        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
 
         // Drain-driven free_queue top-up. The drain shard that serves ready queue
         // q is the sole runtime writer of every free_queue that q's entries
@@ -471,11 +552,11 @@ struct ProfilerAlgorithms {
             *short_site_out = site;
         }
 
-        // The device ready entry was already acknowledged by
-        // try_pop_aicpu_entry(). Keep ownership here until the collector frees
-        // a host-ring slot; retiring on transient host backpressure would make
-        // the buffer unreachable to Derived::on_buffer_collected().
+        // Ownership stays here until the collector frees a host-ring slot;
+        // retiring on transient host backpressure would make the buffer
+        // unreachable to Derived::on_buffer_collected().
         mgr.wait_push_to_ready(site.info, q);
+        return EntryOutcome::kDelivered;
     }
 
     // Top up every (kind, instance) free_queue to kSlotCount before worker
@@ -591,6 +672,28 @@ private:
         if (p != nullptr) return p;
 
         return nullptr;
+    }
+
+    // Retire a ready entry whose payload the host will never read: acknowledge
+    // the device slot so the queue keeps draining, then put the buffer back into
+    // the free_queue it came from so the pool does not shrink. That queue's sole
+    // runtime writer is this drain shard, which is why the buffer can go straight
+    // back rather than through a recycled lane another thread owns; when it has
+    // no room the manager's retired pool holds the buffer until teardown frees
+    // it, exactly as a failed top-up does.
+    template <typename Mgr>
+    static EntryOutcome
+    retire_undeliverable_entry(Mgr &mgr, DataHeader *header, int q, const EntrySite<Module> &site, const char *reason) {
+        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+        LOG_ERROR(
+            "%s: retired ready buffer %p (kind=%d, thread=%d) because %s; its records are lost and are part of this "
+            "run's reconcile gap",
+            Module::kSubsystemName, site.info.dev_buffer_ptr, site.kind, q, reason
+        );
+        if (!try_push_to_free_queue(mgr, *site.free_queue, site.info.dev_buffer_ptr)) {
+            (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
+        }
+        return EntryOutcome::kDropped;
     }
 
     // Append one buffer pointer to a per-instance free_queue if it has
@@ -744,7 +847,7 @@ public:
      * framework picks the right register fallback (identity vs host-shadow
      * malloc) based on whether `copy_to_device` was provided.
      *
-     * `register_cb` may be nullptr — start(tf) installs the appropriate
+     * `register_cb` may be nullptr — set_memory_context() installs the appropriate
      * default for the arch path (identity on SVM platforms, host-shadow
      * malloc + memset 0 + copy_to_device on non-SVM platforms).
      */
@@ -763,6 +866,10 @@ public:
         shm_host_ = shm_host;
         shm_size_ = shm_size;
         device_id_ = device_id;
+        // begin_run() publishes fields before start(). Bind now so a rebuilt
+        // collector cannot translate new host pointers through the previous
+        // region's base. Init/rebind requires the collector threads to be stopped.
+        bind_manager_memory_context();
     }
 
     /**
@@ -779,11 +886,11 @@ public:
         shm_host_ = nullptr;
         shm_size_ = 0;
         device_id_ = -1;
+        manager_.clear_memory_context();
     }
 
     /**
-     * Assemble a MemoryOps from the callbacks stashed by set_memory_context()
-     * and launch the mgmt + collector threads. If shm_host_ is nullptr (Derived's
+     * Launch the mgmt + collector threads. If shm_host_ is nullptr (Derived's
      * init() aborted before set_memory_context, or finalize() has cleared
      * the context) this is a no-op.
      *
@@ -818,49 +925,6 @@ public:
             );
             return;
         }
-
-        MemoryOps ops;
-        ops.alloc = alloc_cb_;
-        ops.free_ = free_cb_;
-        if (register_cb_ != nullptr) {
-            ops.reg = register_cb_;
-        } else if (copy_to_device_) {
-            // Non-SVM platform: host-shadow allocate + copy zeros to device.
-            // Capture `this` so the malloc'd shadow can be registered as
-            // framework-owned via the manager.
-            auto copy_to_device = copy_to_device_;
-            ops.reg = [this,
-                       copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) -> int {
-                if (host_ptr_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-                void *host_ptr = std::malloc(size);
-                if (host_ptr == nullptr) {
-                    *host_ptr_out = nullptr;
-                    return PTO_RUNTIME_ERR_INTERNAL;
-                }
-                std::memset(host_ptr, 0, size);
-                int rc = copy_to_device(dev_ptr, host_ptr, size);
-                if (rc != 0) {
-                    std::free(host_ptr);
-                    *host_ptr_out = nullptr;
-                    return rc;
-                }
-                manager_.add_malloc_shadow(host_ptr);
-                *host_ptr_out = host_ptr;
-                return 0;
-            };
-        } else {
-            // SVM platform: identity-map (host_ptr == dev_ptr).
-            ops.reg = [](void *dev_ptr, size_t /*size*/, int /*device_id*/, void **host_ptr_out) {
-                *host_ptr_out = dev_ptr;
-                return 0;
-            };
-        }
-        // copy_to_device_ / copy_from_device_ may be null (SVM path); the
-        // manager's internal null-checks short-circuit mirror_/range_/buffer_
-        // calls to no-ops in that case.
-        ops.copy_to_device = copy_to_device_;
-        ops.copy_from_device = copy_from_device_;
-        manager_.set_memory_context(std::move(ops), shm_dev_, shm_host_, shm_size_, device_id_);
 
         execution_complete_.store(false, std::memory_order_release);
         // Reset the quiescence handshake so a restarted collector cannot see a
@@ -940,6 +1004,7 @@ public:
         // Phase two: only now can a collector's "my shard is empty" mean the
         // pipeline is empty rather than that mgmt has not pushed yet.
         collect_quiesce_epoch_.store(epoch, std::memory_order_release);
+        manager_.notify_ready_waiters();
         wait_for_epoch(collect_acked_, n, epoch);
     }
 
@@ -967,6 +1032,7 @@ public:
             mgmt_replenish_thread_.join();
         }
         execution_complete_.store(true, std::memory_order_release);
+        manager_.notify_ready_waiters();
         for (auto &thread : collector_threads_) {
             if (thread.joinable()) {
                 thread.join();
@@ -978,7 +1044,123 @@ public:
     Manager &manager() { return manager_; }
     const Manager &manager() const { return manager_; }
 
+    /**
+     * Push one host-shadow field to its device mirror, naming the subsystem and
+     * the field if the write is rejected.
+     *
+     * `write_range_to_device` rejects a field outside the manager's shm window
+     * and returns non-zero. A caller that discards that result configures
+     * nothing and reports nothing: the device keeps its previous value, and the
+     * only trace is the manager's own log line, which names neither the
+     * subsystem nor what was being published. That is how a base-pointer
+     * disagreement between a collector's `shm_host_` and the manager's copy
+     * reaches a reader as "no records were produced" (#2206).
+     *
+     * Returns false on rejection so a caller that can act on it may; callers
+     * that only need the diagnostic can ignore the result, since the logging has
+     * already happened.
+     *
+     * @param host_field  Address inside the host shm shadow.
+     * @param size        Bytes to publish.
+     * @param what        Field name for the log line.
+     */
+    bool publish_field(const volatile void *host_field, size_t size, const char *what) {
+        if (manager_.write_range_to_device(host_field, size) != 0) {
+            LOG_ERROR(
+                "%s: failed to publish %s to the device; it keeps its previous value", Module::kSubsystemName, what
+            );
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Ready buffers the drain path has retired without delivering them since the
+     * last report_drain_drops(). The device published them, so their records are
+     * inside `device_total`, but no collector ever saw them: a non-zero value
+     * means part of the reconcile gap is host-side, and each one was logged as an
+     * ERROR naming the buffer and the reason when it was retired.
+     *
+     * Counted in buffers, not records — the record count of a buffer the host
+     * could not read is not recoverable.
+     */
+    uint64_t drain_dropped_buffers() const { return drain_dropped_buffers_.load(std::memory_order_relaxed); }
+
 protected:
+    // How long one ready queue's head entry may keep failing to be delivered
+    // before it is retired. This is what bounds a host-side transport failure:
+    // without it an entry the host can never read would hold its queue's head
+    // forever, and quiesce() — which waits for every drain shard to report its
+    // queues empty — could not complete. Only a broken path ever spends it, and
+    // it is spent once per undeliverable entry.
+    //
+    // A duration rather than a sweep count because what it rides out is measured
+    // in time: a sweep costs microseconds, so any count small enough to bound
+    // teardown would expire long before a transport failure could clear.
+    static constexpr std::chrono::milliseconds kStalledDrainEntryTimeout{1000};
+
+    /**
+     * Name what the drain path lost, so a reconcile gap is attributable instead
+     * of anonymous. Derived::reconcile_counters() is the only caller: the read
+     * consumes the count, which is what makes each run report its own rather
+     * than the collector's cumulative total across a resident lifetime.
+     */
+    void report_drain_drops() {
+        const uint64_t dropped = drain_dropped_buffers_.exchange(0, std::memory_order_relaxed);
+        if (dropped == 0) return;
+        LOG_ERROR(
+            "%s reconcile: the host drain path retired %lu ready buffer(s) without delivering them. Their records are "
+            "inside device_total but were never collected, so any silent_loss reported below is at least this far "
+            "host-side; the per-buffer ERROR lines above name each buffer and why it was retired.",
+            Derived::kSubsystemName, static_cast<unsigned long>(dropped)
+        );
+    }
+
+    void bind_manager_memory_context() {
+        MemoryOps ops;
+        ops.alloc = alloc_cb_;
+        ops.free_ = free_cb_;
+        if (register_cb_ != nullptr) {
+            ops.reg = register_cb_;
+        } else if (copy_to_device_) {
+            // Non-SVM platform: host-shadow allocate + copy zeros to device.
+            // Capture `this` so the malloc'd shadow can be registered as
+            // framework-owned via the manager.
+            auto copy_to_device = copy_to_device_;
+            ops.reg = [this,
+                       copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) -> int {
+                if (host_ptr_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+                void *host_ptr = std::malloc(size);
+                if (host_ptr == nullptr) {
+                    *host_ptr_out = nullptr;
+                    return PTO_RUNTIME_ERR_INTERNAL;
+                }
+                std::memset(host_ptr, 0, size);
+                int rc = copy_to_device(dev_ptr, host_ptr, size);
+                if (rc != 0) {
+                    std::free(host_ptr);
+                    *host_ptr_out = nullptr;
+                    return rc;
+                }
+                manager_.add_malloc_shadow(host_ptr);
+                *host_ptr_out = host_ptr;
+                return 0;
+            };
+        } else {
+            // SVM platform: identity-map (host_ptr == dev_ptr).
+            ops.reg = [](void *dev_ptr, size_t /*size*/, int /*device_id*/, void **host_ptr_out) {
+                *host_ptr_out = dev_ptr;
+                return 0;
+            };
+        }
+        // copy_to_device_ / copy_from_device_ may be null (SVM path); the
+        // manager's internal null-checks short-circuit mirror_/range_/buffer_
+        // calls to no-ops in that case.
+        ops.copy_to_device = copy_to_device_;
+        ops.copy_from_device = copy_from_device_;
+        manager_.set_memory_context(std::move(ops), shm_dev_, shm_host_, shm_size_, device_id_);
+    }
+
     Manager manager_;
     std::atomic<bool> execution_complete_{false};
     std::vector<std::thread> collector_threads_;
@@ -1027,7 +1209,10 @@ protected:
             }
         }
         if (free_cb) {
-            free_cb(release_ptr);
+            // A release that does not report success leaves memory held, so the
+            // manager's paired occupancy keeps counting it rather than treating
+            // an emptied mapping table as proof.
+            if (int rc = free_cb(release_ptr); rc != 0) manager_.note_release_failed(release_ptr, rc);
         }
     }
 
@@ -1067,7 +1252,7 @@ protected:
             int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
             if (rc != 0 || host_ptr == nullptr) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: register_cb_ failed: %d", rc);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
         } else if (copy_to_device_) {
@@ -1075,7 +1260,7 @@ protected:
             host_ptr = std::malloc(size);
             if (host_ptr == nullptr) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: host shadow alloc failed for %zu bytes", size);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
             std::memset(host_ptr, 0, size);
@@ -1083,7 +1268,7 @@ protected:
             if (rc != 0) {
                 LOG_ERROR("ProfilerBase::alloc_paired_buffer: copy_to_device failed: %d", rc);
                 std::free(host_ptr);
-                if (free_cb_) free_cb_(dev_ptr);
+                release_unregistered_buffer(dev_ptr);
                 return nullptr;
             }
             manager_.add_malloc_shadow(host_ptr);
@@ -1097,7 +1282,316 @@ protected:
         return dev_ptr;
     }
 
+    /**
+     * Release a device pointer this allocation never registered, recording a
+     * release that did not report success.
+     *
+     * Each of the three paths above returns before `register_mapping`, so the
+     * pointer never reaches the manager's mapping table and the init rollback
+     * guard can neither release it nor observe what happened to it: this is the
+     * only place its outcome can be recorded. A context with no free callback
+     * cannot release the pointer at all, which is the same conclusion — the
+     * memory is still held — and is recorded the same way.
+     */
+    void release_unregistered_buffer(void *dev_ptr) {
+        if (dev_ptr == nullptr) return;
+        const int rc = free_cb_ ? free_cb_(dev_ptr) : -1;
+        if (rc != 0) manager_.note_release_failed(dev_ptr, rc);
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-run transport cut
+    // -------------------------------------------------------------------------
+    //
+    // A finite, per-queue proof that one run's published buffers have all been
+    // delivered and processed, usable while a successor keeps publishing. An
+    // empty-sweep observation cannot do that: `found_any` is set by any entry on
+    // any queue, so a busy successor keeps every sweep non-empty and the
+    // quiescence ack never lands. The cut instead fixes a *target count* per
+    // queue at one instant and then watches monotonic counters reach it.
+    //
+    // Every value below is written by exactly one thread: a queue's counters by
+    // the drain owner that serves it (owner `q % shard_count_`), a shard's
+    // processed counter by that collector thread. Nothing here is read or
+    // written unless a run has been retained, so the five other profilers
+    // pay one relaxed load per sweep and nothing else.
+
+    static constexpr size_t kMaxCutSlots = 2;
+    static constexpr size_t kMaxCutQueues = static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS);
+
+    /**
+     * A cut slot's lifecycle.
+     *
+     * `Published` is the only state in which a drain owner may touch the
+     * per-queue arrays, and a slot reaches it only after they are initialized.
+     * It returns to `Free` only once every owner has proved it is no longer
+     * inside them, so the next arm cannot reinitialize an array under a reader
+     * that observed the previous incarnation.
+     */
+    enum class CutState : int { Free = 0, Reserved, Published, Retiring };
+
+    struct CutSlot {
+        std::atomic<int> state{static_cast<int>(CutState::Free)};
+        // Per queue, written once by that queue's owner when it captures the cut
+        // at an entry boundary and read afterwards by that same owner. No other
+        // thread reads `target`.
+        std::array<uint64_t, kMaxCutQueues> target{};
+        // 0 unarmed, 1 armed, 2 capture failed. Written by the queue's owner and
+        // read by the writer, so the access is atomic even though the
+        // writer is unique.
+        std::array<std::atomic<uint8_t>, kMaxCutQueues> qstate{};
+        // Per drain owner, published when every queue it serves has reached its
+        // own target. The count of pushes at or before that instant is what the
+        // collector side must catch up to.
+        std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> push_watermark{};
+        std::array<std::atomic<uint8_t>, Manager::kMaxCollectorShards> stage1{};
+    };
+
+    /**
+     * Arm a cut. Returns its slot index, or -1 when both slots are in use.
+     *
+     * `request_out` receives the capture request this arm published; every
+     * later question about the cut is asked against that value, because an ack
+     * for a *different* request says nothing about this capture.
+     *
+     * The caller must be holding the run's execution claim: the capture reads
+     * `queue_tails[q]`, which is stable only while no producer is running.
+     */
+    int cut_arm(uint64_t *request_out) {
+        if (request_out == nullptr) return -1;
+        *request_out = 0;
+        if (!simpler::dfx::runs::counter_headroom(cut_request_.load(std::memory_order_relaxed))) {
+            note_counter_exhausted("cut request generation");
+            return -1;
+        }
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            int expected = static_cast<int>(CutState::Free);
+            if (!cut_slots_[slot].state.compare_exchange_strong(
+                    expected, static_cast<int>(CutState::Reserved), std::memory_order_acq_rel
+                )) {
+                continue;
+            }
+            // Reserved and not yet published, so no drain owner may read any of
+            // this: initialize first, publish second.
+            CutSlot &s = cut_slots_[slot];
+            s.target.fill(0);
+            for (size_t q = 0; q < kMaxCutQueues; q++)
+                s.qstate[q].store(0, std::memory_order_relaxed);
+            for (int i = 0; i < Manager::kMaxCollectorShards; i++) {
+                s.push_watermark[i].store(0, std::memory_order_relaxed);
+                s.stage1[i].store(0, std::memory_order_relaxed);
+            }
+            s.state.store(static_cast<int>(CutState::Published), std::memory_order_release);
+            *request_out = cut_bump_request();
+            return static_cast<int>(slot);
+        }
+        return -1;
+    }
+
+    /** Every drain owner has acknowledged a boundary pass at or after `request`. */
+    bool cut_acked(uint64_t request) const {
+        for (int i = 0; i < shard_count_; i++) {
+            // `>=` and not `==`: an ack is monotonic, so an owner that has moved
+            // past this request has certainly passed a boundary after it.
+            if (cut_ack_[i].load(std::memory_order_acquire) < request) return false;
+        }
+        return true;
+    }
+
+    /** Block until `request` is acknowledged by every owner, or the budget runs out. */
+    bool cut_wait_for_ack(uint64_t request, int timeout_ms) {
+        if (!mgmt_running_.load(std::memory_order_acquire)) return cut_acked(request);
+        std::unique_lock<std::mutex> lk(cut_mu_);
+        return cut_cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this, request] {
+            return cut_acked(request);
+        });
+    }
+
+    /** Stage 1: every owner reports all of its own queues at their targets. */
+    bool cut_stage1_done(int slot) const {
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) return false;
+        for (int i = 0; i < shard_count_; i++) {
+            if (s.stage1[i].load(std::memory_order_acquire) == 0) return false;
+        }
+        return true;
+    }
+
+    /** Stage 2: every collector shard has processed up to its owner's watermark. */
+    bool cut_stage2_done(int slot) const {
+        if (!cut_stage1_done(slot)) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        for (int i = 0; i < shard_count_; i++) {
+            if (ring_processed_[i].load(std::memory_order_acquire) <
+                s.push_watermark[i].load(std::memory_order_acquire)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * How many of this cut's queues could not be captured.
+     *
+     * False means *unknown*, not zero: until every drain owner has
+     * acknowledged the capture request, a queue that has not been visited yet
+     * is indistinguishable from one that succeeded, so reporting zero failures
+     * would be the absence of a report dressed up as a clean one.
+     */
+    bool cut_failed_queues(int slot, uint64_t request, int *failed_out) const {
+        if (failed_out == nullptr) return false;
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return false;
+        const CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) return false;
+        if (!cut_acked(request)) return false;
+        int failed = 0;
+        for (int q = 0; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q++) {
+            if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_acquire) == 2) failed++;
+        }
+        *failed_out = failed;
+        return true;
+    }
+
+    /**
+     * Retire a cut and hand its slot back.
+     *
+     * Marking the slot non-published is not enough on its own: a drain owner
+     * that already observed `Published` may still be inside the slot's arrays,
+     * and the next arm would reinitialize them under it. So the retirement
+     * publishes a fresh capture request *after* the state change and waits for
+     * every owner to acknowledge a boundary pass that began after it — a pass
+     * that, by the acquire on the request, must have observed `Retiring` and
+     * therefore touched nothing. Earlier passes on that thread are finished by
+     * program order.
+     *
+     * Returns false on timeout; the slot then stays retired for good rather
+     * than being handed to a reader-visible reuse.
+     */
+    bool cut_release(int slot, int timeout_ms) {
+        if (slot < 0 || static_cast<size_t>(slot) >= kMaxCutSlots) return true;
+        CutSlot &s = cut_slots_[static_cast<size_t>(slot)];
+        int expected = static_cast<int>(CutState::Published);
+        if (!s.state.compare_exchange_strong(
+                expected, static_cast<int>(CutState::Retiring), std::memory_order_acq_rel
+            )) {
+            if (expected == static_cast<int>(CutState::Reserved)) {
+                // Reserved but never published: no drain owner can have seen it.
+                s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+                return true;
+            }
+            // Already free, or being retired by somebody else — either way this
+            // caller must not hand it back a second time.
+            return expected == static_cast<int>(CutState::Free);
+        }
+        if (!mgmt_running_.load(std::memory_order_acquire)) {
+            // No drain owner is running, so there is no reader to retire behind.
+            s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+            return true;
+        }
+        const uint64_t request = cut_bump_request();
+        if (!cut_wait_for_ack(request, timeout_ms)) {
+            LOG_ERROR(
+                "%s: cut slot %d could not be retired within %d ms; it is not reused", Module::kSubsystemName, slot,
+                timeout_ms
+            );
+            return false;
+        }
+        s.state.store(static_cast<int>(CutState::Free), std::memory_order_release);
+        return true;
+    }
+
+    /**
+     * Bound the entries one queue may consume before the sweep rotates.
+     *
+     * Zero keeps today's behaviour — drain each queue until it reports empty —
+     * which starves a quiet queue while a busy sibling is served, and therefore
+     * starves that queue's stage 1. Retaining runs sets a finite quantum; nothing
+     * else does.
+     */
+    void set_drain_quantum(int quantum) { drain_quantum_.store(quantum, std::memory_order_relaxed); }
+
+    /**
+     * Arm or disarm the per-entry transport counters retention needs.
+     *
+     * Armed for the whole time runs are retained, not per cut: a counter that started
+     * counting at the first arm would have missed every entry consumed before
+     * it, and stage 1 compares a target captured from that same counter. While
+     * disarmed — which is every profiler that never retains a run — the drain
+     * loop pays one relaxed load per queue visit and the collector one per
+     * buffer, and no atomic is written.
+     */
+    void set_run_counters(bool on) { run_counters_on_.store(on, std::memory_order_release); }
+
+    /** A transport counter ran out of headroom; no cut can be trusted after this. */
+    bool cut_counters_exhausted() const { return cut_counter_exhausted_.load(std::memory_order_acquire); }
+
+    /**
+     * Publish a reference-release request and wait for every collector shard.
+     *
+     * The shard loads this epoch *before* refreshing its own view of the
+     * retained-run table, so an ack can never describe a view taken before
+     * the caller marked an epoch non-admitting. Returns false on timeout, and a
+     * false return is never permission to free: the caller quarantines.
+     */
+    bool request_run_reference_release(int timeout_ms) {
+        // One requester at a time. Two overlapping requests would each wait for
+        // their own epoch value while a shard, which only ever adopts the
+        // newest, could skip the older one entirely — so the older waiter would
+        // time out and quarantine a bucket that was in fact released.
+        std::lock_guard<std::mutex> lk(control_mu_);
+        if (!simpler::dfx::runs::counter_headroom(control_epoch_.load(std::memory_order_relaxed))) {
+            note_counter_exhausted("retained-run control epoch");
+            return false;
+        }
+        const uint64_t epoch = control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        manager_.notify_ready_waiters();
+        std::unique_lock<std::mutex> wait_lk(cut_mu_);
+        return cut_cv_.wait_for(wait_lk, std::chrono::milliseconds(timeout_ms), [this, epoch] {
+            for (int i = 0; i < shard_count_; i++) {
+                // `>=` and not `==`: an ack is monotonic, and a shard that has
+                // already moved past this epoch has certainly passed it.
+                if (control_acked_[i].load(std::memory_order_acquire) < epoch) return false;
+            }
+            return true;
+        });
+    }
+
 private:
+    /** Publish a capture request and return it. Acks are compared against it. */
+    uint64_t cut_bump_request() { return cut_request_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+
+    /**
+     * A transport counter has come within `kCounterMargin` of wrapping.
+     *
+     * Reported once and sticky: a wrapped counter makes every target
+     * comparison meaningless, so the collector refuses rather than publishing a
+     * cut it cannot justify. Waiters are woken because the refusal is what they
+     * are waiting to learn.
+     */
+    void note_counter_exhausted(const char *what) {
+        bool expected = false;
+        if (!cut_counter_exhausted_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+        LOG_ERROR("%s: %s counter is out of headroom; no further cut is trustworthy", Module::kSubsystemName, what);
+        {
+            std::lock_guard<std::mutex> lk(cut_mu_);
+            cut_cv_.notify_all();
+        }
+        notify_transport_progress(0);
+    }
+
+    /**
+     * Wake anything waiting on an ack.
+     *
+     * The mutex is taken after the ack store is already visible, so a waiter
+     * either evaluates its predicate afterwards and sees the ack, or is already
+     * blocked and is woken here. There is no window in between.
+     */
+    void cut_notify_ack() {
+        std::lock_guard<std::mutex> lk(cut_mu_);
+        cut_cv_.notify_all();
+    }
+
     // Teardown-path wait, so a sleep is permitted here: no task's latency
     // passes through it (codestyle.md rule 5 exempts teardown).
     template <typename Acks>
@@ -1121,22 +1615,77 @@ private:
         // served by exactly one shard, so this shard is their sole writer.
         std::vector<std::pair<int, EntrySite<Module>>> short_sites;
 
+        // When each of this shard's queues first failed to deliver its head
+        // entry, or a default-constructed time point while it is delivering
+        // normally. Per queue so one stalled lane does not spend a sibling's
+        // budget.
+        std::vector<std::chrono::steady_clock::time_point> stalled_since(static_cast<size_t>(queue_count_));
+
         while (mgmt_running_.load(std::memory_order_relaxed)) {
+            // An ack covers only a sweep that starts after this epoch is observed.
+            const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
+            // `found_any` gates quiescence — it means a queue still holds an entry
+            // that must be delivered. `retired_or_delivered` gates the idle
+            // backoff, and they differ only while an entry is being retried: a
+            // stalled queue is not idle, but it is also not making progress, and
+            // polling it flat out for the whole budget would burn a core.
             bool found_any = false;
+            bool retired_or_delivered = false;
             for (int q = queue_start; q < queue_count_; q += queue_stride) {
+                // Entry boundary: nothing of this queue's head is half-processed
+                // here, so the capture and its stage-1 check see a
+                // consistent (head, consumed, queue contents) triple. Checked on
+                // every visit, including a queue that turns out to be empty and
+                // one whose last outcome was a retry, so a busy sibling can never
+                // hide a pending request.
+                run_drain_boundary(header, queue_start, queue_stride);
                 ReadyEntry entry;
-                while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
+                int served = 0;
+                const int quantum = drain_quantum_.load(std::memory_order_relaxed);
+                while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
                     // A null free_queue is the "nothing to retry" sentinel;
                     // process_entry only writes this on a short top-up.
                     EntrySite<Module> short_site{};
-                    Alg::process_entry(manager_, header, q, entry, &short_site);
+                    auto &since = stalled_since[static_cast<size_t>(q)];
+                    const bool exhausted = entry_retries_exhausted(since);
+                    const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, &short_site, exhausted);
+                    if (outcome == EntryOutcome::kRetry) {
+                        if (since == std::chrono::steady_clock::time_point{}) {
+                            since = std::chrono::steady_clock::now();
+                        }
+                        // Within the budget the entry is still deliverable, so the
+                        // queue counts as live and quiesce() must wait for it. Past
+                        // the budget only a failing acknowledgement write can
+                        // produce a retry — the device link is gone and cannot
+                        // recover, so reporting the queue live would hang quiesce()
+                        // instead of letting the logged write failure be the signal.
+                        if (!exhausted) {
+                            found_any = true;
+                        }
+                        // The entry still sits at the head either way, so move on
+                        // to the next queue rather than spinning on it.
+                        break;
+                    }
+                    found_any = true;
+                    retired_or_delivered = true;
+                    since = std::chrono::steady_clock::time_point{};
+                    if (outcome == EntryOutcome::kDropped) {
+                        drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                        note_buffer_retired(q);
+                    } else {
+                        note_buffer_delivered(q, queue_start);
+                    }
                     if (short_site.free_queue != nullptr) {
                         record_short_site(short_sites, q, short_site);
                     }
-                    found_any = true;
+                    // Rotate after a bounded number of entries so a sustained
+                    // producer on this queue cannot starve a sibling — and with
+                    // it, that sibling's cut. Zero means today's drain-to-empty.
+                    if (quantum > 0 && ++served >= quantum) break;
                 }
             }
-            if (found_any) {
+            run_drain_boundary(header, queue_start, queue_stride);
+            if (retired_or_delivered) {
                 idle_busy_polls = 0;
             }
 
@@ -1150,13 +1699,12 @@ private:
             // precondition) nothing can arrive behind this report, so it is the
             // quiescent condition for phase one.
             if (!found_any) {
-                const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
                 if (drain_acked_[queue_start].load(std::memory_order_relaxed) != requested) {
                     drain_acked_[queue_start].store(requested, std::memory_order_release);
                 }
             }
 
-            if (!found_any) {
+            if (!retired_or_delivered) {
                 if (idle_busy_polls < kIdleBusyPollLoops) {
                     idle_busy_polls++;
                 } else {
@@ -1167,10 +1715,152 @@ private:
 
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
             ReadyEntry entry;
-            while (Alg::try_pop_aicpu_entry(manager_, header, q, entry, true)) {
-                Alg::process_entry(manager_, header, q, entry, nullptr);
+            auto since = std::chrono::steady_clock::time_point{};
+            while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                const bool exhausted = entry_retries_exhausted(since);
+                const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, nullptr, exhausted);
+                if (outcome == EntryOutcome::kRetry) {
+                    // Past the budget the acknowledgement write is what is
+                    // failing; leave the queue alone rather than retrying a dead
+                    // device link until the pass never ends.
+                    if (exhausted) break;
+                    if (since == std::chrono::steady_clock::time_point{}) {
+                        since = std::chrono::steady_clock::now();
+                    }
+                    // Teardown path, so a sleep is permitted here (codestyle.md
+                    // rule 5): no task's latency passes through it, and it keeps a
+                    // dead device link from pinning a core for the whole budget.
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
+                since = std::chrono::steady_clock::time_point{};
+                if (outcome == EntryOutcome::kDropped) {
+                    drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Transport cut bookkeeping, all single-writer
+    // -------------------------------------------------------------------------
+
+    /** Count one entry this owner delivered to its collector shard. */
+    void note_buffer_delivered(int q, int owner) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
+        if (static_cast<size_t>(q) >= kMaxCutQueues || owner < 0 || owner >= Manager::kMaxCollectorShards) return;
+        const bool ok = simpler::dfx::runs::checked_increment(consumed_total_[static_cast<size_t>(q)]) &&
+                        simpler::dfx::runs::checked_increment(pushed_total_[static_cast<size_t>(owner)]);
+        if (!ok) note_counter_exhausted("per-queue transport");
+    }
+
+    /**
+     * Count one entry this owner consumed without delivering it.
+     *
+     * A retired entry is consumed as far as the cut is concerned — its slot is
+     * gone and no collector will ever see it — so the target stays reachable.
+     * The loss itself is already reported by `drain_dropped_buffers_`.
+     */
+    void note_buffer_retired(int q) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
+        if (static_cast<size_t>(q) >= kMaxCutQueues) return;
+        if (!simpler::dfx::runs::checked_increment(consumed_total_[static_cast<size_t>(q)])) {
+            note_counter_exhausted("per-queue transport");
+        }
+    }
+
+    /**
+     * The only place a cut is captured or advanced.
+     *
+     * Called at entry boundaries only, which is what makes the triple it reads
+     * consistent. Arming refreshes the tail narrowly through the same
+     * per-word call `try_peek_aicpu_entry` uses, and issues it from the word's
+     * sole owner so the host shadow keeps one writer.
+     *
+     * A slot is touched only in `Published`, which is published after its
+     * arrays are initialized and withdrawn before they are reinitialized — and
+     * the ack this pass writes at the end is what proves to a retiring cut that
+     * this owner is no longer inside them.
+     */
+    void run_drain_boundary(DataHeader *header, int queue_start, int queue_stride) {
+        if (!run_counters_on_.load(std::memory_order_relaxed)) return;
+        const uint64_t request = cut_request_.load(std::memory_order_acquire);
+        const bool capture_pending = cut_ack_[queue_start].load(std::memory_order_relaxed) < request;
+        bool progressed = false;
+
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            CutSlot &s = cut_slots_[slot];
+            if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
+            for (int q = queue_start; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q += queue_stride) {
+                if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed) != 0) continue;
+                uint32_t tail = 0;
+                uint32_t head = 0;
+                if (!capture_run_queue(header, q, &head, &tail)) {
+                    // CaptureFailed: this queue's stage 1 is unknown and is
+                    // never satisfied by default.
+                    s.qstate[static_cast<size_t>(q)].store(2, std::memory_order_release);
+                    continue;
+                }
+                const uint32_t outstanding = (tail + Module::kReadyQueueSize - head) % Module::kReadyQueueSize;
+                s.target[static_cast<size_t>(q)] =
+                    consumed_total_[static_cast<size_t>(q)].load(std::memory_order_relaxed) + outstanding;
+                s.qstate[static_cast<size_t>(q)].store(1, std::memory_order_release);
+            }
+            if (s.stage1[queue_start].load(std::memory_order_relaxed) != 0) continue;
+            bool all_reached = true;
+            for (int q = queue_start; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q += queue_stride) {
+                const uint8_t state = s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed);
+                if (state == 0) {
+                    all_reached = false;  // not captured yet
+                    break;
+                }
+                if (state == 2) continue;  // failed queues cannot be waited for
+                if (consumed_total_[static_cast<size_t>(q)].load(std::memory_order_relaxed) <
+                    s.target[static_cast<size_t>(q)]) {
+                    all_reached = false;
+                    break;
+                }
+            }
+            if (all_reached) {
+                s.push_watermark[queue_start].store(
+                    pushed_total_[static_cast<size_t>(queue_start)].load(std::memory_order_relaxed),
+                    std::memory_order_release
+                );
+                s.stage1[queue_start].store(1, std::memory_order_release);
+                progressed = true;
+            }
+        }
+        if (capture_pending) {
+            cut_ack_[queue_start].store(request, std::memory_order_release);
+            cut_notify_ack();
+        }
+        // Stage 1 is what a publisher waits for, so it is woken by the
+        // transition rather than by a timer.
+        if (progressed) notify_transport_progress(0);
+    }
+
+    /** Narrow, owner-issued refresh of one queue's cursors. */
+    bool capture_run_queue(DataHeader *header, int q, uint32_t *head_out, uint32_t *tail_out) {
+        if (header == nullptr) return false;
+        if (manager_.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0 ||
+            manager_.read_range_from_device(&header->queue_tails[q], sizeof(header->queue_tails[q])) != 0) {
+            LOG_ERROR("%s: cut could not refresh ready_queue cursors for thread %d", Module::kSubsystemName, q);
+            return false;
+        }
+        rmb();
+        const uint32_t head = header->queue_heads[q];
+        const uint32_t tail = header->queue_tails[q];
+        if (head >= Module::kReadyQueueSize || tail >= Module::kReadyQueueSize) return false;
+        *head_out = head;
+        *tail_out = tail;
+        return true;
+    }
+
+    // A stall that has not started yet is never exhausted; one that has is
+    // exhausted once it has outlived kStalledDrainEntryTimeout.
+    static bool entry_retries_exhausted(std::chrono::steady_clock::time_point stalled_since) {
+        if (stalled_since == std::chrono::steady_clock::time_point{}) return false;
+        return std::chrono::steady_clock::now() - stalled_since >= kStalledDrainEntryTimeout;
     }
 
     // Append a site unless this shard is already tracking that free_queue. The
@@ -1218,9 +1908,37 @@ private:
         }
     }
 
+    bool quiesce_pending(int shard_index) const {
+        return collect_quiesce_epoch_.load(std::memory_order_acquire) !=
+               collect_acked_[shard_index].load(std::memory_order_relaxed);
+    }
+
     /**
-     * Main collector loop. Blocks on one manager ready-queue shard with a 100 ms
-     * cv-wait tick. On each hit it dispatches the buffer to Derived via
+     * This shard owes an acknowledgement for the retained-run table.
+     *
+     * Part of the ready-ring wait predicate, and level-triggered like the
+     * quiescence term: it stays true until the shard stores its ack at the top
+     * of the loop, after the refresh. Notifying the ring is not enough on its
+     * own — `notify_ready_waiters` wakes the consumer but advances no ready
+     * shard's `state_epoch`, so a consumer asleep on an unchanging empty ring
+     * would re-test a predicate that knows nothing about control, find it
+     * false, and sleep out the rest of its 100 ms tick. A request that lands
+     * between the epoch load at the top of the loop and the wait is the same
+     * case with the same answer: the condition is in the predicate, so the wait
+     * returns at once instead of timing out. `run_begin` blocks on this
+     * acknowledgement before a device launch, so that tick would be paid by
+     * every run.
+     */
+    bool control_pending(int shard_index) const {
+        return control_epoch_.load(std::memory_order_acquire) !=
+               control_acked_[shard_index].load(std::memory_order_relaxed);
+    }
+
+    /**
+     * Main collector loop. Blocks on one manager ready-queue shard. Ready
+     * buffers and lifecycle control requests wake it immediately; the 100 ms
+     * cv-wait tick is a fallback for missed data-path notifications and idle
+     * bookkeeping. On each hit it dispatches the buffer to Derived via
      * on_buffer_collected() and recycles the buffer. Exits only after:
      *
      *   execution_complete_ was set (by stop()) and this ready_queue shard is
@@ -1238,8 +1956,28 @@ private:
         bool has_seen_buffer = false;
 
         while (true) {
+            // Reference-release handshake, at the top of every iteration and
+            // under load — not only when this shard's ring runs dry. The control
+            // epoch is read *before* the snapshot refresh so this ack can never
+            // describe a view taken before the collector marked a run
+            // non-admitting, and it is emitted while this shard holds no bucket
+            // reference.
+            {
+                const uint64_t ctrl = control_epoch_.load(std::memory_order_acquire);
+                if (ctrl != control_acked_[shard_index].load(std::memory_order_relaxed)) {
+                    refresh_retained_run_view(shard_index, 0);
+                    control_acked_[shard_index].store(ctrl, std::memory_order_release);
+                    cut_notify_ack();
+                }
+            }
+            // Refreshed and acked above, so the control term of the wait
+            // predicate below is false again by the time the wait is entered
+            // unless a newer request has already arrived.
             ReadyBufferInfo info;
-            if (manager_.wait_pop_ready(info, wait_tick, shard_index)) {
+            if (manager_.wait_pop_ready(info, wait_tick, shard_index, [this, shard_index] {
+                    return execution_complete_.load(std::memory_order_acquire) || quiesce_pending(shard_index) ||
+                           control_pending(shard_index);
+                })) {
                 consume(info, shard_index);
                 has_seen_buffer = true;
                 idle_start.reset();
@@ -1252,15 +1990,16 @@ private:
                 }
                 break;
             }
-            // Phase two of the quiescence handshake. wait_pop_ready timed out,
-            // so this shard is empty; mgmt has already reported its own sweep
+            // Phase two of the quiescence handshake. A false wait result means
+            // no ready buffer was available after either a timeout or a control
+            // wake. For a pending quiesce, mgmt has already reported its sweep
             // done for this epoch, so nothing further can arrive. Placed above
             // the has_seen_buffer guard below: a shard that never received a
             // buffer is a valid run shape and still has to report, or quiesce()
             // would wait on it forever.
             {
                 const uint64_t requested = collect_quiesce_epoch_.load(std::memory_order_acquire);
-                if (collect_acked_[shard_index].load(std::memory_order_relaxed) != requested) {
+                if (quiesce_pending(shard_index)) {
                     while (manager_.try_pop_ready(info, shard_index)) {
                         consume(info, shard_index);
                         has_seen_buffer = true;
@@ -1298,6 +2037,19 @@ private:
         } else {
             static_cast<Derived *>(this)->on_buffer_collected(info);
         }
+        // After the copy, never before: stage 2 is what licenses
+        // moving this shard's records, so the count must not run ahead of them.
+        if (run_counters_on_.load(std::memory_order_relaxed) && shard_index >= 0 &&
+            shard_index < Manager::kMaxCollectorShards) {
+            const uint64_t processed =
+                ring_processed_[static_cast<size_t>(shard_index)].fetch_add(1, std::memory_order_release) + 1;
+            if (!simpler::dfx::runs::counter_headroom(processed, 0)) {
+                note_counter_exhausted("per-shard processed");
+            }
+            // Exactly the instant this shard satisfies an armed cut's stage 2,
+            // so the publisher is woken by the event and not by a timer.
+            if (cut_watermark_reached(shard_index, processed)) notify_transport_progress(0);
+        }
         if constexpr (Module::kBufferKinds > 1) {
             (void)manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info), shard_index);
         } else {
@@ -1305,9 +2057,23 @@ private:
         }
     }
 
+    /** True at the step on which this shard reaches an armed cut's watermark. */
+    bool cut_watermark_reached(int shard_index, uint64_t processed) const {
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            const CutSlot &s = cut_slots_[slot];
+            if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
+            if (s.stage1[shard_index].load(std::memory_order_acquire) == 0) continue;
+            if (s.push_watermark[shard_index].load(std::memory_order_acquire) == processed) return true;
+        }
+        return false;
+    }
+
     std::vector<std::thread> mgmt_drain_threads_;
     std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
+
+    // Written by every drain shard, read once per run by reconcile_counters().
+    std::atomic<uint64_t> drain_dropped_buffers_{0};
 
     // Two-phase quiescence handshake. Each phase is a monotonic epoch the
     // caller publishes and every worker of that phase echoes back once it has
@@ -1321,8 +2087,54 @@ private:
     std::atomic<uint64_t> collect_quiesce_epoch_{0};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> drain_acked_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> collect_acked_{};
+
+    // Cross-run cut state. Inert while no run has been retained in the
+    // counters: the drain loop pays one relaxed load per queue visit and the
+    // collector one per buffer, and no other profiler arms them.
+    std::array<CutSlot, kMaxCutSlots> cut_slots_{};
+    std::atomic<uint64_t> cut_request_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> cut_ack_{};
+    std::array<std::atomic<uint64_t>, kMaxCutQueues> consumed_total_{};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> pushed_total_{};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> ring_processed_{};
+    std::atomic<int> drain_quantum_{0};
+    std::atomic<bool> run_counters_on_{false};
+    std::atomic<bool> cut_counter_exhausted_{false};
+    std::atomic<uint64_t> control_epoch_{0};
+    std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> control_acked_{};
+    std::mutex control_mu_;
+    // Wakeups for the two ack handshakes — capture/retirement and reference
+    // release. Both are waited on by a caller and satisfied by a drain owner or
+    // a collector shard, so neither side spins.
+    std::mutex cut_mu_;
+    std::condition_variable cut_cv_;
+
+    /**
+     * Optional Derived hook: refresh that shard's private view of the
+     * epoch table. A collector that defines no such method gets the `long`
+     * overload and no behaviour change — the same overload-rank idiom
+     * `refresh_replenish_metadata` already uses here.
+     */
+    template <typename D = Derived>
+    auto refresh_retained_run_view(int shard_index, int)
+        -> decltype(static_cast<D *>(this)->refresh_retained_run_view(shard_index), void()) {
+        static_cast<D *>(this)->refresh_retained_run_view(shard_index);
+    }
+    template <typename D = Derived>
+    void refresh_retained_run_view(int, long) {}
+
+    /**
+     * Optional Derived hook: transport progress the writer is
+     * waiting on has happened. Called only at the exact transitions — a
+     * stage-1 publication, a shard reaching its watermark, a counter refusal —
+     * so the publisher needs no periodic poll to notice them.
+     */
+    template <typename D = Derived>
+    auto notify_transport_progress(int) -> decltype(static_cast<D *>(this)->note_transport_progress(), void()) {
+        static_cast<D *>(this)->note_transport_progress();
+    }
+    template <typename D = Derived>
+    void notify_transport_progress(long) {}
 };
 
 }  // namespace profiling_common
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_

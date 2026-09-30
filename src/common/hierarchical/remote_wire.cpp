@@ -315,9 +315,6 @@ std::vector<uint8_t> encode_call_config(const CallConfig &config) {
     put_i32(out, config.enable_pmu);
     put_i32(out, config.enable_dep_gen);
     put_i32(out, config.enable_scope_stats);
-    // CallConfig::capture_clock_anchors is absent on purpose: every ChipWorker
-    // child decides it locally when it reads the config out of its mailbox, so a
-    // transported value would be overwritten before any runtime reads it.
     put_string(out, call_config_prefix(config), MAX_STRING_BYTES, "CallConfig.output_prefix");
     return out;
 }
@@ -469,6 +466,17 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
         args.remote_desc.empty() || args.remote_desc.size() == args.tensors.size(),
         "remote_wire: remote descriptor count must match tensor count"
     );
+    ensure(
+        args.transfers.empty() || args.transfers.size() == args.tensors.size(),
+        "remote_wire: transfer count must match tensor count"
+    );
+    for (size_t i = 0; i < args.transfers.size(); ++i) {
+        ensure(
+            args.transfers[i] ==
+                legacy_tensor_transfer(static_cast<AddressSpace>(args.tensors[i].buffer.address_space)),
+            "remote_wire: tensor transfer cannot be represented by protocol version 4"
+        );
+    }
     std::vector<uint8_t> out;
     put_u32(out, static_cast<uint32_t>(args.tensors.size()));
     put_u32(out, static_cast<uint32_t>(args.scalars.size()));

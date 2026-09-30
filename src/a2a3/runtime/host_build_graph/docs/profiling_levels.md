@@ -166,7 +166,7 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 Per-thread fanout / fanin edge counts and ready-queue pop hit / miss
-stats live in `aicpu_scheduler_phases[]` (in `chip_swimlane_records.json`
+stats live in `scheduler_records` (in `chip_swimlane_records.json`
 captured at chip_swimlane_level >= 3) and `deps.json`; consume them via
 `simpler_setup/tools/sched_overhead_analysis.py`.
 
@@ -246,7 +246,7 @@ so records and spans read against each other with no alignment step.
 | Group | Kinds |
 | ----- | ----- |
 | Bind segments (one interval each, inside the stage) | `args`, `arena_build`, `static_arena`, `gm_heap`, `shared_mem`, `runtime_init`, `host_orch`, `graph_upload`, `arena_h2d`, `host_view_close` |
-| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_in_graph_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
+| Orchestrator operations (inside `host_orch`) | `submit_task`, `alloc_tensors`, `record_sub_task`, `graph_submit`, `build_definition`, `graph_begin`, `recording_wait`, `graph_commit`, `submit_admit`, `record_handoff`, `generated_args` |
 
 Three of the orchestrator kinds end with a task submitted — `submit_task`,
 `alloc_tensors`, `graph_submit` — so their count is the bind's `total_tasks`
@@ -266,7 +266,7 @@ the wrong one produces a number that reads as data and is not:
 
 - **A record is an interval** — one operation, start to end. Its `detail` says
   *which* operation (a task id, a Graph key, the submission index) or *how much*
-  it covered (`build_definition`'s in-graph task count, `recording_wait`'s in-flight
+  it covered (`build_definition`'s sub-task count, `recording_wait`'s in-flight
   count). That is the whole contract.
 - **A quantity about a segment is an attribute** — `bytes=`, `heap_used=`,
   `spilled=`, `minflt=`, `nvcsw=`. It goes in the segment's attribute string,
@@ -334,7 +334,7 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   Both come from per-kind counters, not from the record pool. The counters use
   lock-free atomic additions across the main and recording-worker lanes, with
   every phase isolated on its own cache line so concurrent `graph_submit` and
-  `record_in_graph_task` updates do not false-share. The per-event pool is armed when the
+  `record_sub_task` updates do not false-share. The per-event pool is armed when the
   artifact is wanted (`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE` *and* an output
   prefix) or whenever the chip swimlane is at `ORCH_PHASES`; a steady-state run
   satisfies neither, so it pays no pool append and no artifact lock at all. A
@@ -354,13 +354,23 @@ python -m pytest <case> --platform <platform> --device 0 --enable-chip-swimlane 
   This is the channel to read for a distribution or a per-event timeline; the
   summed lines cannot express either. Every record carries its producer Linux
   tid. `strace_timing.py --swimlane --host-phase-records <path>` draws each record
-  inside the matching `chip.run.bind`; `record_in_graph_task` and `build_definition`
+  inside the matching `chip.run.bind`; `record_sub_task` and `build_definition`
   appear on the `graph record worker` lane, while outer `graph_submit` events
   appear on the `graph submit main` lane.
 
-- **The host lanes of `chip_swimlane_records.json`**, at level 4 only, joined to
-  the device timeline through the clock anchors (see `host/clock_correlation.h`).
-  Two projections of the pool land there:
+- **The host lanes of `chip_swimlane_records.json`**, normally at level 4.
+  An independently enabled `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` pool can
+  also supply them at level 3 through the shared export path. These records are
+  already Host ns. At level 3 or 4, automatic single-file conversion uses matching
+  TIMING-or-finer Host logs to place Device records within `chip.run.runner_run`.
+  The AICPU launch marker, when present, narrows the placement range. Conversion
+  saves `metadata.clock_alignment` anchors and bounds for source-file readers
+  (see `simpler_setup/tools/containment.py`). Without usable logs or a valid saved
+  mapping, the view remains unaligned. Captures with Host recording armed and finished at level 3 or 4
+  export `host_clock_alignment.<pid>.log` beside the swimlane during native
+  finalize, after the executing process's TIMING-or-finer logs are flushed.
+  This applies to direct L2 and forked ChipWorker runs without SceneTest.
+  Two projections land there:
 
   | Key | Kinds | Rendered as |
   | --- | ----- | ----------- |
@@ -423,14 +433,14 @@ header just like on onboard.
 | Level | Collects |
 | ----- | -------- |
 | 0 | Nothing (disabled) |
-| 1 | AICore timing only (start/end/task_token_raw) — AICPU `complete_task` is bypassed |
+| 1 | AICore timing only (start/end/task_token) — AICPU `complete_task` is bypassed |
 | 2 | + Scheduler per-task dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
 
-At level 1 the AICore record carries the full `task_token_raw`
-(a `TaskId::raw`; see `src/common/host_build_graph/task_id.h`), read straight from
-`LocalContext.async_ctx.task_token.raw` inside the AICore helper —
+At level 1 the AICore record carries the full `task_token`
+(a `TaskId`; see `src/common/host_build_graph/task_id.h`), read straight from
+`LocalContext.async_ctx.task_token` inside the AICore helper —
 already in cache from the dispatch payload, so no extra GM load.
 Identity fields the AICPU side used to write at level 1 (`func_id`,
 `core_type`) are derived host-side:

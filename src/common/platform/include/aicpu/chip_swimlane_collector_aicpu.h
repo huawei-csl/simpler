@@ -34,7 +34,9 @@
  *
  * Two-channel level transport (mirrors the PMU pattern):
  *   - binary on/off — `enable_profiling_flag` bit1 → `set_chip_swimlane_enabled(bool)`
- *     at kernel entry; queried via `is_chip_swimlane_enabled()`.
+ *     at kernel entry; queried via `is_chip_swimlane_enabled()`. Each call
+ *     invalidates the preceding launch's cached level and phase writers,
+ *     including when profiling is disabled and init will not run.
  *   - granular ChipSwimlaneLevel — `ChipSwimlaneDataHeader::chip_swimlane_level`
  *     (shared memory); read in `chip_swimlane_aicpu_init` and cached, then queried
  *     via `get_chip_swimlane_level()` for
@@ -42,6 +44,13 @@
  */
 extern "C" void set_platform_chip_swimlane_base(uint64_t chip_swimlane_data_base);
 extern "C" uint64_t get_platform_chip_swimlane_base();
+
+/**
+ * This run's terminal-snapshot bank address, resolved by the host from the
+ * run's actual pipeline slot. Zero disables every terminal close: the device
+ * has no pipeline slot of its own and never derives a bank without this.
+ */
+extern "C" void set_platform_chip_swimlane_run_terminal_bank(uint64_t bank_addr);
 extern "C" void set_chip_swimlane_enabled(bool enable);
 extern "C" bool is_chip_swimlane_enabled();
 
@@ -129,7 +138,7 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
 /**
  * Commit an AICPU-side timing record for one completed task.
  *
- * AICore-as-producer: identity (task_token_raw) and AICore-side timing
+ * AICore-as-producer: identity (task_token) and AICore-side timing
  * (start/end) live in the per-core ChipSwimlaneAicoreTaskRecord stream;
  * core_type is published once by the host into the collector
  * (ChipSwimlaneCollector::set_core_types); func_id is resolved post-process
@@ -206,39 +215,33 @@ void chip_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_thread
  * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
 void chip_swimlane_aicpu_record_sched_phase(
-    int thread_idx, ChipSwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *shared_at_start = nullptr,
     const int16_t *shared_at_end = nullptr
 );
 
 /**
- * Record the completion point of one dependency-only dummy task.
+ * Record one phase that names the task it acted on.
  *
- * @param thread_idx     Scheduler thread that completed the task
- * @param complete_time  Timestamp sampled immediately before completion propagation
- * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full task identity
- */
-void chip_swimlane_aicpu_record_dummy_task(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-);
-
-/**
- * Record the completion point of one task skipped by a false dispatch predicate.
+ * Which of a runtime's phases name a task is stated by that runtime
+ * (`sched_phase_carries_task_id` in its sched_phase_kind.h), so the kind comes from the
+ * caller rather than from a per-phase entry point here.
  *
- * @param thread_idx     Scheduler thread that completed the task
- * @param complete_time  Timestamp sampled immediately before completion propagation
- * @param loop_iter      Current scheduler-loop iteration number
- * @param task_id        Full task identity
+ * A zero-width marker is this function with `start_time == end_time`: naming an instant
+ * rather than an interval is the caller's way of recording, not a separate kind of
+ * record.
+ *
+ * @param thread_idx      Scheduler thread that ran the phase
+ * @param kind            This runtime's phase for the work performed
+ * @param start_time      Phase start, in system-counter cycles
+ * @param end_time        Phase end, in system-counter cycles
+ * @param loop_iter       Current scheduler-loop iteration number
+ * @param task_id         Full identity of the task this phase acted on
+ * @param tasks_processed Work items the phase handled
  */
-void chip_swimlane_aicpu_record_predicated_skip(
-    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
-);
-
-/** Record one bounded Scheduler-side Graph materialization slice. */
-void chip_swimlane_aicpu_record_graph_prepare(
-    int thread_idx, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
-    uint32_t tasks_materialized
+void chip_swimlane_aicpu_record_task_phase(
+    int thread_idx, SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, TaskId task_id,
+    uint32_t tasks_processed = 1
 );
 
 /**
@@ -260,15 +263,11 @@ void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
  *
  * @param start_time  Submit start timestamp
  * @param end_time    Submit end timestamp
- * @param task_id     Task identifier. For tensormap_and_ringbuffer, full
- *                    encoding: (ring_id << 32) | local_id, enabling
- *                    cross-view correlation between orchestrator and
- *                    scheduler swimlanes.
+ * @param task_id     The submitted task's identity, enabling cross-view
+ *                    correlation between orchestrator and scheduler swimlanes.
  * @param submit_idx  Monotonic submit counter
  */
-void chip_swimlane_aicpu_record_orch_phase(
-    uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx
-);
+void chip_swimlane_aicpu_record_orch_phase(uint64_t start_time, uint64_t end_time, TaskId task_id, uint32_t submit_idx);
 
 /**
  * Write core-to-thread assignment mapping to shared memory.

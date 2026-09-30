@@ -5,7 +5,7 @@ The top-level [README](../README.md) links only the handful of entry-point docs;
 this page is the complete map.
 
 These pages are also published as a searchable site at
-<https://hw-native-sys.github.io/simpler/>, which adds a generated API reference
+<https://www.pypto.ai/simpler/>, which adds a generated API reference
 for `simpler.worker`, `simpler.task_interface` and `simpler.orchestrator`. The
 site is built by `.github/workflows/docs.yml`; `mkdocs.yml` owns its navigation,
 so a new page needs a `nav` entry there as well as a row here.
@@ -52,6 +52,7 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [AICore Kernel Programming](aicore-kernel-programming.md) | Writing AICore kernels for this runtime |
+| [L2 Cache Bypass](l2-cache-bypass.md) | Native CANN ELF patching vs. simpler's args-based nocache-offset delivery |
 | [a5 AICore SIMT Launch](simt-launch.md) | a5 SIMT launch metadata and the `ChipCallable` alignment constraint |
 | [Manual Scope V0](manual-scope.md) | Explicit scope control from orchestration code |
 | [WAR Anti-Dependencies](war-anti-dependency.md) | Write-after-read hazards and how the runtime orders them |

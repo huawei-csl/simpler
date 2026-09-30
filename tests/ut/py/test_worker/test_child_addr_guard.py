@@ -93,8 +93,8 @@ def _dev_handle(ptr: int, *, wid: int = 0, nbytes: int = 64, oid: bytes = _OID) 
     object the fixture created.
     """
     # `owner_worker_id` is not part of an identity, so the worker is folded into `buffer_id` here:
-    # production's `_next_buffer_id()` gives every allocation a distinct id whatever chip it lands
-    # on, and a fixture keyed on the address alone could not express two chips allocating at one.
+    # production burns a distinct id for every allocation whatever chip it lands on, and a fixture
+    # keyed on the address alone could not express two chips allocating at one.
     return wrap_device_malloc(ptr, nbytes, oid, buffer_id=(wid << 48) | ptr, owner_worker_id=wid)
 
 
@@ -126,8 +126,8 @@ def _record_malloc(w: Worker, worker_id: int, ptr: int, size: int = 64) -> Buffe
 def _is_live(w: Worker, ptr: int, wid: int = 0) -> bool:
     """Whether a live allocation sits at ``(wid, ptr)``.
 
-    Production mints each identity from ``_next_buffer_id()``, so a handle rebuilt here does not
-    name the allocation the Worker registered; the address is what a test knows about it.
+    Production burns a fresh identity for each allocation, so a handle rebuilt here does not name
+    the allocation the Worker registered; the address is what a test knows about it.
     """
     return any(int(h.base) == ptr and int(h.owner_worker_id) == wid for h in w._child_alloc.values())
 

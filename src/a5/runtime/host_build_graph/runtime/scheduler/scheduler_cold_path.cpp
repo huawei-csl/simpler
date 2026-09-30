@@ -17,6 +17,7 @@
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -148,26 +149,26 @@ void format_core_status(
         return;
     }
     int32_t kernel = -1;
-    int64_t task_id_raw = -1;
+    TaskId task_id = TaskId::invalid();
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
         kernel = core_state->running_slot_state->to_descriptor().kernel_id[subslot];
-        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->to_descriptor().task_id.raw);
+        task_id = core_state->running_slot_state->to_descriptor().task_id;
     }
     uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
     const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
     if (hw_state == TASK_ACK_STATE) {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s)", core_id, kernel, task_id_raw,
-            cond_reg_state_str
+            buf, buf_size, "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s)", core_id, kernel,
+            TaskId::to_uint64(task_id), cond_reg_state_str
         );
     } else {
         snprintf(
             buf, buf_size,
-            "core%d(busy kernel=%d task=%" PRId64
+            "core%d(busy kernel=%d task=0x%" PRIx64
             " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
-            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
             core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
@@ -204,8 +205,18 @@ bool SchedulerContext::no_thread_owns_running_task() const {
     return true;
 }
 
+// A stall dump's level follows its report, not its line: see StallDumpReport.
+#define STALL_DUMP_LOG(report, ...)                  \
+    do {                                             \
+        if ((report) == StallDumpReport::Shutdown) { \
+            LOG_WARN(__VA_ARGS__);                   \
+        } else {                                     \
+            LOG_INFO(__VA_ARGS__);                   \
+        }                                            \
+    } while (0)
+
 void SchedulerContext::log_stall_diagnostics(
-    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
+    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count, StallDumpReport report
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
 
@@ -219,7 +230,7 @@ void SchedulerContext::log_stall_diagnostics(
         // below it was claimed by the host orchestrator, and no slot above it was.
         for (int32_t si = 0; si < task_count; si++) {
             ChipTaskSlotState &slot_state = tasks.get_slot_state_by_task_id(si);
-            ChipTaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+            const bool completed = tasks.is_completed(si, std::memory_order_relaxed);
             // Polling: no fanin_refcount. Recompute met/total from the inline
             // fanin ids vs the task_states array (rc = satisfied producers,
             // fi = raw producer count) so the stall dump still shows readiness.
@@ -234,11 +245,11 @@ void SchedulerContext::log_stall_diagnostics(
             int32_t kid_aic = slot_state.to_descriptor().kernel_id[0];
             int32_t kid_aiv0 = slot_state.to_descriptor().kernel_id[1];
             int32_t kid_aiv1 = slot_state.to_descriptor().kernel_id[2];
-            int64_t task_id = static_cast<int64_t>(slot_state.to_descriptor().task_id.raw);
-            if (st >= CHIP_TASK_COMPLETED) continue;
-            // The slot mirror has no intermediate ready/running value — it
-            // stays PENDING until the worker stores COMPLETED (PUBLISHED
-            // lives in the task_states array, not here). Classify
+            uint64_t task_id = TaskId::to_uint64(slot_state.to_descriptor().task_id);
+            if (completed) continue;
+            // The state byte has no intermediate ready/running value — a task
+            // stays PENDING until it publishes PUBLISHED or COMPLETED, neither
+            // of which distinguishes queued from running. Classify
             // by the ground truth instead: a slot is RUNNING iff some
             // core has it as running_slot_state. A task occupies at most
             // 3 cores (one cluster), all under the same owner thread by
@@ -261,8 +272,9 @@ void SchedulerContext::log_stall_diagnostics(
             if (is_running) {
                 cnt_running++;
                 if (cnt_running > STALL_DUMP_READY_MAX) continue;
-                LOG_INFO(
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                STALL_DUMP_LOG(
+                    report,
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=RUNNING fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                     "running_on=[owner_thread=%d cores=[%s]]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
@@ -272,8 +284,9 @@ void SchedulerContext::log_stall_diagnostics(
             if (rc >= fi) {
                 cnt_ready++;
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
-                LOG_INFO(
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                STALL_DUMP_LOG(
+                    report,
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                 );
@@ -281,14 +294,16 @@ void SchedulerContext::log_stall_diagnostics(
             }
             cnt_waiting++;
             if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
-            LOG_INFO(
-                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+            STALL_DUMP_LOG(
+                report,
+                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                 " state=WAIT    fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                 thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
             );
         }
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-        LOG_INFO(
+        STALL_DUMP_LOG(
+            report,
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
             "scan_ready=%d scan_waiting=%d scan_running=%d",
             thread_idx, idle_iterations, c, task_count, last_progress_count, cnt_ready, cnt_waiting, cnt_running
@@ -320,12 +335,14 @@ void SchedulerContext::log_stall_diagnostics(
             aiv1_buf, sizeof(aiv1_buf), aiv1_id, aiv1_idle, &core_exec_states_[aiv1_id],
             core_exec_states_[aiv1_id].reg_addr
         );
-        LOG_INFO(
-            "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
+        STALL_DUMP_LOG(
+            report, "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
             idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
     }
 }
+
+#undef STALL_DUMP_LOG
 
 void SchedulerContext::log_shutdown_stall_snapshot(
     int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
@@ -344,7 +361,9 @@ void SchedulerContext::log_shutdown_stall_snapshot(
         thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
     }
     for (int32_t t = 0; t < thread_count; t++) {
-        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count);
+        log_stall_diagnostics(
+            t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, StallDumpReport::Shutdown
+        );
     }
 }
 
@@ -573,7 +592,11 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
+    // native program launch, so only a report stamped with it is this run's;
+    // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
+    const uint64_t report_epoch = get_platform_run_result_epoch();
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
@@ -627,10 +650,15 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
         for (int32_t i = lo; i < hi; i++) {
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+            if (!aicore_report_accepted(hank, report_epoch)) {
                 SPIN_WAIT_HINT();
                 continue;
             }
+            // The report's payload is Normal cacheable memory and nothing gives
+            // these loads an address or data dependency on the marker load, so
+            // without a load-load barrier they may be satisfied ahead of it.
+            // Once per accepted report, not per poll.
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count) {
                 LOG_ERROR(
@@ -811,7 +839,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // hs_setup_done_, so it happens-before every thread's handshake_partition
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
-        chip_swimlane_aicpu_init(runtime->worker_count);
+        chip_swimlane_aicpu_init(runtime->dev.worker_count);
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
@@ -825,7 +853,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
             // records use the host callback path, so the device initializes no
             // dead AICPU orchestrator pool.
             const int orch_phase_threads = 0;
-            chip_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
+            chip_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         chip_swimlane_level_ = ChipSwimlaneLevel::DISABLED;
@@ -833,7 +861,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 #endif
 
     // Core count is needed by every thread to compute its handshake slice.
-    cores_total_num_ = runtime->worker_count;
+    cores_total_num_ = runtime->dev.worker_count;
     if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
@@ -950,7 +978,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
-    func_id_to_addr_ = runtime->func_id_to_addr_;
+    func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
+    func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
     return 0;
 }
@@ -1008,6 +1037,7 @@ void SchedulerContext::deinit() {
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
+    func_id_to_addr_count_ = 0;
 }
 
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {
@@ -1093,7 +1123,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
             if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
+            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {

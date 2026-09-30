@@ -30,6 +30,7 @@
 
 #include <cstring>
 
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -104,7 +105,10 @@ struct DepGenDeviceModule {
     }
 
     static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
-    static void on_pop_success(Context, State *, Buffer *) {}
+    static void on_pop_success(Context, State *state, Buffer *buffer) {
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = state->current_buf_seq;
+    }
     static void on_current_cleared(Context, State *) {}
     static void on_no_replacement(Context, State *) {}
     static void on_null_free_slot(Context, State *) {}
@@ -150,10 +154,30 @@ void dep_gen_aicpu_init() {
     s_dep_gen_state = get_dep_gen_buffer_state(base, /*instance_index=*/0);
 
     rmb();
+    // Keep the buffer this instance already holds, or pop the first one.
+    //
+    // A buffer is only released by a successful enqueue, so a pointer still set
+    // here means the previous run could not hand that buffer over — it had
+    // nothing to publish, or the ready queue was full. Popping a replacement
+    // would strand it: nothing returns it to the free queue, because AICPU is
+    // the queue's consumer and never its producer. Reusing it in place is the
+    // return, and re-stamping is what makes that safe — the buffer still
+    // carries the previous run's identity, and its count must start this run at
+    // zero.
+    uint64_t retained = s_dep_gen_state->current_buf_ptr;
     uint32_t head = s_dep_gen_state->free_queue.head;
     uint32_t tail = s_dep_gen_state->free_queue.tail;
 
-    if (head != tail) {
+    if (retained != 0) {
+        DepGenBuffer *buf = reinterpret_cast<DepGenBuffer *>(retained);
+        buf->count = 0;
+        buf->run_epoch = get_platform_run_result_epoch();
+        buf->local_seq = 0;
+        wmb();
+        s_dep_gen_state->current_buf_seq = 0;
+        LOG_INFO("dep_gen: reusing retained buffer addr=0x%lx", retained);
+    } else if (head != tail) {
+        // The engine's pop stamps identity through on_pop_success.
         (void)try_pop_dep_gen_buffer(0);
         uint64_t buf_ptr = s_dep_gen_state->current_buf_ptr;
         LOG_INFO("dep_gen: popped initial buffer addr=0x%lx", buf_ptr);
@@ -165,8 +189,8 @@ void dep_gen_aicpu_init() {
 }
 
 void dep_gen_aicpu_record_submit(
-    uint64_t task_id_raw, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw,
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
+    const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
     const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num, const int32_t kernel_ids[3]
 ) {
     if (!g_enable_dep_gen) {
@@ -206,7 +230,7 @@ void dep_gen_aicpu_record_submit(
 
     int dc = explicit_dep_count;
     if (dc < 0) dc = 0;
-    if (dc > 0 && explicit_deps_raw == nullptr) dc = 0;
+    if (dc > 0 && explicit_deps == nullptr) dc = 0;
     int needed = dep_gen_records_needed_for(dc);
 
     rmb();
@@ -289,7 +313,7 @@ void dep_gen_aicpu_record_submit(
     uint32_t idx = local_count;
     DepGenRecord *rec = &buf->records[idx];
 
-    rec->task_id = task_id_raw;
+    rec->task_id = task_id;
     // Cast the enum to uint32_t before the ternary so Linux GCC's -Wextra
     // does not warn about "enumerated and non-enumerated type in conditional".
     uint32_t base_flags = in_manual_scope ? static_cast<uint32_t>(DEP_GEN_FLAG_IN_MANUAL_SCOPE) : 0u;
@@ -308,7 +332,7 @@ void dep_gen_aicpu_record_submit(
 
     // explicit_deps (tail of the entry, packed; replay reads only the first base_dc entries)
     if (base_dc > 0) {
-        memcpy(rec->explicit_deps, explicit_deps_raw, static_cast<size_t>(base_dc) * sizeof(uint64_t));
+        memcpy(rec->explicit_deps, explicit_deps, static_cast<size_t>(base_dc) * sizeof(TaskId));
         if (explicit_dep_kinds_raw != nullptr) {
             memcpy(rec->explicit_dep_kinds, explicit_dep_kinds_raw, static_cast<size_t>(base_dc));
         } else {
@@ -362,7 +386,7 @@ void dep_gen_aicpu_record_submit(
     int written = base_dc;
     for (int slot = 1; slot < needed; slot++) {
         auto *over = reinterpret_cast<DepGenOverflowRecord *>(&buf->records[idx + static_cast<uint32_t>(slot)]);
-        over->task_id = task_id_raw;
+        over->task_id = task_id;
         const int chunk =
             ((dc - written) < DEP_GEN_OVERFLOW_DEPS_PER_RECORD) ? (dc - written) : DEP_GEN_OVERFLOW_DEPS_PER_RECORD;
         const bool is_last = (slot == needed - 1);
@@ -374,7 +398,7 @@ void dep_gen_aicpu_record_submit(
         over->dep_count = static_cast<uint16_t>(chunk);
         over->_reserved = 0;
         if (chunk > 0) {
-            memcpy(over->deps, explicit_deps_raw + written, static_cast<size_t>(chunk) * sizeof(uint64_t));
+            memcpy(over->deps, explicit_deps + written, static_cast<size_t>(chunk) * sizeof(TaskId));
             if (explicit_dep_kinds_raw != nullptr) {
                 memcpy(over->kinds, explicit_dep_kinds_raw + written, static_cast<size_t>(chunk));
             } else {
@@ -414,10 +438,14 @@ void dep_gen_aicpu_flush() {
         s_dep_gen_state->current_buf_ptr = 0;
         wmb();
     } else {
+        // ready_queue full at end-of-run: account the loss, but keep the
+        // buffer. Clearing the pointer would strand it — the host never saw it,
+        // so nothing returns it to the free queue. Retaining it lets the next
+        // run's init reuse it in place, which is the only return available to
+        // AICPU.
         LOG_ERROR("dep_gen: flush failed (ready_queue full), %u records dropped", buf->count);
         s_dep_gen_state->dropped_record_count += buf->count;
         buf->count = 0;
-        s_dep_gen_state->current_buf_ptr = 0;
         wmb();
     }
 }

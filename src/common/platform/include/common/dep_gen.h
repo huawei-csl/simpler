@@ -46,6 +46,11 @@
 
 #include "arg_direction.h"  // CORE_MAX_TENSOR_ARGS
 #include "common/platform_config.h"
+// The owning runtime's task handle. Each runtime has its own TaskId in its own
+// namespace, and the include path resolves this bare name to whichever runtime is
+// being built: src/common/<runtime> is on that build's include path, and reaching
+// both headers from one scope is a compile error rather than a silent pick.
+#include "task_id.h"
 
 // =============================================================================
 // dep_gen-local capacity constants
@@ -103,11 +108,11 @@ enum DepGenRecordFlags : uint32_t {
  * blob covers exactly two cache lines instead of straddling three.
  */
 struct DepGenRecord {
-    uint64_t task_id;                                       // TaskId::raw, in the minting runtime's layout
+    TaskId task_id;                                         // identity, in the minting runtime's layout
     uint32_t flags;                                         // DepGenRecordFlags bitmask
     uint16_t tensor_count;                                  // number of valid ChipTensor slots
     uint16_t explicit_dep_count;                            // number of valid explicit_dep slots
-    uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];      // TaskId::raw, length = explicit_dep_count
+    TaskId explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];        // length = explicit_dep_count
     uint8_t explicit_dep_kinds[DEP_GEN_MAX_EXPLICIT_DEPS];  // DepFlags, parallel to explicit_deps[]
     uint8_t arg_types[CORE_MAX_TENSOR_ARGS];                // TensorArgType, length = tensor_count
     int32_t kernel_id[3];  // per-subslot kernel id (AIC, AIV0, AIV1); INVALID_KERNEL_ID = -1
@@ -153,11 +158,11 @@ constexpr int DEP_GEN_OVERFLOW_DEPS_PER_RECORD = 524;
  * back to the preceding base.
  */
 struct DepGenOverflowRecord {
-    uint64_t task_id;    // mirrors base record's task_id for chain join
+    TaskId task_id;      // mirrors base record's task_id for chain join
     uint32_t flags;      // DEP_GEN_FLAG_OVERFLOW [| DEP_GEN_FLAG_LAST_OVERFLOW]
     uint16_t dep_count;  // number of valid entries in deps[]
     uint16_t _reserved;
-    uint64_t deps[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];  // TaskId::raw, length = dep_count
+    TaskId deps[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];    // length = dep_count
     uint8_t kinds[DEP_GEN_OVERFLOW_DEPS_PER_RECORD];  // DepFlags, parallel to deps[]
 } __attribute__((aligned(64)));
 
@@ -201,13 +206,28 @@ inline int dep_gen_records_needed_for(int dc) {
 struct DepGenBuffer {
     // Header (first 64 bytes) — host copies this alone first to learn count.
     volatile uint32_t count;  // Number of valid records committed
-    uint32_t _pad0[15];       // Pad count to 64 B; isolates count's cache line.
+    uint32_t _pad_align;      // Aligns run_epoch to 8 B
+
+    // Which run produced these records. AICPU stamps it when it acquires the
+    // buffer, so it is fixed before the first record lands; the AICPU thread
+    // that acquired the buffer is its only reader until the ready queue
+    // publishes it, so no barrier is needed between the stamp and the
+    // acquisition. It has to be copied out with the records: the pool reuses
+    // this storage, and a later run re-stamps it in place, so a host copy that
+    // pointed back here would report the wrong run.
+    volatile uint64_t run_epoch;  // 0 when the producer had no run identity
+    volatile uint32_t local_seq;  // Buffer's position within its own run
+    uint32_t _pad0[11];           // Pad the header to 64 B; isolates count's cache line.
 
     // Records (flexible-size, up to PLATFORM_DEP_GEN_RECORDS_PER_BUFFER)
     DepGenRecord records[PLATFORM_DEP_GEN_RECORDS_PER_BUFFER];
 } __attribute__((aligned(64)));
 
 static_assert(offsetof(DepGenBuffer, records) == 64, "DepGenBuffer header must be exactly 64 bytes");
+static_assert(
+    offsetof(DepGenBuffer, run_epoch) == 8 && offsetof(DepGenBuffer, local_seq) == 16,
+    "run identity moved inside the DepGenBuffer header"
+);
 
 // =============================================================================
 // SPSC free queue

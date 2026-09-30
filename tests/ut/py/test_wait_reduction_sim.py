@@ -10,7 +10,47 @@
 
 import json
 
-from simpler_setup.tools.wait_reduction_sim import full_reduction, load_wait_graph, online_bitmap, simulate
+import pytest
+
+# Scope-crossing is a per-runtime notion, so these fixtures carry real ids in one
+# layout or the other. Minted through each runtime's own test-side helper.
+from _task_ids import hbg_sub_task as _hbg_sub_task  # noqa: I001
+from _task_ids import tmr_task as _tmr_id
+
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
+from simpler_setup.tools.wait_reduction_sim import (
+    full_reduction,
+    load_wait_graph,
+    online_bitmap,
+    simulate,
+)
+
+
+def test_simulate_counts_cross_scope_edges_by_the_named_runtime(tmp_path):
+    """An edge from a modular task into its own body crosses a scope.
+
+    Read as tmr the high word is masked to 8 bits, which drops hbg's id space: a
+    GLOBAL task and a sub-task under parent 0 would both come out as ring 0 and the
+    edge would look intra-scope. Naming the runtime is what avoids that reading.
+    """
+    outer = "12"
+    inner = str(_hbg_sub_task(0, 0))
+    data = {
+        "runtime": HBG_RUNTIME,
+        "tasks": [{"task_id": t} for t in (outer, inner)],
+        "edges": [{"pred": outer, "succ": inner, "source": "creator", "flags": ["wait", "retain"]}],
+    }
+    path = tmp_path / "deps.json"
+    path.write_text(json.dumps(data))
+
+    assert simulate(path, [4])["windows"]["4"]["cross_scope_wait_pairs"] == 1
+
+    # Same graph with the name dropped: refused rather than counted under the wrong
+    # layout, since the count is a number people act on.
+    data.pop("runtime")
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="runtime"):
+        simulate(path, [4])
 
 
 def _pair_flags(edges) -> dict[tuple[str, str], frozenset[str]]:
@@ -32,10 +72,11 @@ def test_online_bitmap_matches_full_reduction_inside_window():
             assert actual == exact_inside_window
 
 
-def test_simulate_reports_window_cross_ring_and_resource_reductions(tmp_path):
-    ring1_b = str(1 << 32)
-    ring1_c = str((1 << 32) + 1)
+def test_simulate_reports_window_cross_scope_and_resource_reductions(tmp_path):
+    ring1_b = str(_tmr_id(1, 0))
+    ring1_c = str(_tmr_id(1, 1))
     data = {
+        "runtime": TMR_RUNTIME,
         "tasks": [{"task_id": task_id} for task_id in ("0", ring1_b, ring1_c, "3")],
         "edges": [
             {"pred": "0", "succ": ring1_b, "source": "creator", "flags": ["wait", "retain"]},
@@ -56,15 +97,16 @@ def test_simulate_reports_window_cross_ring_and_resource_reductions(tmp_path):
     assert window["retain_classification_uncertain"] == 1
     assert window["redundant_window_misses"] == 1
     assert window["bitmap_misses_within_window"] == 0
-    assert window["cross_ring_redundant_wait_pairs"] == 1
-    assert window["cross_ring_removed"] == 1
-    assert window["cross_ring_misses"] == 0
+    assert window["cross_scope_redundant_wait_pairs"] == 1
+    assert window["cross_scope_removed"] == 1
+    assert window["cross_scope_misses"] == 0
     assert window["estimated_readiness_fanout_nodes_removed"] == 1
     assert window["estimated_dep_pool_entries_removed"] == 1
 
 
 def test_load_wait_graph_inserts_hidden_alloc_before_first_consumer(tmp_path):
     data = {
+        "runtime": TMR_RUNTIME,
         "tasks": [{"task_id": "1"}, {"task_id": "2"}],
         "edges": [
             {"pred": "99", "succ": "1", "source": "creator", "flags": ["wait", "retain"]},
@@ -83,6 +125,7 @@ def test_load_wait_graph_inserts_hidden_alloc_before_first_consumer(tmp_path):
 
 def test_load_wait_graph_or_accumulates_retain_only_records(tmp_path):
     data = {
+        "runtime": TMR_RUNTIME,
         "tasks": [{"task_id": "1"}, {"task_id": "2"}, {"task_id": "3"}],
         "edges": [
             {"pred": "1", "succ": "2", "source": "tensormap", "flags": ["retain"]},

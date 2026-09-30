@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools._runtime_dispatch import normalize_task_id_int
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _REQUIRED_TASK_FIELDS = (
@@ -77,10 +78,23 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
     data = read_perf_data(perf)
     level = data.get("chip_swimlane_level")
     assert level in (1, 2, 3, 4), f"unexpected chip_swimlane_level: {level}"
+    # Identity reaches the artifact, not just the device buffer: every row carries
+    # the epoch the join keys on. One capture is one run, so exactly one epoch,
+    # and never 0 — that would mean the stamp never happened.
+    aicore_rows = raw["aicore_tasks"]
+    assert all(len(row) == 7 for row in aicore_rows), "an aicore_tasks row is not seven columns (missing run_epoch)"
+    aicore_epochs = {row[6] for row in aicore_rows}
+    assert len(aicore_epochs) == 1, f"a single capture produced more than one AICore epoch: {sorted(aicore_epochs)}"
+    assert 0 not in aicore_epochs, "aicore_tasks rows carry epoch 0, so the run identity was never stamped"
     if level >= 2:
         assert data.get("scheduler_task_producer") == "aicpu"
-        assert raw["scheduler_tasks"]["schema_version"] == 1
         assert raw["scheduler_tasks"]["producer"] == "aicpu"
+        task_epochs = {row[4] for row in raw["scheduler_tasks"]["records"]}
+        # Both streams describe the same run, so a disagreement means one of the
+        # two producers is stamping from a different source.
+        assert task_epochs == aicore_epochs, (
+            f"scheduler_tasks epochs {sorted(task_epochs)} disagree with aicore_tasks {sorted(aicore_epochs)}"
+        )
     tasks = data.get("tasks")
     assert isinstance(tasks, list), "tasks field missing or not a list"
     assert len(tasks) > 0, f"perf records empty under {perf}"
@@ -131,8 +145,13 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
         str(perf),
     ]
     deps_sibling = Path(perf).parent / "deps.json"
-    if deps_sibling.exists():
-        sched_cmd += ["--deps-json", str(deps_sibling)]
+    assert deps_sibling.exists(), (
+        f"deps.json absent beside {perf.name} under {out_dir}. This smoke runs with --enable-dep-gen, so the "
+        f"DAG is expected; its absence means dep_gen collected nothing the completeness gate would emit, not "
+        f"that the tool was invoked wrongly. Grep the step's output for 'count mismatch' / 'silent_loss' to "
+        f"see what the collector lost."
+    )
+    sched_cmd += ["--deps-json", str(deps_sibling)]
     result = subprocess.run(sched_cmd, check=True, timeout=120, capture_output=True, text=True)
     for header in ("Part 1:", "Part 2:", "Part 5:", "Part 6:"):
         assert header in result.stdout, f"sched_overhead missing section header '{header}'\nstdout:\n{result.stdout}"
@@ -168,7 +187,7 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
     """
     # Oracle: pop_hit / pop_miss are the sum across all dispatch records.
     # Compares against the "Pop: hit=N, miss=M" line the script prints.
-    phases = perf.get("aicpu_scheduler_phases", [])
+    phases = perf.get("scheduler_records", [])
     oracle_pop_hit = sum(r.get("pop_hit", 0) for thr_recs in phases for r in thr_recs if r.get("phase") == "dispatch")
     oracle_pop_miss = sum(r.get("pop_miss", 0) for thr_recs in phases for r in thr_recs if r.get("phase") == "dispatch")
     pop_match = re.search(r"Pop:\s*hit=(\d+),\s*miss=(\d+)", stdout)
@@ -191,14 +210,10 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
         deps = json.load(f)
     unique_edges = set()
     for e in deps.get("edges", []):
-        try:
-            pred, succ = int(e["pred"]), int(e["succ"])
-        except (TypeError, ValueError, KeyError):
+        pred = normalize_task_id_int(e.get("pred"))
+        succ = normalize_task_id_int(e.get("succ"))
+        if pred is None or succ is None:
             continue
-        if pred < 0:
-            pred &= (1 << 64) - 1
-        if succ < 0:
-            succ &= (1 << 64) - 1
         unique_edges.add((pred, succ))
 
     # Per-thread oracle: a task's fanout is billed to the thread that
@@ -221,12 +236,9 @@ def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Pa
             continue
         if core_to_thread[cid] < 0:
             continue
-        try:
-            tid = int(task["task_id"])
-        except (TypeError, ValueError, KeyError):
+        tid = normalize_task_id_int(task.get("task_id"))
+        if tid is None:
             continue
-        if tid < 0:
-            tid &= (1 << 64) - 1
         if tid in seen_tids:
             continue
         seen_tids.add(tid)

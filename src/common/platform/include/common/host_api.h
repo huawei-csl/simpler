@@ -38,21 +38,43 @@ struct HostApiOps {
     // backend without a host-map path return nullptr / no-op.
     void *(*register_device_memory_to_host)(void *runner_ctx, void *dev_ptr, size_t bytes);
     void (*unregister_device_memory_from_host)(void *runner_ctx, void *dev_ptr);
+    // Host view of a child-memory address, for a host-side orchestrator
+    // (host_build_graph) that reads or writes a device-resident tensor's bytes
+    // to shape the graph. Unlike the pair above, the runner owns the mapping:
+    // it is established over the whole containing allocation on first request
+    // and released by the free of that allocation, so a bind neither pays for
+    // it again nor has to pair an unregister. Returns a host address carrying
+    // dev_ptr's offset, or nullptr when this backend cannot map device memory
+    // to the host (a5 onboard) or the mapping was refused for this allocation
+    // (see issue #1531) — the caller then serves each access with a copy.
+    void *(*acquire_child_memory_host_view)(void *runner_ctx, void *dev_ptr, size_t bytes);
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
     // zero-init pure OUTPUT buffers in lieu of an H2D copy-in.
     int (*device_memset)(void *runner_ctx, void *dev_ptr, int value, size_t size);
-    // Runner-scoped retained temporary buffer for TRB device-arg staging.
-    // This is NOT an allocator — it is a single {addr, size} slot that lives
-    // across runs on the DeviceRunner. trb bind reads the slot, and if the
-    // retained buffer is too small for this run's packed temporary size it
-    // device_free's the old one, device_malloc's a bigger one, and writes the
-    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
-    // (runtime_maker); the platform only remembers the slot so it can be reused
-    // by later runs and freed at finalize. The slot is per pipeline slot, so
-    // two runs in different slots never share a staging buffer. `get` returns
-    // {nullptr, 0} when nothing is retained yet.
+    // Runner-scoped retained temporary buffer for device arguments, used by
+    // every host runtime that gives caller tensors a device buffer. This is NOT an allocator —
+    // it is a single {addr, size} slot that lives across runs on the
+    // DeviceRunner. A bind reads the slot, and if the retained buffer is too
+    // small for this run's packed temporary size it device_free's the old one,
+    // device_malloc's a bigger one, and writes the new {addr, size} back. The
+    // grow/slice logic lives in utils/retained_temp_bump.h; the platform only
+    // remembers the slot so it can be reused by later runs and freed at
+    // finalize. The slot is per pipeline slot, so two runs in different slots
+    // never share a staging buffer. `get` returns {nullptr, 0} when nothing is
+    // retained yet.
     void (*get_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
     void (*set_retained_temp_buffer)(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size);
+    // Grow that slot to at least `bytes` and report the block naming it. The
+    // platform owns the sequence because a managed context must not release the
+    // previous block while a consumer may still read it: there the request takes
+    // a block of its own inside the workspace budget and the previous one stays
+    // where it is until its last consumer retires. A failure leaves the slot
+    // naming whatever it named before, so the caller's old capacity survives.
+    // `bytes` at or below the retained size is answered from the slot with no
+    // allocation. Returns 0 on success.
+    int (*acquire_retained_temp)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
+    );
     // Runner-owned Graph Definition storage: one device block per pipeline slot
     // holding every Definition object of a run end to end, plus the host block
     // the caller assembles them in before the single H2D that ships them.
@@ -76,6 +98,34 @@ struct HostApiOps {
     // into it — the run's total is not known until every recording has ended, so
     // the capacity on offer is whatever the previous bind left behind.
     void (*get_graph_definition_staging)(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size);
+    // Runner-owned storage for one pipeline slot's device-side scheduler state,
+    // both sides of it: `device_out` receives the device block the scheduler
+    // reads and `host_out` the block the caller builds that state in before the
+    // single H2D that ships it. Both are aligned to `alignment` (a power of
+    // two) with at least `bytes` usable behind them, and the caller owns every
+    // offset inside them. Both are the aligned base rather than the allocation
+    // it sits in; nothing here hands out a pointer a free would take.
+    //
+    // Grow-only retention per slot: a request that fits the retained capacity
+    // reuses it, a larger one replaces it, and both sides are released at Worker
+    // finalization. Neither block is cleared here — the caller re-initializes
+    // and re-uploads the whole range it uses on every run, so a retained block
+    // carries nothing between runs.
+    //
+    // Reuse is the slot's, never a run's: the caller acquires during its bind,
+    // and a slot admits one run at a time, so the storage a bind receives was
+    // last used by a run of the same slot that has already released its
+    // bindings. A runner that cannot accept a run refuses this outright rather
+    // than handing back storage whose previous device writer was never proven
+    // stopped. Returns 0 on success.
+    //
+    // This table is internal to one build: it carries no version and callers
+    // index it by member, so the platform library and every runtime library
+    // that reads it are compiled and installed together. Adding an entry here
+    // therefore needs no compatibility handling and offers none.
+    int (*acquire_scheduler_state_storage)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
     // Runner-owned host mirror of the runtime shared memory, one retained buffer
     // per pipeline slot: the block a host-side orchestrator (host_build_graph)
     // writes its shared-memory image into before the bounded H2D ships the live
@@ -90,6 +140,18 @@ struct HostApiOps {
     // re-writes every segment it ships, so only the pages it touches ever become
     // resident. Returns 0 on success.
     int (*acquire_sm_mirror)(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    // Retain the host buffer a run assembles its device execution image in, so
+    // the bytes outlive the preparation that wrote them: the publication that
+    // ships them is a separate step, and a write that is enqueued rather than
+    // issued immediately reads this buffer after its caller has returned.
+    // Host memory only. Same retention contract as acquire_sm_mirror above —
+    // per pipeline slot, grow-only, released at Worker finalization, handed over
+    // uninitialized with no meaning carried between binds. `addr_out` receives a
+    // pointer aligned to `alignment` (a power of two) with at least `bytes`
+    // behind it. Returns 0 on success.
+    int (*acquire_run_image_staging)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+    );
     // Commit the three pooled regions (GM heap, runtime shared memory, and
     // prebuilt runtime arena) of the arena bank selected by this run, as three
     // independent device allocations. `runtime_arena_size == 0` skips the
@@ -132,11 +194,9 @@ struct HostApiOps {
     // address of the ChipCallable header. Pool-managed: identical buffer
     // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
     // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
-    // child_count() == 0. Caller computes child addrs as
-    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and records them in the CallableArtifacts kernel_addrs table, which
-    // DeviceRunner::bind_callable_to_runtime replays onto the runtime's
-    // func_id_to_addr_ before each run.
+    // child_count() == 0. The same call builds the callable's func_id-indexed
+    // function tables in the aligned tail of that one allocation, so a bind
+    // publishes a reference to them and no run rebuilds them.
     uint64_t (*upload_chip_callable_buffer)(void *runner_ctx, const void *callable);
     // Host phase records. The pool is platform-allocated but written directly by
     // the runtime through the inline path in host/host_phase_records.h, so these
@@ -145,26 +205,61 @@ struct HostApiOps {
     // chip-swimlane level, `producer_wants_records` carries the producer's own
     // (a runtime knob the platform does not read).
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
-    void *(*host_phase_pool_arm)(void *runner_ctx, int producer_wants_records);
-    void (*host_phase_pool_finish)(void *runner_ctx, uint64_t submitted_tasks, uint64_t invocation_id);
+    void *(*host_phase_pool_arm)(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records);
+    void (*host_phase_pool_finish)(
+        void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id
+    );
     bool (*publish_chip_swimlane_extension)(
         void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     );
+    // This run's device-published result payload, or nullptr when the run
+    // published none. The platform holds one region per pipeline slot and never
+    // interprets the bytes — the layout is the runtime's own. `run_epoch` is the
+    // epoch the caller's run was given: a region still carrying an earlier run's
+    // epoch reads as absent, so a predecessor's payload cannot be returned as
+    // this run's. See common/device_run_result.h for why the region exists and
+    // for what "absent" does and does not mean.
+    const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
+    // Declare which caller device allocations this run produces. Taken from the orchestration
+    // signature, which is the only place the direction of an argument is known, so a runtime that
+    // gives a caller device tensor an output direction says so here. Holding an allocation is not
+    // producing it — see host/caller_device_buffers.h — which is why this is a separate statement
+    // from the reference the lane takes on the same spans. Zero when the statement is recorded; a
+    // non-zero code is a failure the declaring run must not continue past, since an undeclared
+    // producer reads to every other run as a buffer with no producer.
+    int (*declare_caller_device_writes)(
+        void *runner_ctx, uint64_t run_id, const struct CallerBufferSpan *spans, uint32_t count
+    );
+    // Whether [addr, addr + bytes) has no readable content for this run yet. A host-side
+    // orchestrator asks before reading a caller device tensor's bytes while building its graph: a
+    // declared producer's output has no defined content until that run finishes, and neither does
+    // an allocation a declared producer left without being proven finished. A shared immutable
+    // input has no declared producer and stays readable. Zero for a runner with no such
+    // allocation, no other declaring run, or no table at all.
+    int (*caller_device_span_written_by_other_run)(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes);
 };
 
 /**
  * One run's binding of the immutable function table to a runner and that run's
- * slot/bank selection. Constructed per run and passed by const pointer into the
- * runtime impls; a callback reaches its runner and resources through the bound
- * members instead of a thread-local.
+ * slot/bank selection and epoch. Constructed per run and passed by const
+ * pointer into the runtime impls; a callback reaches its runner and resources
+ * through the bound members instead of a thread-local.
  */
 struct HostApi {
 public:
-    HostApi(void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, const HostApiOps *ops) noexcept :
+    HostApi(
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
+    ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
+        run_epoch_(run_epoch),
         ops_(ops) {}
+
+    // The epoch this run was given. Runtimes that build their own swimlane
+    // record streams stamp it into each row: per-task tokens restart every run,
+    // so a row without it cannot be attributed once one file holds several runs.
+    uint64_t run_epoch() const { return run_epoch_; }
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
@@ -180,6 +275,10 @@ public:
     void unregister_device_memory_from_host(void *dev_ptr) const {
         ops_->unregister_device_memory_from_host(runner_ctx_, dev_ptr);
     }
+    void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes) const {
+        if (ops_->acquire_child_memory_host_view == nullptr) return nullptr;
+        return ops_->acquire_child_memory_host_view(runner_ctx_, dev_ptr, bytes);
+    }
     int device_memset(void *dev_ptr, int value, size_t size) const {
         return ops_->device_memset(runner_ctx_, dev_ptr, value, size);
     }
@@ -188,6 +287,9 @@ public:
     }
     void set_retained_temp_buffer(void *addr, size_t size) const {
         ops_->set_retained_temp_buffer(runner_ctx_, pipeline_slot_, addr, size);
+    }
+    int acquire_retained_temp(size_t bytes, void **addr_out, size_t *size_out) const {
+        return ops_->acquire_retained_temp(runner_ctx_, pipeline_slot_, bytes, addr_out, size_out);
     }
     int acquire_graph_definition_block(size_t bytes, size_t alignment, void **device_out, void **staging_out) const {
         if (ops_->acquire_graph_definition_block == nullptr) return -1;
@@ -203,12 +305,29 @@ public:
         }
         ops_->get_graph_definition_staging(runner_ctx_, pipeline_slot_, addr, size);
     }
+    int acquire_scheduler_state_storage(size_t bytes, size_t alignment, void **device_out, void **host_out) const {
+        if (ops_->acquire_scheduler_state_storage == nullptr) {
+            if (device_out != nullptr) *device_out = nullptr;
+            if (host_out != nullptr) *host_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_scheduler_state_storage(
+            runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
+        );
+    }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {
             if (addr_out != nullptr) *addr_out = nullptr;
             return -1;
         }
         return ops_->acquire_sm_mirror(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
+    }
+    int acquire_run_image_staging(size_t bytes, size_t alignment, void **addr_out) const {
+        if (ops_->acquire_run_image_staging == nullptr) {
+            if (addr_out != nullptr) *addr_out = nullptr;
+            return -1;
+        }
+        return ops_->acquire_run_image_staging(runner_ctx_, pipeline_slot_, bytes, alignment, addr_out);
     }
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) const {
         return ops_->setup_static_arena(runner_ctx_, arena_bank_, gm_heap_size, gm_sm_size, runtime_arena_size);
@@ -243,6 +362,11 @@ public:
     /**
      * Arm this pass's host phase pool.
      *
+     * The pool is one per pipeline slot, not one per runner: a host-orchestrating
+     * bind is preparation, and a prepared successor prepares while its
+     * predecessor is still executing. `pipeline_slot_` is this run's, so the
+     * hook needs no argument for it.
+     *
      * @param producer_wants_records  the producer's own enabling condition; the
      *                                runner ORs it with the chip-swimlane level
      * @return HostPhaseRecordPool* to record into, or nullptr when this pass
@@ -251,11 +375,11 @@ public:
      */
     void *host_phase_pool_arm(bool producer_wants_records) const noexcept {
         if (ops_->host_phase_pool_arm == nullptr) return nullptr;
-        return ops_->host_phase_pool_arm(runner_ctx_, producer_wants_records ? 1 : 0);
+        return ops_->host_phase_pool_arm(runner_ctx_, pipeline_slot_, producer_wants_records ? 1 : 0);
     }
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
-            ops_->host_phase_pool_finish(runner_ctx_, submitted_tasks, invocation_id);
+            ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
         }
     }
     bool publish_chip_swimlane_extension(
@@ -270,10 +394,68 @@ public:
             return false;
         }
     }
+    /**
+     * What this run's device side published for the host to read, or nullptr
+     * when it published nothing. `*bytes_out` receives the payload length.
+     *
+     * Absent is not "succeeded": a producer publishes only what it wants
+     * preserved, so a run with nothing to report and a run that never reached
+     * its publish point both read as absent. A caller decides that a run failed
+     * from the execution error channel and comes here for the detail.
+     */
+    const void *run_result(size_t *bytes_out) const noexcept {
+        if (ops_->get_run_result == nullptr) {
+            if (bytes_out != nullptr) *bytes_out = 0;
+            return nullptr;
+        }
+        return ops_->get_run_result(runner_ctx_, pipeline_slot_, run_epoch_, bytes_out);
+    }
+
+    /**
+     * Declare which caller device allocations this run produces.
+     *
+     * Made from the orchestration signature during this run's own bind, which is the one moment
+     * an argument's direction is known here.
+     *
+     * @return true when the statement stands — including on a platform that publishes no such
+     *         entry, where there is nothing to record and no other run can be reading one. False
+     *         means the platform has the entry and could not make it, which the caller has to
+     *         treat as this run's failure rather than proceeding with an undeclared output.
+     */
+    [[nodiscard]] bool
+    declare_caller_device_writes(const struct CallerBufferSpan *spans, uint32_t count) const noexcept {
+        if (ops_->declare_caller_device_writes == nullptr) return true;
+        return ops_->declare_caller_device_writes(runner_ctx_, run_identity(), spans, count) == 0;
+    }
+
+    /**
+     * Whether `[addr, addr + bytes)` has no readable content for this run yet.
+     *
+     * Asked before reading a caller device tensor's bytes on the host while building this run's
+     * graph. True means those bytes have no defined content yet, because a *declared producer* is
+     * still live or ended unproven — not merely because another run also names the allocation,
+     * which is legal and common for a shared immutable input.
+     *
+     * False when the platform has no such query, so a backend without it behaves exactly as it
+     * did.
+     */
+    bool caller_device_span_written_by_other_run(uint64_t addr, uint64_t bytes) const noexcept {
+        if (ops_->caller_device_span_written_by_other_run == nullptr) return false;
+        return ops_->caller_device_span_written_by_other_run(runner_ctx_, run_identity(), addr, bytes) != 0;
+    }
 
 private:
+    /**
+     * This run's identity for the caller-buffer table: its pipeline slot, offset so it is never
+     * zero. A slot holds one run for that run's whole lifetime, so it names the declaring run for
+     * exactly as long as the declaration may exist, and it is the same identity the lane's
+     * reference uses.
+     */
+    uint64_t run_identity() const noexcept { return static_cast<uint64_t>(pipeline_slot_) + 1; }
+
     void *runner_ctx_{nullptr};
     uint32_t pipeline_slot_{0};
     uint32_t arena_bank_{0};
+    uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
 };

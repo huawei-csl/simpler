@@ -29,6 +29,21 @@ from simpler_setup.scene_test import (
 )
 
 
+def _recording_converter(calls):
+    """Stand in for the converter subprocess, reporting the success it models.
+
+    The return value is the contract `_convert_rank_swimlanes` reads to decide
+    whether a merge needs its per-Rank fallback, so a stub that dropped it
+    would exercise the fallback in every test.
+    """
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    return run
+
+
 def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_path, monkeypatch) -> None:
     scene_test_module = importlib.import_module("simpler_setup.scene_test")
     for rank in (0, 1):
@@ -38,7 +53,7 @@ def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_pat
             records.write_text("{}")
 
     calls = []
-    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
 
     scene_test_module._convert_case_swimlane("case", tmp_path)
 
@@ -49,7 +64,13 @@ def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_pat
     ]
 
 
-def test_l3_swimlane_postprocess_falls_back_per_rank_below_level_four(tmp_path, monkeypatch, caplog) -> None:
+def test_l3_swimlane_postprocess_merges_below_level_four(tmp_path, monkeypatch, caplog) -> None:
+    """Placement comes from the Host log, so no capture level gates the merge.
+
+    A level-3 capture has fewer device streams to draw and a looser join, both of
+    which the converter reports; neither is a reason to fall back to one trace
+    per Rank, which is what a reader of a collective cannot use.
+    """
     scene_test_module = importlib.import_module("simpler_setup.scene_test")
     for rank in (0, 1):
         records = tmp_path / f"rank{rank}" / "d0" / "chip_swimlane_records.json"
@@ -57,17 +78,12 @@ def test_l3_swimlane_postprocess_falls_back_per_rank_below_level_four(tmp_path, 
         records.write_text(json.dumps({"chip_swimlane_level": 3}))
 
     calls = []
-    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
 
     scene_test_module._convert_case_swimlane("case", tmp_path)
 
-    # No cross-Rank merge without clock anchors — one single-file conversion per Rank.
-    assert [call["input_path"] for call in calls] == [
-        tmp_path / "rank0" / "d0" / "chip_swimlane_records.json",
-        tmp_path / "rank1" / "d0" / "chip_swimlane_records.json",
-    ]
-    assert all("dispatch" not in call for call in calls)
-    assert "cross-Rank merging needs --enable-chip-swimlane 4" in caplog.text
+    assert [call["input_path"] for call in calls] == [tmp_path]
+    assert calls[0]["dispatch"] == "d0"
 
 
 def test_l3_swimlane_postprocess_refuses_asymmetric_local_capture_indexes(tmp_path, monkeypatch, caplog) -> None:
@@ -79,7 +95,7 @@ def test_l3_swimlane_postprocess_refuses_asymmetric_local_capture_indexes(tmp_pa
             records.write_text("{}")
 
     calls = []
-    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
 
     scene_test_module._convert_case_swimlane("case", tmp_path)
 
@@ -118,7 +134,7 @@ def test_l3_swimlane_postprocess_uses_parent_identity_when_rank_d_paths_are_reor
         )
 
     calls = []
-    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", lambda **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
 
     scene_test_module._convert_case_swimlane("case", tmp_path)
 

@@ -43,6 +43,7 @@ constexpr int PLATFORM_MAX_BLOCKDIM = 36;
 constexpr int PLATFORM_CORES_PER_BLOCKDIM = 3;
 constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
+constexpr uint32_t PLATFORM_SSBUF_SIZE = 3 * 1024;
 
 /**
  * Maximum AICPU scheduling threads
@@ -114,6 +115,15 @@ constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
  * by SIMPLER_SCHEDULER_TIMEOUT_MS when that env var is valid.
  */
 constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 20000;
+
+/**
+ * Tensor data spin-wait timeout defaults (milliseconds).
+ * The AICPU platform variant selects one value as
+ * PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS in spin_hint.h. Simulation keeps a
+ * larger budget because its AICPU and AICore threads share host CPU resources.
+ */
+constexpr int32_t PLATFORM_ONBOARD_TENSOR_DATA_WAIT_TIMEOUT_MS = 15000;
+constexpr int32_t PLATFORM_SIM_TENSOR_DATA_WAIT_TIMEOUT_MS = 30000;
 
 /**
  * Default host-side stream synchronization timeout (milliseconds).

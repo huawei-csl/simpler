@@ -9,22 +9,29 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime Builder - rt2 Implementation (host_build_graph: Host Orchestration)
+ * host_build_graph runtime maker (host orchestration).
  *
- * Provides init_runtime_impl and validate_runtime_impl functions for rt2 runtime.
  * The HOST runs the orchestrator to completion, populates shared memory + the
  * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
  *
- * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
- *   - dlopens the orchestration SO on the host and runs it to build the graph
+ * register_callable_impl:
+ *   - dlopens the orchestration SO on the host and resolves its entry points,
+ *     which bind then invokes per run
+ *
+ * bind_callable_to_runtime_impl:
+ *   - Gives host-memory tensor arguments slices of the pipeline slot's retained
+ *     temporary buffer, copies every readable input H2D, and records one lease
+ *     each with its transfer directions. The copy is here rather than in
+ *     copy_in_run_inputs_impl because the orchestration entry below reads these
+ *     tensors while it builds the graph
+ *   - Runs the resolved orchestration entry to build the graph
  *   - Sets up runtime state for host orchestration
  *
- * validate_runtime_impl:
+ * copy_back_run_outputs_impl / release_run_bindings_impl:
  *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
  *     are skipped)
- *   - Frees device memory
+ *   - Releases the run's leases. The slices are no-ops: the retained buffer
+ *     outlives the run and is freed once at Worker finalization.
  */
 
 #include <dlfcn.h>
@@ -83,7 +90,12 @@
 #include "host_log.h"
 #include "host/platform_compile_info.h"
 #include "host/raii_scope_guard.h"
+#include "host/kernel_pipeline_contract.h"
 #include "utils/device_arena.h"
+#include "utils/retained_temp_bump.h"
+#include "utils/temp_buffer_plan.h"
+#include "utils/program_tensor_args.h"
+#include "utils/tensor_lease_release.h"
 #include "prepare_callable_common.h"
 
 // This file returns both kinds of negative status — a latched device code
@@ -103,6 +115,10 @@ static_assert(
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL == static_cast<uint64_t>(ChipSwimlaneLevel::SCHED_PHASES),
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
@@ -127,8 +143,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
     // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank. The common C API keeps collector-bearing configurations on
-    // the sequential path until their state is per-epoch.
+    // arena bank.
     return 1;
 }
 
@@ -328,13 +343,24 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
         *task_capacity = override_value;
     }
 
-    // Any positive count is usable: a task id indexes its slot directly, so
-    // nothing masks with this value. The power-of-two, >= 4 requirement belongs to
-    // tensormap_and_ringbuffer, which does mask, and is enforced in that runtime's
-    // own resolve; neither the RuntimeEnv setter nor Worker.run constrains the
-    // value, so this bound is the only one a ring_task_window passes through.
-    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(INT32_MAX)) {
-        LOG_ERROR("ring_task_window=%" PRIu64 " must be in [1, INT32_MAX]", *task_capacity);
+    // Any positive count is usable: a task id indexes its slot directly, so no slot
+    // lookup masks with this value. The power-of-two, >= 4 requirement belongs to
+    // tensormap_and_ringbuffer, which does mask there, and is enforced in that
+    // runtime's own resolve; neither the RuntimeEnv setter nor Worker.run constrains
+    // the value, so this bound is the only one a ring_task_window passes through.
+    //
+    // The upper bound is the one place a task id IS masked: a sub-task's id carries
+    // its modular task's local id in a fixed-width parent field, and that mint masks
+    // rather than fails, so a count past the field would truncate a parent silently.
+    // The shared-memory limit below is the tighter of the two in practice -- a slot
+    // costs kilobytes, so INT32_MAX bytes runs out first -- which makes this a guard
+    // that should never be the one to fire rather than a cap anyone meets.
+    if (*task_capacity < 1 || *task_capacity > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM)) {
+        LOG_ERROR(
+            "ring_task_window=%" PRIu64 " must be in [1, %d]: a modular task's local id has to fit the parent field "
+            "of the sub-task ids it mints",
+            *task_capacity, TaskId::GLOBAL_TASK_MAX_NUM
+        );
         return false;
     }
     // A slot state reaches its payload and descriptor through a 32-bit
@@ -353,7 +379,7 @@ static bool resolve_graph_task_capacity(const uint64_t *ring_task_window, uint64
     return true;
 }
 
-static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
+static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
     if (runtime == nullptr || api == nullptr || host_header == nullptr) {
         return 0;
     }
@@ -373,12 +399,23 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_code(sched_error_code);
 }
 
+static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
+    const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases(), api);
+    LOG_DEBUG(
+        "Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", counts.freed, counts.buffer_noop,
+        counts.external_noop
+    );
+}
+
 namespace {
 
+// What a run's scheduler state leaves behind for the readers that come after
+// its bind: where the state is on the device, the layout that describes it, and
+// the HostApi the D2H readback goes through. The storage itself belongs to the
+// runner's pipeline slot, not here, so this record owns nothing and ends with
+// the run.
 struct SchedulerStateOwner {
-    void *allocation;
     void *state_base;
-    uint64_t allocation_size;
     AicoreSchedulerLayout layout;
     const HostApi *api;
 };
@@ -390,7 +427,7 @@ struct SchedulerJsonRecord {
     uint64_t start_cycles;
     uint64_t end_cycles;
     uint64_t loop_iter;
-    const char *kind;
+    SchedPhaseKind kind;
     uint64_t tasks_processed;
     uint64_t task_id;
     bool has_task;
@@ -402,7 +439,7 @@ const char *scheduler_core_type_name(int32_t core_type) {
 
 void append_scheduler_record(
     std::vector<SchedulerJsonRecord> *records, uint64_t start_cycles, uint64_t end_cycles, uint64_t loop_iter,
-    const char *kind, uint64_t tasks_processed, uint64_t task_id = 0, bool has_task = true
+    SchedPhaseKind kind, uint64_t tasks_processed, uint64_t task_id = 0, bool has_task = true
 ) {
     if (records == nullptr || start_cycles == 0 || end_cycles < start_cycles) return;
     records->push_back({start_cycles, end_cycles, loop_iter, kind, tasks_processed, task_id, has_task});
@@ -433,21 +470,50 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
     const auto *controls = scheduler_state_at<SchedulerTaskControl>(host_base, owner.layout.task_controls_offset);
 
-    std::ostringstream tasks_json;
-    tasks_json << "[";
-    bool first_task = true;
+    const bool need_scheduler_timing = level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
+
+    // One eligibility pass, before either section is written. The reader requires
+    // Scheduler timing for every AICore task it sees (swimlane_converter.py's
+    // level>=2 join is `set(aicore) - set(scheduler)` and must be empty), so a
+    // task that cannot appear in both sections must appear in neither. Deciding
+    // per-section instead means a single incomplete trace costs this run its
+    // whole Scheduler timing, its AICPU lifecycle records and its Scheduler
+    // activity streams -- every section after the one that gave up -- while
+    // leaving the already-published AicoreTasks in the one shape the reader
+    // rejects.
+    std::vector<uint64_t> emitted_tasks;
+    emitted_tasks.reserve(static_cast<size_t>(owner.layout.task_count));
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskTrace &trace = traces[task_id];
         if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
             trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
             continue;
+        if (need_scheduler_timing &&
+            (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles)) {
+            LOG_WARN(
+                "A5 HBG: dropping task id=%" PRIu64 " from this run's swimlane — incomplete Scheduler timing "
+                "(dispatch_end=%" PRIu64 ", complete_start=%" PRIu64 ", kernel_end=%" PRIu64 ")",
+                task_id, trace.dispatch_end_cycles, trace.complete_start_cycles, trace.kernel_end_cycles
+            );
+            continue;
+        }
+        emitted_tasks.push_back(task_id);
+    }
+
+    std::ostringstream tasks_json;
+    tasks_json << "[";
+    bool first_task = true;
+    const uint64_t swimlane_run_epoch = api->run_epoch();
+    for (uint64_t task_id : emitted_tasks) {
+        const SchedulerTaskTrace &trace = traces[task_id];
         const uint64_t receive_to_start =
             trace.ready_observe_cycles != 0 && trace.kernel_start_cycles >= trace.ready_observe_cycles ?
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
                 0;
         if (!first_task) tasks_json << ",";
         tasks_json << "\n    [" << trace.worker_id << ", " << task_id << ", " << task_id << ", "
-                   << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << "]";
+                   << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << ", "
+                   << swimlane_run_epoch << "]";
         first_task = false;
     }
     if (!first_task) tasks_json << "\n  ";
@@ -460,22 +526,16 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         return false;
     }
 
-    if (level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING)) {
+    if (need_scheduler_timing) {
         std::ostringstream scheduler_tasks_json;
-        scheduler_tasks_json << "{\n    \"schema_version\": 1,\n    \"producer\": \"aicore\",\n    \"records\": [";
+        scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;
-        for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
+        for (uint64_t task_id : emitted_tasks) {
             const SchedulerTaskTrace &trace = traces[task_id];
-            if (trace.valid == 0 || trace.kernel_start_cycles == 0 ||
-                trace.kernel_end_cycles < trace.kernel_start_cycles || trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
-                continue;
-            if (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles) {
-                LOG_WARN("A5 HBG: incomplete Scheduler task timing for task id=%" PRIu64, task_id);
-                return false;
-            }
             if (!first_scheduler_task) scheduler_tasks_json << ",";
             scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_id << ", "
-                                 << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << "]";
+                                 << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << ", "
+                                 << swimlane_run_epoch << "]";
             first_scheduler_task = false;
         }
         if (!first_scheduler_task) scheduler_tasks_json << "\n    ";
@@ -490,28 +550,29 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         }
 
         const auto *lifecycle =
-            scheduler_state_at<AicpuCoreLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
+            scheduler_state_at<AicpuThreadLifecycleTrace>(host_base, owner.layout.aicpu_lifecycle_traces_offset);
         std::ostringstream lifecycle_json;
         lifecycle_json << "[";
         bool first = true;
-        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
-            const AicpuCoreLifecycleTrace &trace = lifecycle[worker];
-            if (trace.handshake_observed_cycles == 0) continue;
+        for (uint64_t thread = 0; thread < PLATFORM_MAX_AICPU_THREADS; ++thread) {
+            const AicpuThreadLifecycleTrace &trace = lifecycle[thread];
+            if (trace.handshake_start_cycles == 0) continue;
             if (!first) lifecycle_json << ",";
-            lifecycle_json << "\n    {\"worker_id\": " << trace.worker_id
-                           << ", \"aicpu_thread_id\": " << trace.aicpu_thread_id << ", \"core_type\": \""
-                           << scheduler_core_type_name(static_cast<int32_t>(trace.core_type))
-                           << "\", \"physical_core_id\": " << trace.physical_core_id
-                           << ", \"handshake_observed_cycles\": " << trace.handshake_observed_cycles
-                           << ", \"handshake_partition_complete_cycles\": " << trace.handshake_partition_complete_cycles
+            lifecycle_json << "\n    {\"aicpu_thread_id\": " << trace.aicpu_thread_id
+                           << ", \"handshake_start_cycles\": " << trace.handshake_start_cycles
+                           << ", \"handshake_complete_cycles\": " << trace.handshake_complete_cycles
                            << ", \"config_start_cycles\": " << trace.config_start_cycles
                            << ", \"topology_complete_cycles\": " << trace.topology_complete_cycles
+                           << ", \"context_publish_start_cycles\": " << trace.context_publish_start_cycles
                            << ", \"context_publish_complete_cycles\": " << trace.context_publish_complete_cycles
                            << ", \"bootstrap_wait_start_cycles\": " << trace.bootstrap_wait_start_cycles
                            << ", \"bootstrap_complete_cycles\": " << trace.bootstrap_complete_cycles
-                           << ", \"register_release_cycles\": " << trace.register_release_cycles
-                           << ", \"exit_signal_cycles\": " << trace.exit_signal_cycles
-                           << ", \"exit_ack_cycles\": " << trace.exit_ack_cycles << "}";
+                           << ", \"register_release_start_cycles\": " << trace.register_release_start_cycles
+                           << ", \"register_release_end_cycles\": " << trace.register_release_end_cycles
+                           << ", \"exit_signal_start_cycles\": " << trace.exit_signal_start_cycles
+                           << ", \"exit_signal_end_cycles\": " << trace.exit_signal_end_cycles
+                           << ", \"exit_wait_start_cycles\": " << trace.exit_wait_start_cycles
+                           << ", \"exit_wait_end_cycles\": " << trace.exit_wait_end_cycles << "}";
             first = false;
         }
         if (!first) lifecycle_json << "\n  ";
@@ -532,50 +593,47 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         const SchedulerWorkerContext &context = contexts[worker];
         if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
         append_scheduler_record(
-            &records[context.worker_index], context.bootstrap_start_cycles, context.bootstrap_end_cycles, 0,
-            "bootstrap", context.bootstrap_task_count, 0, false
+            &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
+            SchedPhaseKind::Bootstrap, context.bootstrap_task_count, 0, false
         );
     }
     for (uint64_t task_id = 0; task_id < owner.layout.task_count; ++task_id) {
         const SchedulerTaskTrace &trace = traces[task_id];
-        if (trace.fanin_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
-                &records[trace.fanin_scheduler_worker_id], trace.fanin_start_cycles, trace.fanin_end_cycles,
-                trace.fanin_loop_iter, "fanin", 1, task_id
+                &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
+                trace.state_probe_end_cycles, trace.dispatch_loop_iter, SchedPhaseKind::StateProbe, 1, task_id
             );
         }
-        if (trace.claim_worker_id < SCHEDULER_WORKER_CAPACITY) {
-            append_scheduler_record(
-                &records[trace.claim_worker_id], trace.claim_start_cycles, trace.claim_end_cycles,
-                trace.claim_loop_iter,
-                trace.ready_source == static_cast<uint64_t>(SchedulerReadySource::STOLEN) ? "ready_steal" :
-                                                                                            "ready_claim",
-                1, task_id
-            );
-        }
-        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        const auto ready_source = static_cast<SchedulerReadySource>(trace.ready_source);
+        const auto publication_mode = static_cast<SchedulerPublicationMode>(trace.publication_mode);
+        const bool refill = publication_mode == SchedulerPublicationMode::REFILL;
+        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
-                trace.dispatch_loop_iter, "dispatch", 1, task_id
+                trace.dispatch_loop_iter,
+                ready_source == SchedulerReadySource::STOLEN ? SchedPhaseKind::Worksteal : SchedPhaseKind::Dispatch, 1,
+                task_id
             );
         }
         if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.complete_scheduler_worker_id], trace.complete_start_cycles, trace.complete_end_cycles,
-                trace.complete_loop_iter, "complete", 1, task_id
+                trace.complete_loop_iter, SchedPhaseKind::Complete, 1, task_id
             );
         }
         if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
-                trace.refill_loop_iter, "direct_refill", 1, trace.refill_task_id
+                trace.refill_loop_iter, SchedPhaseKind::Refill, 1, trace.refill_task_id
             );
         }
         const SchedulerTaskControl &control = controls[task_id];
         if (control.scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
             append_scheduler_record(
                 &records[control.scheduler_worker_id], control.completion_resolve_start_cycles,
-                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, "resolve", 1, task_id
+                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, SchedPhaseKind::Resolve, 1,
+                task_id
             );
         }
     }
@@ -603,7 +661,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             for (uint32_t index = 0; index < committed; ++index) {
                 const SchedulerIdleRecord &record = buffer.records[index];
                 append_scheduler_record(
-                    &records[worker], record.start_time, record.end_time, record.loop_iter, "idle", 0, 0, false
+                    &records[worker], record.start_time, record.end_time, record.loop_iter, SchedPhaseKind::Idle, 0, 0,
+                    false
                 );
             }
             dropped_by_worker[worker] = buffer.dropped;
@@ -611,7 +670,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     }
 
     std::ostringstream scheduler_json;
-    scheduler_json << "{\n    \"schema_version\": 1,\n    \"streams\": [";
+    scheduler_json << "{\n    \"streams\": [";
     bool first_stream = true;
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         const SchedulerWorkerContext &context = contexts[worker];
@@ -620,11 +679,14 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         std::sort(records[worker].begin(), records[worker].end(), [](const auto &lhs, const auto &rhs) {
             if (lhs.start_cycles != rhs.start_cycles) return lhs.start_cycles < rhs.start_cycles;
             if (lhs.end_cycles != rhs.end_cycles) return lhs.end_cycles < rhs.end_cycles;
-            return std::strcmp(lhs.kind, rhs.kind) < 0;
+            // Ordered by the name a report spells, not by the enumerator value: the
+            // tie-break exists only to make the output deterministic, and the
+            // enumerators are numbered by producer grouping rather than alphabetically.
+            return std::strcmp(sched_phase_kind_name(lhs.kind), sched_phase_kind_name(rhs.kind)) < 0;
         });
         if (!first_stream) scheduler_json << ",";
-        scheduler_json << "\n      {\"platform\": \"a5\", \"runtime\": \"host_build_graph\", "
-                          "\"producer\": \"aicore\", \"scheduler_id\": "
+        scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
+                          "\"scheduler_id\": "
                        << context.scheduler_index << ", \"worker_id\": " << worker << ", \"core_type\": \""
                        << scheduler_core_type_name(context.core_type)
                        << "\", \"physical_core_id\": " << context.physical_core_id
@@ -634,9 +696,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             const SchedulerJsonRecord &record = records[worker][index];
             if (index != 0) scheduler_json << ",";
             scheduler_json << "\n        {\"start_cycles\": " << record.start_cycles
-                           << ", \"end_cycles\": " << record.end_cycles << ", \"loop_iter\": " << record.loop_iter
-                           << ", \"kind\": \"" << record.kind << "\", \"tasks_processed\": " << record.tasks_processed
-                           << ", \"task_id\": ";
+                           << ", \"end_cycles\": " << record.end_cycles << ", \"run_epoch\": " << api->run_epoch()
+                           << ", \"loop_iter\": " << record.loop_iter << ", \"kind\": \""
+                           << sched_phase_kind_name(record.kind)
+                           << "\", \"tasks_processed\": " << record.tasks_processed << ", \"task_id\": ";
             if (record.has_task) scheduler_json << record.task_id;
             else scheduler_json << "null";
             scheduler_json << "}";
@@ -746,14 +809,14 @@ struct DefinitionUploads {
     size_t spilled;
 };
 
-// Ship the run's Definition objects and bind every outer Graph task to the one
+// Prepare the run's Definition objects and bind every outer Graph task to the one
 // with its key. The recorders built most or all of them in place in the block's
 // host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
-// issues a single H2D of the used prefix. The device initial classify then replaces
-// each task's graph_context with an execution constructed in its own heap.
+// records the used prefix for synchronous publication. Device initial classify
+// replaces each task's graph_context with an execution constructed in its own heap.
 bool bind_graph_definitions(
-    const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
+    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
     ReadyQueuePopulations *ready_queue_populations
 ) {
     *uploads = DefinitionUploads{};
@@ -819,12 +882,14 @@ bool bind_graph_definitions(
             const size_t padded = align_up(object_bytes);
             std::memset(base + object_bytes, 0, padded - object_bytes);
         }
-        if (api->copy_to_device(block, staging, block_bytes) != 0) {
-            LOG_ERROR("host-orch: failed to upload the Graph Definition block");
-            return false;
-        }
         uploads->count = packed.size();
         uploads->bytes = block_bytes;
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
+            uploads->spilled
+        );
+        runtime->add_pending_metadata(block, staging, block_bytes, HostPhaseKind::BindGraphUpload, attrs);
     }
 
     for (size_t index = 0; index < count; ++index) {
@@ -835,26 +900,25 @@ bool bind_graph_definitions(
         }
         auto object_it = packed.find(upload->full_key);
         if (object_it == packed.end() || block == nullptr || staging == nullptr) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
-        // The object as it was shipped, so what this validates is the bytes the
-        // device will read rather than a host copy of them.
+        // Validate the prepared bytes that publication will copy to the device.
         const auto *definition = reinterpret_cast<const GraphDefinition *>(
             staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
         );
         if (definition->total_bytes != object_it->second.image_bytes) {
-            LOG_ERROR("host-orch: Graph task has no matching uploaded Definition object");
+            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
         GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count <= 0 || definition->task_count > MAX_IN_GRAPH_TASKS ||
+        if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
             definition->full_key != upload->full_key ||
             !graph_execution_storage_layout(
                 definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
             ) ||
             storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != definition->boundary_count ||
+            upload->outer_slot->to_payload().tensor_count != definition->boundary_tensor_count ||
             upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
             LOG_ERROR("host-orch: invalid Graph Definition for task");
             return false;
@@ -875,11 +939,11 @@ bool bind_graph_definitions(
         }
         PackedDefinition &packed_definition = object_it->second;
         if (!packed_definition.populations_ready) {
-            const InGraphTaskDefinition *tasks = graph_definition_array<InGraphTaskDefinition>(
-                *definition, definition->off_in_graph_tasks, definition->task_count
+            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
+                *definition, definition->off_sub_tasks, definition->task_count
             );
             if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition in-graph task array");
+                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
                 return false;
             }
             for (int32_t i = 0; i < definition->task_count; ++i) {
@@ -912,21 +976,26 @@ struct GraphHostStateBinding {
     OrchestratorState &orchestrator;
 };
 
-void release_scheduler_state(Runtime *runtime, const HostApi *api) {
-    if (runtime == nullptr || api == nullptr) return;
-    SchedulerStateOwner owner{};
+// The two bootstrap words move together: a resident base surviving a legacy
+// selection would name storage this run no longer describes, and a mode without
+// its base would send the AICore to a null context. Every selection path goes
+// through publish_scheduler_bootstrap.
+//
+// The storage that base named belongs to the pipeline slot. What ends here is
+// this run's claim on it — the record, the bootstrap words and the handshake
+// words — and the slot's next run re-initializes and re-ships the whole range
+// before naming it again. Nothing is freed here; the slot cannot be re-entered
+// before this run has released its bindings, which is where this runs from.
+void release_scheduler_state(Runtime *runtime) {
+    if (runtime == nullptr) return;
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
-        auto it = scheduler_state_owners.find(runtime);
-        if (it != scheduler_state_owners.end()) {
-            owner = it->second;
-            scheduler_state_owners.erase(it);
-        }
+        scheduler_state_owners.erase(runtime);
     }
-    if (owner.allocation != nullptr) api->device_free(owner.allocation);
+    runtime->publish_scheduler_bootstrap(0, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = 0;
-        runtime->workers[i].task = 0;
+        runtime->dev.workers[i].aicpu_ready = 0;
+        runtime->dev.workers[i].task = 0;
     }
 }
 
@@ -934,9 +1003,10 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
     always_assert(
         mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
     );
+    runtime->publish_scheduler_bootstrap(mode, 0);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = mode;
-        runtime->workers[i].task = 0;
+        runtime->dev.workers[i].aicpu_ready = 0;
+        runtime->dev.workers[i].task = 0;
     }
 }
 
@@ -944,7 +1014,7 @@ bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
 ) {
-    release_scheduler_state(runtime, api);
+    release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
         LOG_ERROR(
             "A5 HBG AICore scheduler: invalid graph size tasks=%d window=%" PRIu64, total_tasks, task_window_size
@@ -968,6 +1038,7 @@ bool create_scheduler_state(
     std::vector<int64_t> inline_completed_task_ids;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t aic_task_count = 0;
+    bool sampled_task_timing_enabled = false;
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
@@ -975,25 +1046,29 @@ bool create_scheduler_state(
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_id = -1;
+    // The progress byte is PENDING or COMPLETED throughout this walk, never
+    // PUBLISHED: that value is stored only by the device dispatch path, which
+    // has not run yet, and orch::prepare_task resets every claimed slot this
+    // bind. So `is_completed` and its negation partition the tasks here, and a
+    // future host-side publication would silently change what these tests mean.
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
         SchedulerTaskShape shape{};
         SchedulerGraphResult status = scheduler_classify_task_shape(host_graph, task_id, &shape);
         bool inline_dispatch_task = false;
         if (status != SchedulerGraphResult::OK) {
-            bool inline_completed_task = status == SchedulerGraphResult::UNSUPPORTED_SHAPE &&
-                                         slot.active_mask.raw() == 0 && slot.logical_block_num == 1 &&
-                                         slot.total_required_subtasks == 0 &&
-                                         slot.task_state.load(std::memory_order_acquire) == CHIP_TASK_COMPLETED &&
-                                         slot.task_attrs.allow_early_resolve() &&
-                                         !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
+            bool inline_completed_task =
+                status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
+                slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
+                host_sm_handle.header->tasks.is_completed(task_id) && slot.task_attrs.allow_early_resolve() &&
+                !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
             if (inline_completed_task) {
                 inline_completed_task_ids.push_back(task_id);
                 continue;
             }
             inline_dispatch_task = status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
                                    slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
-                                   slot.task_state.load(std::memory_order_acquire) == CHIP_TASK_PENDING &&
+                                   !host_sm_handle.header->tasks.is_completed(task_id) &&
                                    !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
             if (!inline_dispatch_task) {
                 LOG_ERROR(
@@ -1030,7 +1105,7 @@ bool create_scheduler_state(
         const uint32_t expected_subtasks = logical_block_num * active_subtasks;
         if ((!inline_dispatch_task && (slot.active_mask.raw() != classified_active_mask ||
                                        static_cast<uint32_t>(slot.total_required_subtasks) != expected_subtasks)) ||
-            expected_subtasks > UINT16_MAX || slot.task_state.load(std::memory_order_acquire) != CHIP_TASK_PENDING ||
+            expected_subtasks > UINT16_MAX || host_sm_handle.header->tasks.is_completed(task_id) ||
             (slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1))) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task id=%" PRId64
@@ -1084,6 +1159,9 @@ bool create_scheduler_state(
         metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
         metadata.total_required_subtasks = static_cast<uint16_t>(expected_subtasks);
         metadata.timing_slot = slot.task_attrs.timing_slot();
+        sampled_task_timing_enabled =
+            sampled_task_timing_enabled ||
+            (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
         if ((active_mask & 1U) != 0) {
             ++aic_task_count;
             aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
@@ -1127,21 +1205,29 @@ bool create_scheduler_state(
     layout.aiv_worker_demand = aiv_worker_demand;
 
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_ALIGNMENT - 1;
-    void *allocation = api->device_malloc(static_cast<size_t>(allocation_size));
-    if (allocation == nullptr) {
-        LOG_ERROR("A5 HBG AICore scheduler: failed to allocate %" PRIu64 " scheduler state bytes", allocation_size);
+    // The slot's retained pair, each side aligned with at least total_size
+    // behind it. Handed over uninitialized and never carrying anything between
+    // runs: the initialization below writes this run's whole length, and the
+    // publication ships it.
+    void *device_state = nullptr;
+    void *host_base = nullptr;
+    if (api->acquire_scheduler_state_storage(
+            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_ALIGNMENT), &device_state,
+            &host_base
+        ) != 0 ||
+        device_state == nullptr || host_base == nullptr) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: failed to obtain %" PRIu64 " scheduler state bytes (%" PRIu64 " with alignment)",
+            layout.total_size, allocation_size
+        );
         return false;
     }
-    const uintptr_t aligned_address = (reinterpret_cast<uintptr_t>(allocation) + SCHEDULER_STATE_ALIGNMENT - 1) &
-                                      ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
+    const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
 
-    std::vector<uint8_t> storage(static_cast<size_t>(allocation_size));
-    const uintptr_t host_aligned_address =
-        (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
-        ~(static_cast<uintptr_t>(SCHEDULER_STATE_ALIGNMENT) - 1);
-    void *host_base = reinterpret_cast<void *>(host_aligned_address);
+    // The only pass over this run's total_size: it zeroes and fills the whole
+    // length, which is what makes a retained block's previous contents
+    // unreachable.
     if (!scheduler_init_data_from_layout(host_base, layout)) {
-        api->device_free(allocation);
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
@@ -1150,20 +1236,6 @@ bool create_scheduler_state(
     for (int64_t task_id : inline_completed_task_ids) {
         task_controls[task_id].state = static_cast<int64_t>(SchedulerTaskState::DONE);
         task_controls[task_id].wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
-    }
-    static_assert(
-        SCHEDULER_CALLABLE_CAPACITY == RUNTIME_MAX_FUNC_ID,
-        "scheduler state callable table must cover the runtime table"
-    );
-    auto *callable_addresses = scheduler_state_at<uint64_t>(host_base, layout.callable_addresses_offset);
-    const bool cpu_sim = std::strcmp(get_platform(), "a5sim") == 0;
-    for (uint32_t func_id = 0; func_id < SCHEDULER_CALLABLE_CAPACITY; ++func_id) {
-        const uint64_t callable_address = runtime->get_function_bin_addr(static_cast<int32_t>(func_id));
-        callable_addresses[func_id] =
-            callable_address == 0 ?
-                0 :
-                (cpu_sim ? reinterpret_cast<const CoreCallable *>(callable_address)->resolved_addr() :
-                           callable_address + CoreCallable::binary_data_offset());
     }
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
@@ -1177,6 +1249,7 @@ bool create_scheduler_state(
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
     run_control->chip_swimlane_level = api->chip_swimlane_level();
+    run_control->sampled_task_timing_enabled = sampled_task_timing_enabled ? 1 : 0;
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
     run_control->task_metadata_offset = layout.task_metadata_offset;
     run_control->ready_inboxes_offset = layout.ready_inboxes_offset;
@@ -1195,21 +1268,25 @@ bool create_scheduler_state(
     int32_t aiv_rank = 0;
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         SchedulerWorkerContext &context = contexts[i];
-        context.core_type = static_cast<int32_t>(runtime->workers[i].core_type);
+        context.core_type = static_cast<int32_t>(runtime->core_type_rule(i));
         context.physical_core_id = -1;
         context.type_rank = context.core_type == static_cast<int32_t>(CoreType::AIC) ? aic_rank++ : aiv_rank++;
-        context.active = 0;
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
-        context.completion_inboxes_offset = layout.completion_inboxes_offset;
+        context.scheduler_ssbuf_reserved0 = 0;
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
-        context.ready_owner_states_offset = layout.ready_owner_states_offset;
+        context.scheduler_ssbuf_reserved1 = 0;
         context.ready_directory_offset = layout.ready_directory_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
-        context.dispatch_slots_offset = layout.dispatch_slots_offset;
-        context.callable_addresses_offset = layout.callable_addresses_offset;
+        context.scheduler_ssbuf_reserved2 = 0;
+        // The absolute address of the callable's registration-owned entry
+        // table, with its own length: nothing in this per-bind allocation holds
+        // that table, so it is named by address rather than by offset from the
+        // base above.
+        context.callable_addresses_address = runtime->callable_entry_table_addr();
+        context.callable_addresses_count = runtime->callable_table_len();
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.bootstrap_done = 0;
         context.gang_coordinator_offset = layout.gang_coordinator_offset;
@@ -1228,25 +1305,19 @@ bool create_scheduler_state(
         context.worker_index = static_cast<uint64_t>(i);
     }
 
-    if (api->copy_to_device(
-            reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size)
-        ) != 0) {
-        api->device_free(allocation);
-        LOG_ERROR("A5 HBG AICore scheduler: failed to publish scheduler state");
-        return false;
-    }
-    for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
-        runtime->workers[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING;
-        runtime->workers[i].task =
-            aligned_address + layout.worker_contexts_offset + static_cast<uint64_t>(i) * sizeof(SchedulerWorkerContext);
-    }
+    runtime->publish_scheduler_bootstrap(
+        SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
+    );
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime,
-            SchedulerStateOwner{allocation, reinterpret_cast<void *>(aligned_address), allocation_size, layout, api}
+            runtime, SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api}
         );
     }
+    runtime->add_pending_metadata(
+        reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(layout.total_size),
+        HostPhaseKind::Count, {}
+    );
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
     return true;
 }
@@ -1290,9 +1361,7 @@ int32_t run_host_orchestration(
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator
     // wrote onto the real base before the image travels.
-    if (!orchestrator.init(
-            host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), HEAP_VIRTUAL_CAPACITY, task_capacity
-        )) {
+    if (!orchestrator.init(host_sm, reinterpret_cast<void *>(HEAP_VIRTUAL_BASE), MAX_HEAP_CAPACITY, task_capacity)) {
         LOG_ERROR("host-orch: orchestrator init against host SM failed");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1344,7 +1413,7 @@ int32_t run_host_orchestration(
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
     // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at staging time (host_build_graph/host_tensor_access.h),
+    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
     // so the host orchestrator can read control tensors (e.g. paged_attention's
     // context_lens/block_table) whether or not the platform maps device memory
     // into the host address space.
@@ -1364,9 +1433,17 @@ int32_t run_host_orchestration(
     entry_points->bind(rt);
 
     const BindPhaseMark orch_phase = bind_phase_begin();
-    rt_scope_begin(rt);
-    entry_points->entry(orch_l2);
-    rt_scope_end(rt);
+    {
+        // Recorder jobs borrow this build's state and execute code from its SO.
+        // Drain before commit can retire their entries, and before unwinding can
+        // release graph_state, orchestrator, or the tensor-access views.
+        RAIIScopeGuard recorder_completion([rt]() {
+            rt->ops->graph_record_wait(rt);
+        });
+        rt_scope_begin(rt);
+        entry_points->entry(orch_l2);
+        rt_scope_end(rt);
+    }
     rt_orchestration_done(rt);
 #if SIMPLER_ORCH_PROFILING
     // Per-sub-step cumulatives across this bind's submits. The accumulators only
@@ -1431,27 +1508,11 @@ int32_t run_host_orchestration(
         ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
     }
 
-    // Upload each distinct Definition as its own retained device object and bind
-    // every outer Graph task to it. Per-invocation data already lives in that
-    // task's payload regions and is copied with the shared-memory image below.
-    const BindPhaseMark graph_phase = bind_phase_begin();
+    // Bind Graph tasks to retained Definition addresses. The slot holds the
+    // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &ready_queue_populations)) {
         return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // `bytes` is what this segment copied: the Definition objects, which are all
-        // it copies. `defs` and `submissions` differ by the replay count — one
-        // Definition serves every Graph task with its key. `spilled` is how many
-        // objects the recorders could not build in the block, and so is 0 for a bind
-        // the retained staging was big enough for. It is deliberately not spelled
-        // `copied=`, which on arena_h2d means a zone rather than a count.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "defs=%zu bytes=%" PRIu64 " submissions=%zu spilled=%zu", definition_uploads.count,
-            definition_uploads.bytes, graph_host_upload_count(*graph_state), definition_uploads.spilled
-        );
-        record_bind_phase(HostPhaseKind::BindGraphUpload, graph_phase, attrs, definition_uploads.bytes);
     }
 
     ReadyQueueCapacities ready_queue_capacities{};
@@ -1459,11 +1520,11 @@ int32_t run_host_orchestration(
     if (ready_queue_status != 0) {
         LOG_ERROR(
             "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph=%" PRIu64 "/%" PRIu64 ")",
+            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
             READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
             ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
             ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
-            ready_queue_populations.graph_ready, ready_queue_populations.graph_prepare
+            ready_queue_populations.graph_prepare
         );
         LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
         return ready_queue_status;
@@ -1499,7 +1560,7 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
-    runtime->sm_image_bytes = image_bytes;
+    runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are
     // committed: the arena up to its shared-memory tail, and the graph heap to the
@@ -1576,7 +1637,7 @@ int32_t run_host_orchestration(
     );
     static_assert(
         alignof(ChipTaskStorage) <= DeviceArena::kDefaultBaseAlign,
-        "an in-graph task's storage alignment must be covered by the heap region's base alignment"
+        "a sub-task's storage alignment must be covered by the heap region's base alignment"
     );
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
@@ -1588,11 +1649,21 @@ int32_t run_host_orchestration(
     // vector's data() is not.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
     const uint64_t upload_bytes = copied_bytes + image_bytes;
-    std::vector<std::byte> storage(upload_bytes + CHIP_ALIGN_SIZE, std::byte{0});
-    char *upload_base = reinterpret_cast<char *>(
-        (reinterpret_cast<uintptr_t>(storage.data()) + CHIP_ALIGN_SIZE - 1) &
-        ~static_cast<uintptr_t>(CHIP_ALIGN_SIZE - 1)
-    );
+    // Assembled in staging the runner retains rather than in a buffer that dies
+    // with this frame: publication is a separate step, so the bytes have to still
+    // be here when it reads them. Over-allocated by the alignment the layout
+    // needs, and handed over uninitialized: what this bind writes are the copied
+    // zone and the live segments `compact_live_image` emits, so the alignment gaps
+    // between segments carry whatever the block last held. No device code reads a
+    // gap — every reader indexes a segment through the layout — which is what makes
+    // clearing the whole block per bind unnecessary rather than merely expensive.
+    void *staging_addr = nullptr;
+    if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
+        staging_addr == nullptr) {
+        LOG_ERROR("host-orch: staging for a %" PRIu64 "-byte runtime image is unavailable", upload_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    char *upload_base = static_cast<char *>(staging_addr);
 
     // The copied zone carries no host address: the orchestrator and the ops table are
     // both host-only, and no device code may reach host memory through the image.
@@ -1611,24 +1682,14 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    const BindPhaseMark h2d_phase = bind_phase_begin();
-    if (api->copy_to_device(arena_dev + layout.off_copied_begin, upload_base, upload_bytes) != 0) {
-        LOG_ERROR("host-orch: H2D of the runtime image failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
-        char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs),
-            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
-            nt, upload_bytes, copied_bytes, image_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-            bind_usage.scalar_elems
-        );
-        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, upload_bytes);
-    }
+    // Prepared, not published: `publish_run_image_impl` performs this write, and
+    // records the BindArenaH2d segment that measures it. The pool counters travel
+    // with the record because only this bind knows them; the rest of that
+    // segment's attributes the publication rebuilds from `dev` and the length.
+    runtime->set_pending_publication(
+        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
+        bind_usage.scalar_elems
+    );
     return total_tasks;
 }
 
@@ -1751,9 +1812,16 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
     }
-    LOG_INFO("Orchestration SO: %zu bytes staged", orch_so_size);
+    LOG_INFO("Orchestration SO: %zu bytes uploaded", orch_so_size);
     return 0;
 }
+
+/**
+ * The A5 host_build_graph AICore scheduler dispatches from resolved kernel-entry
+ * addresses it reads out of the registration-owned entry table, so registration
+ * builds that view alongside the object one.
+ */
+extern "C" bool runtime_uses_callable_entry_table_impl() { return true; }
 
 /**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
@@ -1787,6 +1855,8 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("orch_args pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    const int transfer_status = validate_program_tensor_transfers(orch_args);
+    if (transfer_status != 0) return transfer_status;
     // host_build_graph host-orch: register_callable_impl resolved the
     // orchestration entry on the host and passed it here as host_orch_func_ptr;
     // it is run below (after the arena is built) against a host SM mirror.
@@ -1794,14 +1864,18 @@ extern "C" int bind_callable_to_runtime_impl(
     int scalar_count = orch_args->scalar_count();
     LOG_INFO("RT2 bind: %d tensors + %d scalars, host orchestration mode", tensor_count, scalar_count);
 
-    // Arm before the first segment below: the record pool has to exist for
-    // `args`, which runs well before the device collector is provisioned. The
-    // guard ends the bind on every exit, not just the successful one — a bind
-    // that fails part-way is exactly when its breakdown is worth having, and an
-    // unfinished bind publishes nothing.
+    // Rebinding an unpublished run must not replace its source or device owners.
+    if (runtime->pending_publication().bytes != 0 || !runtime->pending_publication().prerequisites.empty()) {
+        LOG_ERROR("bind_callable_to_runtime_impl: unpublished metadata still belongs to this run");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     host_phase_trace_begin(api);
-    auto host_phase_guard = RAIIScopeGuard([]() {
-        host_phase_trace_end();
+    bool prepared = false;
+    auto host_phase_guard = RAIIScopeGuard([runtime, api, &prepared]() {
+        if (!prepared) {
+            runtime->clear_pending_publication();
+            host_phase_trace_end(api);
+        }
     });
 
     uint64_t task_capacity = 0;
@@ -1826,9 +1900,39 @@ extern "C" int bind_callable_to_runtime_impl(
     // the point at which a task could make it stale.
     HostTensorAccessor tensor_access(api);
 
+    // A lease recorded by an earlier bind names an offset this bind is about to
+    // re-slice, so carrying one over would copy this run's bytes back to that
+    // run's host pointer. Every exit path from here on leaves the ledger owned
+    // by the caller's Runtime, and this is where it starts empty.
+    runtime->tensor_leases().clear();
+
+    // No scheduler is selected until this bind selects one. Without this, a bind
+    // that fails before it reaches a selection would leave the previous run's
+    // mode and its base — naming an allocation this bind may already have freed —
+    // in the descriptor the next launch uploads. The handshake words the platform
+    // zeroes in prepare_launch_shape give the same guarantee for their half.
+    runtime->publish_scheduler_bootstrap(0, 0);
+
+    // The retained temporary buffer is always used on the hbg path — it is an
+    // internal allocation optimization, not user-facing config. The buffer
+    // lives on the runner across runs, one per pipeline slot; here we grow it
+    // to this run's packed size and bump-slice from it. A run holds its
+    // pipeline slot from bind through validate and a concurrent reservation is
+    // admitted only on a distinct slot, so no other run can re-slice this
+    // buffer while these slices are live.
+    //
+    // Inside the args span: growing the buffer is the only device allocation
+    // this phase can make, so a steady-state workload reporting no allocation
+    // cost here is a measurement rather than a definition.
     const BindPhaseMark args_phase = bind_phase_begin();
-    uint64_t staged_bytes = 0;
-    int staged_tensors = 0;
+    RetainedTempBump bump;
+    const size_t required_temp_bytes = packed_temp_bytes(orch_args);
+    if (!bump.begin(api, required_temp_bytes)) {
+        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    uint64_t h2d_bytes = 0;
+    int h2d_tensors = 0;
     for (int i = 0; i < tensor_count; i++) {
         ChipTensor t = orch_args->tensor(i);
 
@@ -1839,33 +1943,53 @@ extern "C" int bind_callable_to_runtime_impl(
         if (t.is_device_memory()) {
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
             LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            // The bytes stay where the caller put them, so orchestration has no
+            // copy-in buffer to read them from. Claim the span now and let the
+            // platform resolve a means only if an access actually lands in it.
+            if (!tensor_access.add_child_memory(t.buffer.addr, t.buffer.size)) {
+                LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
             device_args.add_tensor(t);
             continue;
         }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
+        // An empty tensor addresses nothing, so it takes no slice and carries a
+        // null address rather than one aliasing the next tensor's.
+        if (size == 0) {
+            t.buffer.addr = 0;
+            device_args.add_tensor(t);
+            continue;
+        }
 
-        void *dev_ptr = api->device_malloc(size);
+        void *dev_ptr = bump.acquire(size);
         if (dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
+            LOG_ERROR(
+                "Retained temp buffer slice miss for tensor %d: bytes=%zu offset=%zu capacity=%zu", i, size,
+                bump.next_offset(), bump.capacity()
+            );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
 
         // Pure write-only OUTPUT buffers are never read by the kernel and hold
-        // no meaningful host content, so they need no device staging — the
+        // no meaningful host content, so they need no copy-in — the
         // kernel defines what it writes and any unwritten bytes are undefined.
-        // IN / INOUT (read-before-write) are staged H2D.
+        // IN / INOUT (read-before-write) are copied in H2D. The copy happens here
+        // rather than in copy_in_run_inputs_impl because the orchestrator below
+        // runs on the host and reads these tensors while it builds the graph;
+        // that function documents what makes the earlier copy sound.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        if (!is_pure_output) {
+        bool needs_copy_in = !is_pure_output;
+        if (needs_copy_in) {
             int rc = api->copy_to_device(dev_ptr, host_ptr, size);
             if (rc != 0) {
-                LOG_ERROR("Failed to stage tensor %d to device", i);
-                api->device_free(dev_ptr);
+                LOG_ERROR("Failed to copy tensor %d in to the device", i);
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
-            staged_bytes += static_cast<uint64_t>(size);
-            ++staged_tensors;
+            h2d_bytes += static_cast<uint64_t>(size);
+            ++h2d_tensors;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
@@ -1874,11 +1998,13 @@ extern "C" int bind_callable_to_runtime_impl(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+        runtime->tensor_leases().push_back(
+            {host_ptr, dev_ptr, size, needs_copy_in, needs_copy_back, TensorReleaseKind::BufferNoop}
+        );
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
-        // staged control tensors (e.g. paged_attention's context_lens and
+        // host-memory control tensors (e.g. paged_attention's context_lens and
         // block_table) via get_tensor_data to shape the graph. A pure output
         // has no valid readable bytes before execution, and a5 cannot map it;
         // exposing its caller buffer would therefore make reads unsafe. Leave
@@ -1890,7 +2016,7 @@ extern "C" int bind_callable_to_runtime_impl(
         }
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "device_malloc reaches into the virtual heap window");
+        always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "an argument slice reaches into the virtual heap window");
         device_args.add_tensor(t);
     }
     for (int i = 0; i < scalar_count; i++) {
@@ -1898,9 +2024,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     {
         char attrs[kBindAttrsCapacity];
-        snprintf(
-            attrs, sizeof(attrs), "ntensor=%d staged=%d bytes=%" PRIu64, tensor_count, staged_tensors, staged_bytes
-        );
+        snprintf(attrs, sizeof(attrs), "ntensor=%d h2d=%d bytes=%" PRIu64, tensor_count, h2d_tensors, h2d_bytes);
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 
@@ -1910,7 +2034,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // submitted its tasks, and the heap's only once orchestration has allocated
     // its intermediate buffers. Both are committed by the single
     // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_pairs_; the free is deferred to
+    // runs — do NOT record in tensor_leases(); the free is deferred to
     // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
     // the reserve sequence on a host-side arena.
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
@@ -1927,11 +2051,6 @@ extern "C" int bind_callable_to_runtime_impl(
         snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
         record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
     }
-
-    // The shared memory is placed at the end of orchestration, so until then this
-    // bind has none. Clearing the pointer keeps a failure before that point from
-    // leaving the previous bind's address for the error-code read to follow.
-    runtime->set_gm_sm_ptr(nullptr);
 
     // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
@@ -1958,10 +2077,10 @@ extern "C" int bind_callable_to_runtime_impl(
     runtime_wire_arena_pointers(host_arena, layout, rt);
     // Stash the layout inside the RuntimeContext image so the AICPU can recover every
     // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration is what performs that copy, and the runtime header is
-    // part of what travels. The runtime arena's device base does NOT travel — it is
-    // on the host Runtime (set_prebuilt_arena below), since the AICPU needs that
-    // pointer before it can dereference the image.
+    // because orchestration assembles the image this header is part of, and the
+    // publication uploads what it assembled. The runtime arena's device base does
+    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
+    // AICPU needs that pointer before it can dereference the image.
     rt->prebuilt_layout = layout;
     record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
 
@@ -1986,18 +2105,22 @@ extern "C" int bind_callable_to_runtime_impl(
         // owns these buffers, so drop the window on both exits.
         const size_t view_count = tensor_access.mapping_count();
         const uint64_t view_bytes = tensor_access.mapped_bytes();
+        const uint64_t device_copies = tensor_access.device_copy_count();
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
         {
             char attrs[kBindAttrsCapacity];
-            snprintf(attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64, view_count, view_bytes);
+            snprintf(
+                attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64 " devcopy=%" PRIu64, view_count, view_bytes,
+                device_copies
+            );
             record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, attrs);
         }
         if (total_tasks < 0) {
             LOG_ERROR("host-orch: orchestration run failed");
             return total_tasks;
         }
-        runtime->host_total_tasks = total_tasks;
+        runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 
@@ -2012,23 +2135,118 @@ extern "C" int bind_callable_to_runtime_impl(
 
     LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
+    prepared = true;
     return 0;
 }
 
 /**
- * Validate runtime results and cleanup.
+ * Consume this run's metadata in dependency order, synchronously.
+ * A failed copy stops publication and consumes the remaining sources. Device
+ * destinations remain owned until the failed-prepare cleanup releases them.
+ */
+extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("publish_run_image_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    auto host_phase_guard = RAIIScopeGuard([api]() {
+        host_phase_trace_end(api);
+    });
+    auto publication = runtime->take_pending_publication();
+    if (publication.bytes == 0 || publication.device_target == nullptr || publication.source == nullptr) {
+        LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    for (const auto &region : publication.prerequisites) {
+        const BindPhaseMark phase = bind_phase_begin();
+        if (api->copy_to_device(region.device_target, region.source, region.bytes) != 0) {
+            LOG_ERROR("host-orch: metadata prerequisite publication failed");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (region.phase != HostPhaseKind::Count) {
+            record_bind_phase(region.phase, phase, region.attributes.c_str(), region.bytes);
+        }
+    }
+    const BindPhaseMark h2d_phase = bind_phase_begin();
+    if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
+        LOG_ERROR("host-orch: H2D of the runtime image failed");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    {
+        // The image size and the task count are on the descriptor this bind
+        // filled, and the copied zone is what the length has left over, so only
+        // the pool counters had to travel.
+        const uint64_t image_bytes = runtime->dev.sm_image_bytes;
+        const uint64_t copied_bytes = publication.bytes - image_bytes;
+        // The widest attribute string a segment formats: eight uint64 fields plus
+        // their labels. With the counters ahead of it in the recorded string, this
+        // is the tail a truncation eats first.
+        char attrs[kBindAttrsCapacity];
+        snprintf(
+            attrs, sizeof(attrs),
+            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+            static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes, copied_bytes, image_bytes,
+            publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+        );
+        record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
+    }
+    return 0;
+}
+
+/**
+ * Stage one run's inputs. A no-op for this runtime.
+ *
+ * host_build_graph runs its orchestrator on the host during bind, and that
+ * orchestrator reads the input tensors it was given while it builds the graph,
+ * so the bytes have to be in place before orchestration rather than after it —
+ * `bind_callable_to_runtime_impl` copies them there. What makes that sound is
+ * that a bind serves exactly one run: the graph this bind materializes carries
+ * the values it read, so the bytes and the graph belong to the same run.
+ */
+extern "C" int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
+
+/**
+ * Release the tensor bindings the bind recorded, and end this run's claim on
+ * the scheduler state it published.
+ *
+ * Its own entry rather than the tail of the copy-back, so that reading a run's
+ * results and retiring the device memory behind them are separately orderable.
+ */
+extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
+    if (runtime == nullptr || api == nullptr) {
+        LOG_ERROR("release_run_bindings_impl: null runtime or HostApi");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Close only this run's trace; another run may already own the recorder.
+    host_phase_trace_end(api);
+    runtime->clear_pending_publication();
+    release_run_tensor_leases(runtime, api);
+    release_scheduler_state(runtime);
+    // The dispatch table is owned by bind_callable_to_runtime, which clears it
+    // before replaying the active callable's addresses. The chip-callable device
+    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
+    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
+    // same callable repeatedly does not re-upload.
+    return 0;
+}
+
+/**
+ * Inspect one run's results.
  *
  * This function:
- * 1. Copies recorded tensors from device back to host
- * 2. Frees device memory for recorded tensors
- * 3. Clears tensor pair state
+ * 1. Reads the device-side runtime status when the run failed on the device
+ * 2. Copies written tensors from device back to host
+ *
+ * It releases nothing; `release_run_bindings_impl` ends the bindings it reads.
  *
  * @param runtime       Pointer to Runtime
  * @param execution_rc  Device-runner drain status after successful enqueue,
  *                      or enqueue status on failure
+ * @param launched      Nonzero when this run reached a stream, and its
+ *                      device-side status is therefore readable
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
+extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2043,17 +2261,19 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
-    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
+    const TensorLease *tensor_leases = runtime->tensor_leases().data();
+    int tensor_lease_count = static_cast<int>(runtime->tensor_leases().size());
 
-    LOG_INFO("ChipTensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO("ChipTensor leases to process: %d", tensor_lease_count);
 
     bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    if (execution_rc != 0) {
+    // The shared-memory status is device state, readable only for a run that
+    // reached a stream.
+    if (execution_rc != 0 && launched != 0) {
         runtime_status = read_runtime_status(runtime, api, &host_header);
     }
     if (runtime_status != 0) {
@@ -2064,59 +2284,40 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
-        for (int i = 0; i < tensor_pair_count; i++) {
-            const TensorPair &pair = tensor_pairs[i];
+        for (int i = 0; i < tensor_lease_count; i++) {
+            const TensorLease &lease = tensor_leases[i];
 
             // Skip if device pointer is null
-            if (pair.dev_ptr == nullptr) {
+            if (lease.dev_ptr == nullptr) {
                 LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
-            if (pair.host_ptr == nullptr) {
+            if (lease.host_ptr == nullptr) {
                 LOG_DEBUG("ChipTensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
             // Read-only INPUT tensors were uploaded H2D but the kernel never
             // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
+            // They are still released through release_kind below.
+            if (!lease.needs_copy_back) {
                 LOG_DEBUG("ChipTensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, lease.dev_ptr, lease.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("ChipTensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }
 
-    // Cleanup device tensors
-    LOG_INFO("=== Cleaning Up ===");
-    for (int i = 0; i < tensor_pair_count; i++) {
-        if (tensor_pairs[i].dev_ptr != nullptr) {
-            api->device_free(tensor_pairs[i].dev_ptr);
-        }
-    }
-    LOG_INFO("Freed %d device allocations", tensor_pair_count);
-    release_scheduler_state(runtime, api);
-
-    // The dispatch table is owned by bind_callable_to_runtime, which clears it
-    // before replaying the active callable's addresses. The chip-callable device
-    // buffer behind those addresses is pool-managed by DeviceRunner (keyed by
-    // content hash) and bulk-freed in DeviceRunner::finalize(), so re-running the
-    // same callable repeatedly does not re-upload.
-
-    // Clear tensor pairs
-    runtime->tensor_pairs_.clear();
-
-    LOG_INFO("=== Finalize Complete ===");
+    LOG_INFO("=== Result Copy-Back Complete ===");
 
     if (rc == 0 && runtime_status != 0) {
         rc = runtime_status;

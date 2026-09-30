@@ -20,6 +20,7 @@
 #include "host_build_graph/host_phase_trace.h"
 #include "host_build_graph/runtime_core.h"
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,16 +138,23 @@ static bool require_no_producer(RuntimeContext *rt, const simpler::hbg::Tensor &
 
     orch.report_fatal(
         SIMPLER_ERROR_INVALID_ARGS, caller,
-        "tensor is produced by task %#llx (id space %u); host_build_graph finishes orchestration before the "
+        "tensor is produced by task %#" PRIx64 " (id space %s); host_build_graph finishes orchestration before the "
         "device starts, so a submitted kernel has not written this buffer and a runtime allocation is "
         "uninitialized -- pass the value as an orchestration argument, or have a task write it",
-        static_cast<unsigned long long>(producer.raw), static_cast<unsigned int>(producer.space())
+        TaskId::to_uint64(producer), producer.space_name()
     );
     return false;
 }
 
 uint64_t
 get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    // Short-circuit after a fatal, as every other orchestration entry does. Two things turn on it
+    // here: the value would be discarded with the graph, and an access this run no longer needs
+    // must not be in a position to publish a cause — the failure already latched is one of the
+    // run's own, and no later attempt is guaranteed to reproduce it.
+    if (rt->orchestrator->is_fatal()) {
+        return 0;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -164,12 +172,25 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
     uint64_t result = 0;
     if (!host_tensor_read(rt->tensor_access, elem_addr, &result, elem_size)) {
-        rt->orchestrator->report_fatal(
+        // This access's own reason, on this thread, before anything else can be refused elsewhere.
+        const bool dependency = host_tensor_refusal_was_dependency();
+        // Ownership of the run's failure comes from the exchange this report performs, not from a
+        // check before it: the reporters are not one thread, so a recording worker can latch the
+        // field between any load and this call.
+        const bool owns_failure = rt->orchestrator->report_fatal_owned(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no host view for device address %#llx (%llu bytes): during host orchestration only tensors the "
-            "runtime staged are readable, not runtime-created or child-memory buffers",
+            "no host view for device address %#llx (%llu bytes): during host orchestration only host-memory "
+            "tensors the runtime copied in and child-memory tensors the caller passed in are readable, not "
+            "runtime-created buffers",
             (unsigned long long)elem_addr, (unsigned long long)elem_size
         );
+        // Published by the access that owns the failure and was itself refused for a dependency,
+        // and by nothing else. A losing reporter neither publishes nor clears: a wait another
+        // refused access already published stands, and an unrelated failure — even one carrying
+        // this same code — cannot inherit a refusal that happened on another thread.
+        if (dependency && owns_failure) {
+            host_tensor_note_dependency_wait_cause(rt->tensor_access);
+        }
         return 0;
     }
     return result;
@@ -178,6 +199,10 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
 void set_tensor_data(
     RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
+    // Same as the read above, and for the same two reasons.
+    if (rt->orchestrator->is_fatal()) {
+        return;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
@@ -194,12 +219,17 @@ void set_tensor_data(
     uint64_t elem_size = get_element_size(tensor.dtype);
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
     if (!host_tensor_write(rt->tensor_access, elem_addr, &value, elem_size)) {
-        rt->orchestrator->report_fatal(
+        const bool dependency = host_tensor_refusal_was_dependency();
+        const bool owns_failure = rt->orchestrator->report_fatal_owned(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
-            "no writable host view for device address %#llx (%llu bytes): during host orchestration only tensors "
-            "the runtime staged are writable, not runtime-created or child-memory buffers",
+            "no writable host view for device address %#llx (%llu bytes): during host orchestration only "
+            "host-memory tensors the runtime copied in and child-memory tensors the caller passed in are "
+            "writable, not runtime-created buffers",
             (unsigned long long)elem_addr, (unsigned long long)elem_size
         );
+        if (dependency && owns_failure) {
+            host_tensor_note_dependency_wait_cause(rt->tensor_access);
+        }
     }
 }
 

@@ -151,6 +151,19 @@ private:
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
 
+    // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
+    // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
+    // was queued with. Pure scratch -- pop_batch_tagged writes every element a
+    // later read touches, so nothing here carries meaning across calls or runs and
+    // deinit() leaves it alone. It lives here rather than on that function's stack
+    // so the TaskId array's default construction is paid once, at construction,
+    // instead of on every dispatch attempt that finds a free core.
+    struct EarlyStagingScratch {
+        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    };
+    EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
+
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
     DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
@@ -179,7 +192,13 @@ private:
     // be submitted; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
+    // The active callable's registration-owned object-address table and the
+    // number of entries it holds, both bound from the descriptor in the cold
+    // path. The table is in the callable's registration block, not in the
+    // descriptor, so the length is the only bound available here: an index past
+    // it is unmapped rather than in-range-and-zero.
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t func_id_to_addr_count_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
@@ -414,8 +433,10 @@ private:
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
 
-    __attribute__((noinline, cold)) void
-    log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+    __attribute__((noinline, cold)) void log_stall_diagnostics(
+        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count,
+        StallDumpReport report
+    );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
         int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
@@ -446,15 +467,15 @@ private:
     // dominant SIMPLER_STALL_DETAIL_* sub-class plus a few locator fields, which
     // handle_timeout_exit propagates to host alongside the unchanged code 100.
     struct StallClassification {
-        int32_t detail;         // SIMPLER_STALL_DETAIL_*
-        int32_t cnt_running;    // tasks observed RUNNING (on a core)
-        int32_t cnt_ready;      // fanin-satisfied but not dispatched
-        int32_t cnt_waiting;    // still waiting on fanin
-        int32_t completed;      // completed_tasks_ snapshot
-        int32_t total;          // total_tasks_ snapshot
-        int32_t orch_done;      // orchestrator_done flag (0/1)
-        int64_t stuck_task_id;  // S1: first RUNNING task's id (-1 if none)
-        int32_t stuck_core;     // S1: core hosting it (-1 if none)
+        int32_t detail;        // SIMPLER_STALL_DETAIL_*
+        int32_t cnt_running;   // tasks observed RUNNING (on a core)
+        int32_t cnt_ready;     // fanin-satisfied but not dispatched
+        int32_t cnt_waiting;   // still waiting on fanin
+        int32_t completed;     // completed_tasks_ snapshot
+        int32_t total;         // total_tasks_ snapshot
+        int32_t orch_done;     // orchestrator_done flag (0/1)
+        TaskId stuck_task_id;  // S1: first RUNNING task's id, invalid() if none
+        int32_t stuck_core;    // S1: core hosting it (-1 if none)
     };
 
     // Scan the rings once (same ground truth as log_stall_diagnostics: a slot is
@@ -480,8 +501,8 @@ private:
     // =========================================================================
 
     uint64_t get_function_bin_addr(int func_id) const {
-        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+        if (!func_id_to_addr_ || func_id < 0 || static_cast<uint32_t>(func_id) >= func_id_to_addr_count_) {
+            LOG_ERROR("func_id=%d is out of range [0, %u) or the table is unbound", func_id, func_id_to_addr_count_);
             return 0;
         }
         return func_id_to_addr_[func_id];

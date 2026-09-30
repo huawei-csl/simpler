@@ -134,7 +134,7 @@ struct alignas(64) Tensor {
     }
 
     /// True when `buffer.addr` is a device pointer allocated by the child process
-    /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
+    /// (host skips the H2D copy-in for bind's arguments). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
     [[nodiscard]] bool is_device_memory() const { return address_space == AddressSpace::DEVICE; }
 
@@ -419,6 +419,8 @@ struct alignas(64) Tensor {
     }
 
     /// The boundary form of this tensor: geometry and resolved address only.
+    // This conversion exports geometry and address only; it does not reconstruct a
+    // submission request. A new invocation supplies its own transfer policy.
     ChipTensor to_boundary() const {
         ChipTensor arg{};
         arg.buffer = buffer;

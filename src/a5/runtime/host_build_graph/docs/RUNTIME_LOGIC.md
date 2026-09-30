@@ -11,14 +11,14 @@ host run/bind: stage external tensors, execute orchestration to completion
         ↓
 host: copy the prebuilt graph image to device memory
         ↓
-device: attach the image, classify tasks, dispatch with AICPU schedulers
+device: attach the image, classify tasks, dispatch with the selected scheduler
         ↓
 host: collect outputs and destroy/reset per-run state
 ```
 
-The device has no orchestration thread. Every launched AICPU thread participates
-in scheduling its assigned AICore workers; the highest-index thread first
-attaches the prebuilt runtime and publishes the boot barrier.
+The device has no orchestration thread. The resident scheduler uses one AIV
+Scheduler per discovered cluster; AICPU initializes, monitors, and tears down the
+workers. The explicit legacy path uses AICPU scheduling.
 
 This ordering is the defining constraint of the runtime. The host constructs the
 whole graph before any device task can complete.
@@ -49,17 +49,79 @@ For each run, the host:
 2. reserves one backing arena for runtime/shared-memory subregions;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
-5. finalizes task counts and the graph image; and
-6. copies the shared-memory image and the arena's copied zone to the device.
+5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
+6. returns from bind, then synchronously publishes Definitions, any resident
+   scheduler state, and finally the shared-memory image with the copied zone.
+
+`publish_run_image_impl` is the single metadata consumer. Definition and compact
+image sources are retained by the exclusive pipeline slot; A5 scheduler source
+storage moves into the same pending record. Device allocations keep their
+existing owners. No rebind/growth may replace borrowed staging before the copy
+returns. Consuming the record also consumes it on failure: later regions are not
+written, launch is forbidden, and failed-prepare cleanup retires run-owned
+allocations. Abandoning a bind clears its sources without performing metadata
+copies. Tensor copy-in and host get/set remain preparation effects; failed
+publication cannot undo them.
+
+One owner-checked host phase trace covers bind and publication. GraphUpload and
+ArenaH2d measure their actual successful copies and preserve byte-count details;
+packing is preparation work. A completed run's release cannot close a successor's
+trace. Publication is synchronous; these lifetimes do not cover asynchronous DMA
+or captured graphs.
 
 An orchestration fatal stops this sequence before the upload. The orchestrator
 runs on the host, so its code is latched in `OrchestratorState::fatal_code` and
 never reaches shared memory; the bind maps it onto the status the caller sees.
 
+Step 1 gives each caller tensor a slice of the runner's retained temporary buffer
+rather than a per-run `device_malloc` / `device_free` pair: bind packs the run's
+non-child tensors to a 1024-aligned required size, grows the buffer only when a
+run needs more than is currently retained, and bump-slices each tensor from it,
+so a steady-state workload performs no temporary device allocation at all. The
+slices are recorded as `BufferNoop` leases — validate copies the written ones
+back and releases none, and the buffer itself is freed once at Worker finalize.
+The buffer is per pipeline slot; a run holds its slot from bind through validate
+and a concurrent reservation is admitted only on a distinct slot, so no other
+run can re-slice a buffer whose slices are still live. The mechanism
+(`RetainedTempBump`, `src/common/utils/retained_temp_bump.h`) is shared with
+`tensormap_and_ringbuffer`; that runtime's `RUNTIME_LOGIC.md` §2.4 carries the
+grow/slice details.
+
+The H2D copy-in of a tensor precedes its registration with the run's host
+accessor, so a reused slice can never expose the previous run's bytes to
+orchestration.
+
+An empty caller tensor addresses nothing, so it takes no slice and reaches
+orchestration with a null address. **This is a change in what hbg accepts.**
+Before the retained temporary buffer, a zero-byte non-child tensor that was not a pure
+`OUT` failed the bind: it was handed to `HostTensorAccessor::add`, which rejects
+an empty region, and the bind reported `no host view for tensor N`. It is now
+passed through, which is what `tensormap_and_ringbuffer` has always done.
+
+A pure `OUT` tensor gets a slice but is never copied in, and nothing
+zero-fills it, so the bytes a kernel does not write are whatever the slice last
+held. That was already true of a fresh `device_malloc` — the allocator pools and
+reuses device memory — but the residue is no longer always arbitrary. **On a run
+that reuses the retained buffer unchanged, it is whatever the previous tensor
+occupying that byte range left there.** The slot is keyed by pipeline slot
+alone, not by callable or by tensor identity, so that is the same tensor's own
+bytes only when the same callable runs consecutively with the same argument
+layout; a slot alternating between callables leaves another callable's bytes.
+A run that allocated or grew the buffer gets uninitialized allocator memory as
+before, and so does the first run of any Worker, because
+`RetainedTempBump::begin()` neither preserves nor initializes a buffer it
+replaces. So a kernel that writes only part of its output fails
+deterministically across the steady-state rounds of a fixed-shape workload —
+where a golden check is least likely to catch it — and randomly everywhere
+else. `device_memset` exists for zero-filling pure outputs;
+neither runtime uses it, because it would cost a device operation per output per
+run.
+
 ### 2.3 Device Execution and Teardown
 
-The boot thread attaches the already-populated arena without resetting it. All
-threads classify/dispatch their core partitions and then shut those cores down.
+The highest-index AICPU thread attaches the already-populated arena without
+resetting it and publishes the boot barrier. All threads classify/dispatch their
+core partitions and then shut those cores down.
 The last arriving thread destroys the attached runtime before publishing cleanup
 eligibility. Exactly one returning AICPU thread claims that eligibility and
 resets executor/scheduler state for the next run.
@@ -150,7 +212,7 @@ signal, so such a queue accepts one push and then reports full. The ramp is
 mandatory but it is a function of `capacity` alone, so
 `SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
 shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
-`total_tasks`: graph execution expands a GRAPH task into on-device in-graph tasks that
+`total_tasks`: graph execution expands a GRAPH task into on-device sub-tasks that
 push past the host task count, so every slot must carry a valid sequence.
 
 Both run before the boot thread publishes `runtime_init_ready_`, which is what
@@ -338,6 +400,98 @@ The drain's `pending_task` stays valid for the complete attempt: all participant
 threads load it before the coordinator can pass the stage-done barrier and clear
 it. A recovery return for a null pointer would describe an unreachable state and
 could strand the drain protocol, so the active path relies on that invariant.
+
+### 7.1 Resident Scheduler Local State
+
+Each READY acquire initializes a fresh core-local configuration. Dispatch and
+completion use cached worker IDs; the Executor derives payload addresses from
+one shared region offset and the worker ID. Narrow offsets are validated before
+conversion, and every cluster member must agree with the fixed payload stride.
+All discovered clusters and all three lanes in each cluster participate.
+Graph demand is checked against available capacity; it does not mask workers.
+Partial-core masking has no current workload requirement and would add a
+separate participation policy to bootstrap, dispatch and shutdown. All discovered
+lanes therefore participate, and bootstrap partitions the task scan across their
+Schedulers. This scan parallelism is not an isolated performance measurement.
+
+Owner pending endpoints and publication masks are private to the Scheduler.
+Self-execution notifications contain only a pending-slot mask: the slot stays
+READY with the same generation until the local Executor claims it, so the ready
+token is reconstructed from the slot. Completion generation validation still
+prevents stale notifications from freeing or refilling a pending slot.
+
+The local configuration occupies 88 bytes and the base local state 256 bytes
+under the 64-bit ABI, including its optional profiling pointer. A separate
+240-byte profiling state holds six timing slots, two self-execution traces,
+worker trace caches, profiling offsets, and the loop counter/valid mask.
+Remote traces reside in SSBUF. Sampling is derived from the timing-slot range.
+
+The host records whether any task requests sampled timing in the run control.
+Only a run with chip profiling or sampled timing enters the resident function
+specialization that allocates profiling state; the plain specialization does
+not allocate it. These functions do not inline into the common entry. The
+combined local state with profiling is 496 bytes. These sizes exclude other
+function locals, worker statistics and compiler spills. Compile-time assertions
+anchor the 64-bit configuration, slot, base and profiling state sizes; they do
+not establish the dynamic AICore stack high-water mark.
+
+Before bootstrap, every participating core invalidates its entire data cache.
+The callable table and task metadata are immutable throughout that run, allowing
+callable lookup and completion resolution to omit repeated invalidation of those
+immutable lines.
+
+Dispatch payloads remain in GM. Remote dispatch and completion generations,
+and Executor trace staging, occupy the last contiguous KiB of each cluster's
+3 KiB SSBUF; the low 2 KiB remain available to user kernels. Each of three
+lanes has two dispatch slots, two 64-byte trace slots, and one completion word.
+Local trace payloads have natural alignment independently of shared slots.
+
+A dispatch word packs generation and signed timing slot; the Executor owns a
+completion-word shadow containing both slot generations. Polling misses need
+no barrier. A hit acquires before consuming payload or trace, while payload
+writeback and ready publication share a release barrier. Tokens are SPSC and
+use no SSBUF read-modify-write atomics. The Scheduler initializes every token
+before publishing the header, and each invocation validates the region.
+Self-execution uses local notifications, completion generations and trace storage.
+
+The Scheduler and Executor share the SSBUF structure definitions in the same
+runtime build. Each run initializes the region before use.
+There is no compatibility contract between SSBUF layouts from different runtime
+builds: a launch replaces prior tokens and metadata instead of consuming them.
+Header validation checks the initialized region; initialization and the launch
+gate, rather than a layout-version field, establish its freshness.
+Reserved bytes have unspecified contents and must not be read. Any newly
+introduced field must be explicitly initialized before the header is published.
+
+Initialization and bootstrap precede execution: every Scheduler initializes its
+cluster's SSBUF before reporting bootstrap arrival; AICPU waits for the aggregate
+`bootstrap_complete` before releasing the DATA_MAIN_BASE launch gate. Executors
+validate the header only after that gate opens. The kernel-author storage
+boundary is documented in [A5 runtime variants](../../../docs/runtimes.md#host_build_graph).
+
+The dispatch timing interval ends at `ready_publish_cycles`, immediately before
+READY token publication. It excludes READY publication and all subsequent
+dispatch-trace GM writes. Device RunWall measures the full on-NPU run
+independently of this phase boundary.
+
+Simulation allocates an aligned 3 KiB backing region per physical cluster,
+shared by its AIC and two AIV lanes and retired with the run. Initialization
+tolerates nonzero previous contents.
+
+Resolved counts accumulate locally until an idle pass with no local executable
+task or deferred reservation, or the common run epilogue. Trace and error
+publication precedes each count flush. The AICPU watchdog remains 20 seconds
+by default, so continuously busy work without count publication can reach
+that timeout.
+The intended runs normally complete in under one second. Completion accounting
+therefore avoids periodic publication on the busy path; the continuous-busy
+timeout is an accepted limit outside that expected duration, not evidence that
+busy execution has stopped making progress.
+
+Directory queries are skipped when no unreserved FREE slot can accept
+work. Idle polling backs off from 8 to at most 32 iterations. Dispatch trace
+GM writes follow ready publication; Host tooling computes ready-to-kernel
+latency from the recorded timestamps.
 
 ## 8. Scalar Access During Construction
 

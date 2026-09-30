@@ -9,7 +9,7 @@ across the L3→L2 (and L4→L3) boundaries without a side table.
 This page is the user-facing how-to. The byte layout itself is pinned by the
 `static_assert`s in [`src/common/task_interface/buffer.h`](../src/common/task_interface/buffer.h)
 — sizes, field offsets, and enum values all fail the build if they drift, and
-[`tests/ut/cpp/types/test_buffer.cpp`](../tests/ut/cpp/types/test_buffer.cpp)
+[`tests/ut/cpp/common/task_interface/test_buffer.cpp`](../tests/ut/cpp/common/task_interface/test_buffer.cpp)
 pins them again from the outside.
 
 All three types are that header's C++ structs bound directly, so Python and C++
@@ -29,7 +29,7 @@ forget it on.
 | Type | What it is | Where it lives |
 | ---- | ---------- | -------------- |
 | **`Buffer`** | An owned backing (POSIX shm / fork-COW / device malloc) with a canonical identity + lifecycle. Stays with the Worker that created it. | owner side (L3+) |
-| **`Tensor`** | A **self-describing task argument**: the full buffer descriptor embedded + a strided view `(byte_offset, shapes, strides, dtype)`. The wire element of `TaskArgs`. Carries no materialized address. | `simpler.buffer`, re-exported from `simpler.task_interface` |
+| **`Tensor`** | A **self-describing task argument**: the full buffer descriptor embedded + a strided view `(byte_offset, shapes, strides, dtype)`. The wire element of `TaskArgs`. Carries no materialized address. | `simpler.task_interface` (public import) |
 | **`ChipTensor`** | A task argument as it arrives at the chip runtime: a resolved address plus a strided view, and nothing else. Exists **only** at the L2 device-runtime boundary. | L2 leaf |
 | **`simpler::{hbg,tmr}::Tensor`** | One runtime's working form — a `ChipTensor`'s geometry plus what that runtime decided about it (producing task, overlap version, dependency treatment, derived caches). `Runtime::set_orch_args` adopts each argument into it, on the host. | inside one runtime |
 
@@ -68,7 +68,7 @@ collapse that into a single type were considered and dropped.
 
 ### Rejected: merge `Tensor` into `ChipTensor`
 
-Drop `buffer.addr`, add the buffer descriptor, and have the H2D staging step
+Drop `buffer.addr`, add the buffer descriptor, and have the H2D copy-in step
 rewrite the backend tag and body (and mint a fresh identity for the device copy).
 That is self-consistent, but it charges the device for host-side fields:
 
@@ -103,7 +103,41 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` (still spelled `child_memory` until the wire flip) |
+| `buffer.address_space` | = | `address_space` |
+| `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
+
+`AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
+only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
+and `D2H` is reserved and rejected. Callable direction still controls input copies
+and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
+import grants and `TensorArgType` access checks are unchanged.
+
+```python
+view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
+args.add_tensor(view, transfer=TensorTransfer.NONE)
+args.add_tensor(view, transfer=TensorTransfer.H2D)
+```
+
+The two entries above share one view and independently request transfer; neither
+changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
+`ChipStorageTaskArgs.add_tensor` keeps HOST/H2D and DEVICE/NONE. The L2
+`ChipTensor.make(..., address_space=...)` constructor selects location only;
+`child_memory` remains a compatibility spelling and cannot be combined with
+`address_space`. Both spellings use the same add-time defaults.
+
+Mailbox slots preserve each request in byte 141, formerly reserved view padding;
+standalone Tensor values do not carry it. Re-export and L2 materialization preserve
+the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE;
+HOST/NONE returns UNSUPPORTED, and invalid pairs return INVALID_ARGUMENT, before
+any tensor content copy or device allocation. Host-only leaves can use HOST/NONE.
+This does not change HBG's existing host-access implementation. Remote protocol v4
+represents only legacy location defaults: its encoder rejects other per-call
+requests before emitting a payload instead of silently dropping them.
+Tensor/ChipTensor sizes remain 144/72 bytes; the internal ChipTensor carrier uses
+byte 70 for the request. Local endpoints must use the same build, as for every
+existing layout change. ChipTensor remains a transitional materialized ABI carrier,
+not a second public transfer-policy model.
 
 **Dead on the device** (`Tensor`-only): `magic` discriminates untrusted bytes at
 a decode boundary the device does not have. `identity` / `backend_kind` / `body`
@@ -132,8 +166,8 @@ task.
 > OverlapMap by it rather than by `buffer.addr` would make two views of one
 > backing bucket together by construction. That needs 32 B — which fits the
 > existing `_pad_cl2[36]` at `sizeof == 128`, i.e. **without** merging anything
-> else. If it is ever done, the H2D staging step must mint a *new* identity for
-> each staged copy, because the device buffer is a distinct backing from the host
+> else. If it is ever done, the H2D copy-in step must mint a *new* identity for
+> each copy, because the device buffer is a distinct backing from the host
 > one it was copied from.
 
 ### Rejected: keep the wire type transport-only, use `ChipTensor` in the L3 orch
@@ -163,8 +197,8 @@ a Python module that imports the wrong one now names a type that exists and
 behaves differently — so the mismatch surfaces where it is used.
 
 **So the split costs the user nothing to know.** You name a `Tensor`, submit it,
-and the chip's C++ orchestration receives it resolved; the type name does not
-even appear in your code — you write `buffer.tensor(shapes, dtype)` and
+and the chip's C++ orchestration receives it resolved. Build the view with
+`Tensor(buffer, shapes=shapes, dtype=dtype)` and submit it with
 `args.add_tensor(t, tag)`. Resolving the address in between is the framework's
 job, and keeping the two forms as separate types is what makes that boundary a
 type change rather than a silently wrong address.
@@ -187,13 +221,25 @@ destination), and a tensor over it must be dispatched only to that worker.
 
 ## Naming a view
 
-`buffer.tensor(...)` names a view over the backing:
+`Tensor(buffer, shapes=..., dtype=...)` names a view over the backing:
 
 ```python
-v = h.tensor(shapes=(M, N), dtype)                        # contiguous (row-major strides)
-v = h.tensor(shapes=(N, M), dtype, strides=(1, M))        # transposed
-v = h.tensor(shapes=(M, K), dtype, byte_offset=off)       # sub-region
+from simpler.task_interface import Tensor
+
+v = Tensor(h, shapes=(M, N), dtype=dtype)                     # contiguous
+v = Tensor(h, shapes=(N, M), dtype=dtype, strides=(1, M))     # transposed
+v = Tensor(h, shapes=(M, K), dtype=dtype, byte_offset=off)    # sub-region
 ```
+
+Construction copies the descriptor and validates the view; it neither allocates
+backing storage nor reads or transfers its contents. All views keep the same
+Buffer identity. A Tensor snapshot does not retain allocation ownership or prevent
+explicit Buffer close; submission still validates live registration. Constructing
+a new view from a closed Buffer is rejected.
+
+`buffer.tensor(shapes, dtype, ...)` is a compatibility forwarding method to this
+constructor. The existing descriptor-based constructor remains available for
+internal wire callers. Both use the same geometry validator.
 
 `strides` are **element** strides and are strictly > 0 — broadcast (stride 0) and
 negative step are unsupported, and a singleton dimension's stride is never
@@ -204,8 +250,8 @@ dtype size.
 
 ```python
 ta = TaskArgs()
-ta.add_tensor(a_h.tensor((SIZE,), DataType.FLOAT32), TensorArgType.INPUT)
-ta.add_tensor(out_h.tensor((SIZE,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+ta.add_tensor(Tensor(a_h, shapes=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+ta.add_tensor(Tensor(out_h, shapes=(SIZE,), dtype=DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
 orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 ```
 
@@ -337,7 +383,7 @@ values are final, at submit:
   named as an output and then silently losing every write in the child.
 - **No overlapping writes within one task.** Two arguments of one task that name
   intersecting bytes of the same backing are rejected: they belong to one node,
-  so there is no order between them to express, and a device-staged copy of a
+  so there is no order between them to express, and a device-side copy of a
   host backing does not even alias on the device for the L2 overlap map to
   notice. Disjoint slices of one buffer stay legal — that is what `byte_offset`
   is for, and this check runs the same two-stage comparison dependency
@@ -351,7 +397,7 @@ completion token for a downstream task to depend on.
 ## Scope / status
 
 This page describes the memory model end to end. **The dispatch wire is
-connected**: `TaskArgs` carries the `Tensor`, `buffer.tensor(...)` reaches a
+connected**: `TaskArgs` carries the `Tensor`, `Tensor(buffer, ...)` reaches a
 consumer, and the submit-time checks above run on every submit. Still absent are
 the other allocators (`alloc_shared_tensor`, `alloc_child_tensor`), and the
 endpoint x `address_space` check inside `materialize` — a device backing resolved
@@ -366,6 +412,44 @@ it. `ChipTensor` survives only in `ChipStorageTaskArgs`, the POD `ChipWorker`
 consumes — an L2 worker materializes into it inside `run` before calling down.
 
 Single-machine (host + device) L3→L2 and L4→L3→L2 dispatch is implemented and
-verified in `a2a3sim` and onboard `a2a3`. The remote **receive**
-side and the buffer lifecycle robustness (`release_buffer`, in-flight retain /
-deferred-free) are later phases (P2).
+verified in `a2a3sim` and onboard `a2a3`. The remote **receive** side is a later
+phase (P2).
+
+Buffer lifecycle robustness is partly in place, and which guarantee applies
+depends on the API that releases the storage. `Worker.free` is atomic with a
+direct L2 submission's accepted-use registration — see
+[Direct L2 invocation binding](#direct-l2-invocation-binding). `release_buffer`
+and deferred physical free are still P2.
+
+## Direct L2 invocation binding
+
+`Worker(level=2).submit` snapshots the TaskArgs views, tags, transfer requests and
+scalar values before binding. This copies descriptors and scalar values, not tensor
+payloads. Changing the caller's TaskArgs after that boundary cannot redirect the
+accepted call or change its retained Buffer identities.
+
+The snapshot uses the same submit-time grant and writable-overlap checks as L3.
+Every DEVICE_MALLOC or VMM_WINDOW argument must match a live allocation's complete
+descriptor on the target chip, including its identity and generation. A cached
+import does not authorize a revoked allocation. Rejection precedes import and
+native submission.
+
+Validation and in-flight identity registration share the chip lock `Worker.free`
+holds across its own revoke, which makes the two orderings exhaustive: a
+submission that registers first makes a later free refuse, and a free that
+revokes first makes the submission reject. The reservation then protects
+materialization, native submission and execution through run finalization; a
+failed bind or rejected submission drops it. This retains the existing fail-fast
+in-flight free contract, without adding deferred physical free.
+
+`release_buffer` is **not** inside that fence. It samples the same in-flight set
+and then closes the backing, so a submission accepted between the sample and the
+close can still map an identity that release is about to unlink. Bringing host
+backing release inside the fence is part of the P2 lifecycle work above.
+
+This boundary covers the public Worker TaskArgs path. The low-level ChipWorker
+POD compatibility entry and external borrowed-pointer construction remain separate
+migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
+Explicit task dependencies stay an L3 orchestration concept: a direct L2
+submission is one task, so no `TaskArgs` dependency entry reaches the chip
+through this path.
