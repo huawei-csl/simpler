@@ -133,7 +133,6 @@ int StoreTracrMetaData(RuntimeT &runtime) {
     }
 
     metadata["pid"] = 1;
-    metadata["start_time"] = 0;
     metadata["tid"] = 0;
 
     fs::path metadata_dir = base_dir / ("metadata.json");
