@@ -615,10 +615,12 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
     );
 
     if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->get_aicpu_thread_num()) {
-        // The GroupQueue controller stores spans with explicit, simulated
-        // timestamps, so this thread's buffer is not in time order. The
-        // post-processor's k-way merge requires it to be, and reads front()/back()
-        // as the thread's time bounds. Sorting here is outside the measured window.
+        // The controller stores its core-lane spans with explicit, simulated
+        // timestamps, so this buffer is not in append order by time. The
+        // post-processor merges the per-thread buffers with a k-way merge that
+        // requires each to be sorted, and reads front()/back() as the thread's
+        // bounds; without this a third of the merged trace comes out of order.
+        // Runs after dispatch has ended, outside the window the run measures.
         if (tracrThread->_traceIdx > 1) {
             std::stable_sort(
                 tracrThread->_traces.begin(), tracrThread->_traces.begin() + tracrThread->_traceIdx,
