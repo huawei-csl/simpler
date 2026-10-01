@@ -33,6 +33,44 @@ inline std::atomic<int> g_TraCR_thread_idx_counter{0};
 // Global thread local thread idx placeholder
 inline thread_local int g_TraCR_thread_idx{-1};
 
+/*
+ * Scheduler-loop markers are named after each runtime's own SchedPhaseKind
+ * vocabulary (src/common/{host_build_graph,tensormap_and_ringbuffer}/sched_phase_kind.h),
+ * so a TraCR lane and a chip-swimlane bar covering the same code call it the
+ * same thing.
+ *
+ * These replaced Phase1..Phase4, which named a position in the loop rather than
+ * the work it does. Two of the old names were actively misleading:
+ *
+ *   old name  new name           what it actually wraps
+ *   --------  -----------------  ----------------------------------------------
+ *   Phase1    Complete           Observe FINs and run completion work. In
+ *                                group_queue on a simulated device this is one
+ *                                watermark read retiring a contiguous prefix
+ *                                rather than a per-core MMIO sweep -- same role
+ *                                in the loop, different mechanism.
+ *   Phase2    Drain_Sync_Start   The sync_start stop-the-world drain attempt
+ *                                (SchedPhaseKind::Drain). This, not the marker
+ *                                that used to be called Drain.
+ *   Phase3    Dummy              Dependency-only dummy / false-predicate
+ *                                retirement. Emitted by tensormap_and_ringbuffer;
+ *                                host_build_graph does this on its resolution
+ *                                thread instead.
+ *   Phase4    Dispatch           Publish ready tasks to AICore
+ *                                (dispatch_ready_tasks).
+ *   Drain     Idle               host_build_graph / group_queue: a loop
+ *                                iteration that made no progress.
+ *   Drain     Release            tensormap_and_ringbuffer: the deferred-release
+ *                                drain (SchedPhaseKind::Release).
+ *
+ * The last two are why Drain had to go: one marker name stood for two unrelated
+ * phases depending on which runtime emitted it, so a trace could not be read
+ * without knowing which binary produced it.
+ *
+ * Group_Feed is new and group_queue-only: handing an open group's entries to the
+ * controller (feed_open_groups). It runs before completion on every iteration
+ * and has no host_build_graph counterpart.
+ */
 #define MARKER_TYPES       \
     X(Orchestrating)       \
     X(Read_Dimensions)     \
@@ -40,18 +78,20 @@ inline thread_local int g_TraCR_thread_idx{-1};
     X(Pre_Loop_Info)       \
     X(PTO2_SCOPE_)         \
     X(Scheduling)          \
-    X(Phase1)              \
-    X(Phase2)              \
-    X(Phase3)              \
-    X(Phase4)              \
-    X(Drain)               \
+    X(Complete)            \
+    X(Drain_Sync_Start)    \
+    X(Dummy)               \
+    X(Dispatch)            \
+    X(Idle)                \
     X(Initializing)        \
     X(De_Initializing)     \
     X(DLL_loading)         \
     X(Allocating)          \
     X(Running_Task_Single) \
     X(Running_Task_Pair)   \
-    X(Resolving)
+    X(Resolving)           \
+    X(Release)             \
+    X(Group_Feed)
 
 enum MarkerType {
 #define X(name) name,

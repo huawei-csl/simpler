@@ -1120,8 +1120,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Refill from the ready group queue before looking for work: a thread works
         // through one group at a time, handing the controller more of it as its
         // position window and the controller's hold room allow.
-        if (gq_group::active() && feed_open_groups(thread_idx)) {
-            made_progress = true;
+        // Nested rather than a short-circuit && so the marker covers only the feed
+        // itself: with grouping off there is no feed phase to show at all.
+        if (gq_group::active()) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Group_Feed, 0);
+            if (feed_open_groups(thread_idx)) {
+                made_progress = true;
+            }
         }
 #if SIMPLER_DFX
         CYCLE_COUNT_START();
@@ -1153,7 +1158,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Complete, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores() || gq_outstanding;
@@ -1314,7 +1319,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain_Sync_Start, 0);
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1401,7 +1406,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dispatch, 0);
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
@@ -1491,7 +1496,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
             // Polling: no deferred producer-release phase to drain on an idle pass.
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Idle, 0);
             idle_iterations++;
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
