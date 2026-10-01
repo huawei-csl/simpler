@@ -100,6 +100,21 @@ add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 
+# TraCR. Applies to every variant built from this tree, including the simulated
+# a2a3asim/a2a3asimgq ones -- they compile the same host sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(host_runtime)
+
+# Build the trace post-processor from the host tree, not the AICPU one: it is an
+# offline host tool and the AICPU cross-toolchain has no <filesystem>. Doing it
+# here (rather than only under platform/sim, as upstream does) is what makes the
+# reader exist for an a2a3asim/a2a3asimgq build, which never configures the sim
+# tree. The guard keeps a build that configures several trees from declaring the
+# target twice.
+if(BUILD_TRACR AND NOT TARGET tracr_process)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+endif()
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

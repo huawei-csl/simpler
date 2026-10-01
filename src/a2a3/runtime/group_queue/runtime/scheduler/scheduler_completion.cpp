@@ -10,6 +10,9 @@
  */
 #include "scheduler_context.h"
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #ifdef __SIMULATED_DEVICE__
 #include "aicpu/asimgq_core.h"
 #include "scheduler/gq_index_space.h"
@@ -309,6 +312,17 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             ++cur_thread_completed;
+            // Close the core lane only for an entry the manager itself placed
+            // (capacity_token >= 0), which is the only kind that opened one in
+            // prepare_subtask_to_core. A grouped entry is placed by the controller:
+            // the manager never learns its core, and Owner::core_id is a booking
+            // placeholder (the thread's first core), so resetting on it would emit
+            // tens of thousands of unmatched events on one arbitrary lane. Per-core
+            // lanes for grouped work would have to come from the controller's own
+            // index_core/finish timestamps, not from here.
+            if (o.capacity_token >= 0) {
+                INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + o.core_id);
+            }
             // The controller chose which core ran this entry, so the offset the
             // manager recorded is a capacity token rather than a placement. It is
             // still what bounds intake -- a group may hold 18 cores' worth of work --
@@ -434,6 +448,7 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
@@ -448,6 +463,7 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
         }
 
         // 2. Update slot data

@@ -81,6 +81,11 @@ add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 
+# TraCR. The sim platform compiles the same instrumented runtime sources as
+# onboard, so it needs the include paths even when BUILD_TRACR is OFF.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(host_runtime)
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

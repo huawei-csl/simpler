@@ -76,6 +76,11 @@ add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
+# TraCR. Applies to every variant built from this tree, including the simulated
+# a2a3asim/a2a3asimgq ones -- they compile the same AICPU sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
 # __SIMULATED_DEVICE__ says "no real AICore fabric". It gates the platform-level
 # deltas -- skip the AICore launch, skip set_platform_regs, short-circuit the exit
 # handshake, load the calibration table -- which are identical whichever simulated
