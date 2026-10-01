@@ -34,11 +34,54 @@ def _driver():
 
 
 @pytest.mark.manual
-@pytest.mark.platforms(["a2a3", "a2a3asim", "a2a3asimgq"])
+@pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.device_count(1)
 def test_qwen3_14b_decode_host_build_graph(st_platform, st_device_ids, request):
+    """The recorded-Graph orchestration. Onboard only: a Graph reaches the device
+    as one task the Scheduler expands, which is the thing under test here."""
     assert _driver().run(st_device_ids, st_platform, **standalone_pytest_options(request)) == 0
+
+
+@pytest.mark.manual
+@pytest.mark.platforms(["a2a3", "a2a3asim"])
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.device_count(1)
+def test_qwen3_14b_decode_expanded(st_platform, st_device_ids, request):
+    """The same layers submitted inline rather than recorded. This is the M0 arm:
+    it is the one orchestration group_queue can also run, so it is what makes the
+    comparison below a comparison of runtimes rather than of graphs."""
+    driver = _driver()
+    assert (
+        driver.run(
+            st_device_ids,
+            st_platform,
+            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            **standalone_pytest_options(request),
+        )
+        == 0
+    )
+
+
+@pytest.mark.manual
+@pytest.mark.platforms(["a2a3asimgq"])
+@pytest.mark.runtime("group_queue")
+@pytest.mark.device_count(1)
+def test_qwen3_14b_decode_group_queue(st_platform, st_device_ids, request):
+    """The M2 arm: same expanded orchestration, scheduled by group_queue. The
+    layer-boundary rt_group_begin/rt_group_end the expanded source carries are
+    no-ops under host_build_graph and declarations here."""
+    driver = _driver()
+    assert (
+        driver.run(
+            st_device_ids,
+            st_platform,
+            runtime="group_queue",
+            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            **standalone_pytest_options(request),
+        )
+        == 0
+    )
 
 
 if __name__ == "__main__":

@@ -18,7 +18,14 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TMR_CASE_DIR = HERE.parents[1] / "tensormap_and_ringbuffer/qwen3_14b_decode"
 RUNTIME = "host_build_graph"
-ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_layers.cpp"
+# Two orchestrations of the same 40 layers. The recorded one submits each layer as
+# a Graph for the device Scheduler to expand; the expanded one runs the layer
+# definition inline, so the same tasks and edges reach the manager directly. Only
+# the expanded one can run under group_queue, which does not expand a Graph, and
+# an arm-to-arm comparison needs both sides on the same one.
+GRAPH_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_layers.cpp"
+EXPANDED_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_layers_expanded.cpp"
+ORCHESTRATION_SOURCE = GRAPH_ORCHESTRATION_SOURCE
 CASE_NAME = "GraphExecutionBatch16Seq3500"
 
 
