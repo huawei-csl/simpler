@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <cstring>
 
 #include <tracr/tracr.hpp>
@@ -615,19 +614,6 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
     );
 
     if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->get_aicpu_thread_num()) {
-        // The controller stores its core-lane spans with explicit, simulated
-        // timestamps, so this buffer is not in append order by time. The
-        // post-processor merges the per-thread buffers with a k-way merge that
-        // requires each to be sorted, and reads front()/back() as the thread's
-        // bounds; without this a third of the merged trace comes out of order.
-        // Runs after dispatch has ended, outside the window the run measures.
-        if (tracrThread->_traceIdx > 1) {
-            std::stable_sort(
-                tracrThread->_traces.begin(), tracrThread->_traces.begin() + tracrThread->_traceIdx,
-                [](const TraCR::Payload &a, const TraCR::Payload &b) { return a.timestamp < b.timestamp; }
-            );
-        }
-
         if (runtime->get_tracr_data() != nullptr && tracrThread->_traceIdx > 0) {
             TraCR::Payload *tracrData = reinterpret_cast<TraCR::Payload *>(runtime->get_tracr_data());
             const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);

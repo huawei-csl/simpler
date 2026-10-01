@@ -19,6 +19,7 @@
 
 #include <filesystem>  // C++17 or newer
 #include <fstream>
+#include <algorithm>
 #include <array>
 #include <string>
 #include <vector>
@@ -196,6 +197,20 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     if (rc != 0) {
         LOG_ERROR("device_runner->copy_from_device 'tracrDataSizes' failed rc=%d", rc);
         return rc;
+    }
+
+    // Put each thread's traces in timestamp order. A producer that stores a span
+    // with an explicit timestamp -- the GroupQueue controller records a simulated
+    // interval whose end has not happened yet -- leaves its buffer out of append
+    // order, and TracrData2BTS writes it as-is for a post-processor whose k-way
+    // merge requires sorted input and reads front()/back() as the thread's bounds.
+    // Host-side and after the run, so the device pays nothing for it.
+    for (int t = 0; t < runtime.get_aicpu_thread_num(); ++t) {
+        TraCR::Payload *begin = tracrData.data() + static_cast<size_t>(t) * TraCR::CAPACITY;
+        const size_t n = tracrDataSizes[t] < TraCR::CAPACITY ? tracrDataSizes[t] : TraCR::CAPACITY;
+        std::stable_sort(begin, begin + n, [](const TraCR::Payload &a, const TraCR::Payload &b) {
+            return a.timestamp < b.timestamp;
+        });
     }
 
     // Now, store the traces into '~/ascend/tracr/'
