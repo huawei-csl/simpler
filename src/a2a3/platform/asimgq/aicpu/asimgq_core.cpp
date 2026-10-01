@@ -9,6 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "aicpu/asimgq_core.h"
+
+#if ASIMGQ_TRACR_CORE_LANES
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+#endif
 #include "aicpu/platform_aicpu_affinity.h"
 
 #include <vector>
@@ -179,6 +184,16 @@ struct SimPackage {
     uint32_t aiv1 = UINT32_MAX;
 };
 
+// Queue-local core slot -> the die-wide core id the scheduler knows it by. The
+// controller itself has no use for this (it names cores by their slot), but a
+// per-core TraCR lane does: the trace's channel has to be the same core the
+// host-side metadata names. Only populated when core lanes are compiled in.
+#if ASIMGQ_TRACR_CORE_LANES
+struct SimCoreIdentity {
+    uint32_t global_id = UINT32_MAX;
+};
+#endif
+
 // One GroupQueue: the controller for the packages and cores it serves.
 //
 // It is owned outright by a single AICPU scheduler: no other thread reads or
@@ -227,6 +242,9 @@ struct alignas(64) SimQueue {
     uint32_t package_count = 0;
     SimCore cores[SIM_QUEUE_MAX_PACKAGES * 3];
     uint32_t core_count = 0;
+#if ASIMGQ_TRACR_CORE_LANES
+    SimCoreIdentity core_identity[SIM_QUEUE_MAX_PACKAGES * 3];
+#endif
 
     // Every core's state, as the controller holds it. There is no frontend
     // controller between the queue and the cores: each core signals its own ACK
@@ -588,6 +606,43 @@ void refresh_core(SimQueue &q, uint32_t slot) {
 // Commit one entry to a core, starting no earlier than the core is free and no
 // earlier than the entry existed. The end is computed here, once, and never
 // revisited — which is what replaces advancing a state machine on every access.
+#if ASIMGQ_TRACR_CORE_LANES
+// Channel base, set at bring-up. UINT32_MAX means "not configured": emit nothing
+// rather than onto channel 0, which is an AICPU thread's lane.
+uint32_t g_tracr_lane_base = UINT32_MAX;
+
+// Push one core-lane span straight into this thread's TraCR buffer.
+//
+// INSTRUMENTATION_MARK_SET stamps "now", which is wrong here: the span being
+// recorded is a simulated interval that has not happened yet in wall time. The
+// Payload carries its own timestamp, so the pair is stored directly. The buffer
+// is left unsorted by this -- TRACR_FINALIZE sorts it before handing it over,
+// because the post-processor's k-way merge requires each thread's traces to be
+// in timestamp order.
+inline void tracr_core_span(
+    const SimQueue &q, uint32_t core_slot, uint32_t func_id, bool is_mix, uint64_t begin_ticks, uint64_t end_ticks
+) {
+    if (g_tracr_lane_base == UINT32_MAX || !tracrThread) {
+        return;
+    }
+    const uint32_t gid = q.core_identity[core_slot].global_id;
+    if (gid == UINT32_MAX) {
+        return;
+    }
+    const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + gid);
+    const uint16_t event = static_cast<uint16_t>(is_mix ? Running_Task_Pair : Running_Task_Single);
+    // Simulated time is cntvct rescaled to PLATFORM_PROF_SYS_CNT_FREQ, and TraCR
+    // timestamps are nanoseconds off that same counter, so the two differ by a
+    // constant factor and share an epoch.
+    tracrThread->store_trace(
+        TraCR::Payload{channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks, PLATFORM_PROF_SYS_CNT_FREQ)}
+    );
+    tracrThread->store_trace(
+        TraCR::Payload{channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks, PLATFORM_PROF_SYS_CNT_FREQ)}
+    );
+}
+#endif
+
 void commit(
     SimQueue &q, uint32_t core_slot, const SimQueueEntryStore &e, uint32_t part, uint64_t start, uint64_t pushed_at
 ) {
@@ -649,6 +704,11 @@ void commit(
         // A mix part cannot move: its halves share one package's local memory.
         c.pipe_stealable = (e.type != SimTaskType::Mix);
     }
+#if ASIMGQ_TRACR_CORE_LANES
+    // The kernel body only: fin includes the handshake a non-pipelined task pays
+    // before the kernel starts, which `compute` excludes by construction.
+    tracr_core_span(q, core_slot, e.func_id[part], e.type == SimTaskType::Mix, fin - dur, fin);
+#endif
     c.finish[c.outstanding] = fin;
     c.index[c.outstanding] = e.index[part];
     ++c.outstanding;
@@ -1206,11 +1266,21 @@ void init() {
     }
 }
 
+void set_tracr_core_lane_base(uint32_t channel_base) {
+#if ASIMGQ_TRACR_CORE_LANES
+    g_tracr_lane_base = channel_base;
+#else
+    (void)channel_base;
+#endif
+}
+
 void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, uint32_t aiv0_core, uint32_t aiv1_core) {
     (void)package_idx;
+#if !ASIMGQ_TRACR_CORE_LANES
     (void)aic_core;
     (void)aiv0_core;
     (void)aiv1_core;
+#endif
     if (queue_idx >= SIM_MAX_QUEUES) {
         return;
     }
@@ -1228,6 +1298,11 @@ void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, ui
     q.aic_m.set(p.aic);
     q.aiv_m.set(p.aiv0);
     q.aiv_m.set(p.aiv1);
+#if ASIMGQ_TRACR_CORE_LANES
+    q.core_identity[p.aic].global_id = aic_core;
+    q.core_identity[p.aiv0].global_id = aiv0_core;
+    q.core_identity[p.aiv1].global_id = aiv1_core;
+#endif
     for (uint32_t core : {p.aic, p.aiv0, p.aiv1}) {
         q.pkg_of_core[core] = pi;
         refresh_core(q, core);

@@ -93,6 +93,18 @@ if(ASIM_DEVICE)
     target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asim")
 endif()
 if(ASIMGQ_DEVICE)
+    # Per-core TraCR lanes for the GroupQueue. Only the controller knows which core
+    # ran a grouped task, so the spans are emitted from the device model rather than
+    # the scheduler. Opt-in: it adds two stores per task inside the measured window,
+    # so a build with it on is its own baseline.
+    option(ASIMGQ_TRACR_CORE_LANES "Emit per-core TraCR lanes from the GroupQueue model" OFF)
+    if(DEFINED ENV{ASIMGQ_TRACR_CORE_LANES})
+        set(ASIMGQ_TRACR_CORE_LANES $ENV{ASIMGQ_TRACR_CORE_LANES})
+    endif()
+    if(BUILD_TRACR AND ASIMGQ_TRACR_CORE_LANES)
+        message(STATUS "Enabling GroupQueue per-core TraCR lanes")
+        target_compile_definitions(aicpu_kernel PRIVATE ASIMGQ_TRACR_CORE_LANES=1)
+    endif()
     target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asimgq")
 endif()
 

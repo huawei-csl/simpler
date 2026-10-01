@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 
 #include <tracr/tracr.hpp>
@@ -177,6 +178,9 @@ void asim_bringup(Runtime *runtime, int32_t nthreads) {
     // The manager's read of the watermark is an MMIO-class access: one latency,
     // and further words of the look-ahead list ride behind it.
     asimgq::set_queue_latencies_ns(/*report_ns=*/notice_ns, /*poll_ns=*/10);
+    // Core lanes are channel-numbered after the AICPU thread lanes, matching the
+    // order StoreTracrMetaData writes channel_names in.
+    asimgq::set_tracr_core_lane_base(static_cast<uint32_t>(nthreads));
     asimgq::init();
 
     Handshake *workers = runtime->get_workers();
@@ -611,6 +615,17 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
     );
 
     if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->get_aicpu_thread_num()) {
+        // The GroupQueue controller stores spans with explicit, simulated
+        // timestamps, so this thread's buffer is not in time order. The
+        // post-processor's k-way merge requires it to be, and reads front()/back()
+        // as the thread's time bounds. Sorting here is outside the measured window.
+        if (tracrThread->_traceIdx > 1) {
+            std::stable_sort(
+                tracrThread->_traces.begin(), tracrThread->_traces.begin() + tracrThread->_traceIdx,
+                [](const TraCR::Payload &a, const TraCR::Payload &b) { return a.timestamp < b.timestamp; }
+            );
+        }
+
         if (runtime->get_tracr_data() != nullptr && tracrThread->_traceIdx > 0) {
             TraCR::Payload *tracrData = reinterpret_cast<TraCR::Payload *>(runtime->get_tracr_data());
             const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);

@@ -117,6 +117,27 @@ void set_queue_latencies_ns(uint64_t report_ns, uint64_t poll_ns);
 // where a mix group can land.
 void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, uint32_t aiv0_core, uint32_t aiv1_core);
 
+// Per-core TraCR lanes for the GroupQueue.
+//
+// The manager cannot produce these: the controller chooses the core, so by the
+// time an entry retires the manager knows only a booking placeholder. The
+// controller does know -- at commit() it has the core, the func_id, and the
+// task's start and end, all three computed once and never revised. So the span
+// is emitted from here, with explicit timestamps, rather than from the
+// scheduler.
+//
+// Off by default and deliberately so: this runs on the AICPU inside the window
+// the run measures, two 16-byte stores per task. A build with it on is its own
+// baseline and must not be compared against one without it.
+#ifndef ASIMGQ_TRACR_CORE_LANES
+#define ASIMGQ_TRACR_CORE_LANES 0
+#endif
+
+// Channel base for the core lanes: the host-side metadata names AICPU threads
+// first, then cores, so a core's channel is this plus its die-wide id. Set once
+// at bring-up; the lanes are inert until it is.
+void set_tracr_core_lane_base(uint32_t channel_base);
+
 // Shape of a queued task, which is what decides where the controller may push it.
 // Cube and Vector each occupy one core, on any package. Mix is one entry
 // describing a package-wide task: a cube half and up to two vector halves, pushed
