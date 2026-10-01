@@ -231,6 +231,14 @@ struct alignas(64) SimQueue {
     // The rotation advances on a successful push, not on the clock, so placement is
     // reproducible and independent of when a read happens to land.
     uint32_t rr = 0;
+    // Which of a package's two vector cores a vector task is offered first. `rr`
+    // alone cannot decide this: it counts packages, so the slot it names is always
+    // a multiple of three and therefore always the package's cube core. The scan
+    // below takes the first core at or after that, which for a vector task is the
+    // package's aiv0 -- so aiv1 is reached only when aiv0 is already busy, and a
+    // workload that never saturates one vector core per package never reaches the
+    // second at all.
+    uint32_t vrr = 0;
 
     // How deep each ring may go: the cores of that shape this queue serves, and
     // its packages for mix. A queue that cannot hold more than its cores can run
@@ -801,11 +809,17 @@ bool place_mix(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
 // leave an idle core standing.
 bool place_single(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     const CoreMask &type_m = (e.type == SimTaskType::Cube) ? q.aic_m : q.aiv_m;
-    const uint32_t from = (q.rr * 3) % q.core_count;
+    // A package occupies three consecutive slots: cube, aiv0, aiv1. Start a cube
+    // scan on the package boundary, and a vector scan on one of that package's two
+    // vector slots in turn, so both are offered work.
+    const uint32_t base = (q.rr * 3) % q.core_count;
+    const uint32_t from =
+        (e.type == SimTaskType::Cube) ? base : (base + 1 + (q.vrr & 1u)) % q.core_count;
     const uint32_t idle = select_rotating(mask_and(q.free_m, type_m), from, q.core_count);
     if (idle != UINT32_MAX) {
         commit(q, idle, e, 0, at, at);
         q.rr = (q.rr + 1) % q.package_count;
+        if (e.type != SimTaskType::Cube) ++q.vrr;
         return true;
     }
     const CoreMask pipe = mask_and(q.pipe_m, type_m);
@@ -823,6 +837,7 @@ bool place_single(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     }
     commit(q, best, e, 0, best_at < at ? at : best_at, at);
     q.rr = (q.rr + 1) % q.package_count;
+    if (e.type != SimTaskType::Cube) ++q.vrr;
     return true;
 }
 
