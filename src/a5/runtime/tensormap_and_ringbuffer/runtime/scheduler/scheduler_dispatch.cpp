@@ -999,7 +999,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Complete, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -1120,7 +1120,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain_Sync_Start, 0);
 #if SIMPLER_DFX
             uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
             uint64_t drain_stage_wall = 0;
@@ -1152,7 +1152,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
             if (dummy_got > 0) {
                 (void)(dummy_got);
-                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dummy, 0);
             }
 #if SIMPLER_DFX
             // Dummy outer phase: covers handling of all dummies popped this
@@ -1236,7 +1236,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         // pmu_active is cached at function scope above (loop-invariant).
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dispatch, 0);
 
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
@@ -1324,7 +1324,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // otherwise drain via on_task_release.
             bool release_elided = deferred_release_count > 0 && orchestrator_done_.load(std::memory_order_acquire);
             if (deferred_release_count > 0 && !release_elided) {
-                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Release, 0);
             }
             drain_or_elide_deferred_releases(
                 sched_, deferred_release_slot_states, deferred_release_count, release_elided

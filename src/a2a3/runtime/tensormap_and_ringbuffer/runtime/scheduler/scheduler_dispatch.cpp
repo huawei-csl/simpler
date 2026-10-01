@@ -1047,7 +1047,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Complete, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -1171,7 +1171,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain_Sync_Start, 0);
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1211,7 +1211,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
             if (dummy_got > 0) {
                 (void)(dummy_got);
-                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dummy, 0);
             }
 #if SIMPLER_DFX
             // Dummy outer phase: covers all dependency-only items popped this
@@ -1315,7 +1315,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Dispatch, 0);
 
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
@@ -1410,7 +1410,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
             while (deferred_release_count > 0) {
-                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Release, 0);
 
 #if SIMPLER_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
