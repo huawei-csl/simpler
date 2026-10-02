@@ -50,3 +50,44 @@ def test_deepseek_v4_flash_decode_host_build_graph(st_platform, st_device_ids):
     # exists, so the case passes by running clean and its parameters need no
     # content. The former `CASES[*]["skip_golden"]` said the same thing.
     assert _driver().run(st_device_ids, st_platform, skip_golden=True) == 0
+
+
+@pytest.mark.manual
+@pytest.mark.platforms(["a2a3", "a2a3asim"])
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.device_count(2)
+def test_deepseek_v4_flash_decode_expanded(st_platform, st_device_ids):
+    """The same blocks called in place rather than recorded. The M0 arm: it is the
+    orchestration group_queue can also run, so it is what makes the comparison
+    below one of runtimes rather than of orchestrations."""
+    driver = _driver()
+    assert (
+        driver.run(
+            st_device_ids,
+            st_platform,
+            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            skip_golden=True,
+        )
+        == 0
+    )
+
+
+@pytest.mark.manual
+@pytest.mark.platforms(["a2a3asimgq"])
+@pytest.mark.runtime("group_queue")
+@pytest.mark.device_count(2)
+def test_deepseek_v4_flash_decode_group_queue(st_platform, st_device_ids):
+    """The M2 arm. The expanded source carries no rt_group_begin/rt_group_end, so
+    this runs the graph undeclared: it measures what the completion path alone is
+    worth, not what declared grouping adds."""
+    driver = _driver()
+    assert (
+        driver.run(
+            st_device_ids,
+            st_platform,
+            runtime="group_queue",
+            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            skip_golden=True,
+        )
+        == 0
+    )

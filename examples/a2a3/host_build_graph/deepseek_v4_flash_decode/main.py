@@ -50,7 +50,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TMR_CASE_DIR = HERE.parents[1] / "tensormap_and_ringbuffer/deepseek_v4_flash_decode"
 RUNTIME = "host_build_graph"
-ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_graph.cpp"
+# Two orchestrations of the same 43 layers. The recorded one submits each block as
+# a Graph for the device Scheduler to expand; the expanded one calls each block's
+# definition in place, so the same tasks and edges reach the manager directly.
+# Only the expanded one can run under a runtime that does not expand a Graph.
+GRAPH_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_graph.cpp"
+EXPANDED_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_expanded.cpp"
+ORCHESTRATION_SOURCE = GRAPH_ORCHESTRATION_SOURCE
 
 
 def _load_tmr_driver():
