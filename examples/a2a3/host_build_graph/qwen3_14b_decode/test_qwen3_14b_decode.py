@@ -19,6 +19,12 @@ from simpler_setup.scene_test import standalone_pytest_options
 
 _DRIVER_NAME = "_qwen3_14b_a2a3_hbg_driver"
 
+# Layers to run when the card cannot hold all 40. 0.66 GB of weights and 0.36 GB
+# of KV pool per layer, plus ~3 GB of embedding and lm_head that do not scale,
+# so 16 is ~19 GB against a 32 GB part. A card that can hold all 40 runs the
+# whole model by setting this to 40.
+_SIM_LAYERS = 16
+
 
 def _driver():
     cached = sys.modules.get(_DRIVER_NAME)
@@ -56,7 +62,8 @@ def test_qwen3_14b_decode_expanded(st_platform, st_device_ids, request):
         driver.run(
             st_device_ids,
             st_platform,
-            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            orchestration_source=driver.expanded_source_for(_SIM_LAYERS),
+            n_layers=_SIM_LAYERS,
             **standalone_pytest_options(request),
         )
         == 0
@@ -77,7 +84,8 @@ def test_qwen3_14b_decode_group_queue(st_platform, st_device_ids, request):
             st_device_ids,
             st_platform,
             runtime="group_queue",
-            orchestration_source=driver.EXPANDED_ORCHESTRATION_SOURCE,
+            orchestration_source=driver.expanded_source_for(_SIM_LAYERS),
+            n_layers=_SIM_LAYERS,
             **standalone_pytest_options(request),
         )
         == 0

@@ -26,6 +26,30 @@ RUNTIME = "host_build_graph"
 GRAPH_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_layers.cpp"
 EXPANDED_ORCHESTRATION_SOURCE = HERE / "kernels/orchestration/decode_fwd_layers_expanded.cpp"
 ORCHESTRATION_SOURCE = GRAPH_ORCHESTRATION_SOURCE
+
+
+def expanded_source_for(n_layers: int, out_dir: Path | None = None) -> Path:
+    """The expanded orchestration, rewritten for a shorter decoder stack.
+
+    The layer count is one `constexpr` the orchestration loops over, and it also
+    divides the KV pool into per-layer pages, so it has to agree with the
+    `n_layers` the host allocates for -- a mismatch misaddresses the pool rather
+    than failing. Deriving the source here is what keeps the two from drifting.
+    """
+    if n_layers == 40:
+        return EXPANDED_ORCHESTRATION_SOURCE
+    if not 1 <= n_layers <= 40:
+        raise ValueError(f"n_layers must be in 1..40, got {n_layers}")
+    text = EXPANDED_ORCHESTRATION_SOURCE.read_text(encoding="utf-8")
+    needle = "constexpr uint32_t num_layers = 40;"
+    if text.count(needle) != 1:
+        raise RuntimeError(f"expected exactly one {needle!r} in {EXPANDED_ORCHESTRATION_SOURCE}")
+    text = text.replace(needle, f"constexpr uint32_t num_layers = {n_layers};")
+    out_dir = out_dir or (HERE / "kernels/orchestration/generated")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    derived = out_dir / f"decode_fwd_layers_expanded_l{n_layers}.cpp"
+    derived.write_text(text, encoding="utf-8")
+    return derived
 CASE_NAME = "GraphExecutionBatch16Seq3500"
 
 

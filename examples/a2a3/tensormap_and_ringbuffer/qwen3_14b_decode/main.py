@@ -598,6 +598,12 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     skip_golden: bool = False,
     seed: int = 1234,
     seq_len: int = 3500,
+    # Fewer than the model's 40 decoder layers. The orchestration loops over a
+    # single constant and every host-side table is sized per layer, so a shorter
+    # stack is the same graph with fewer repeats -- which is what lets the case
+    # fit a card that cannot hold all 40. MAX_SEQ is not adjustable the same way:
+    # it is baked into the harvested kernels.
+    n_layers: int = N_LAYERS,
     enable_chip_swimlane: int = 0,
     dump_args: int = 0,
     enable_pmu: int = 0,
@@ -664,16 +670,16 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     chip_handle = worker.register(chip)
     worker.init()
     try:
-        buffers = _allocate_params(worker, N_LAYERS)
+        buffers = _allocate_params(worker, n_layers)
         golden = None
         if skip_golden:
-            _upload_fixture(worker, buffers, seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
+            _upload_fixture(worker, buffers, seed=seed, seq_len=seq_len, n_layers=n_layers)
         else:
             print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
-            golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
-            _upload_materialized_fixture(worker, buffers, golden, N_LAYERS)
-            _decode_golden(golden, n_layers=N_LAYERS)
-        task_args = _build_task_args(buffers, N_LAYERS, spec["orchestration"]["signature"])
+            golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=n_layers)
+            _upload_materialized_fixture(worker, buffers, golden, n_layers)
+            _decode_golden(golden, n_layers=n_layers)
+        task_args = _build_task_args(buffers, n_layers, spec["orchestration"]["signature"])
         config = _build_config(
             runtime_env,
             enable_chip_swimlane=diagnostics.chip_swimlane,
