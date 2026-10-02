@@ -57,7 +57,7 @@ class TestMatmulHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "default",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {},
         },
@@ -99,3 +99,20 @@ class TestMatmulHostBuildGraph(SceneTestCase):
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GroupQueue arm. group_queue shares host_build_graph's orchestration ABI and
+# its common/ tree, so the same sources compile under both and no kernel or
+# orchestration copy is needed -- only the runtime the scheduler is built from
+# changes. a2a3asimgq is the only platform that builds group_queue.
+# ---------------------------------------------------------------------------
+@scene_test(level=2, runtime="group_queue")
+class TestMatmulGroupQueue(TestMatmulHostBuildGraph):
+    """The same graph, scheduled by group_queue."""
+
+    CASES = [
+        {**_c, "platforms": ["a2a3asimgq"]}
+        for _c in TestMatmulHostBuildGraph.CASES
+        if "a2a3" in _c["platforms"]
+    ]

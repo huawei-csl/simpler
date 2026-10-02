@@ -54,13 +54,13 @@ class TestGraphExecutionHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "record_then_replay_1d",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": ["a2a3sim"],
             "params": {"shape": (128 * 128,)},
         },
         {
             "name": "record_then_replay_2d",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "params": {"shape": (128 * 128, 1)},
         },
     ]

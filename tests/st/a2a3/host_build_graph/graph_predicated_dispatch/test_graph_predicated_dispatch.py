@@ -110,7 +110,7 @@ class TestGraphPredicatedDispatch(SceneTestCase):
     CASES = [
         {
             "name": "PredicateAcrossGraphReplays",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "params": {},
         },
     ]

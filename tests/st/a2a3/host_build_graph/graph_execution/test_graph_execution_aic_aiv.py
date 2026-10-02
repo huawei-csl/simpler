@@ -51,7 +51,7 @@ class TestGraphExecutionAicAivHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "record_then_replay_aic_aiv",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": ["a2a3sim"],
             "params": {},
         },

@@ -76,7 +76,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             # runtime_env.ring_task_window if needed; the GM heap needs no sizing,
             # since it is committed to the size orchestration measured.
             "name": "Case1",
-            "platforms": ["a2a3", "a2a3asim", "a2a3asimgq"],
+            "platforms": ["a2a3", "a2a3asim"],
             "manual": True,
             # host-orchestration populates the whole task graph before the device
             # schedules and reclaims nothing mid-orchestration, so the window must
@@ -99,7 +99,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "Case2",
-            "platforms": ["a2a3", "a2a3asim", "a2a3asimgq"],
+            "platforms": ["a2a3", "a2a3asim"],
             "manual": True,
             # host-orchestration populates the whole task graph before the device
             # schedules and reclaims nothing mid-orchestration, so the window must
@@ -122,7 +122,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "small1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -136,7 +136,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "small2",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 1,
@@ -171,3 +171,4 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
+

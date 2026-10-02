@@ -63,7 +63,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3", "a2a3asim"],
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -77,7 +77,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "Case2",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 64,
@@ -92,7 +92,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "Case3",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 64,
@@ -107,7 +107,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "CaseSmall1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": ["a2a3sim"],
             "params": {
                 "batch": 1,
@@ -122,7 +122,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "CaseSmall2",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 1,
@@ -137,7 +137,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "CaseSmall3",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 1,
@@ -152,7 +152,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "CaseVarSeq2",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 2,
@@ -168,7 +168,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         },
         {
             "name": "CaseVarSeq4",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3sim", "a2a3", "a2a3asim"],
             "manual": True,
             "params": {
                 "batch": 4,
@@ -204,3 +204,20 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GroupQueue arm. group_queue shares host_build_graph's orchestration ABI and
+# its common/ tree, so the same sources compile under both and no kernel or
+# orchestration copy is needed -- only the runtime the scheduler is built from
+# changes. a2a3asimgq is the only platform that builds group_queue.
+# ---------------------------------------------------------------------------
+@scene_test(level=2, runtime="group_queue")
+class TestBatchPagedAttentionGroupQueue(TestBatchPagedAttentionHostBuildGraph):
+    """The same graph, scheduled by group_queue."""
+
+    CASES = [
+        {**_c, "platforms": ["a2a3asimgq"]}
+        for _c in TestBatchPagedAttentionHostBuildGraph.CASES
+        if "a2a3" in _c["platforms"]
+    ]

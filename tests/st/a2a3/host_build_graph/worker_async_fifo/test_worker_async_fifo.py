@@ -183,7 +183,7 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
     CASES = [
         {
             "name": "whole_run_fifo",
-            "platforms": ["a2a3"],
+            "platforms": ["a2a3", "a2a3asim"],
             "config": {"device_count": 1, "num_sub_workers": 1},
             "params": {},
         },
@@ -505,6 +505,12 @@ class TestWorkerAsyncWholeRunFifoTmr(TestWorkerAsyncWholeRunFifo):
     # Its own copies under the tensormap_and_ringbuffer tree: a source names one
     # runtime's Tensor, so it cannot be compiled under both.
     CALLABLE = _rebase_callable(TestWorkerAsyncWholeRunFifo.CALLABLE, _TMR_KERNELS)
+    # The simulated-device platforms never build tensormap_and_ringbuffer, so this
+    # class cannot inherit the hbg list verbatim.
+    CASES = [
+        {**_c, "platforms": [_p for _p in _c["platforms"] if not _p.startswith("a2a3asim")]}
+        for _c in TestWorkerAsyncWholeRunFifo.CASES
+    ]
 
     def test_incompatible_runtime_env_falls_back_to_depth_one(self, st_platform, st_worker):
         if st_platform != "a2a3":
@@ -573,3 +579,20 @@ class TestWorkerAsyncWholeRunFifoTmr(TestWorkerAsyncWholeRunFifo):
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GroupQueue arm. group_queue shares host_build_graph's orchestration ABI and
+# its common/ tree, so the same sources compile under both and no kernel or
+# orchestration copy is needed -- only the runtime the scheduler is built from
+# changes. a2a3asimgq is the only platform that builds group_queue.
+# ---------------------------------------------------------------------------
+@scene_test(level=3, runtime="group_queue")
+class TestWorkerAsyncWholeRunFifoGroupQueue(TestWorkerAsyncWholeRunFifo):
+    """The same graph, scheduled by group_queue."""
+
+    CASES = [
+        {**_c, "platforms": ["a2a3asimgq"]}
+        for _c in TestWorkerAsyncWholeRunFifo.CASES
+        if "a2a3" in _c["platforms"]
+    ]

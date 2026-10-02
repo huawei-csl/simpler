@@ -98,7 +98,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         ],
     }
 
-    _PLATFORMS = ["a2a3"]
+    _PLATFORMS = ["a2a3", "a2a3asim"]
 
     CASES = [
         {
@@ -309,3 +309,20 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
 
         with pytest.raises(NativeOverlapError, match="did not overlap"):
             assert_native_overlap(parse_spans(captured.splitlines()))
+
+
+# ---------------------------------------------------------------------------
+# GroupQueue arm. group_queue shares host_build_graph's orchestration ABI and
+# its common/ tree, so the same sources compile under both and no kernel or
+# orchestration copy is needed -- only the runtime the scheduler is built from
+# changes. a2a3asimgq is the only platform that builds group_queue.
+# ---------------------------------------------------------------------------
+@scene_test(level=2, runtime="group_queue")
+class TestConcurrentPrepareStressHbgGroupQueue(TestConcurrentPrepareStressHbg):
+    """The same graph, scheduled by group_queue."""
+
+    CASES = [
+        {**_c, "platforms": ["a2a3asimgq"]}
+        for _c in TestConcurrentPrepareStressHbg.CASES
+        if "a2a3" in _c["platforms"]
+    ]
