@@ -432,6 +432,59 @@ of it.
 A core finishing sets its position's bit in the queue; the queue publishes the
 **contiguous prefix** over those bits as a watermark in one control register.
 One read of that register retires everything it covers, which is what replaces
+asking each core in turn.
+
+**A finish above the prefix is held as a bit, not an index.** The look-ahead is
+one word in which bit *i* is the completion of `watermark + 1 + i`. The
+watermark's own position is not stored -- it is not complete by definition, or
+the prefix would have passed it -- so the window covers one position more than it
+has bits.
+
+That representation is chosen for what the advance costs. A list of indices has
+to be searched associatively once per position the prefix crosses, and a run of
+*n* contiguous finishes costs *n* such searches plus a sorted insert on every
+arrival. As bits, the advance is a find-first-zero and a shift:
+
+```text
+on completion of p:
+    p  < watermark   already covered
+    p  > watermark   bits |= 1 << (p - watermark - 1)
+    p == watermark   n = count_trailing_ones(bits) + 1
+                     watermark += n;  bits >>= n
+```
+
+The shift and the advance are the same count, because the position the watermark
+lands on is the one the window does not store.
+
+The register carries the watermark and the published window together, so the
+manager's whole read is **one access** however much finished out of order, where
+a list cost one further word per live entry. One access is also what relative
+bits require and absolute indices did not: a bitmap read against a stale
+watermark misreads every position, while a stale index still says what it means.
+
+**The horizon is hard, and the manager is what makes it safe.** A position
+further above the watermark than the window reaches has no bit and could not be
+recorded -- and a completion that cannot be recorded would strand its task, since
+the prefix would never pass it. `GqIndexSpace::room()` therefore refuses to issue
+such a position at all, taking the tighter of its capacity bound and the horizon.
+That makes overflow unreachable rather than merely unlikely, and it is
+deadlock-free: positions are issued ascending and a consumer may only name
+producers that already hold one, so whatever the watermark waits on is already in
+flight and throttling new submissions cannot starve it. `ahead_overflow` latches
+if the guard is ever wrong, so the case is diagnosable rather than silent.
+
+Measured, the horizon is slack: paged_attention's finishes reach at most 21
+positions above the watermark against a window of 64, and `ahead_overflow` is
+zero.
+
+**Submission order is a throughput concern, not a correctness one.** Submitting
+in roughly the order tasks will finish keeps the prefix moving and positions
+recycling. Getting it wrong costs backpressure at the manager -- never a lost
+completion, and never a stranded task.
+
+A core finishing sets its position's bit in the queue; the queue publishes the
+**contiguous prefix** over those bits as a watermark in one control register.
+One read of that register retires everything it covers, which is what replaces
 asking each core in turn. An out-of-order finish simply waits for its prefix.
 
 ### Latencies

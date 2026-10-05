@@ -105,10 +105,14 @@ setup that was missing from the model entirely — both in
 
 Two cases carry the campaign. Both arms of each pair run back to back in one
 submission on one held card, so the delta is free of the ~3 % session drift.
+paged_attention's figure is the pooled median of **eight interleaved reps**: its
+M0 arm holds to 0.7 %, but its M2 arm spans 13.7 %, so a single pair cannot place
+it closer than a few points. Every one of those eight reps fell between -58.1 %
+and -52.0 %.
 
 | case | M0 | M2 | vs M0 |
 | ---- | -- | -- | ----- |
-| paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.239 ms | 9.918 ms | **-55.4 %** |
+| paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.285 ms | 9.776 ms | **-56.1 %** |
 | qwen3-14b `decode_fwd`, 40 layers (pypto-lib) | 28.423 ms | 18.989 ms | **-33.2 %** |
 
 The in-repo expanded 40-layer qwen, a separate orchestration of the same model,

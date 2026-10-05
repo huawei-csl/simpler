@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "aicpu/asimgq_core.h"  // SIM_AHEAD_HORIZON: the contract this window honours
 #include "scheduler/scheduler_types.h"
 
 // =============================================================================
@@ -57,9 +58,19 @@ class alignas(64) GqIndexSpace {
     // by the watermark covering it, or by an ahead-of-watermark notification. An
     // entry the controller has already finished but not yet reported still holds
     // its slot, which is what the hardware bound actually is.
+    // Two bounds, and the tighter one wins. `capacity_` limits the positions this
+    // manager has not yet retired, discounting those it already knows finished.
+    // The horizon limits the raw distance from the watermark, which that discount
+    // does not: a position further above it than the controller's look-ahead
+    // reaches could not be recorded at all, so it is never issued.
     uint32_t room() const {
         const uint32_t held = static_cast<uint32_t>(push_index_ - watermark_) - early_n_;
-        return capacity_ > held ? capacity_ - held : 0;
+        const uint32_t by_capacity = capacity_ > held ? capacity_ - held : 0;
+        const uint32_t spread = static_cast<uint32_t>(push_index_ - watermark_);
+        const uint32_t by_horizon = asimgq::SIM_AHEAD_HORIZON > spread
+                                        ? asimgq::SIM_AHEAD_HORIZON - spread
+                                        : 0;
+        return by_capacity < by_horizon ? by_capacity : by_horizon;
     }
     uint64_t push_index() const { return push_index_; }
     // Positions handed out that this manager has not yet retired. Under the
