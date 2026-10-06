@@ -57,49 +57,25 @@ entirely inside run-to-run spread. Their apparent errors (+8.7 %, −18.8 %) are
 noise with no information content. `paged_attention` Case2 is a smaller Case1
 and adds no coverage.
 
-## Current fidelity (2026-09-04, 4 threads)
+## Fidelity against silicon
 
-| case | real | aSim | error |
-| ---- | ---- | ---- | ----- |
-| paged_attention Case1 | 19 550 µs | 19 453 µs | **−0.50 %** |
-| qwen3_14b_decode | 43 418 µs | 43 542 µs | **+0.29 %** |
+Both baselines' error against the hardware they model, the three-arm method, and
+the residual blind spots are in **[validation/fidelity.md](validation/fidelity.md)**.
+The short version, for reading the deltas below:
 
-Two properties make this a gate rather than a fit:
+| case | M0 error vs silicon | M2 vs M0 | M2 vs silicon |
+| ---- | ------------------- | -------- | ------------- |
+| paged_attention Case1 | +5.0 % (M0 slow) | -55.1 % | **-52.9 %** |
+| qwen3-14B decode, 40L | -4.1 % (M0 fast) | -28.1 % | **-31.1 %** |
 
-- **The signs are mixed.** Every earlier stage was uniformly negative, the
-  signature of a missing term. Mixed signs at this magnitude is noise.
-- **The errors are below the real measurement's own reproducibility.** Case1's
-  real window read 19 772 µs in one campaign and 19 550 µs in the next — 1.1 %
-  apart. There is nothing further to demonstrate without many more reps.
+**The error changes sign between the cases, so it does not cancel in a delta.**
+Every GroupQueue figure in this document is quoted against M0; the last column is
+what it becomes against a real device, and the correction goes one way on
+paged_attention and the other on qwen.
 
-Progression, on Case1 at 4 threads: **−9.0 % → −3.7 % → −0.50 %**. The first
-step was correcting the in-situ poll cost, the second was adding the AICore-side
-setup that was missing from the model entirely — both in
-[calibration.md](calibration.md).
-
-## Residuals and known blind spots
-
-1. **One fitted parameter remains** (`read = 195 ns`). It is *identifiable*
-   rather than free — poll count differs 3.4× between the two cases, so a
-   materially wrong value would give task-count-scaled errors of consistent
-   sign, and instead both land within ±0.3 % with opposite signs. It was
-   nonetheless fitted *before* `ack` was corrected, so it may have absorbed part
-   of the setup term.
-2. **No core-bound case is validated.** Both cases leave the cores ≥86 % idle,
-   so the 2-deep pipeline's overlap assumption — that `receive_to_start` hides
-   behind the previous task's compute — is never exercised. It would bite in a
-   case where cores saturate.
-3. **Compute-distribution shape is unmodelled and measured not to matter here.**
-   1.89 % of real tasks exceed mean+3σ, which aSim's bounded Irwin-Hall draw
-   cannot produce, with tails to 4.6× the mean. Quadrupling σ moved the window
-   0.4 %, so with cores idle this cannot supply a meaningful error — but it is a
-   latent term for a core-bound case.
-4. **Bias stability across thread counts was the fitness test for A/B use.**
-   Before the corrections the error ran −13.9 % at 1 thread to −9.0 % at 4;
-   fitting `W(N) = S + P/N` localised it to the parallel term (serial −2.1 %,
-   parallel −16.2 %), which is what identified the poll cost as the cause. Any
-   future regression should be re-checked the same way, because a bias that
-   varies with configuration does not cancel in an M0-vs-M2 delta.
+An older gate reading ±0.5 % is still cited in places. It was measured with
+`scan_and_claim` as M0, not the `host_build_graph` M0 these campaigns use, and
+does not transfer -- see the subdoc.
 
 ## What the GroupQueue is worth (2026-09-21)
 
@@ -114,6 +90,12 @@ and -52.0 %.
 | ---- | -- | -- | ----- |
 | paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.285 ms | 9.776 ms | **-56.1 %** |
 | qwen3-14b `decode_fwd`, 40 layers (pypto-lib) | 28.423 ms | 18.989 ms | **-33.2 %** |
+
+**These are gains against M0, and M0's own error against silicon changes sign
+between the two cases** -- see [validation/fidelity.md](validation/fidelity.md).
+Corrected to hardware, paged_attention's gain shrinks (to -52.9 %) and qwen's
+grows (to -31.1 %), so neither figure here transfers to a real device unchanged
+and they do not move together.
 
 The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
 independently measures -32.6 %, so the qwen figure reproduces across two

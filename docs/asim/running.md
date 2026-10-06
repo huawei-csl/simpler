@@ -10,8 +10,14 @@ builds with the AICore replaced by an AICPU-hosted model:
 
 | platform | runtime | role |
 | -------- | ------- | ---- |
+| `a2a3` | `host_build_graph` | **base** — real silicon, the fidelity reference |
 | `a2a3asim` | `host_build_graph` | **M0** — the baseline scheduler |
 | `a2a3asimgq` | `group_queue` | **M2** — the GroupQueue under evaluation |
+
+The base arm is the same runtime as M0 on the real device, so the pair measures
+the device model alone. Run all three interleaved in one lock when you want the
+fidelity figure alongside the delta — the method and the numbers are in
+[validation/fidelity.md](validation/fidelity.md).
 
 They are silicon-agnostic in the sense that they compute nothing, but they run
 **on a real AICPU** and therefore still take a device. Every invocation goes
@@ -66,6 +72,11 @@ python -m pytest tests/st/a2a3/host_build_graph/paged_attention \
 # M2
 python -m pytest tests/st/a2a3/group_queue/paged_attention \
     --platform a2a3asimgq --device $TASK_DEVICE \
+    --case Case1 --manual include --skip-golden --rounds 14 --log-level INFO
+
+# base — real silicon, same test as M0, no calibration (it computes for real)
+python -m pytest tests/st/a2a3/host_build_graph/paged_attention \
+    --platform a2a3     --device $TASK_DEVICE \
     --case Case1 --manual include --skip-golden --rounds 14 --log-level INFO
 ```
 
@@ -129,6 +140,12 @@ setup is not worth standing up. Its shipped (non-expanded) orchestration submits
 each layer as a Graph, which `group_queue` cannot expand — pass the expanded
 source.
 
+**The base arm has to take that in-repo path.** The pypto runner picks its own
+platform and would need the wrapper rebuilt around a real device, so the
+three-arm fidelity run drives the expanded orchestration directly on all three
+platforms instead. That also keeps the arms honest: the same 11,087-task
+orchestration reaches each of them.
+
 ## Reading a run
 
 `device_wall` is the measurement. One marker per invocation, in nanoseconds:
@@ -166,9 +183,13 @@ These are not style preferences; each one was learned from a wrong number.
 
   | case | arm | repeatability |
   | ---- | --- | ------------- |
-  | qwen-40L | both | 0.55 % over three consecutive runs |
+  | qwen-40L | all three | 0.7 % over three interleaved reps |
+  | PA Case1 | base (`a2a3`) | 1.1 % over four reps |
   | PA Case1 | M0 (`a2a3asim`) | 0.7 % over eight reps |
   | PA Case1 | **M2 (`a2a3asimgq`)** | **13.7 % over eight reps** |
+
+  The spread is a property of the arm and the case together, not of the arm:
+  M2 holds to 2.3 % on qwen and to 17.6 % on PA in the same session.
 
   PA's GroupQueue arm drifts upward across successive runs inside one
   submission, so interleaving does not fully cancel it. Two four-rep interleaved
