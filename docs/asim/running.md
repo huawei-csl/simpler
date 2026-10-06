@@ -45,11 +45,17 @@ Three things about this build that cost time to rediscover:
   host and a container (a bind mount), building in both leaves files owned by
   different users and the next rebuild fails on permissions. Pick the one that
   carries the CANN toolchain and do every build, install and run there.
-- **A built `.so` has to reach both load locations** to take effect:
-  `build/lib/{arch}/{variant}/{runtime}/` and the installed copy under
-  `.venv/.../simpler_setup/_assets/build/lib/...`. `build_runtimes` writes both;
-  hand-swapping a binary for an A/B must do the same, or the run silently uses
-  the other one.
+- **Which copy of a binary runs depends on where you launch from**, not on which
+  copy is newer. There are two: `build/lib/{arch}/{variant}/{runtime}/` and the
+  installed one under `.venv/.../simpler_setup/_assets/build/lib/...`. A run
+  launched from the worktree root (`python -m pytest`, or a script there) imports
+  `simpler_setup` from the source tree, whose `PROJECT_ROOT` is the worktree
+  because it has no `_assets/src` -- so it loads `build/lib/`, which is what
+  `build_runtimes` writes. The installed copy is read only when `simpler_setup`
+  comes from site-packages, and `build_runtimes` does **not** refresh it, so it
+  goes stale silently. Check with
+  `python -c "import simpler_setup.environment as e; print(e.PROJECT_ROOT)"` from
+  the directory you launch in.
 
 PTO-ISA comes from the repo's `pto_isa.pin`. Do not export `PTO_ISA_ROOT` — it is
 resolved from the pin, and an ambient path that has drifted off it is now
@@ -200,8 +206,8 @@ These are not style preferences; each one was learned from a wrong number.
   not measurable on PA's M2 arm at all; use qwen, whose arms hold to 0.55 %.
 - **To A/B a code change, build both binaries first and swap the `.so` between
   runs** inside a single submission, rather than rebuilding between submissions.
-  Copy it to **both** load locations — `build/lib/...` and the installed
-  `.venv/.../simpler_setup/_assets/build/lib/...`.
+  Copy it to the location your launch directory resolves to (above) -- and to
+  both, if anything in the submission might run from elsewhere.
 - **Instrumentation is not free.** Adding the overrun and poll-cost counters to
   `[GQ_WORK]` cost ~1.3 % of `device_wall`, so an instrumented build is its own
   baseline and must not be compared against an uninstrumented one.

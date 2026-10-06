@@ -65,8 +65,8 @@ The short version, for reading the deltas below:
 
 | case | M0 error vs silicon | M2 vs M0 | M2 vs silicon |
 | ---- | ------------------- | -------- | ------------- |
-| paged_attention Case1 | +5.0 % (M0 slow) | -55.1 % | **-52.9 %** |
-| qwen3-14B decode, 40L | -4.1 % (M0 fast) | -28.1 % | **-31.1 %** |
+| paged_attention Case1 | +5.2 % (M0 slow) | -57.7 % | **-55.5 %** |
+| qwen3-14B decode, 40L | -4.3 % (M0 fast) | -28.3 % | **-31.3 %** |
 
 **The error changes sign between the cases, so it does not cancel in a delta.**
 Every GroupQueue figure in this document is quoted against M0; the last column is
@@ -93,8 +93,8 @@ and -52.0 %.
 
 **These are gains against M0, and M0's own error against silicon changes sign
 between the two cases** -- see [validation/fidelity.md](validation/fidelity.md).
-Corrected to hardware, paged_attention's gain shrinks (to -52.9 %) and qwen's
-grows (to -31.1 %), so neither figure here transfers to a real device unchanged
+Corrected to hardware, paged_attention's gain shrinks (to -55.5 %) and qwen's
+grows (to -31.3 %), so neither figure here transfers to a real device unchanged
 and they do not move together.
 
 **The gain is not the cost of transport.** Give M0 a zero-latency connection to

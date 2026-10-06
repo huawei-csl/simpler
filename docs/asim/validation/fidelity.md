@@ -46,15 +46,21 @@ paged_attention ran 4 reps of 14 rounds, qwen 3; the first two rounds of every
 run are dropped, giving 48 and 36 samples per arm. qwen is the in-repo expanded
 orchestration (11,087 tasks), which the simulated arms require -- the shipped one
 submits each layer as a Graph that a GroupQueue controller has no Graph Execution
-to expand.
+to expand. M2 includes `6244769b` (the controller offers both of a package's
+vector cores).
 
 | case | base (silicon) | sim (M0) | simgc (M2) | M0 error | M2 vs M0 | M2 vs silicon |
 | ---- | -------------- | -------- | ---------- | -------- | -------- | ------------- |
-| paged_attention Case1 | 21.189 ms | 22.254 ms | 9.985 ms | **+5.0 %** | -55.1 % | **-52.9 %** |
-| qwen3-14B decode, 40L | 34.530 ms | 33.109 ms | 23.792 ms | **-4.1 %** | -28.1 % | **-31.1 %** |
+| paged_attention Case1 | 21.173 ms | 22.282 ms | 9.430 ms | **+5.2 %** | -57.7 % | **-55.5 %** |
+| qwen3-14B decode, 40L | 34.632 ms | 33.147 ms | 23.779 ms | **-4.3 %** | -28.3 % | **-31.3 %** |
+
+**The M0 error replicates.** An earlier session, before `6244769b`, read +5.0 %
+and -4.1 % -- within 0.2 points of these. paged_attention's M2-vs-M0 figure here
+(-57.7 %) sits inside its arm's 14.9 % spread of the pooled -56.1 % in
+[validation.md](../validation.md), so it is not a different result.
 
 **The error changes sign between the cases, so it is not a bias that cancels.**
-aSim's M0 runs 5 % slow on paged_attention and 4 % fast on qwen. Mixed signs are
+aSim's M0 runs 5.2 % slow on paged_attention and 4.3 % fast on qwen. Mixed signs are
 the good case -- a uniform bias is the signature of a term the model is missing
 -- but the magnitude is an order of magnitude above the ±0.5 % the
 `scan_and_claim` gate above recorded, and because it differs per case it does
@@ -70,24 +76,25 @@ On paged_attention the error is **in the scheduling window, not in fixed cost**:
 
 | | base | sim (M0) | error |
 | - | ---- | -------- | ----- |
-| `device_wall` | 21.189 ms | 22.254 ms | +5.0 % |
-| scheduling window | 18.079 ms | 19.054 ms | +5.4 % |
-| remainder | 3.110 ms | 3.200 ms | +2.9 % |
+| `device_wall` | 21.173 ms | 22.282 ms | +5.2 % |
+| scheduling window | 18.098 ms | 19.081 ms | +5.4 % |
+| remainder | 3.075 ms | 3.201 ms | +4.1 % |
 
-The remainder -- everything `device_wall` holds that the window does not --
-agrees to 2.9 %, which is where it should be, since aSim reproduces that part by
+The remainder -- everything `device_wall` holds that the window does not -- is
+0.13 ms apart in absolute terms, against 0.98 ms in the window, which is where it
+should be, since aSim reproduces that part by
 running the same code. So the discrepancy is the device model, not the harness
 around it.
 
 Three cautions:
 
 - **The M2 arm's window is not comparable and is left out.** Its `sched_cost`
-  reads 14.97 ms against a 9.99 ms `device_wall` -- larger than the wall that
+  read 14.97 ms against a 9.99 ms `device_wall` -- larger than the wall that
   contains it, so the two runtimes do not mean the same thing by that marker.
   Only `device_wall` is quoted for M2 until that is understood.
-- **qwen's -28.1 % is softer than the -32.6 % recorded for this same expanded
+- **qwen's -28.3 % is softer than the -32.6 % recorded for this same expanded
   path** in [What the GroupQueue is worth](../validation.md#what-the-groupqueue-is-worth-2026-09-21).
-  The gap is 4.5 points against 0.7 % run-to-run noise, so it is real. The
+  The gap is 4.3 points against 0.8 % run-to-run noise, so it is real. The
   bitmap look-ahead is independently recorded as costing qwen 3.2 %, which would
   put the expected figure near -29.8 % -- close, but this has not been isolated
   on this build, so treat it as the likely cause rather than the established one.
@@ -98,8 +105,8 @@ Work equivalence holds on both cases -- compute issued, M0 against M2:
 
 | case | M0 | M2 | delta | completed |
 | ---- | -- | -- | ----- | --------- |
-| paged_attention Case1 | 91.133 ms | 91.055 ms | -0.086 % | 65,792 / 65,792 |
-| qwen3-14B decode, 40L | 746.567 ms | 746.517 ms | -0.007 % | 11,087 / 11,087 |
+| paged_attention Case1 | 91.132 ms | 91.072 ms | -0.065 % | 65,792 / 65,792 |
+| qwen3-14B decode, 40L | 746.582 ms | 746.324 ms | -0.034 % | 11,087 / 11,087 |
 
 ## Residuals and known blind spots
 
