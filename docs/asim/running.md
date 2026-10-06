@@ -30,6 +30,25 @@ A platform variant builds its own runtime only, so the two are independent: a
 change to `src/a2a3/platform/asimgq/` or `src/a2a3/runtime/group_queue/` needs
 only the second.
 
+Three things about this build that cost time to rediscover:
+
+- **`pip install .` does not build the simulated-device variants.** They are not
+  auto-detected, so the two commands above are the only way they appear under
+  `build/lib/`. A stale variant is silent: the run loads whatever `.so` is there.
+- **Build in one environment and stay in it.** If the repo is shared between a
+  host and a container (a bind mount), building in both leaves files owned by
+  different users and the next rebuild fails on permissions. Pick the one that
+  carries the CANN toolchain and do every build, install and run there.
+- **A built `.so` has to reach both load locations** to take effect:
+  `build/lib/{arch}/{variant}/{runtime}/` and the installed copy under
+  `.venv/.../simpler_setup/_assets/build/lib/...`. `build_runtimes` writes both;
+  hand-swapping a binary for an A/B must do the same, or the run silently uses
+  the other one.
+
+PTO-ISA comes from the repo's `pto_isa.pin`. Do not export `PTO_ISA_ROOT` — it is
+resolved from the pin, and an ambient path that has drifted off it is now
+rejected rather than silently used.
+
 ## Case 1 — paged_attention Case1
 
 65,792 tasks in 256 disjoint components. Both arms run the **same graph**; the
