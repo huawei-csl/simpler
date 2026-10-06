@@ -24,6 +24,7 @@ Living document — update on every design refinement and every measured result.
 | [calibration.md](calibration.md) | Every injected number, its provenance, and which are measured vs fitted |
 | [validation.md](validation.md) | Method, case selection, the measured GroupQueue deltas, and which M2 campaign is which |
 | [validation/fidelity.md](validation/fidelity.md) | How close the simulated device is to silicon, per baseline, and the residual blind spots |
+| [validation/transport-ablation.md](validation/transport-ablation.md) | **Why the GroupQueue wins even against a zero-latency AICPU-to-AICore connection** -- the central argument, with the ablation behind it |
 | [validation/m2-scheduling-window.md](validation/m2-scheduling-window.md) | M2 against `scan_and_claim`, gated on the scheduling window (2026-09-04) |
 | [validation/m2-group-queue.md](validation/m2-group-queue.md) | M2 with the task-grouping contract, gated on `device_wall` (2026-09-14) |
 | [log.md](log.md) | Dated design log |

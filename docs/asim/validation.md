@@ -97,6 +97,13 @@ Corrected to hardware, paged_attention's gain shrinks (to -52.9 %) and qwen's
 grows (to -31.1 %), so neither figure here transfers to a real device unchanged
 and they do not move together.
 
+**The gain is not the cost of transport.** Give M0 a zero-latency connection to
+the AICores -- free send, free status read, instant completion notice -- and it
+still loses to an unmodified M2 by 2.0x on paged_attention and 1.4x on qwen; free
+transport closes 27 % and 2 % of the gap. The advantage is that readiness,
+completion and placement leave the AICPU's critical path. The ablation and the
+mechanism are in [validation/transport-ablation.md](validation/transport-ablation.md).
+
 The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
 independently measures -32.6 %, so the qwen figure reproduces across two
 codegen paths.

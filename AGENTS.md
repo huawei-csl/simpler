@@ -28,14 +28,21 @@ Read in this order:
 
 1. [docs/asim/validation.md](docs/asim/validation.md) — what it is worth, what
    the numbers do and do not license, and the audit that rules out a simulation
-   artefact. **Start here.** The headline is paged_attention Case1 −55.4 % and
-   qwen3-14B 40-layer decode −33.2 %, and the audit explains why those are lower
-   bounds.
-2. [docs/asim/device-model.md](docs/asim/device-model.md) §5 — the structure
+   artefact. **Start here.** The headline is paged_attention Case1 −56.1 % and
+   qwen3-14B 40-layer decode −33.2 % against the simulated baseline, and the
+   audit explains why those are lower bounds;
+   [validation/fidelity.md](docs/asim/validation/fidelity.md) gives what they
+   become against real silicon.
+2. [docs/asim/validation/transport-ablation.md](docs/asim/validation/transport-ablation.md)
+   — **the central argument of the proposal**: why the GroupQueue still wins
+   when the AICPU scheduler is given a zero-latency connection to the AICores.
+   Read it before reasoning about where the gain comes from — the obvious guess,
+   cheaper MMIO, is the one it rules out.
+3. [docs/asim/device-model.md](docs/asim/device-model.md) §5 — the structure
    itself: topology, core states, placement, completion, the latency budget.
-3. [docs/asim/running.md](docs/asim/running.md) — how to build and run both
+4. [docs/asim/running.md](docs/asim/running.md) — how to build and run both
    cases, and the measurement discipline the numbers depend on.
-4. [docs/asim/DESIGN.md](docs/asim/DESIGN.md) — why the simulator is built the
+5. [docs/asim/DESIGN.md](docs/asim/DESIGN.md) — why the simulator is built the
    way it is, and what its timing model can and cannot answer.
 
 Four things that will save you a wrong conclusion:
