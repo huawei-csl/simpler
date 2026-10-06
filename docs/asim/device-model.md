@@ -435,32 +435,40 @@ One read of that register retires everything it covers, which is what replaces
 asking each core in turn.
 
 **A finish above the prefix is held as a bit, not an index.** The look-ahead is
-one word in which bit *i* is the completion of `watermark + 1 + i`. The
-watermark's own position is not stored -- it is not complete by definition, or
-the prefix would have passed it -- so the window covers one position more than it
-has bits.
+a window of `SIM_AHEAD_HORIZON` (1024) bits in which bit *i* is the completion of
+`watermark + 1 + i`. The watermark's own position is not stored -- it is not
+complete by definition, or the prefix would have passed it -- so the window
+covers one position more than it has bits.
 
 That representation is chosen for what the advance costs. A list of indices has
 to be searched associatively once per position the prefix crosses, and a run of
 *n* contiguous finishes costs *n* such searches plus a sorted insert on every
-arrival. As bits, the advance is a find-first-zero and a shift:
+arrival. As bits, an arrival is one indexed set and the advance is a walk of
+exactly the run it absorbs:
 
 ```text
 on completion of p:
     p  < watermark   already covered
-    p  > watermark   bits |= 1 << (p - watermark - 1)
-    p == watermark   n = count_trailing_ones(bits) + 1
-                     watermark += n;  bits >>= n
+    p  > watermark   set bit at slot(p - watermark - 1)
+    p == watermark   n = run of set bits from the head, cleared as it passes
+                     watermark += n + 1;  head += n + 1
 ```
 
-The shift and the advance are the same count, because the position the watermark
-lands on is the one the window does not store.
+The window is **circular**: the head moves rather than the contents shifting, so
+widening it past one word costs nothing per advance. Nothing shifts zeros in
+behind the head, so each bit the head crosses is cleared as it goes -- a stale
+one would read as a completion that never happened. The head and the watermark
+move by the same count, one more than the run, the extra step being the position
+the window does not store.
 
-The register carries the watermark and the published window together, so the
-manager's whole read is **one access** however much finished out of order, where
-a list cost one further word per live entry. One access is also what relative
-bits require and absolute indices did not: a bitmap read against a stale
-watermark misreads every position, while a stale index still says what it means.
+The register carries the watermark and the **published** window -- its lowest
+`SIM_AHEAD_PUBLISHED` (32) bits -- together, so the manager's whole read is
+**one access** however much finished out of order, where a list cost one further
+word per live entry. The window spans at most two of the buffer's words, so
+assembling those 32 bits is two reads and a splice rather than a walk, however
+wide the horizon. One access is also what relative bits require and absolute
+indices did not: a bitmap read against a stale watermark misreads every position,
+while a stale index still says what it means.
 
 **The horizon is hard, and the manager is what makes it safe.** A position
 further above the watermark than the window reaches has no bit and could not be
@@ -473,9 +481,12 @@ producers that already hold one, so whatever the watermark waits on is already i
 flight and throttling new submissions cannot starve it. `ahead_overflow` latches
 if the guard is ever wrong, so the case is diagnosable rather than silent.
 
-Measured, the horizon is slack: paged_attention's finishes reach at most 21
-positions above the watermark against a window of 64, and `ahead_overflow` is
-zero.
+Measured, the horizon is slack by a wide margin: paged_attention's finishes reach
+at most 21 positions above the watermark and qwen's 17, against a window of 1024,
+and `ahead_overflow` is zero. The width is set that far past what these two
+graphs need because exceeding it would strand a task rather than slow one, and a
+graph that has never run here is not evidence about its disorder; at one bit each
+it costs 128 bytes per queue.
 
 **Submission order is a throughput concern, not a correctness one.** Submitting
 in roughly the order tasks will finish keeps the prefix moving and positions
@@ -572,7 +583,7 @@ flowchart LR
     AICK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     AIVK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     CTRL -- "update · 80–140 ns<br/><i>across the die into the AICPU package</i>" --> STAT
-    STAT -- "<b>read_queue_status&#40;&#41; · 5 ns</b><br/><b>+ 2 ns per further look-ahead word</b><br/><i>local to the package · reads pipeline</i>" --> MGR
+    STAT -- "<b>read_queue_status&#40;&#41; · 5 ns</b><br/><b>one word, whatever finished out of order</b><br/><i>local to the package</i>" --> MGR
 ```
 
 | Path | ns | Anchor | Who pays |
@@ -586,8 +597,7 @@ flowchart LR
 | controller ↔ AIC/AIV, cancellation | 30 each way | the same controller-to-core message | a core that has gone idle, waiting on the answer |
 | AIC/AIV → controller, FIN | 80 (Case1) / 140 (qwen) raised, + 30 link | the calibrated `notice` is what raising a FIN costs the core; the signal then crosses the same link every other controller-core message takes | nobody — device-internal |
 | controller → status register, update | 80 (Case1) / 140 (qwen) | the calibrated `notice`: the write crosses the die into the AICPU package, so it costs what an AICPU↔AICPU hop costs | nobody — the controller writes it |
-| status register → manager, `read_queue_status()` | **5** | an MMIO-class access to a register in this package, so the manager reads it locally | **the AICPU** — with the next row, the only occupancy on the completion path |
-| status register → manager, each further look-ahead word | **2 each** | the reads pipeline, so a word behind one already in flight costs its issue slot, not another access latency | **the AICPU**; a list of *n* live entries costs 5 + *n* × 2 ns, the extra word being the stale terminator that ends the scan |
+| status register → manager, `read_queue_status()` | **5** | an MMIO-class access to a register in this package, so the manager reads it locally; the watermark and the published look-ahead share one word, so the cost does not grow with how much finished out of order | **the AICPU** — the only occupancy on the completion path |
 
 The watermark and the look-ahead buffer are **not** on the queue's side of the
 die. They sit in the AICPU package, and the controller pays the cross-die cost to
@@ -650,9 +660,8 @@ The completion path is where the structural difference is large.
 costs the manager 195 ns × cores. (195 is the in-situ poll cost, the model's one
 fitted parameter; the raw nGnRE LDR measures 92 ns.) The GroupQueue reads a
 watermark **once** for 5 ns, from a register in its own package, and retires
-everything it covers — plus 2 ns for each further look-ahead word naming a
-position that finished out of order, the reads riding behind the first rather
-than each paying its own access.
+everything it covers, plus whatever the published look-ahead names beside it in
+the same word.
 
 That is why the saving is a collapse in *poll count* rather than a cheaper poll:
 on qwen a manager reads its queue once per ~19 retirements where the per-core

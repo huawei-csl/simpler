@@ -271,9 +271,13 @@ void queue_debug(
 // inside the queue, with the manager uninvolved, and a shift network over 18
 // entries fits well inside the report path already modelled.
 // Positions the look-ahead covers above the watermark, held inside the queue.
-// Twice `SIM_HELD_CAP`, so a queue that honours it cannot be asked to record a
-// position it has no bit for.
-constexpr uint32_t SIM_AHEAD_HORIZON = 64;
+// Far past anything the workloads here reach -- paged_attention's furthest finish
+// is 21 above the watermark -- because the consequence of exceeding it is a
+// stranded task rather than a slow one, and a graph this has never run is not
+// evidence about its disorder. At one bit each it is 128 bytes per queue, still a
+// fifth of what the list of indices it replaced occupied.
+constexpr uint32_t SIM_AHEAD_HORIZON = 1024;
+constexpr uint32_t SIM_AHEAD_WORDS = SIM_AHEAD_HORIZON / 64;
 
 // Of those, how many the status register carries. The register is one 64-bit
 // word -- a 32-bit watermark beside this many bits -- so the manager's whole read

@@ -276,6 +276,12 @@ amounts of work for the same modelled cost:
 | `group_queue`, qwen | ~237 ns | ~64 + 64 per look-ahead word | ~70 % of polls, **2.7 % of the window** |
 | `group_queue`, Case1 | ~1 600 ns | same | nearly every poll, **11 % of the window** |
 
+The modelled column is the cost in force when these shares were measured, when
+the look-ahead was a list of indices the manager read word by word. It is now a
+flat 10 ns: the watermark and the published look-ahead share one word. The work
+per call is unchanged, so both overrun shares are larger than the table says --
+they are read as lower bounds, which is the direction the audit already assumes.
+
 `scan_and_claim` advances one core per read, so its work is O(1) and always fits.
 A GroupQueue poll retires everything that has come due — ~0.3 positions per poll
 on qwen but ~11 on Case1 — so its work scales with retirement density, and 89 % of
