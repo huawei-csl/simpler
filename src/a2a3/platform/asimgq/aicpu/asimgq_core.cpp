@@ -34,7 +34,6 @@ uint64_t g_push_ticks = 0;         // manager's posted write into a queue
 uint64_t g_fin_ticks = 0;          // core finish -> its FIN signal is raised
 uint64_t g_report_ticks = 0;       // that fact -> legible in the manager's register
 uint64_t g_queue_poll_ticks = 0;   // one read of that register
-uint64_t g_ahead_word_ticks = 0;   // one look-ahead word, serially read
 uint64_t g_mix_push_ticks = 0;     // controller's per-entry push of a mix group
 uint64_t g_mix_arrival_ticks = 0;  // controller -> core, per mix entry
 uint64_t g_cancel_ticks = 0;       // controller -> core, one way, for a cancellation
@@ -215,7 +214,6 @@ struct alignas(64) SimQueue {
     // the single value the manager reads instead of polling every core.
     uint64_t watermark = 0;
     uint64_t high_water = 0;
-    uint64_t bits[SIM_QUEUE_WINDOW / 64] = {};
     // Which core the controller placed each position on. The manager does not
     // choose it -- placement is the controller's -- but its per-task bookkeeping
     // is indexed by core, so the choice has to be reported back.
@@ -421,16 +419,21 @@ struct alignas(64) SimQueue {
     uint64_t retire_lag_max = 0;
     uint64_t retire_n = 0;
 
-    // Finished positions the prefix has not yet reached, held ascending. Bounded
-    // at one per core; a position that does not fit simply waits for the
+    // Finished positions the prefix has not yet reached, one bit each over a
+    // window `SIM_AHEAD_HORIZON` wide; a position beyond it waits for the
     // watermark, as everything did before.
-    uint64_t ahead[SIM_LOOKAHEAD] = {};
-    uint32_t ahead_count = 0;
-    // Deepest the list has ever been, and how many finishes found it full and had
-    // to wait for the watermark instead. Together they say whether the buffer's
-    // depth is what bounds out-of-order retirement.
+    // Bit i is the completion of `watermark + 1 + i`, held circularly: the window
+    // rotates rather than shifts, so advancing it is a moved head instead of a
+    // pass over every word. Nothing shifts zeros in behind the head, so a bit the
+    // head passes is cleared as it goes -- a stale one would read as a completion
+    // that never happened.
+    uint64_t ahead_bits[SIM_AHEAD_WORDS] = {};
+    uint32_t ahead_base = 0;  // slot holding `watermark + 1`
+    // Furthest above the watermark a finish has landed, and how many landed past
+    // the window and had to wait for the watermark instead. Together they say
+    // whether the window's width is what bounds out-of-order retirement.
     uint32_t ahead_high_water = 0;
-    uint64_t ahead_dropped = 0;
+    uint64_t ahead_overflow = 0;
 };
 
 SimQueue g_queues[SIM_MAX_QUEUES];
@@ -504,69 +507,48 @@ uint64_t sample_compute_ticks(SimQueue &q, int32_t func_id) {
     return static_cast<uint64_t>(dur);
 }
 
-// Record that `index` finished. Bits are set in completion order; the watermark
-// only ever advances over a contiguous run, so an out-of-order finish waits for
-// its prefix. Held ascending in `ahead`, so the manager reads the list in index
-// order and stops at the first stale entry.
+// Record that `index` finished. A position below the watermark is already
+// covered by the prefix; the watermark's own position advances it; anything
+// above sets its bit.
+//
+// The advance walks the run of completions the prefix now absorbs, clearing each
+// as the head passes it, and moves the head by one more than the run -- the extra
+// step being the watermark's own position, which the window does not store.
 void mark_queue_done(SimQueue &q, uint64_t index) {
-    if (index == UINT64_MAX) {
+    if (index == UINT64_MAX || index < q.watermark) {
         return;
     }
-    const uint64_t slot = index & (SIM_QUEUE_WINDOW - 1);
-    q.bits[slot >> 6] |= (1ULL << (slot & 63));
     if (index > q.watermark) {
-        if (q.ahead_count < SIM_LOOKAHEAD) {
-            uint32_t at = q.ahead_count;
-            while (at > 0 && q.ahead[at - 1] > index) {
-                q.ahead[at] = q.ahead[at - 1];
-                --at;
-            }
-            q.ahead[at] = index;
-            ++q.ahead_count;
-            if (q.ahead_count > q.ahead_high_water) {
-                q.ahead_high_water = q.ahead_count;
-            }
-        } else {
-            ++q.ahead_dropped;
+        const uint64_t off = index - q.watermark - 1;
+        if (off >= SIM_AHEAD_HORIZON) {
+            // Unreachable while the manager honours the horizon when it issues a
+            // position. Latched rather than dropped, so a wrong guard shows up
+            // instead of silently stranding the task.
+            ++q.ahead_overflow;
+            return;
         }
+        const uint32_t slot = (q.ahead_base + static_cast<uint32_t>(off)) & (SIM_AHEAD_HORIZON - 1);
+        q.ahead_bits[slot >> 6] |= (1ULL << (slot & 63));
+        const uint32_t reach = static_cast<uint32_t>(off) + 1;
+        if (reach > q.ahead_high_water) {
+            q.ahead_high_water = reach;
+        }
+        return;
     }
-    const uint64_t before = q.watermark;
-    while (q.watermark < q.high_water) {
-        const uint64_t w = q.watermark & (SIM_QUEUE_WINDOW - 1);
-        if ((q.bits[w >> 6] & (1ULL << (w & 63))) == 0) {
+    uint32_t run = 0;
+    while (run < SIM_AHEAD_HORIZON) {
+        const uint32_t slot = (q.ahead_base + run) & (SIM_AHEAD_HORIZON - 1);
+        const uint64_t bit = 1ULL << (slot & 63);
+        if ((q.ahead_bits[slot >> 6] & bit) == 0) {
             break;
         }
-        q.bits[w >> 6] &= ~(1ULL << (w & 63));
-        ++q.watermark;
+        q.ahead_bits[slot >> 6] &= ~bit;
+        ++run;
     }
-    if (q.watermark == before || q.ahead_count == 0) {
-        // Nothing the prefix newly covers, so nothing to drop. Retirement is dense
-        // on some workloads -- one poll can retire a dozen positions -- and a
-        // compaction pass per retirement is the simulator's own cost, charged to
-        // the window it is supposed to be measuring.
-        return;
-    }
-    // The prefix has covered the low entries; drop them and close the gap, so
-    // ahead[0] is again the first finished position above the watermark. The list
-    // is ascending, so the covered ones are a prefix of it.
-    uint32_t keep = 0;
-    while (keep < q.ahead_count && q.ahead[keep] <= q.watermark) {
-        ++keep;
-    }
-    if (keep == 0) {
-        return;
-    }
-    for (uint32_t i = keep; i < q.ahead_count; ++i) {
-        q.ahead[i - keep] = q.ahead[i];
-    }
-    q.ahead_count -= keep;
-    for (uint32_t i = q.ahead_count; i < q.ahead_count + keep; ++i) {
-        q.ahead[i] = 0;
-    }
+    q.watermark += run + 1;
+    q.ahead_base = (q.ahead_base + run + 1) & (SIM_AHEAD_HORIZON - 1);
 }
 
-// Recompute one package's wholly-free bit. A cohort member needs a package whose
-// three cores are all free, and the manager reads how many there are on every
 // status poll, so the count is maintained rather than swept for.
 void update_package_free(SimQueue &q, uint32_t pi) {
     const SimPackage &p = q.packages[pi];
@@ -1036,13 +1018,15 @@ bool enqueue_entry(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
 }
 
 // Whether a position this queue was given has finished. The watermark covers the
-// contiguous prefix; `bits` carries the finishes above it and is cleared only as
-// the watermark absorbs them, so the two together are exact however far out of
-// order this queue retires.
+// contiguous prefix and the look-ahead word carries the finishes above it, so the
+// two together are exact across the whole horizon.
 bool position_done(const SimQueue &q, uint64_t index) {
     if (index == UINT64_MAX || index < q.watermark) return true;
-    const uint64_t slot = index & (SIM_QUEUE_WINDOW - 1);
-    return (q.bits[slot >> 6] & (1ULL << (slot & 63))) != 0;
+    if (index == q.watermark) return false;
+    const uint64_t off = index - q.watermark - 1;
+    if (off >= SIM_AHEAD_HORIZON) return false;
+    const uint32_t slot = (q.ahead_base + static_cast<uint32_t>(off)) & (SIM_AHEAD_HORIZON - 1);
+    return (q.ahead_bits[slot >> 6] & (1ULL << (slot & 63))) != 0;
 }
 
 // Drop the producers that have finished and say whether any remain. The test is
@@ -1246,7 +1230,6 @@ void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint6
 void set_queue_latencies_ns(uint64_t report_ns, uint64_t poll_ns) {
     g_report_ticks = ns_to_ticks(report_ns);
     g_queue_poll_ticks = ns_to_ticks(poll_ns);
-    g_ahead_word_ticks = ns_to_ticks(SIM_AHEAD_WORD_NS);
     g_mix_push_ticks = ns_to_ticks(SIM_MIX_PUSH_NS);
     g_mix_arrival_ticks = ns_to_ticks(SIM_GQ_CORE_LINK_NS);
     g_cancel_ticks = ns_to_ticks(SIM_GQ_CORE_LINK_NS);
@@ -1578,19 +1561,23 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
         const uint32_t resident = 2 * slots[r] > open2 ? 2 * slots[r] - open2 : 0;
         st.load[r] = resident + (q.push[r] - q.pop[r]);
     }
-    for (uint32_t i = 0; i < SIM_LOOKAHEAD; ++i) {
-        st.ahead[i] = q.ahead[i];
+    // The published window spans at most two words of the rotating buffer, so it
+    // is two reads and a splice rather than a walk.
+    {
+        const uint32_t wi = q.ahead_base >> 6;
+        const uint32_t sh = q.ahead_base & 63;
+        uint64_t win = q.ahead_bits[wi] >> sh;
+        if (sh != 0) {
+            win |= q.ahead_bits[(wi + 1) & (SIM_AHEAD_WORDS - 1)] << (64 - sh);
+        }
+        st.ahead_bits = static_cast<uint32_t>(win & ((1ULL << SIM_AHEAD_PUBLISHED) - 1));
     }
 #if ASIMGQ_SELF_PROFILE
     q.poll_status_ticks += get_sys_cnt_aicpu() - t_status0;
 #endif
-    // The watermark read and the live look-ahead entries behind it. The accesses
-    // pipeline, so the poll latency above covers the first and each further word
-    // adds only its issue cost -- a full list of 18 costs 5 + 17 x 2 ns, not the
-    // 18 serial accesses that once made this read dearer than the MMIO core poll
-    // the GroupQueue exists to replace.
-    const uint32_t words = q.ahead_count < SIM_LOOKAHEAD ? q.ahead_count + 1 : SIM_LOOKAHEAD;
-    deadline += (words > 1 ? words - 1 : 0) * g_ahead_word_ticks;
+    // The status read is one access: the watermark and the published look-ahead
+    // share a register, where a list of indices took one further word per live
+    // entry. The poll latency above is the whole of it.
     record_poll_work(q, entered_at);
     {
         const uint64_t now = get_sys_cnt_aicpu();
@@ -1747,14 +1734,14 @@ void queue_retire_lag(uint32_t queue_idx, uint64_t *mean_ns, uint64_t *max_ns, u
     *max_ns = q.retire_lag_max * 1000000000ULL / hz;
 }
 
-void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *dropped) {
+void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *overflow) {
     if (queue_idx >= SIM_MAX_QUEUES) {
         *high_water = 0;
-        *dropped = 0;
+        *overflow = 0;
         return;
     }
     *high_water = g_queues[queue_idx].ahead_high_water;
-    *dropped = g_queues[queue_idx].ahead_dropped;
+    *overflow = g_queues[queue_idx].ahead_overflow;
 }
 
 uint64_t queue_self_overrun_ticks(uint32_t queue_idx) {

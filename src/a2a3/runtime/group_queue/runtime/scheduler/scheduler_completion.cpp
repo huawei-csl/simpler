@@ -295,9 +295,8 @@ void SchedulerContext::check_running_cores_for_completion(
         GqIndexSpace &space = gq_index_[thread_idx];
         const asimgq::SimQueueStatus st = asimgq::read_queue_status(static_cast<uint32_t>(thread_idx));
         space.advance_watermark(st.watermark);
-        for (uint32_t a = 0; a < asimgq::SIM_LOOKAHEAD; ++a) {
-            if (st.ahead[a] <= st.watermark) break;  // stale entry ends the list
-            space.note_early(st.ahead[a]);
+        for (uint64_t rest = st.ahead_bits; rest != 0; rest &= rest - 1) {
+            space.note_early(st.watermark + 1 + static_cast<uint64_t>(__builtin_ctzll(rest)));
         }
         uint64_t pos = 0;
         while (space.next_retired(&pos)) {

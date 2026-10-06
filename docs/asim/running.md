@@ -30,6 +30,25 @@ A platform variant builds its own runtime only, so the two are independent: a
 change to `src/a2a3/platform/asimgq/` or `src/a2a3/runtime/group_queue/` needs
 only the second.
 
+Three things about this build that cost time to rediscover:
+
+- **`pip install .` does not build the simulated-device variants.** They are not
+  auto-detected, so the two commands above are the only way they appear under
+  `build/lib/`. A stale variant is silent: the run loads whatever `.so` is there.
+- **Build in one environment and stay in it.** If the repo is shared between a
+  host and a container (a bind mount), building in both leaves files owned by
+  different users and the next rebuild fails on permissions. Pick the one that
+  carries the CANN toolchain and do every build, install and run there.
+- **A built `.so` has to reach both load locations** to take effect:
+  `build/lib/{arch}/{variant}/{runtime}/` and the installed copy under
+  `.venv/.../simpler_setup/_assets/build/lib/...`. `build_runtimes` writes both;
+  hand-swapping a binary for an A/B must do the same, or the run silently uses
+  the other one.
+
+PTO-ISA comes from the repo's `pto_isa.pin`. Do not export `PTO_ISA_ROOT` — it is
+resolved from the pin, and an ambient path that has drifted off it is now
+rejected rather than silently used.
+
 ## Case 1 — paged_attention Case1
 
 65,792 tasks in 256 disjoint components. Both arms run the **same graph**; the
@@ -141,9 +160,23 @@ the in-repo expanded orchestration, since the pypto path emits no counters.
 
 These are not style preferences; each one was learned from a wrong number.
 
-- **Run both arms back to back inside one `task-submit`.** Three consecutive
-  runs of one binary agree to 0.55 %, but the same build an hour later differs by
-  ~3 %. A cross-submission A/B cannot resolve anything below that.
+- **Run both arms back to back inside one `task-submit`**, and **repeat the
+  pair** -- a single pair resolves much less than it looks like it does. The two
+  cases are not alike here, and the difference is large:
+
+  | case | arm | repeatability |
+  | ---- | --- | ------------- |
+  | qwen-40L | both | 0.55 % over three consecutive runs |
+  | PA Case1 | M0 (`a2a3asim`) | 0.7 % over eight reps |
+  | PA Case1 | **M2 (`a2a3asimgq`)** | **13.7 % over eight reps** |
+
+  PA's GroupQueue arm drifts upward across successive runs inside one
+  submission, so interleaving does not fully cancel it. Two four-rep interleaved
+  measurements of the same change read -57.7 % and -54.0 %; pooled over all
+  eight they give -56.1 %. **Quote PA from a pooled median of several
+  interleaved reps, never from one pair** -- an earlier single-pair -55.4 % was
+  reported to a tenth of a point it never had. A change worth less than ~5 % is
+  not measurable on PA's M2 arm at all; use qwen, whose arms hold to 0.55 %.
 - **To A/B a code change, build both binaries first and swap the `.so` between
   runs** inside a single submission, rather than rebuilding between submissions.
   Copy it to **both** load locations — `build/lib/...` and the installed

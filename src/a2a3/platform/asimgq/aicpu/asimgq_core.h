@@ -265,12 +265,21 @@ void queue_debug(
 // a cohort, and they ride the same read because they are the same register file.
 // Carrying them here is what keeps cohort assembly from costing a manager any
 // access it was not already making.
-// Positions a queue can report as finished ahead of its prefix. One per core it
-// serves: that is how many tasks can be in flight on its cores at once, so a
-// deeper buffer would hold entries no core could have produced. The buffer lives
-// in the AICPU package alongside the watermark; the controller writes both from
-// across the die.
-constexpr uint32_t SIM_LOOKAHEAD = 18;
+// Positions a queue can report as finished ahead of its prefix, held as one bit
+// each: bit i is the completion of `watermark + 1 + i`. The watermark's own
+// position is not stored -- it is not complete by definition, or the prefix would
+// already have passed it -- so the window covers one position more than it has
+// bits.
+//
+// A bit vector rather than a list of indices because the prefix advance is then a
+// find-first-zero and a shift, both single-cycle, where a list has to be searched
+// associatively once per position the prefix crosses. It also makes the whole
+// record one word to read instead of one word per live entry.
+//
+// The horizon is hard: a position past `watermark + SIM_AHEAD_HORIZON` has no bit
+// and could not be recorded. `GqIndexSpace` refuses to issue one, so the case is
+// unreachable rather than merely unlikely -- see `ahead_overflow`, which latches
+// if that guard is ever wrong.
 
 // What one word of the look-ahead list costs the manager to read. The watermark
 // and this buffer sit inside the AICPU package -- the controller updates them from
@@ -282,9 +291,26 @@ constexpr uint32_t SIM_LOOKAHEAD = 18;
 // The queue's own sorted insert is not charged: it happens when a core finishes,
 // inside the queue, with the manager uninvolved, and a shift network over 18
 // entries fits well inside the report path already modelled.
-// One further look-ahead word. Each 64-bit read is its own access and costs the
-// same as the first, so a scan of N words costs N times this.
-constexpr uint64_t SIM_AHEAD_WORD_NS = 10;
+// Positions the look-ahead covers above the watermark, held inside the queue.
+// Far past anything the workloads here reach -- paged_attention's furthest finish
+// is 21 above the watermark -- because the consequence of exceeding it is a
+// stranded task rather than a slow one, and a graph this has never run is not
+// evidence about its disorder. At one bit each it is 128 bytes per queue, still a
+// fifth of what the list of indices it replaced occupied.
+constexpr uint32_t SIM_AHEAD_HORIZON = 1024;
+constexpr uint32_t SIM_AHEAD_WORDS = SIM_AHEAD_HORIZON / 64;
+
+// Of those, how many the status register carries. The register is one 64-bit
+// word -- a 32-bit watermark beside this many bits -- so the manager's whole read
+// is a single access however much finished out of order, where a list of indices
+// cost one access per live entry. Positions above this window are reported on a
+// later poll, once the watermark has moved under them; the same was true of the
+// list, which carried its lowest entries first.
+//
+// One word also makes the read atomic, which relative bits require and absolute
+// indices did not: a bitmap read against a stale watermark misreads every
+// position, where a stale index still says what it means.
+constexpr uint32_t SIM_AHEAD_PUBLISHED = 32;
 
 struct SimQueueStatus {
     uint64_t watermark;       // contiguous completed prefix
@@ -301,7 +327,7 @@ struct SimQueueStatus {
     // Without these a task that finishes out of order cannot retire until
     // everything before it has, so it cannot release its consumers either: one
     // long task holds up every shorter one behind it.
-    uint64_t ahead[SIM_LOOKAHEAD];
+    uint32_t ahead_bits;
     // Entries each ring can still take, indexed by SimTaskType. A manager sizes
     // its pop from the shared ready queues by this, so it never claims work its
     // group has nowhere to put. Only the owning manager fills a ring, so a reading
@@ -465,10 +491,11 @@ uint64_t queue_finish_ts(uint32_t queue_idx, uint64_t index);
 // core going idle and the manager being able to do anything about it.
 void queue_retire_lag(uint32_t queue_idx, uint64_t *mean_ns, uint64_t *max_ns, uint64_t *n);
 
-// How deep the look-ahead list has ever been, and how many finishes found it full
-// and fell back to waiting for the watermark. A non-zero drop count means the
-// buffer's depth, not the ordering, is what bounds out-of-order retirement.
-void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *dropped);
+// The furthest above the watermark any finish has landed, and how many fell
+// outside the horizon entirely. The first says how much of the window the
+// workload's completion disorder actually uses; the second must stay zero, since
+// a position past the horizon cannot be recorded at all.
+void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *overflow);
 
 void queue_stall_stats(
     uint32_t queue_idx, uint64_t *polls, uint64_t *stalled, uint64_t *stall_idle_cores, uint64_t *stall_mix_head,

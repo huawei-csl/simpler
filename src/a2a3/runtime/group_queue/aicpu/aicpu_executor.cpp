@@ -171,11 +171,11 @@ void asim_bringup(Runtime *runtime, int32_t nthreads) {
     asimgq::set_compute_ns_table(
         runtime->asim_compute_ns_, runtime->asim_compute_sigma_ns_, RUNTIME_MAX_FUNC_ID, /*default*/ 1000
     );
-        // What a manager pays to read its own queue: the watermark and look-ahead
+    // What a manager pays to read its own queue: the watermark and look-ahead
     // buffer live in its package, so the read is local. The controller pays the
     // cross-die cost of updating them, which is the calibrated `notice`.
-    // The manager's read of the watermark is an MMIO-class access: one latency,
-    // and further words of the look-ahead list ride behind it.
+    // The read is one MMIO-class access, the watermark and the published
+    // look-ahead sharing a single word.
     asimgq::set_queue_latencies_ns(/*report_ns=*/notice_ns, /*poll_ns=*/10);
     // Core lanes are channel-numbered after the AICPU thread lanes, matching the
     // order StoreTracrMetaData writes channel_names in.
