@@ -28,7 +28,18 @@ void *MemoryAllocator::alloc(size_t size) {
     void *ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
     if (rc != 0) {
-        LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
+        // What this allocator already holds, which is what decides whether a
+        // refusal means the request was too large or the run had already taken
+        // the card. Without it the two are indistinguishable from the log.
+        size_t held = 0;
+        {
+            std::scoped_lock<std::mutex> lk(mu_);
+            held = committed_bytes_;
+        }
+        LOG_ERROR(
+            "rtMalloc failed: %d (size=%zu, already committed by this allocator=%zu, would total=%zu)", rc, size,
+            held, held + size
+        );
         ACL_LOG_ERROR_DETAIL(rc);
         return nullptr;
     }
