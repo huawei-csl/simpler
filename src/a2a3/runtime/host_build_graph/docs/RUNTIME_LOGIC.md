@@ -330,6 +330,11 @@ decided. Completion readiness itself remains the boot classifier + wake lists.
   `cluster * 3`, reaching above bit 63 on supported devices.
 - Sync-start cohorts stage locally when possible; wider ownership spans use a
   generation-tagged global drain before launch.
+- A producer that releases a cohort whose early drain a scheduler thread owns
+  leaves the routing to that owner. An owner that backs out before staging routes
+  the cohort as an ordinary ready sync_start task (`route_to_ready_queue`), not
+  through `push_ready_routed`, which would take the released task for a
+  duplicate and drop it.
 - Every lane completion increments `completed_subtasks`. The task completes once
   that count equals `block_num * popcount(active_mask)`.
 - Completion sets the task's flag and reclassifies its wake-list consumers.

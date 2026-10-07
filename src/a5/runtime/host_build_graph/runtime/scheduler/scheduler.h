@@ -584,6 +584,14 @@ struct SchedulerState {
                 return;
             }
         }
+        route_to_ready_queue(slot_state);
+    }
+
+    // Puts a ready task on the one queue its kind and shape select, with no
+    // early-dispatch handling. A caller that has already settled a task's early
+    // dispatch routes through this: push_ready_routed takes a task its release
+    // already turned DISPATCHED for a duplicate, and drops it.
+    void route_to_ready_queue(ChipTaskSlotState *slot_state) {
         bool pushed;
         if (slot_state->task_kind == TaskKind::GRAPH) {
             pushed = graph_ready_queue.push(slot_state);
@@ -1071,7 +1079,10 @@ struct SchedulerState {
             slot_state.to_payload().early_sync_drain_state.exchange(EARLY_SYNC_DRAIN_NONE, std::memory_order_seq_cst);
         if ((previous & EARLY_SYNC_DRAIN_OWNER) == 0) return;
         if ((previous & EARLY_SYNC_DRAIN_READY) != 0) {
-            push_ready_routed(&slot_state);
+            // The producer released while this thread owned the drain and left the
+            // routing to it. Nothing is staged, so the cohort dispatches as an
+            // ordinary ready sync_start task.
+            route_to_ready_queue(&slot_state);
             return;
         }
         if (slot_state.to_payload().early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_STAGING) {

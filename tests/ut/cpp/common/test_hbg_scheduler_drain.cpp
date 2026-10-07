@@ -12,6 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
 #include "scheduler/scheduler_context.h"
 
@@ -86,4 +88,79 @@ TEST(SchedulerDrainTest, FollowerReturnsWhenCoordinatorReopenedAfterAckPublicati
     EXPECT_EQ(SchedulerContextTestPeer::drain_stage_go(context), 0u)
         << "only the coordinator of a live round releases staging";
     EXPECT_EQ(SchedulerContextTestPeer::sync_start_pending(context), 1) << "the late arrival must not reopen the gate";
+}
+
+namespace {
+
+// An empty queue over caller-owned slots, in the state init_data_from_layout and
+// seed_slots leave one in on the device.
+void attach_queue(ChipReadyQueue &queue, std::vector<ChipReadyQueueSlot> &slots) {
+    queue.slots = slots.data();
+    queue.capacity = slots.size();
+    queue.mask = slots.size() - 1;
+    queue.enqueue_pos.store(0, std::memory_order_relaxed);
+    queue.dequeue_pos.store(0, std::memory_order_relaxed);
+    queue.max_occupancy.store(0, std::memory_order_relaxed);
+    queue.seed_slots();
+}
+
+// A whole-device MIX sync_start cohort the host qualified for early dispatch: queued
+// for pre-staging, its producers still running, nothing of it staged anywhere.
+struct EarlySyncCohort {
+    std::unique_ptr<ChipTaskStorage> storage = std::make_unique<ChipTaskStorage>();
+    ChipTaskSlotState &slot = storage->slot;
+
+    EarlySyncCohort() {
+        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1);
+        slot.task_attrs.set_sync_start();
+        slot.ed_flags = ED_FLAG_CANDIDATE;
+        slot.logical_block_num = 24;
+        slot.to_payload().early_dispatch_state.store(EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+    }
+};
+
+struct EarlySyncQueues {
+    SchedulerState sched{};
+    std::vector<ChipReadyQueueSlot> sync_slots = std::vector<ChipReadyQueueSlot>(8);
+    std::vector<ChipReadyQueueSlot> early_slots = std::vector<ChipReadyQueueSlot>(8);
+
+    EarlySyncQueues() {
+        attach_queue(sync_mix(), sync_slots);
+        attach_queue(sched.early_sync_start_queue, early_slots);
+    }
+    ChipReadyQueue &sync_mix() { return sched.ready_sync_queues[static_cast<int32_t>(ResourceShape::MIX)]; }
+};
+
+}  // namespace
+
+// A producer that finishes while a scheduler thread owns its consumer's early sync
+// drain leaves routing to that owner. When the owner then backs out -- another drain
+// holds the gate, or it finds the cohort already released -- the cohort is ready and
+// unstaged, and nothing else will route it: it has to reach the sync ready queue, or
+// it waits forever with every core idle.
+TEST(SchedulerDrainTest, CancelledEarlySyncDrainRoutesAReleasedCohortToTheSyncReadyQueue) {
+    EarlySyncQueues queues;
+    EarlySyncCohort cohort;
+
+    ASSERT_TRUE(SchedulerState::try_claim_early_sync_drain(cohort.slot.to_payload()));
+    queues.sched.push_ready_routed(&cohort.slot);
+    ASSERT_EQ(queues.sync_mix().size(), 0u) << "a release that finds a drain owner leaves routing to it";
+
+    queues.sched.cancel_early_sync_drain(cohort.slot);
+
+    EXPECT_EQ(queues.sync_mix().pop(), &cohort.slot) << "the owner must route the released cohort it gives up";
+    EXPECT_EQ(queues.sched.early_sync_start_queue.size(), 0u) << "a released cohort is no pre-staging candidate";
+}
+
+// Backing out before the producer releases leaves the cohort a pre-staging candidate.
+TEST(SchedulerDrainTest, CancelledEarlySyncDrainRequeuesAnUnreleasedCohortForPreStaging) {
+    EarlySyncQueues queues;
+    EarlySyncCohort cohort;
+
+    ASSERT_TRUE(SchedulerState::try_claim_early_sync_drain(cohort.slot.to_payload()));
+    queues.sched.cancel_early_sync_drain(cohort.slot);
+
+    uint64_t task_id = 0;
+    EXPECT_EQ(queues.sched.early_sync_start_queue.pop_tagged(&task_id), &cohort.slot);
+    EXPECT_EQ(queues.sync_mix().size(), 0u) << "an unreleased cohort is not ready";
 }
