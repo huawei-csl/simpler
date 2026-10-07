@@ -1,19 +1,14 @@
 # M2 campaign — the ready group queue (2026-09-14, qwen sweep re-measured 2026-09-17)
 
-> **Caveat (2026-10-07) — the M2 figures on this page overstate the GroupQueue.**
-> Every M2 `device_wall` here has the simulator's entire self-overrun subtracted
-> (`SIM_WINDOW_CORRECTION` in `src/common/platform/include/aicpu/device_phase_aicpu.h`,
-> on since 2026-09-14), including the part the simulated cores were computing
-> through. On qwen that puts M2 below the physical floor: M0's busiest cube core
-> carries 30.8 ms of work in a 32.0 ms window, so no scheduler can gain more than a
-> few percent there, and the qwen gains quoted here are an artefact. Raw scheduler
-> windows, same session: paged_attention M0 19.11 -> M2 14.25 ms (-25 %); qwen
-> M0 32.00 -> M2 36.83 ms (+15 %). paged_attention's true gain lies between the
-> raw -25 % and the corrected figure until the correction is fixed. M0 figures,
-> including M0's fidelity against silicon, are unaffected.
->
-> This campaign was measured with the correction in place: it landed in the same
-> commit as the GroupQueue device.
+> **Superseded figures (2026-10-07).** Every M2 `device_wall` on this page was
+> measured before the simulator's cores ran on a model clock, when the window
+> correction removed simulator work the cores had computed through. That
+> over-states every M2 gain here, and on qwen it produced gains no schedule can
+> reach: qwen is bound by its cube cores' compute. The page is kept as the record
+> of this campaign's method and of the grouping contract; for what the GroupQueue
+> is worth, use the current measurement in
+> [validation.md](../validation.md#what-the-groupqueue-is-worth) -- paged_attention
+> -48.0 %, qwen +13.0 % against M0.
 
 What the task-grouping contract is worth, measured as **`device_wall`** against an
 M0 of `host_build_graph` + simulated cores (`a2a3asim`). Method and fidelity:

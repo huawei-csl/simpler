@@ -24,28 +24,26 @@ the manager stops choosing which core runs a task and stops polling each core to
 learn it finished. It is measured on an AICPU-hosted simulated device, against
 the unmodified `host_build_graph` scheduler on the same graph.
 
-> **Caveat (2026-10-07):** every published M2 `device_wall` has the simulator's
-> whole self-overrun subtracted, including overrun the simulated cores computed
-> through. The qwen gains are an artefact (M0 is within 4 % of qwen's cube-work
-> floor), and paged_attention's true gain lies between -25 % (raw scheduler
-> window) and the published figure. Each affected page carries the details at
-> its top. Compare raw `sched_start..sched_end` windows, not M2 `device_wall`,
-> until the correction is fixed.
+> **M2 figures dated before 2026-10-07 over-state the GroupQueue** -- the window
+> correction removed simulator work the cores had computed through. The
+> simulated cores now run on a model clock that makes it exact. Current result:
+> paged_attention -48.0 % against M0, qwen +13.0 % (a loss: qwen is bound by its
+> cube cores' compute). Quote only figures dated 2026-10-07 or later.
 
 Read in this order:
 
 1. [docs/asim/validation.md](docs/asim/validation.md) — what it is worth, what
    the numbers do and do not license, and the audit that rules out a simulation
-   artefact. **Start here.** The headline is paged_attention Case1 −56.1 % and
-   qwen3-14B 40-layer decode −33.2 % against the simulated baseline, and the
-   audit explains why those are lower bounds;
-   [validation/fidelity.md](docs/asim/validation/fidelity.md) gives what they
-   become against real silicon.
+   artefact. **Start here.** The headline is paged_attention Case1 −48.0 %
+   against the simulated baseline (−46.7 % against real silicon) and qwen3-14B
+   40-layer decode +13.0 % (+8.3 %);
+   [validation/fidelity.md](docs/asim/validation/fidelity.md) gives the
+   simulated baseline's own error against silicon.
 2. [docs/asim/validation/transport-ablation.md](docs/asim/validation/transport-ablation.md)
-   — **the central argument of the proposal**: why the GroupQueue still wins
-   when the AICPU scheduler is given a zero-latency connection to the AICores.
-   Read it before reasoning about where the gain comes from — the obvious guess,
-   cheaper MMIO, is the one it rules out.
+   — **the central argument of the proposal**: on paged_attention, why the
+   GroupQueue still wins when the AICPU scheduler is given a zero-latency
+   connection to the AICores. Read it before reasoning about where the gain
+   comes from — the obvious guess, cheaper MMIO, is the one it rules out.
 3. [docs/asim/device-model.md](docs/asim/device-model.md) §5 — the structure
    itself: topology, core states, placement, completion, the latency budget.
 4. [docs/asim/running.md](docs/asim/running.md) — how to build and run both
@@ -53,12 +51,15 @@ Read in this order:
 5. [docs/asim/DESIGN.md](docs/asim/DESIGN.md) — why the simulator is built the
    way it is, and what its timing model can and cannot answer.
 
-Four things that will save you a wrong conclusion:
+Five things that will save you a wrong conclusion:
 
 - **Only two cases are in scope** (since 2026-09-21): paged_attention Case1 and
-  qwen3-14B `decode_fwd` at 40 layers. Smaller cases were dropped — they sit
-  below the ~1 ms break-even where the controller's fixed cost dominates, and
-  their regressions are that threshold rather than a defect.
+  qwen3-14B `decode_fwd` at 40 layers. Smaller cases were dropped as too small
+  to matter. The ~1 ms break-even measured for them predates the model clock,
+  which over-stated M2, so the true threshold is higher.
+- **Check every simulated figure against the busiest core's summed compute.**
+  No schedule can finish faster, and a figure below it is a measurement defect,
+  not a result — that check is what exposed the over-correction.
 - **Compare arms back to back inside one `task-submit`.** Consecutive runs agree
   to 0.55 %; the same build an hour later differs by ~3 %.
 - **A skip-golden run proves nothing about correctness** — the simulated device

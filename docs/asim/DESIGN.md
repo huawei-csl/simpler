@@ -24,7 +24,7 @@ Living document — update on every design refinement and every measured result.
 | [calibration.md](calibration.md) | Every injected number, its provenance, and which are measured vs fitted |
 | [validation.md](validation.md) | Method, case selection, the measured GroupQueue deltas, and which M2 campaign is which |
 | [validation/fidelity.md](validation/fidelity.md) | How close the simulated device is to silicon, per baseline, and the residual blind spots |
-| [validation/transport-ablation.md](validation/transport-ablation.md) | **Why the GroupQueue wins even against a zero-latency AICPU-to-AICore connection** -- the central argument, with the ablation behind it |
+| [validation/transport-ablation.md](validation/transport-ablation.md) | **Why the GroupQueue wins on paged_attention even against a zero-latency AICPU-to-AICore connection** -- the central argument, with the ablation behind it |
 | [validation/m2-scheduling-window.md](validation/m2-scheduling-window.md) | M2 against `scan_and_claim`, gated on the scheduling window (2026-09-04) |
 | [validation/m2-group-queue.md](validation/m2-group-queue.md) | M2 with the task-grouping contract, gated on `device_wall` (2026-09-14) |
 | [log.md](log.md) | Dated design log |
@@ -111,8 +111,8 @@ Case1 (65 536 tasks, 4 threads):
 
 1. **Cores are concurrent state machines driven by model-clock deadlines, never
    inline-spun.** On a push, aSim admits the task into core C’s state machine
-   ([device-model.md](device-model.md)) and schedules its **ACK** and **FIN** absolute deadlines on the
-   thread's model clock, then returns immediately. It must **not** spin the
+   ([device-model.md](device-model.md)) and schedules its **ACK** and **FIN**
+   absolute deadlines on the thread's model clock, then returns immediately. It must **not** spin the
    compute duration inline — that would serialize all “compute” onto the
    scheduler thread and destroy the parallelism that sets makespan. A status read
    evaluates the machine against the model clock. N cores thus “run”
@@ -123,10 +123,10 @@ Case1 (65 536 tasks, 4 threads):
    latency (a2a3 real poll ≈ 92 ns `nGnRE`; plus the doorbell-write cost). Spin,
    not sleep — codestyle rule 5 forbids sleeping on the dispatch path, and a
    spin gives ns precision. Work that does not fit inside the latency goes on the
-   thread's ledger rather than into the modelled world. These injected latencies are simultaneously the
-   fidelity mechanism **and** the experiment knob (zero the poll cost → measure
-   the makespan drop from a HW structure that removes it).
-
+   thread's ledger rather than into the modelled world. These injected latencies
+   are simultaneously the fidelity mechanism **and** the experiment knob (zero
+   the poll cost → measure the makespan drop from a HW structure that removes
+   it).
 
 ## 4. Milestones
 

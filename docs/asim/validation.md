@@ -1,24 +1,10 @@
 # aSim validation — method, cases, fidelity, and measured deltas
 
-> **Caveat (2026-10-07) — the M2 figures on this page overstate the GroupQueue.**
-> Every M2 `device_wall` here has the simulator's entire self-overrun subtracted
-> (`SIM_WINDOW_CORRECTION` in `src/common/platform/include/aicpu/device_phase_aicpu.h`,
-> on since 2026-09-14), including the part the simulated cores were computing
-> through. On qwen that puts M2 below the physical floor: M0's busiest cube core
-> carries 30.8 ms of work in a 32.0 ms window, so no scheduler can gain more than a
-> few percent there, and the qwen gains quoted here are an artefact. Raw scheduler
-> windows, same session: paged_attention M0 19.11 -> M2 14.25 ms (-25 %); qwen
-> M0 32.00 -> M2 36.83 ms (+15 %). paged_attention's true gain lies between the
-> raw -25 % and the corrected figure until the correction is fixed. M0 figures,
-> including M0's fidelity against silicon, are unaffected.
->
-> Affected below: the headline table, the summary under *Fidelity against
-> silicon*, and the transport claim. The audit's reading that M2's deltas are
-> *lower* bounds was wrong for the same reason -- the overrun it cited as
-> inflating M2 had already been subtracted.
-
-How M0 is judged, which workloads can judge it, where the model stands, and
-what the GroupQueue is worth against it. Landing page: [DESIGN.md](DESIGN.md).
+> **M2 figures dated before 2026-10-07 over-state the GroupQueue.** Until the
+> simulated cores ran on a model clock ([DESIGN.md](DESIGN.md) §3), the window
+> correction removed simulator work the cores had computed through. Current
+> figures are in [What the GroupQueue is worth](#what-the-groupqueue-is-worth);
+> earlier ones are kept below for their method and marked superseded.
 
 ## The gate is the scheduling window, not `device_wall`
 
@@ -82,8 +68,8 @@ The short version, for reading the deltas below:
 
 | case | M0 error vs silicon | M2 vs M0 | M2 vs silicon |
 | ---- | ------------------- | -------- | ------------- |
-| paged_attention Case1 | +5.2 % (M0 slow) | -57.7 % | **-55.5 %** |
-| qwen3-14B decode, 40L | -4.3 % (M0 fast) | -28.3 % | **-31.3 %** |
+| paged_attention Case1 | +2.5 % (M0 slow) | -48.0 % | **-46.7 %** |
+| qwen3-14B decode, 40L | -4.2 % (M0 fast) | +13.0 % | **+8.3 %** |
 
 **The error changes sign between the cases, so it does not cancel in a delta.**
 Every GroupQueue figure in this document is quoted against M0; the last column is
@@ -94,7 +80,41 @@ An older gate reading ±0.5 % is still cited in places. It was measured with
 `scan_and_claim` as M0, not the `host_build_graph` M0 these campaigns use, and
 does not transfer -- see the subdoc.
 
-## What the GroupQueue is worth (2026-09-21)
+## What the GroupQueue is worth
+
+Measured 2026-10-07 on the model clock, all three arms interleaved inside one
+device lock -- 48 samples per arm on paged_attention, 36 on qwen. qwen is the
+in-repo expanded 40-layer orchestration.
+
+| case | silicon | M0 | M2 | M2 vs M0 | M2 vs silicon |
+| ---- | ------- | -- | -- | -------- | ------------- |
+| paged_attention Case1, 65,792 tasks | 21.249 ms | 21.775 ms | 11.327 ms | **-48.0 %** | **-46.7 %** |
+| qwen3-14B decode, 40 layers | 34.551 ms | 33.116 ms | 37.424 ms | **+13.0 %** | **+8.3 %** |
+
+**paged_attention: the GroupQueue nearly halves the time.** Its cores sit ~90 %
+idle under M0, because the AICPU scheduler cannot feed them faster than ~1.1 us a
+task; the GroupQueue takes readiness, completion and placement off that path.
+
+**qwen: the GroupQueue loses.** qwen is bound by its cube cores' compute: the
+busiest one carries 30.8 ms of work, and M0 finishes within ~4 % of that, so no
+scheduler has more than a few percent to gain. M2 lands 13 % above M0. Why M2
+spends that extra time on a compute-bound graph has not been traced yet.
+
+**The paged_attention gain is not the cost of transport.** Give M0 a zero-latency
+connection to the AICores -- free send, free status read, instant completion
+notice -- and it is still 1.63x the time of an unmodified M2; free transport
+closes 30 % of the gap. The ablation and the mechanism are in
+[validation/transport-ablation.md](validation/transport-ablation.md).
+
+Compute issued agrees between the arms to 0.04 % (paged_attention) and 0.06 %
+(qwen), and every task completes in every run.
+
+### Superseded: the 2026-09-21 campaign
+
+> Measured before the model clock. Every M2 figure in this subsection and the two
+> that follow over-states the GroupQueue -- on qwen, past what its compute allows.
+> They are kept for the method, the graph-shape facts, and the grouping
+> question; do not quote the M2 percentages.
 
 Two cases carry the campaign. Both arms of each pair run back to back in one
 submission on one held card, so the delta is free of the ~3 % session drift.
@@ -107,19 +127,6 @@ and -52.0 %.
 | ---- | -- | -- | ----- |
 | paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.285 ms | 9.776 ms | **-56.1 %** |
 | qwen3-14b `decode_fwd`, 40 layers (pypto-lib) | 28.423 ms | 18.989 ms | **-33.2 %** |
-
-**These are gains against M0, and M0's own error against silicon changes sign
-between the two cases** -- see [validation/fidelity.md](validation/fidelity.md).
-Corrected to hardware, paged_attention's gain shrinks (to -55.5 %) and qwen's
-grows (to -31.3 %), so neither figure here transfers to a real device unchanged
-and they do not move together.
-
-**The gain is not the cost of transport.** Give M0 a zero-latency connection to
-the AICores -- free send, free status read, instant completion notice -- and it
-still loses to an unmodified M2 by 2.0x on paged_attention and 1.4x on qwen; free
-transport closes 27 % and 2 % of the gap. The advantage is that readiness,
-completion and placement leave the AICPU's critical path. The ablation and the
-mechanism are in [validation/transport-ablation.md](validation/transport-ablation.md).
 
 The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
 independently measures -32.6 %, so the qwen figure reproduces across two
@@ -208,6 +215,15 @@ why PA is the one that rewards grouping; it just does not set the sign.
 
 ## Is an M0-vs-M2 delta an artefact? (audit, 2026-09-17)
 
+> **Resolved 2026-10-07.** The audit's conclusion -- that the fix is virtual time
+> rather than a faster simulator -- is what now runs: each simulated device keeps
+> a per-thread ledger of its work beyond the latencies it models and runs that
+> thread's cores on real time less it, so the phase recorder's removal of the
+> same ledger is exact ([DESIGN.md](DESIGN.md) §3). Its reading that M2's deltas
+> were **lower** bounds was wrong: the overrun it describes as inflating M2's
+> window had already been subtracted, cores' compute included, which made the
+> deltas over-statements. The text below is the audit as written.
+
 The M2 wins are large enough that the burden is on the simulator to show it is
 not handing them out. Everything below was checked with the two arms running the
 same graph back to back on one locked card.
@@ -257,14 +273,20 @@ run is its own baseline.
 
 ## The M2 campaigns
 
-What the GroupQueue is worth has been measured twice, against different baselines
-and with different gates. They are kept apart because their figures do not compare:
+What the GroupQueue is worth has been measured three times, against different
+baselines and gates. They are kept apart because their figures do not compare:
 
 | campaign | gate | M0 | headline |
 | -------- | ---- | -- | -------- |
-| [2026-09-04](validation/m2-scheduling-window.md) | scheduling window (`sched_cost=`) | `scan_and_claim` | qwen +4.6 %, paged_attention −11.8 % |
-| [2026-09-14](validation/m2-group-queue.md) | `device_wall` | `host_build_graph` (`a2a3asim`) | paged_attention −55 %, qwen a loss at every group size |
+| [2026-09-04](validation/m2-scheduling-window.md) | scheduling window (`sched_cost=`), raw | `scan_and_claim` | qwen +4.6 %, paged_attention −11.8 % |
+| [2026-09-14](validation/m2-group-queue.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −55 %, qwen a loss at every group size |
+| [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | paged_attention −48.0 %, qwen +13.0 % |
 
-The later one adds the task-grouping contract: the ready queue holds groups rather
-than tasks, and a controller resolves a group's internal edges. It wins where
+The raw window of the first campaign includes the simulator's own work, which
+inflates M2; the second removed that work including the part the cores computed
+through, which over-states M2. The third runs the cores on a model clock so the
+removal is exact, and is the one to quote.
+
+The second and third add the task-grouping contract: the ready queue holds groups
+rather than tasks, and a controller resolves a group's internal edges. It wins where
 groups are independent of each other and loses where they are chained.

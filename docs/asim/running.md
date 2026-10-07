@@ -185,25 +185,22 @@ These are not style preferences; each one was learned from a wrong number.
 
 - **Run both arms back to back inside one `task-submit`**, and **repeat the
   pair** -- a single pair resolves much less than it looks like it does. The two
-  cases are not alike here, and the difference is large:
+  cases are not alike here, and the difference is large (2026-10-07, model
+  clock):
 
   | case | arm | repeatability |
   | ---- | --- | ------------- |
-  | qwen-40L | all three | 0.7 % over three interleaved reps |
-  | PA Case1 | base (`a2a3`) | 1.1 % over four reps |
-  | PA Case1 | M0 (`a2a3asim`) | 0.7 % over eight reps |
-  | PA Case1 | **M2 (`a2a3asimgq`)** | **13.7 % over eight reps** |
+  | qwen-40L | silicon, M0 | 0.7-0.8 % over three interleaved reps |
+  | qwen-40L | M2 (`a2a3asimgq`) | 1.6 % over three reps |
+  | PA Case1 | silicon, M0 | 1.4 % over four reps |
+  | PA Case1 | **M2 (`a2a3asimgq`)** | **6.5 % over four reps** |
 
-  The spread is a property of the arm and the case together, not of the arm:
-  M2 holds to 2.3 % on qwen and to 17.6 % on PA in the same session.
-
-  PA's GroupQueue arm drifts upward across successive runs inside one
-  submission, so interleaving does not fully cancel it. Two four-rep interleaved
-  measurements of the same change read -57.7 % and -54.0 %; pooled over all
-  eight they give -56.1 %. **Quote PA from a pooled median of several
-  interleaved reps, never from one pair** -- an earlier single-pair -55.4 % was
-  reported to a tenth of a point it never had. A change worth less than ~5 % is
-  not measurable on PA's M2 arm at all; use qwen, whose arms hold to 0.55 %.
+  The spread is a property of the arm and the case together, not of the arm.
+  Before the model clock PA's M2 arm spanned 13.7-17.6 %: the simulator's own
+  work, which varies run to run, sat inside its window. Taking it out halved the
+  spread but did not remove it, so **quote PA from a pooled median of several
+  interleaved reps, never from one pair**, and treat a change worth less than
+  ~3 % on PA's M2 arm as unmeasured. qwen's arms hold to under 2 %.
 - **To A/B a code change, build both binaries first and swap the `.so` between
   runs** inside a single submission, rather than rebuilding between submissions.
   Copy it to the location your launch directory resolves to (above) -- and to
@@ -211,14 +208,19 @@ These are not style preferences; each one was learned from a wrong number.
 - **Instrumentation is not free.** Adding the overrun and poll-cost counters to
   `[GQ_WORK]` cost ~1.3 % of `device_wall`, so an instrumented build is its own
   baseline and must not be compared against an uninstrumented one.
-- **Read `[GQ_WORK] poll_overrun_us` before quoting an M2 number.** The
-  simulator overruns the latency it models whenever its own work costs more than
-  the access it stands for. M2's `device_wall` already has that overrun
-  subtracted -- `[SIM_WINCORR] subtracted_ticks=` reports how much per thread --
-  and the subtraction over-corrects wherever the simulated cores were computing
-  through it. Compare the raw `sched_start..sched_end` window across arms, and
-  check any M2 figure against the busiest core's summed compute, which no
-  schedule can beat. See the caveat in [validation.md](validation.md).
+- **`device_wall` excludes the simulator's own work; the raw scheduler window
+  does not.** Each simulated device runs its cores on a per-thread model clock --
+  real time less the thread's ledger of work beyond the latencies it models --
+  and the phase recorder removes the same ledger from `device_wall`, so
+  `device_wall` describes the modelled design ([DESIGN.md](DESIGN.md) §3).
+  `[SIM_WINCORR] subtracted_ticks=` (M2) and `[ASIM_WORK] overrun_us` plus
+  `push_overrun_us` (M0) report the ledger per thread. The
+  `sched_start..sched_end` lines are real time and include it, so compare
+  `device_wall` across arms, never raw windows. Two checks before quoting a
+  simulated number: it must not be below the busiest core's summed compute,
+  which no schedule can beat; and the threads' ledgers must not diverge by more
+  than a few percent of the window, because that divergence is the one residue a
+  per-thread clock cannot remove.
 
 ## Calibration
 
