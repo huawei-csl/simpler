@@ -613,6 +613,10 @@ _RUNTIME_ENV = {
         "ring_dep_pool": 16384,
     },
     "host_build_graph": {},
+    # The group_queue arm runs the same expanded orchestration as the
+    # host_build_graph one, so it takes the same (default) ring sizing. Without an
+    # entry here the arm the test declares dies with KeyError after compiling.
+    "group_queue": {},
 }
 
 
@@ -893,7 +897,9 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-p", "--platform", required=True, choices=["a2a3"])
+    parser.add_argument(
+        "-p", "--platform", required=True, choices=["a2a3", "a2a3asim", "a2a3asimgq"]
+    )
     parser.add_argument("-d", "--device", default="0-1", help="device id, list or range (e.g. 8,9 or 8-9)")
     parser.add_argument("--rounds", type=int, default=1, help="decode steps to run over the same child memory")
     parser.add_argument(

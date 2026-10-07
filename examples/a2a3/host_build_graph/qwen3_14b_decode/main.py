@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -76,14 +77,29 @@ def run(device_ids, platform: str, **kwargs) -> int:
 
 
 def main(argv=None) -> int:
+    """Standalone entry.
+
+    The pytest arms differ in runtime and orchestration, but the harness folds a
+    passing child job's stdout away, so `[STRACE] device_wall` never surfaces
+    there. These env knobs let the CLI reach the same three arms, which is the
+    only way to read a timing off this case. Defaults reproduce the previous
+    behaviour exactly.
+
+      QWEN_RUNTIME=group_queue                 # for the a2a3asimgq arm
+      QWEN_ORCH=expanded [QWEN_LAYERS=16]      # the arm both sim platforms run
+    """
     driver = _load_tmr_driver()
-    return driver.main(
-        argv,
-        case_name=CASE_NAME,
-        runtime=RUNTIME,
-        orchestration_source=ORCHESTRATION_SOURCE,
-        runtime_env={},
-    )
+    overrides: dict = {"runtime": os.environ.get("QWEN_RUNTIME", RUNTIME), "runtime_env": {}}
+    layers = os.environ.get("QWEN_LAYERS")
+    if os.environ.get("QWEN_ORCH", "").lower() in ("expanded", "1", "on", "true"):
+        overrides["orchestration_source"] = (
+            expanded_source_for(int(layers)) if layers else EXPANDED_ORCHESTRATION_SOURCE
+        )
+    else:
+        overrides["orchestration_source"] = ORCHESTRATION_SOURCE
+    if layers:
+        overrides["n_layers"] = int(layers)
+    return driver.main(argv, case_name=CASE_NAME, **overrides)
 
 
 if __name__ == "__main__":

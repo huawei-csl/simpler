@@ -44,6 +44,7 @@ See README.md for the measurements and for the fixes that got the replay running
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -83,8 +84,27 @@ def run(device_ids, platform: str, **kwargs) -> int:
 
 
 def main(argv=None) -> int:
+    """Standalone entry.
+
+    The pytest arms differ in runtime and orchestration, but the harness folds a
+    passing child job's stdout away, so `[STRACE] device_wall` never surfaces
+    there. These env knobs let the CLI reach the simulated arms, which is the
+    only way to read a timing off this case. Defaults are unchanged.
+
+      DS_RUNTIME=group_queue   # the a2a3asimgq arm
+      DS_ORCH=expanded         # the orchestration both simulated arms run
+    """
     driver = _load_tmr_driver()
-    return driver.main(argv, runtime=RUNTIME, orchestration_source=ORCHESTRATION_SOURCE)
+    src = (
+        EXPANDED_ORCHESTRATION_SOURCE
+        if os.environ.get("DS_ORCH", "").lower() in ("expanded", "1", "on", "true")
+        else ORCHESTRATION_SOURCE
+    )
+    return driver.main(
+        argv,
+        runtime=os.environ.get("DS_RUNTIME", RUNTIME),
+        orchestration_source=src,
+    )
 
 
 if __name__ == "__main__":
