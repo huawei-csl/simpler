@@ -75,7 +75,9 @@ uint32_t core_index_for_addr(uint64_t reg_addr);
 // Dispatch: the scheduler wrote `task_id` to core `core_idx`'s DATA_MAIN_BASE.
 // `func_id` is the kernel this task runs — selects its compute duration from the
 // table. Admits the task into the 2-deep pipeline and schedules its deadlines.
-void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id);
+// When chip swimlane is recording, it also writes the swimlane record a real
+// core would write for this task, identified by `task_token_raw`.
+void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw);
 
 // Poll: advance core `core_idx`'s state machine to the current clock and return
 // its COND word (the last ACK/FIN event reached by `now`). Charges the read

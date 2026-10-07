@@ -270,6 +270,9 @@ private:
         // the simulated device is handed it directly, because what it replays is
         // that kernel's calibrated duration.
         int32_t func_id;
+        // The task's identity, which a real AICore copies from the payload into
+        // its swimlane record. The simulated device writes that record itself.
+        uint64_t task_token_raw;
 #endif
     };
 
@@ -294,7 +297,9 @@ private:
         // No AICore reads DATA_MAIN_BASE here: the task is handed to the
         // simulated device, which schedules its completion and publishes the
         // core's COND itself.
-        asim::asim_push(asim::core_index_for_addr(h.reg_addr), static_cast<int32_t>(h.reg_task_id), h.func_id);
+        asim::asim_push(
+            asim::core_index_for_addr(h.reg_addr), static_cast<int32_t>(h.reg_task_id), h.func_id, h.task_token_raw
+        );
 #else
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
 #endif

@@ -12,7 +12,9 @@
 
 #include <vector>
 
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_time.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 
 namespace asim {
@@ -61,6 +63,53 @@ struct alignas(64) SimCore {
 
 std::vector<SimCore> g_cores;
 uint64_t g_reg_base = 0;
+
+// The swimlane record a real core writes per task: start and end from its own
+// clock, and the identity it copied out of the payload. No kernel runs here, so
+// the simulated core writes it, taking the next slot of the buffer the AICPU
+// published for that core -- the same reservation a real core makes, in the same
+// dispatch order, so buffer rotation and host collection are unchanged.
+struct RecordCursor {
+    uint64_t buf = 0;
+    uint32_t seq = UINT32_MAX;  // never a published seq, so the first write loads the head
+    uint32_t slot = 0;
+};
+enum class Recording : uint8_t { Unresolved, Off, On };
+Recording g_recording = Recording::Unresolved;
+const uint64_t *g_record_heads = nullptr;  // core index -> &ChipSwimlaneActiveHead
+std::vector<RecordCursor> g_record_cursor;
+
+void emit_record(
+    uint32_t core_idx, uint64_t token, uint32_t reg_task_id, uint64_t receive, uint64_t start, uint64_t end
+) {
+    if (g_recording == Recording::Unresolved) {
+        // The rotation table is filled by the collector's init, which runs after
+        // this device's init() and before the first dispatch.
+        const uint64_t table = is_chip_swimlane_enabled() ? get_platform_chip_swimlane_aicore_rotation_table() : 0;
+        g_record_heads = reinterpret_cast<const uint64_t *>(table);
+        g_recording = table != 0 ? Recording::On : Recording::Off;
+    }
+    if (g_recording != Recording::On || g_record_heads[core_idx] == 0) {
+        return;
+    }
+    const auto *head = reinterpret_cast<const ChipSwimlaneActiveHead *>(g_record_heads[core_idx]);
+    RecordCursor &cur = g_record_cursor[core_idx];
+    const uint32_t seq = head->current_buf_seq;
+    if (seq != cur.seq) {
+        cur.seq = seq;
+        cur.buf = head->current_buf_ptr;
+        cur.slot = 0;
+    }
+    if (cur.buf == 0 || cur.slot >= PLATFORM_AICORE_BUFFER_SIZE) {
+        return;
+    }
+    ChipSwimlaneAicoreTaskRecord &r = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(cur.buf)->records[cur.slot++];
+    r.start_time = start;
+    r.end_time = end;
+    r.task_token_raw = token;
+    r.reg_task_id = reg_task_id;
+    r.receive_to_start_cycles = static_cast<uint32_t>(start - receive);
+}
 
 // Injected latencies and the M0 compute duration, in the sys-cnt tick domain.
 uint64_t g_push_ticks = 0;
@@ -252,6 +301,8 @@ void set_compute_ns_table(
 }
 
 void init() {
+    g_recording = Recording::Unresolved;
+    g_record_cursor.assign(g_cores.size(), RecordCursor{});
     for (uint32_t i = 0; i < g_cores.size(); ++i) {
         g_cores[i] = SimCore{};
         // Distinct non-zero seed per core; xorshift64 must never start at 0.
@@ -272,7 +323,7 @@ uint32_t core_index_for_addr(uint64_t reg_addr) {
 // few ns of work hide under the ~64/77 ns spin), so the measured makespan
 // reflects only the modeled costs.
 
-void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id) {
+void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw) {
     const uint64_t deadline = get_sys_cnt_aicpu() + g_push_ticks;
     SimCore &c = g_cores[core_idx];
     const uint64_t dur = sample_compute_ticks(c, func_id);
@@ -284,6 +335,9 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id) {
         c.active_ack_at = deadline + g_ack_ticks;
         c.active_fin_at = c.active_ack_at + dur;
         ++c.residency_n;
+        emit_record(
+            core_idx, task_token_raw, static_cast<uint32_t>(task_id), deadline, c.active_ack_at, c.active_fin_at
+        );
     } else {
         // Partially Free -> Fully Busy: the pipelined task is auto-acked only
         // when the active task finishes. (The scheduler never pushes before the
@@ -296,6 +350,12 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id) {
             c.residency_max = sit;
         }
         ++c.residency_n;
+        // advance() promotes it at the active task's finish with no latch of its
+        // own, so that instant is both its receive and its start.
+        emit_record(
+            core_idx, task_token_raw, static_cast<uint32_t>(task_id), c.active_fin_at, c.active_fin_at,
+            c.active_fin_at + dur
+        );
     }
     wait_until(deadline);
 }
