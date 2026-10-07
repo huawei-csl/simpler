@@ -277,6 +277,32 @@ void SchedulerContext::log_stall_diagnostics(
                     " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                 );
+                if (slot_state.task_attrs.requires_sync_start()) {
+                    // A cohort staged only into pending slots is on no core's running slot,
+                    // so it reads as READY above; say where its blocks actually are.
+                    int32_t pending_on = 0;
+                    for (int32_t cid = 0; cid < cores_total_num_; cid++) {
+                        if (core_exec_states_[cid].pending_slot_state == &slot_state) pending_on++;
+                    }
+                    const TaskPayload &pl = slot_state.to_payload();
+                    int32_t staged_cores = 0;
+                    for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                        staged_cores += __builtin_popcountll(pl.staged_core_mask[w].load(std::memory_order_relaxed));
+                    }
+                    LOG_INFO(
+                        "[STALL thread=%d idle_iterations=%d] SYNC task_id=%" PRId64
+                        " ed_flags=0x%x ed_state=%u esd=0x%x launch=%u next_blk=%d published=%d"
+                        " running_slot_count=%d staged_cores=%d pending_on=%d",
+                        thread_idx, idle_iterations, task_id, static_cast<unsigned>(slot_state.ed_flags),
+                        static_cast<unsigned>(pl.early_dispatch_state.load(std::memory_order_relaxed)),
+                        static_cast<unsigned>(pl.early_sync_drain_state.load(std::memory_order_relaxed)),
+                        static_cast<unsigned>(pl.early_dispatch_launch_state.load(std::memory_order_relaxed)),
+                        static_cast<int32_t>(slot_state.next_block_idx.load(std::memory_order_relaxed)),
+                        static_cast<int32_t>(pl.published_block_count.load(std::memory_order_relaxed)),
+                        static_cast<int32_t>(pl.running_slot_count.load(std::memory_order_relaxed)), staged_cores,
+                        pending_on
+                    );
+                }
                 continue;
             }
             cnt_waiting++;
@@ -323,6 +349,55 @@ void SchedulerContext::log_stall_diagnostics(
         LOG_INFO(
             "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
             idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
+        );
+    }
+
+    // Every offset holding a pending-occupied mark. An idle one ("!IDLE") breaks the
+    // tracker's invariant and makes its cluster unplaceable for MIX work.
+    {
+        char occ[512] = {0};
+        int32_t pos = 0;
+        int32_t n_occ = 0;
+        int32_t n_idle_occ = 0;
+        CoreTracker::BitStates p = tracker.debug_pending_occupied();
+        while (p.has_value()) {
+            int32_t off = p.pop_first();
+            int32_t cid = tracker.get_core_id_by_offset(off);
+            bool idle = tracker.debug_is_idle(off);
+            const CoreExecState &ce = core_exec_states_[cid];
+            long long run = ce.running_slot_state ? (long long)ce.running_slot_state->to_descriptor().task_id.raw : -1;
+            long long pend = ce.pending_slot_state ? (long long)ce.pending_slot_state->to_descriptor().task_id.raw : -1;
+            n_occ++;
+            if (idle) n_idle_occ++;
+            if (pos + 64 < static_cast<int32_t>(sizeof(occ))) {
+                int w = snprintf(
+                    occ + pos, sizeof(occ) - pos, " c%d%s(r=%lld p=%lld preg=%d)", cid, idle ? "!IDLE" : "", run, pend,
+                    ce.pending_reg_task_id
+                );
+                if (w > 0) pos += w;
+            }
+        }
+        LOG_INFO(
+            "[STALL thread=%d idle_iterations=%d] PENDING_OCC count=%d idle_with_mark=%d:%s", thread_idx,
+            idle_iterations, n_occ, n_idle_occ, occ
+        );
+    }
+    if (thread_idx == 0) {
+        ChipTaskSlotState *pt = drain_state_.pending_task.load(std::memory_order_relaxed);
+        LOG_INFO(
+            "[STALL thread=%d idle_iterations=%d] DRAIN pending=%d attempt=%llu task=%lld stage_go=%d done_mask=0x%x"
+            " acks=[%llx %llx %llx %llx] rsq_mix=%llu early_sync_q=%llu",
+            thread_idx, idle_iterations, drain_state_.sync_start_pending.load(std::memory_order_relaxed),
+            (unsigned long long)drain_state_.drain_attempt.load(std::memory_order_relaxed),
+            pt ? (long long)pt->to_descriptor().task_id.raw : -1LL,
+            drain_state_.drain_stage_go.load(std::memory_order_relaxed),
+            drain_state_.drain_stage_done_mask.load(std::memory_order_relaxed),
+            (unsigned long long)drain_ack_tokens_[0].load(std::memory_order_relaxed),
+            (unsigned long long)drain_ack_tokens_[1].load(std::memory_order_relaxed),
+            (unsigned long long)drain_ack_tokens_[2].load(std::memory_order_relaxed),
+            (unsigned long long)drain_ack_tokens_[3].load(std::memory_order_relaxed),
+            (unsigned long long)sched_->ready_sync_queues[static_cast<int32_t>(ResourceShape::MIX)].size(),
+            (unsigned long long)sched_->early_sync_start_queue.size()
         );
     }
 }
