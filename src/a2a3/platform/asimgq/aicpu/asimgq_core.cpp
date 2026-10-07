@@ -652,14 +652,21 @@ inline void tracr_core_span(
     }
     const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + gid);
     const uint16_t event = static_cast<uint16_t>(is_mix ? Running_Task_Pair : Running_Task_Single);
-    // Simulated time is cntvct rescaled to PLATFORM_PROF_SYS_CNT_FREQ, and TraCR
-    // timestamps are nanoseconds off that same counter, so the two differ by a
-    // constant factor and share an epoch.
+    // Simulated time is cntvct rescaled to PLATFORM_PROF_SYS_CNT_FREQ. Since the
+    // model clock the queue's instants are real time LESS its accumulated overrun,
+    // while every other marker in this buffer is stamped on the real counter --
+    // so the two no longer share an epoch, and the gap grows through the run (it
+    // reached ~16 ms on qwen). Add the offset back, or the core lanes drift
+    // progressively earlier than the AICPU lanes beside them.
+    const uint32_t qi = static_cast<uint32_t>(&q - g_queues);
+    const uint64_t ofs = qi < SIM_MAX_QUEUES ? g_self_overrun_ticks[qi] : 0;
     tracrThread->store_trace(
-        TraCR::Payload{channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks, PLATFORM_PROF_SYS_CNT_FREQ)}
+        TraCR::Payload{channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)}
     );
     tracrThread->store_trace(
-        TraCR::Payload{channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks, PLATFORM_PROF_SYS_CNT_FREQ)}
+        TraCR::Payload{
+            channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+        }
     );
 }
 #endif
