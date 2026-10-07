@@ -127,8 +127,8 @@ which let a finished task retire before the tasks in front of it. That points at
 the completion path rather than at placement or throughput, and the loop split
 agrees:
 
-| | M0 | M2 |
-| --- | --- | --- |
+| quantity | M0 | M2 |
+| -------- | -- | -- |
 | AICPU work (complete + dispatch) | 18.9 ms | 13.6 ms |
 | idle | 24.5 ms | 34.3 ms |
 | ready → dispatch | 62 µs | 22 µs |
@@ -228,8 +228,8 @@ makespan while the others idle. Bounding each ring to the cores it feeds (one
 queued entry per core, so three tasks per slot: running, pipelined, queued) took
 qwen from 48 737 µs to **46 471 µs**:
 
-| | index window | ring bounded to cores |
-| --- | --- | --- |
+| metric | index window | ring bounded to cores |
+| ------ | ------------ | --------------------- |
 | window | 48 737 µs | **46 471 µs** |
 | ring spread, mean / max | 6–9 / 24 | **2 / 6** |
 | ring wait per task | 34–41 µs | **12 µs** |
@@ -244,8 +244,8 @@ Bounding intake leaves ~4.3 % imbalance, and three attempts to close it by havin
 a manager *withhold* work when a peer had a better place for it all made the
 window worse — each one improving balance and losing more than it gained:
 
-| | window | imbalance | pipeline wait | AIC occupancy |
-| --- | --- | --- | --- | --- |
+| configuration | window | imbalance | pipeline wait | AIC occupancy |
+| ------------- | ------ | --------- | ------------- | ------------- |
 | ring bound only | **46 471 µs** | +4.35 % | **19.5 µs** | **66.2 %** |
 | defer if a peer has a free core | 47 526 µs | +3.10 % | 11.9 µs | 64.7 % |
 | defer if a peer holds less load | 47 953 µs | **+1.76 %** | 10.6 µs | 64.1 % |
@@ -270,8 +270,8 @@ and not the work as a share of the window.
 The two arms overrun very differently, because their device calls do different
 amounts of work for the same modelled cost:
 
-| | work per call | modelled | overruns |
-| --- | --- | --- | --- |
+| arm | work per call | modelled | overruns |
+| --- | ------------- | -------- | -------- |
 | `scan_and_claim` | 15-27 ns | 92-195 ns read | never |
 | `group_queue`, qwen | ~237 ns | ~64 + 64 per look-ahead word | ~70 % of polls, **2.7 % of the window** |
 | `group_queue`, Case1 | ~1 600 ns | same | nearly every poll, **11 % of the window** |
@@ -294,9 +294,10 @@ per-poll work from ~2 000 ns to ~1 600 ns and moved Case1 from +1.7 % to
 −0.5 %..−2.3 %. What remains is structural: closing it means moving retirement off
 the measured thread, not optimising it further.
 
-**Read `[ASIM_OVERRUN]` before quoting any M2 number**, and prefer it to
-`[ASIM_POLL]`: the latter reports total work, which over-states the problem where
-the work fits and says nothing about where it does not.
+**Read the overrun before quoting any M2 number** -- `poll_overrun_us` and
+`push_overrun_us` in `[GQ_WORK]`, printed as `[ASIM_OVERRUN]` when this campaign
+ran -- and prefer it to the total work (`[ASIM_POLL]` then): total work over-states
+the problem where the work fits and says nothing about where it does not.
 
 ## MIX is modelled; sync_start is what qwen needed
 

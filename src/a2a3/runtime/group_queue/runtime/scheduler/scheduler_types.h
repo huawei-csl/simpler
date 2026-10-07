@@ -322,6 +322,9 @@ public:
     // SET on dispatch (both running-first and pending), CLEAR on idle or pending_freed.
 
     void set_pending_occupied(int32_t bit_offset) { pending_occupied_ |= BitStates::bit(bit_offset); }
+    bool is_pending_occupied(int32_t bit_offset) const {
+        return (pending_occupied_ & BitStates::bit(bit_offset)).has_value();
+    }
     void clear_pending_occupied(int32_t bit_offset) {
         pending_occupied_ ^= (pending_occupied_ & BitStates::bit(bit_offset));
     }

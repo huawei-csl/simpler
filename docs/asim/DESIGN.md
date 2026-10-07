@@ -24,6 +24,7 @@ Living document — update on every design refinement and every measured result.
 | [calibration.md](calibration.md) | Every injected number, its provenance, and which are measured vs fitted |
 | [validation.md](validation.md) | Method, case selection, the measured GroupQueue deltas, and which M2 campaign is which |
 | [validation/fidelity.md](validation/fidelity.md) | How close the simulated device is to silicon, per baseline, and the residual blind spots |
+| [validation/transport-ablation.md](validation/transport-ablation.md) | **Why the GroupQueue wins on paged_attention even against a zero-latency AICPU-to-AICore connection** -- the central argument, with the ablation behind it |
 | [validation/m2-scheduling-window.md](validation/m2-scheduling-window.md) | M2 against `scan_and_claim`, gated on the scheduling window (2026-09-04) |
 | [validation/m2-group-queue.md](validation/m2-group-queue.md) | M2 with the task-grouping contract, gated on `device_wall` (2026-09-14) |
 | [log.md](log.md) | Dated design log |
@@ -58,13 +59,29 @@ The device model (§3, §4a) follows the compute-core state machine described in
 ## 3. Timing model — DECIDED: Mode A (real-time fidelity)
 
 aSim behaves as exactly like a real device as possible: it takes the **same
-real wall-clock time** a real device would. The scheduler runs for real on the
-AICPU (its own compute is incurred naturally), and aSim reproduces the device’s
-contribution — compute time and MMIO latencies — in **real time**. Makespan =
-measured real wall-clock (equivalently the scheduler’s own `device_wall`
-marker, which now reflects the emulated timeline).
+time** a real device would. The scheduler runs for real on the AICPU (its own
+compute is incurred naturally), and aSim reproduces the device’s contribution —
+compute time and MMIO latencies — on the scheduler's own timeline. Makespan is
+the scheduler’s `device_wall` marker.
 
-Two clocks still exist but are **fused**: aSim’s time *is* real wall-clock.
+**aSim's time is each scheduler thread's model clock: real time less that
+thread's ledger** — every tick its model has spent beyond the latencies it
+charged. The model runs on the same AICPU thread it serves, and its own work can
+exceed the latency it models: a status read the GroupQueue charges at 10 ns does
+a retirement's worth of bookkeeping. The ledger takes that excess out of the
+modelled world, so the cores stand still while it accrues, and the phase recorder
+removes the same excess from `device_wall`. The removal is exact because the
+cores did not move: subtracting it from a timeline the cores kept running on
+would delete time they spent computing, and on a busy-core case would report
+less than the work they carried.
+
+The clocks are per thread, which makes them exact for everything a thread's own
+cores do. A thread can still be delayed by another thread's excess, through the
+shared state the scheduler threads coordinate on. No counter bounds that residue,
+so it was tested instead: adding 150 or 400 ns of simulator work to every access
+-- which multiplies each thread's ledger, and how far the threads' ledgers drift
+apart -- moved qwen's `device_wall` by at most 1 % and left paged_attention within
+its noise. `[ASIM_WORK]` and `[GQ_WORK]` report each thread's ledger.
 
 ### What Mode A measures — and what it cannot
 
@@ -93,22 +110,24 @@ Case1 (65 536 tasks, 4 threads):
 
 ### Two implementation pillars (fidelity depends on both)
 
-1. **Cores are concurrent state machines driven by `cntvct` deadlines, never
+1. **Cores are concurrent state machines driven by model-clock deadlines, never
    inline-spun.** On a push, aSim admits the task into core C’s state machine
-   ([device-model.md](device-model.md)) and schedules its **ACK** and **FIN** absolute real-time deadlines,
-   then returns immediately. It must **not** spin the compute duration inline —
-   that would serialize all “compute” onto the scheduler thread and destroy the
-   parallelism that sets makespan. A status read evaluates the machine against
-   `cntvct`. N cores thus “run” concurrently in real wall-clock, exactly like
-   silicon; ACK/FIN-notice latency emerges from when the scheduler next polls C.
+   ([device-model.md](device-model.md)) and schedules its **ACK** and **FIN**
+   absolute deadlines on the thread's model clock, then returns immediately. It must **not** spin the
+   compute duration inline — that would serialize all “compute” onto the
+   scheduler thread and destroy the parallelism that sets makespan. A status read
+   evaluates the machine against the model clock. N cores thus “run”
+   concurrently, exactly like silicon; ACK/FIN-notice latency emerges from when
+   the scheduler next polls C.
 2. **Per-op MMIO latency is the inline part — a `cntvct` busy-spin, not a
    sleep.** Each `read_reg`/`write_reg` against aSim busy-spins the calibrated
    latency (a2a3 real poll ≈ 92 ns `nGnRE`; plus the doorbell-write cost). Spin,
    not sleep — codestyle rule 5 forbids sleeping on the dispatch path, and a
-   spin gives ns precision. These injected latencies are simultaneously the
-   fidelity mechanism **and** the experiment knob (zero the poll cost → measure
-   the makespan drop from a HW structure that removes it).
-
+   spin gives ns precision. Work that does not fit inside the latency goes on the
+   thread's ledger rather than into the modelled world. These injected latencies
+   are simultaneously the fidelity mechanism **and** the experiment knob (zero
+   the poll cost → measure the makespan drop from a HW structure that removes
+   it).
 
 ## 4. Milestones
 

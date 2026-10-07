@@ -1,0 +1,167 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1180" viewBox="0 0 1600 1180">
+<defs>
+<marker id="ah-2F5D8A" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2F5D8A"/></marker>
+<marker id="ah-9A3412" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9A3412"/></marker>
+<marker id="ah-3A3F45" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3A3F45"/></marker>
+</defs>
+<rect x="0" y="0" width="1600" height="1180" fill="#FFFFFF"/>
+<text x="60" y="62" font-family="Helvetica, Arial, sans-serif" font-size="30" font-weight="bold" fill="#1F2328" text-anchor="start">M0: what aSim simulates, and the latencies it charges</text>
+<text x="60" y="94" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" fill="#57606A" text-anchor="start">a2a3asim + host_build_graph. Where the two cases differ, values read paged_attention Case1 / qwen3-14B decode.</text>
+<rect x="60" y="140" width="400" height="444" rx="10" fill="#EEF3F9" stroke="#2F5D8A" stroke-width="2"/>
+<text x="80" y="176" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="bold" fill="#2F5D8A" text-anchor="start">AICPU package</text>
+<rect x="392.4" y="128" width="49.6" height="24" rx="12" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="417.2" y="144" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#2F5D8A" text-anchor="middle">REAL</text>
+<text x="80" y="206" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">host_build_graph scheduler: real code,</text>
+<text x="80" y="227" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">running at real AICPU speed</text>
+<rect x="80" y="250" width="175" height="72" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="92" y="276" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">sched thread 0</text>
+<text x="92" y="300" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">6 packages = 18 cores</text>
+<rect x="265" y="250" width="175" height="72" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="277" y="276" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">sched thread 1</text>
+<text x="277" y="300" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">6 packages = 18 cores</text>
+<rect x="80" y="334" width="175" height="72" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="92" y="360" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">sched thread 2</text>
+<text x="92" y="384" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">6 packages = 18 cores</text>
+<rect x="265" y="334" width="175" height="72" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="277" y="360" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">sched thread 3</text>
+<text x="277" y="384" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">6 packages = 18 cores</text>
+<rect x="80" y="430" width="360" height="40" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="260.0" y="456" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="middle">shared global ready queue (atomics)</text>
+<text x="80" y="508" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">Measured on paged_attention: ~1.15 us of</text>
+<text x="80" y="528" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">scheduler software per task, per thread</text>
+<text x="80" y="548" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">(~0.95 us with transport made free)</text>
+<rect x="600" y="190" width="300" height="320" rx="10" fill="#E8F4F1" stroke="#1B6F69" stroke-width="2"/>
+<text x="618" y="224" font-family="Helvetica, Arial, sans-serif" font-size="20" font-weight="bold" fill="#1B6F69" text-anchor="start">Per-core registers</text>
+<rect x="790.4" y="178" width="91.60000000000001" height="24" rx="12" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="836.2" y="194" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#1B6F69" text-anchor="middle">SIMULATED</text>
+<rect x="618" y="250" width="264" height="64" rx="8" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="632" y="276" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">DATA_MAIN_BASE</text>
+<text x="632" y="298" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">task in</text>
+<rect x="618" y="330" width="264" height="64" rx="8" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="632" y="356" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">COND</text>
+<text x="632" y="378" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">ACK / FIN out</text>
+<text x="618" y="424" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">asim_push and asim_read_status</text>
+<text x="618" y="444" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">replace the MMIO store and nGnRE</text>
+<text x="618" y="464" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">load; the COND word is bit-identical.</text>
+<rect x="1040" y="140" width="500" height="444" rx="10" fill="#E8F4F1" stroke="#1B6F69" stroke-width="2"/>
+<text x="1060" y="176" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="bold" fill="#1B6F69" text-anchor="start">Compute cores</text>
+<rect x="1430.4" y="128" width="91.60000000000001" height="24" rx="12" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1476.2" y="144" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#1B6F69" text-anchor="middle">SIMULATED</text>
+<text x="1060" y="204" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">24 packages x (1 AIC + 2 AIV) = 72 cores</text>
+<rect x="1060" y="226" width="460" height="120" rx="8" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="1072" y="248" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start" font-style="italic">one package</text>
+<rect x="1074" y="260" width="136" height="74" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1142" y="286" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIC</text>
+<text x="1142" y="310" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep intake:</text>
+<text x="1142" y="326" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">active + pushed</text>
+<rect x="1222" y="260" width="136" height="74" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1290" y="286" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIV0</text>
+<text x="1290" y="310" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep intake:</text>
+<text x="1290" y="326" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">active + pushed</text>
+<rect x="1370" y="260" width="136" height="74" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1438" y="286" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIV1</text>
+<text x="1438" y="310" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep intake:</text>
+<text x="1438" y="326" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">active + pushed</text>
+<rect x="1056" y="378" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1098" y="402" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">landed</text>
+<rect x="1182" y="378" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1224" y="402" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">noticed</text>
+<rect x="1308" y="378" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1350" y="402" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">running</text>
+<rect x="1434" y="378" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1476" y="402" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">FIN</text>
+<line x1="1142" y1="396" x2="1179" y2="396" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1161.0" y="432" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">entry poll 318 ns</text>
+<line x1="1268" y1="396" x2="1305" y2="396" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1287.0" y="432" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">pick-up 491 / 581</text>
+<line x1="1394" y1="396" x2="1431" y2="396" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1413.0" y="432" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">compute</text>
+<text x="1060" y="468" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">Compute is drawn per kernel from the calibration:</text>
+<text x="1060" y="490" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">paged_attention 4 kernels, 1.20-1.64 us;</text>
+<text x="1060" y="510" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">qwen 36 kernels, 0.08-270 us, median 19.5 us.</text>
+<text x="1060" y="538" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">A pushed task waiting in the intake costs 0 ns:</text>
+<text x="1060" y="558" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">it starts as the active one ends.</text>
+<line x1="464" y1="300" x2="594" y2="300" stroke="#2F5D8A" stroke-width="2.5" marker-end="url(#ah-2F5D8A)"/>
+<text x="530.0" y="270" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#2F5D8A" text-anchor="middle">push</text>
+<text x="530.0" y="322" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">5 ns AICPU</text>
+<text x="530.0" y="338" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">occupancy</text>
+<line x1="904" y1="300" x2="1034" y2="300" stroke="#2F5D8A" stroke-width="2.5" marker-end="url(#ah-2F5D8A)"/>
+<text x="970.0" y="270" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#2F5D8A" text-anchor="middle">arrives</text>
+<text x="970.0" y="288" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">+310 ns</text>
+<line x1="1036" y1="445" x2="906" y2="445" stroke="#9A3412" stroke-width="2.5" marker-end="url(#ah-9A3412)"/>
+<text x="970.0" y="469" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#9A3412" text-anchor="middle">FIN visible</text>
+<text x="970.0" y="487" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">after 80 / 140 ns</text>
+<line x1="596" y1="445" x2="466" y2="445" stroke="#9A3412" stroke-width="2.5" marker-end="url(#ah-9A3412)"/>
+<text x="530.0" y="469" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#9A3412" text-anchor="middle">COND read</text>
+<text x="530.0" y="487" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">195 ns per core,</text>
+<text x="530.0" y="503" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">strictly serial</text>
+<text x="530.0" y="521" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="normal" fill="#57606A" text-anchor="middle">(raw LDR: 92 ns)</text>
+<text x="60" y="640" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" fill="#1F2328" text-anchor="start">Where one task's time goes, idle core, median kernel</text>
+<text x="60" y="668" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#57606A" text-anchor="start">Each bar is 100 % of the span from the push to the scheduler reading the FIN; segments are to scale within each bar.</text>
+<text x="60" y="736" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" fill="#1F2328" text-anchor="start">paged_attention</text>
+<rect x="250.00" y="706" width="2.21" height="44" fill="#2F5D8A" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="252.21" y="706" width="137.28" height="44" fill="#7FA3C7" stroke="#FFFFFF" stroke-width="1"/>
+<text x="320.8547888774459" y="733" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">arrival 310</text>
+<rect x="389.50" y="706" width="140.82" height="44" fill="#A9C3DC" stroke="#FFFFFF" stroke-width="1"/>
+<text x="459.9073120494336" y="733" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">entry poll 318</text>
+<rect x="530.32" y="706" width="217.44" height="44" fill="#C9D9E8" stroke="#FFFFFF" stroke-width="1"/>
+<text x="639.0370751802266" y="733" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">pick-up 491</text>
+<rect x="747.75" y="706" width="670.46" height="44" fill="#5E9C76" stroke="#FFFFFF" stroke-width="1"/>
+<text x="1082.9866117404738" y="733" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF" text-anchor="middle">compute 1,514</text>
+<rect x="1418.22" y="706" width="35.43" height="44" fill="#E3A587" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1453.65" y="706" width="86.35" height="44" fill="#9A3412" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250" y="706" width="1290" height="44" fill="none" stroke="#3A3F45" stroke-width="1.5"/>
+<text x="1540" y="772" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="end">2,913 ns in all; everything but compute is 48 % of it</text>
+<text x="60" y="828" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" fill="#1F2328" text-anchor="start">qwen 40L</text>
+<rect x="250.00" y="798" width="0.60" height="44" fill="#2F5D8A" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250.31" y="798" width="19.02" height="44" fill="#7FA3C7" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="269.33" y="798" width="19.51" height="44" fill="#A9C3DC" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="288.83" y="798" width="35.64" height="44" fill="#C9D9E8" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="324.48" y="798" width="1194.97" height="44" fill="#5E9C76" stroke="#FFFFFF" stroke-width="1"/>
+<text x="921.9631901840492" y="825" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF" text-anchor="middle">compute 19,478</text>
+<rect x="1519.45" y="798" width="8.59" height="44" fill="#E3A587" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1528.04" y="798" width="11.96" height="44" fill="#9A3412" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250" y="798" width="1290" height="44" fill="none" stroke="#3A3F45" stroke-width="1.5"/>
+<text x="1540" y="864" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="end">21,027 ns in all; everything but compute is 7 % of it</text>
+<text x="60" y="902" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">segment</text>
+<text x="250" y="902" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">paged_attention</text>
+<text x="400" y="902" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">qwen</text>
+<text x="520" y="902" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">what it is</text>
+<rect x="60" y="916" width="14" height="14" fill="#2F5D8A"/>
+<text x="84" y="928" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">push</text>
+<text x="250" y="928" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">5 ns</text>
+<text x="400" y="928" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">5 ns</text>
+<text x="520" y="928" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">AICPU posts DATA_MAIN_BASE; the only AICPU occupancy on dispatch</text>
+<rect x="60" y="938" width="14" height="14" fill="#7FA3C7"/>
+<text x="84" y="950" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">arrival</text>
+<text x="250" y="950" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">310 ns</text>
+<text x="400" y="950" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">310 ns</text>
+<text x="520" y="950" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the store crosses the die to the core</text>
+<rect x="60" y="960" width="14" height="14" fill="#A9C3DC"/>
+<text x="84" y="972" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">entry poll</text>
+<text x="250" y="972" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">318 ns</text>
+<text x="400" y="972" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">318 ns</text>
+<text x="520" y="972" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the core's own spin loop notices the task</text>
+<rect x="60" y="982" width="14" height="14" fill="#C9D9E8"/>
+<text x="84" y="994" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">pick-up</text>
+<text x="250" y="994" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">491 ns</text>
+<text x="400" y="994" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">581 ns</text>
+<text x="520" y="994" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">dcci + ack before the kernel body</text>
+<rect x="60" y="1004" width="14" height="14" fill="#5E9C76"/>
+<text x="84" y="1016" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">compute</text>
+<text x="250" y="1016" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">1,514 ns</text>
+<text x="400" y="1016" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">19,478 ns</text>
+<text x="520" y="1016" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">calibrated kernel duration (median shown)</text>
+<rect x="60" y="1026" width="14" height="14" fill="#E3A587"/>
+<text x="84" y="1038" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">FIN notice</text>
+<text x="250" y="1038" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">80 ns</text>
+<text x="400" y="1038" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">140 ns</text>
+<text x="520" y="1038" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the core's FIN becomes visible to the AICPU</text>
+<rect x="60" y="1048" width="14" height="14" fill="#9A3412"/>
+<text x="84" y="1060" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">COND read</text>
+<text x="250" y="1060" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">195 ns</text>
+<text x="400" y="1060" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">195 ns</text>
+<text x="520" y="1060" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">AICPU reads that core's status; one core per read</text>
+<text x="60" y="1130" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">Latencies from microbenchmarks and in-situ calibration (docs/asim/calibration.md); read = 195 ns is the model's one fitted parameter.</text>
+<text x="60" y="1152" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">M0 against real silicon, device_wall: +2.5 to +3.6 % on paged_attention, -4.2 to -4.4 % on qwen (two sessions, 2026-10-07, model clock).</text>
+</svg>

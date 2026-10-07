@@ -45,11 +45,17 @@ Three things about this build that cost time to rediscover:
   host and a container (a bind mount), building in both leaves files owned by
   different users and the next rebuild fails on permissions. Pick the one that
   carries the CANN toolchain and do every build, install and run there.
-- **A built `.so` has to reach both load locations** to take effect:
-  `build/lib/{arch}/{variant}/{runtime}/` and the installed copy under
-  `.venv/.../simpler_setup/_assets/build/lib/...`. `build_runtimes` writes both;
-  hand-swapping a binary for an A/B must do the same, or the run silently uses
-  the other one.
+- **Which copy of a binary runs depends on where you launch from**, not on which
+  copy is newer. There are two: `build/lib/{arch}/{variant}/{runtime}/` and the
+  installed one under `.venv/.../simpler_setup/_assets/build/lib/...`. A run
+  launched from the worktree root (`python -m pytest`, or a script there) imports
+  `simpler_setup` from the source tree, whose `PROJECT_ROOT` is the worktree
+  because it has no `_assets/src` -- so it loads `build/lib/`, which is what
+  `build_runtimes` writes. The installed copy is read only when `simpler_setup`
+  comes from site-packages, and `build_runtimes` does **not** refresh it, so it
+  goes stale silently. Check with
+  `python -c "import simpler_setup.environment as e; print(e.PROJECT_ROOT)"` from
+  the directory you launch in.
 
 PTO-ISA comes from the repo's `pto_isa.pin`. Do not export `PTO_ISA_ROOT` — it is
 resolved from the pin, and an ambient path that has drifted off it is now
@@ -163,11 +169,21 @@ log lands in a directory shared with every other user on the box.
 
 | marker | arm | what it settles |
 | ------ | --- | --------------- |
-| `[ASIM_WORK]` | M0 | compute issued, dispatches, poll overrun |
-| `[GQ_WORK]` | M2 | compute issued by shape, look-ahead depth, poll and push overrun, steal counters |
-| `[M0_DONE]` / `[M2_DONE]` | both | tasks completed against tasks total |
+| `[ASIM_WORK]` | M0 | compute issued, dispatches, poll and push overrun |
+| `[GQ_WORK]` | M2 | compute issued by shape, positions issued, poll and push overrun, look-ahead depth, cube idle by cause, held entries, steals |
+| `[M0_DONE]` / `[M2_DONE]` | both | tasks completed against tasks total; M2's also gives how many durations came from the calibration rather than a default, and why the grouping path passed tasks over |
 | `[M0_HIST]` / `[M2_HIST]` | both | compute samples per `func_id` |
-| `[GQ_CALIB]` | M2 | share of tasks whose duration came from the calibration rather than a default |
+
+`[GQ_WORK]`'s `aic_idle_us` is cube-core time spent free, split by what was
+waiting at the time: `drain_us`, a sync-start drain holding dispatch;
+`intake_us`, cube work in the software ready queue; `stranded_us`, cube work
+committed to a peer queue; `none_us`, nothing. A core holding an unreleased cohort
+member is not free and is not counted.
+
+**Both arms print the same amount**: one work line per thread and two per run.
+These lines are written inside `device_wall`, so an arm that printed more would
+carry the difference into its measurement -- M2 once printed three times as many
+and paid ~0.36 ms a run for it.
 
 Compare compute issued across the arms before trusting any delta. On the two
 cases it matches to 0.08 % and 0.005 % — though for qwen those figures come from
@@ -179,36 +195,44 @@ These are not style preferences; each one was learned from a wrong number.
 
 - **Run both arms back to back inside one `task-submit`**, and **repeat the
   pair** -- a single pair resolves much less than it looks like it does. The two
-  cases are not alike here, and the difference is large:
+  cases are not alike here, and the difference is large (2026-10-07, model
+  clock):
 
   | case | arm | repeatability |
   | ---- | --- | ------------- |
-  | qwen-40L | all three | 0.7 % over three interleaved reps |
-  | PA Case1 | base (`a2a3`) | 1.1 % over four reps |
-  | PA Case1 | M0 (`a2a3asim`) | 0.7 % over eight reps |
-  | PA Case1 | **M2 (`a2a3asimgq`)** | **13.7 % over eight reps** |
+  | qwen-40L | silicon, M0 | 0.6-0.9 % over three interleaved reps |
+  | qwen-40L | M2 (`a2a3asimgq`) | 1.5 % over three reps |
+  | PA Case1 | silicon, M0 | 0.7-1.7 % over four reps |
+  | PA Case1 | **M2 (`a2a3asimgq`)** | **7.6 % over four reps** |
 
-  The spread is a property of the arm and the case together, not of the arm:
-  M2 holds to 2.3 % on qwen and to 17.6 % on PA in the same session.
-
-  PA's GroupQueue arm drifts upward across successive runs inside one
-  submission, so interleaving does not fully cancel it. Two four-rep interleaved
-  measurements of the same change read -57.7 % and -54.0 %; pooled over all
-  eight they give -56.1 %. **Quote PA from a pooled median of several
-  interleaved reps, never from one pair** -- an earlier single-pair -55.4 % was
-  reported to a tenth of a point it never had. A change worth less than ~5 % is
-  not measurable on PA's M2 arm at all; use qwen, whose arms hold to 0.55 %.
+  The spread is a property of the arm and the case together, not of the arm.
+  Before the model clock PA's M2 arm spanned 13.7-17.6 %: the simulator's own
+  work, which varies run to run, sat inside its window. Taking it out halved the
+  spread but did not remove it, so **quote PA from a pooled median of several
+  interleaved reps, never from one pair**, and treat a change worth less than
+  ~3 % on PA's M2 arm as unmeasured. qwen's arms hold to under 2 %.
 - **To A/B a code change, build both binaries first and swap the `.so` between
   runs** inside a single submission, rather than rebuilding between submissions.
-  Copy it to **both** load locations — `build/lib/...` and the installed
-  `.venv/.../simpler_setup/_assets/build/lib/...`.
+  Copy it to the location your launch directory resolves to (above) -- and to
+  both, if anything in the submission might run from elsewhere.
 - **Instrumentation is not free.** Adding the overrun and poll-cost counters to
   `[GQ_WORK]` cost ~1.3 % of `device_wall`, so an instrumented build is its own
   baseline and must not be compared against an uninstrumented one.
-- **Read `[GQ_WORK] poll_overrun_us` before quoting an M2 number.** The
-  simulator overruns the latency it models whenever its own work costs more than
-  the access it stands for, and that excess lands inside the measured window.
-  See the audit in [validation.md](validation.md).
+- **`device_wall` excludes the simulator's own work; the raw scheduler window
+  does not.** Each simulated device runs its cores on a per-thread model clock --
+  real time less the thread's ledger of work beyond the latencies it models --
+  and the phase recorder removes the same ledger from `device_wall`, so
+  `device_wall` describes the modelled design ([DESIGN.md](DESIGN.md) §3).
+  `poll_overrun_us` plus `push_overrun_us` -- in `[GQ_WORK]` for M2, with
+  `overrun_us` in place of the first in `[ASIM_WORK]` for M0 -- is each thread's
+  ledger for the run. The
+  `sched_start..sched_end` lines are real time and include it, so compare
+  `device_wall` across arms, never raw windows. Two checks before quoting a
+  simulated number: it must not be below the busiest core's summed compute,
+  which no schedule can beat; and the threads' ledgers must not diverge by more
+  than a few percent of the window, because coupling through that divergence is
+  the one effect a per-thread clock does not remove (DESIGN.md §3 has the check
+  that showed it small).
 
 ## Calibration
 

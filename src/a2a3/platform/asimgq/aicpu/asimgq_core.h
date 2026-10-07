@@ -38,9 +38,12 @@
 //   submit(queue, task)        — hand a ready task to the queue
 //   read_queue_status(queue)   — its completed prefix, and what it holds
 //
-// Timing is real wall-clock (Mode A): each call busy-spins its modeled latency,
-// and a task's compute elapses because its end is scheduled at
-// `start + ack + compute` while real time passes as the scheduler works. Nothing
+// Timing is real time less the model's own excess (Mode A): each call holds its
+// caller for its modeled latency in real time, and a task's compute elapses
+// because its end is scheduled at `start + ack + compute` while the scheduler
+// works. Model times are on the queue's clock -- real time less every tick its
+// model has spent beyond the latencies it charged -- so the cores stand still
+// while the model overruns. Nothing
 // is simulated in between: a task's end is computed once, when it is pushed to a
 // core, so a poll compares the clock against the soonest end rather than replaying
 // an interval.
@@ -254,12 +257,6 @@ void calib_coverage(uint64_t *hits, uint64_t *misses);
 // Dispatches charged per func_id -- compared across models, says whether both ran the same work.
 void func_hist(uint64_t *out, uint32_t n);
 
-// The controller's own view, for diagnosing a manager that has stopped retiring.
-void queue_debug(
-    uint32_t queue_idx, uint64_t *watermark, uint64_t *high_water, uint32_t *packages, uint32_t *free_packages,
-    uint64_t *ring_push, uint64_t *ring_pop
-);
-
 // What one read of a queue's status register yields. The completed prefix is
 // what a manager needs on every pass; the other two are what it needs to assemble
 // a cohort, and they ride the same read because they are the same register file.
@@ -352,8 +349,9 @@ struct SimQueueStatus {
     uint32_t held_room;
 };
 
-// Start every cohort member this queue holds, no earlier than `at` and no earlier
-// than the core it sits on comes free. The manager calls this
+// Start every cohort member this queue holds, no earlier than `at` -- an instant on
+// the real clock, which the queue converts to its own -- and no earlier than the
+// core it sits on comes free. The manager calls this
 // once the cohort is placed device-wide; until then the members occupy their
 // cores without running, which is what co-residency costs. Charged as a posted
 // write into the queue, like submitting an entry.
@@ -478,6 +476,21 @@ void queue_residency(uint32_t queue_idx, uint64_t *ring_ns, uint64_t *bound_ns, 
 // core it is staged on until the whole cohort is released device-wide, so these
 // say how much of the group's starvation that barrier owns.
 void queue_aic_idle(uint32_t queue_idx, uint64_t *idle_us, uint64_t *idle_gated_us, uint64_t *gated_us);
+
+// Diagnostic: how a queue that finds cube cores idle asks the software what was
+// waiting -- cube tasks in the managers' ready queues, and whether a sync-start
+// drain was holding dispatch. Called from inside a status read, only when a cube
+// core is idle, so its cost is the model's excess rather than the manager's.
+using ReadyBacklogProbe = uint32_t (*)(void *ctx, bool *drain_active);
+void set_ready_backlog_probe(ReadyBacklogProbe probe, void *ctx);
+
+// Ungated cube idle, in core-microseconds, split by what was waiting when the
+// core stood idle: a drain held dispatch; cube work sat in the shared software
+// queue; cube work sat committed in a peer queue (its ring, or pipelined behind
+// a running task); or nothing at all.
+void queue_aic_idle_split(
+    uint32_t queue_idx, uint64_t *drain_us, uint64_t *intake_us, uint64_t *stranded_us, uint64_t *none_us
+);
 
 // When the core running `index` ended, in the manager's own clock domain. This is
 // a diagnostic read of state the queue already holds, not a modelled access: it

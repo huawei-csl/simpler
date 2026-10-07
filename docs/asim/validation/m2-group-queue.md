@@ -1,5 +1,15 @@
 # M2 campaign — the ready group queue (2026-09-14, qwen sweep re-measured 2026-09-17)
 
+> **Superseded figures (2026-10-07).** Every M2 `device_wall` on this page was
+> measured before the simulator's cores ran on a model clock, when the window
+> correction removed simulator work the cores had computed through. That
+> over-states every M2 gain here, and on qwen it produced gains no schedule can
+> reach: qwen is bound by its cube cores' compute. The page is kept as the record
+> of this campaign's method and of the grouping contract; for what the GroupQueue
+> is worth, use the current measurement in
+> [validation.md](../validation.md#what-the-groupqueue-is-worth) -- paged_attention
+> -47.9 %, qwen +1.2 % against M0.
+
 What the task-grouping contract is worth, measured as **`device_wall`** against an
 M0 of `host_build_graph` + simulated cores (`a2a3asim`). Method and fidelity:
 [../validation.md](../validation.md). The earlier campaign reads the scheduling
