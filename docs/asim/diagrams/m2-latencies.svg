@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1310" viewBox="0 0 1600 1310">
+<defs>
+<marker id="ah-2F5D8A" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2F5D8A"/></marker>
+<marker id="ah-9A3412" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9A3412"/></marker>
+<marker id="ah-3A3F45" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3A3F45"/></marker>
+<marker id="ah-5B3F8C" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#5B3F8C"/></marker>
+<marker id="ah-1B6F69" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1B6F69"/></marker>
+</defs>
+<rect x="0" y="0" width="1600" height="1310" fill="#FFFFFF"/>
+<text x="60" y="62" font-family="Helvetica, Arial, sans-serif" font-size="30" font-weight="bold" fill="#1F2328" text-anchor="start">M2: the GroupQueue aSim simulates, and the latencies it charges</text>
+<text x="60" y="94" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="normal" fill="#57606A" text-anchor="start">a2a3asimgq + group_queue. Where the two cases differ, values read paged_attention Case1 / qwen3-14B decode.</text>
+<rect x="60" y="140" width="420" height="470" rx="10" fill="#EEF3F9" stroke="#2F5D8A" stroke-width="2"/>
+<text x="80" y="176" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="bold" fill="#2F5D8A" text-anchor="start">AICPU package</text>
+<rect x="412.4" y="128" width="49.6" height="24" rx="12" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="437.2" y="144" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#2F5D8A" text-anchor="middle">REAL</text>
+<text x="80" y="206" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">group_queue managers: real code,</text>
+<text x="80" y="227" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">running at real AICPU speed</text>
+<rect x="80" y="248" width="185" height="64" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="92" y="273" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">manager 0</text>
+<text x="92" y="295" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">owns queue 0 only</text>
+<rect x="275" y="248" width="185" height="64" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="287" y="273" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">manager 1</text>
+<text x="287" y="295" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">owns queue 1 only</text>
+<rect x="80" y="324" width="185" height="64" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="92" y="349" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">manager 2</text>
+<text x="92" y="371" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">owns queue 2 only</text>
+<rect x="275" y="324" width="185" height="64" rx="8" fill="#FFFFFF" stroke="#2F5D8A" stroke-width="1.5"/>
+<text x="287" y="349" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">manager 3</text>
+<text x="287" y="371" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">owns queue 3 only</text>
+<rect x="80" y="418" width="380" height="74" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="92" y="443" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1B6F69" text-anchor="start">status register x4</text>
+<text x="92" y="465" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">watermark + 32 look-ahead bits,</text>
+<text x="92" y="483" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">one word per queue (simulated)</text>
+<line x1="270.0" y1="416" x2="270.0" y2="400" stroke="#1B6F69" stroke-width="2" marker-end="url(#ah-1B6F69)"/>
+<text x="280.0" y="410" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1B6F69" text-anchor="start">read: 10 ns, one word</text>
+<text x="80" y="520" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">No shared ready queue, nothing atomic</text>
+<text x="80" y="540" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">between managers.</text>
+<text x="80" y="568" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">Measured on paged_attention: ~570 ns of</text>
+<text x="80" y="588" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">manager wall per task, per thread</text>
+<rect x="600" y="140" width="400" height="470" rx="10" fill="#F3EFF9" stroke="#5B3F8C" stroke-width="2"/>
+<text x="620" y="176" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="bold" fill="#5B3F8C" text-anchor="start">GroupQueue controller x4</text>
+<rect x="890.4" y="128" width="91.60000000000001" height="24" rx="12" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="936.2" y="144" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#5B3F8C" text-anchor="middle">SIMULATED</text>
+<text x="620" y="204" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">one per manager, 6 packages each</text>
+<rect x="620" y="226" width="360" height="62" rx="8" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="634" y="251" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">ready rings</text>
+<text x="634" y="273" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">cube, vector and mix, each pushed independently</text>
+<rect x="620" y="300" width="360" height="62" rx="8" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="634" y="325" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">hold array</text>
+<text x="634" y="347" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">32 slots x 4 dependency comparators</text>
+<rect x="620" y="374" width="360" height="62" rx="8" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="634" y="399" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">watermark + look-ahead</text>
+<text x="634" y="421" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">1,024 positions; 32 bits published</text>
+<rect x="620" y="448" width="360" height="62" rx="8" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="634" y="473" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">placement</text>
+<text x="634" y="495" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">idle core first, else behind a busy one</text>
+<rect x="620" y="522" width="360" height="62" rx="8" fill="#FFFFFF" stroke="#5B3F8C" stroke-width="1.5"/>
+<text x="634" y="547" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#1F2328" text-anchor="start">steal</text>
+<text x="634" y="569" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">cancel a pipelined task, 30 ns each way</text>
+<rect x="1120" y="140" width="420" height="470" rx="10" fill="#E8F4F1" stroke="#1B6F69" stroke-width="2"/>
+<text x="1140" y="176" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="bold" fill="#1B6F69" text-anchor="start">Compute cores</text>
+<rect x="1430.4" y="128" width="91.60000000000001" height="24" rx="12" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1476.2" y="144" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="bold" fill="#1B6F69" text-anchor="middle">SIMULATED</text>
+<text x="1140" y="204" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">24 packages x (1 AIC + 2 AIV) = 72,</text>
+<text x="1140" y="225" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#1F2328" text-anchor="start">18 per controller</text>
+<rect x="1140" y="244" width="380" height="116" rx="8" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5" stroke-dasharray="5,4"/>
+<text x="1152" y="266" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start" font-style="italic">one package</text>
+<rect x="1152" y="276" width="112" height="72" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1208" y="302" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIC</text>
+<text x="1208" y="324" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep</text>
+<text x="1208" y="340" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">intake</text>
+<rect x="1274" y="276" width="112" height="72" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1330" y="302" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIV0</text>
+<text x="1330" y="324" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep</text>
+<text x="1330" y="340" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">intake</text>
+<rect x="1396" y="276" width="112" height="72" rx="8" fill="#E8F4F1" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1452" y="302" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="bold" fill="#1F2328" text-anchor="middle">AIV1</text>
+<text x="1452" y="324" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">2-deep</text>
+<text x="1452" y="340" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="middle">intake</text>
+<rect x="1134" y="384" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1176" y="408" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">landed</text>
+<rect x="1236" y="384" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1278" y="408" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">noticed</text>
+<rect x="1338" y="384" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1380" y="408" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">running</text>
+<rect x="1440" y="384" width="84" height="36" rx="18" fill="#FFFFFF" stroke="#1B6F69" stroke-width="1.5"/>
+<text x="1482" y="408" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="middle">FIN</text>
+<line x1="1220" y1="402" x2="1233" y2="402" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1227.0" y="438" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">poll 318 ns</text>
+<line x1="1322" y1="402" x2="1335" y2="402" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1329.0" y="454" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">pick-up 491/581</text>
+<line x1="1424" y1="402" x2="1437" y2="402" stroke="#3A3F45" stroke-width="1.8" marker-end="url(#ah-3A3F45)"/>
+<text x="1431.0" y="438" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#1F2328" text-anchor="middle">compute</text>
+<text x="1140" y="488" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">The same core model as M0: compute drawn</text>
+<text x="1140" y="508" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">per kernel from the calibration.</text>
+<text x="1140" y="536" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">Pick-up here is M0's calibrated ack less</text>
+<text x="1140" y="556" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the 628 ns of AICPU-to-core travel a</text>
+<text x="1140" y="576" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">controller's adjacent push does not make.</text>
+<line x1="484" y1="300" x2="594" y2="300" stroke="#2F5D8A" stroke-width="2.5" marker-end="url(#ah-2F5D8A)"/>
+<text x="540.0" y="270" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#2F5D8A" text-anchor="middle">submit</text>
+<text x="540.0" y="288" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">5 ns occupancy</text>
+<text x="540.0" y="324" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">arrives +310 ns</text>
+<line x1="1004" y1="300" x2="1114" y2="300" stroke="#2F5D8A" stroke-width="2.5" marker-end="url(#ah-2F5D8A)"/>
+<text x="1060.0" y="270" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#2F5D8A" text-anchor="middle">push</text>
+<text x="1060.0" y="288" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">30 ns link</text>
+<text x="1060.0" y="324" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#2F5D8A" text-anchor="middle">0 if pipelined</text>
+<line x1="1116" y1="500" x2="1006" y2="500" stroke="#9A3412" stroke-width="2.5" marker-end="url(#ah-9A3412)"/>
+<text x="1060.0" y="524" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#9A3412" text-anchor="middle">FIN raised</text>
+<text x="1060.0" y="542" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">80 / 140 ns</text>
+<text x="1060.0" y="558" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">+ 30 ns link</text>
+<line x1="596" y1="500" x2="486" y2="500" stroke="#9A3412" stroke-width="2.5" marker-end="url(#ah-9A3412)"/>
+<text x="540.0" y="524" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#9A3412" text-anchor="middle">update</text>
+<text x="540.0" y="542" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">80 / 140 ns</text>
+<text x="540.0" y="558" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#9A3412" text-anchor="middle">across the die</text>
+<text x="60" y="680" font-family="Helvetica, Arial, sans-serif" font-size="22" font-weight="bold" fill="#1F2328" text-anchor="start">One task's span on an idle core, median kernel</text>
+<text x="60" y="708" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" fill="#57606A" text-anchor="start">Each bar is 100 % of the span from the submit to the manager reading the retirement; segments are to scale within each bar.</text>
+<text x="60" y="774" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" fill="#1F2328" text-anchor="start">paged_attention</text>
+<rect x="250.00" y="744" width="2.25" height="44" fill="#2F5D8A" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="252.25" y="744" width="139.44" height="44" fill="#7FA3C7" stroke="#FFFFFF" stroke-width="1"/>
+<text x="321.9665271966527" y="771" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">arrival 310</text>
+<rect x="391.68" y="744" width="13.49" height="44" fill="#B9A6D6" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="405.18" y="744" width="143.03" height="44" fill="#A9C3DC" stroke="#FFFFFF" stroke-width="1"/>
+<text x="476.69456066945605" y="771" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">entry poll 318</text>
+<rect x="548.21" y="744" width="220.85" height="44" fill="#C9D9E8" stroke="#FFFFFF" stroke-width="1"/>
+<text x="658.6349372384938" y="771" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#1F2328" text-anchor="middle">pick-up 491</text>
+<rect x="769.06" y="744" width="680.98" height="44" fill="#5E9C76" stroke="#FFFFFF" stroke-width="1"/>
+<text x="1109.550209205021" y="771" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF" text-anchor="middle">compute 1,514</text>
+<rect x="1450.04" y="744" width="35.98" height="44" fill="#E3A587" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1486.03" y="744" width="13.49" height="44" fill="#B9A6D6" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1499.52" y="744" width="35.98" height="44" fill="#D9825B" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1535.50" y="744" width="4.50" height="44" fill="#9A3412" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250" y="744" width="1290" height="44" fill="none" stroke="#3A3F45" stroke-width="1.5"/>
+<text x="1540" y="810" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="end">2,868 ns; M0's span is 2,913 ns</text>
+<text x="60" y="866" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" fill="#1F2328" text-anchor="start">qwen 40L</text>
+<rect x="250.00" y="836" width="0.60" height="44" fill="#2F5D8A" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250.31" y="836" width="19.00" height="44" fill="#7FA3C7" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="269.31" y="836" width="1.84" height="44" fill="#B9A6D6" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="271.15" y="836" width="19.50" height="44" fill="#A9C3DC" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="290.65" y="836" width="35.62" height="44" fill="#C9D9E8" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="326.26" y="836" width="1194.12" height="44" fill="#5E9C76" stroke="#FFFFFF" stroke-width="1"/>
+<text x="923.3233532934132" y="863" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" fill="#FFFFFF" text-anchor="middle">compute 19,478</text>
+<rect x="1520.38" y="836" width="8.58" height="44" fill="#E3A587" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1528.96" y="836" width="1.84" height="44" fill="#B9A6D6" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1530.80" y="836" width="8.58" height="44" fill="#D9825B" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="1539.39" y="836" width="0.61" height="44" fill="#9A3412" stroke="#FFFFFF" stroke-width="1"/>
+<rect x="250" y="836" width="1290" height="44" fill="none" stroke="#3A3F45" stroke-width="1.5"/>
+<text x="1540" y="902" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="end">21,042 ns; M0's span is 21,027 ns</text>
+<text x="60" y="948" font-family="Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" fill="#5B3F8C" text-anchor="start">M2 does not win on a task's latency: its dispatch crosses one more link than M0's. It wins on what the AICPU pays per task.</text>
+<text x="60" y="996" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">segment</text>
+<text x="210" y="996" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">PA</text>
+<text x="290" y="996" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">qwen</text>
+<text x="380" y="996" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#57606A" text-anchor="start">what it is</text>
+<rect x="60" y="1010" width="14" height="14" fill="#2F5D8A"/>
+<text x="84" y="1022" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">submit</text>
+<text x="210" y="1022" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">5</text>
+<text x="290" y="1022" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">5</text>
+<text x="380" y="1022" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">manager's posted write into its queue</text>
+<rect x="60" y="1032" width="14" height="14" fill="#7FA3C7"/>
+<text x="84" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">arrival</text>
+<text x="210" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">310</text>
+<text x="290" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">310</text>
+<text x="380" y="1044" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the entry becomes legible to the controller</text>
+<rect x="60" y="1054" width="14" height="14" fill="#B9A6D6"/>
+<text x="84" y="1066" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">link</text>
+<text x="210" y="1066" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">30</text>
+<text x="290" y="1066" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">30</text>
+<text x="380" y="1066" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">controller to core, one way</text>
+<rect x="60" y="1076" width="14" height="14" fill="#A9C3DC"/>
+<text x="84" y="1088" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">entry poll</text>
+<text x="210" y="1088" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">318</text>
+<text x="290" y="1088" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">318</text>
+<text x="380" y="1088" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">the core's own loop notices the task</text>
+<rect x="60" y="1098" width="14" height="14" fill="#C9D9E8"/>
+<text x="84" y="1110" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">pick-up</text>
+<text x="210" y="1110" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">491</text>
+<text x="290" y="1110" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">581</text>
+<text x="380" y="1110" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">dcci + ack before the kernel body</text>
+<rect x="60" y="1120" width="14" height="14" fill="#5E9C76"/>
+<text x="84" y="1132" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">compute</text>
+<text x="210" y="1132" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">1,514</text>
+<text x="290" y="1132" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">19,478</text>
+<text x="380" y="1132" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">calibrated kernel duration (median)</text>
+<rect x="60" y="1142" width="14" height="14" fill="#E3A587"/>
+<text x="84" y="1154" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">FIN raised</text>
+<text x="210" y="1154" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">80</text>
+<text x="290" y="1154" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">140</text>
+<text x="380" y="1154" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">what raising a FIN costs the core</text>
+<rect x="60" y="1164" width="14" height="14" fill="#B9A6D6"/>
+<text x="84" y="1176" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">link</text>
+<text x="210" y="1176" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">30</text>
+<text x="290" y="1176" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">30</text>
+<text x="380" y="1176" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">core back to its controller</text>
+<rect x="60" y="1186" width="14" height="14" fill="#D9825B"/>
+<text x="84" y="1198" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">update</text>
+<text x="210" y="1198" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">80</text>
+<text x="290" y="1198" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">140</text>
+<text x="380" y="1198" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">controller writes the AICPU-side register</text>
+<rect x="60" y="1208" width="14" height="14" fill="#9A3412"/>
+<text x="84" y="1220" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">status read</text>
+<text x="210" y="1220" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">10</text>
+<text x="290" y="1220" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#1F2328" text-anchor="start">10</text>
+<text x="380" y="1220" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" fill="#57606A" text-anchor="start">one word: watermark + look-ahead</text>
+<text x="900" y="996" font-family="Helvetica, Arial, sans-serif" font-size="17" font-weight="bold" fill="#1F2328" text-anchor="start">What the AICPU pays per task</text>
+<text x="900" y="1018" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">paged_attention, wall per task per scheduler thread, measured</text>
+<text x="900" y="1070" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">M0</text>
+<rect x="1060" y="1046" width="448.5" height="34" fill="#2F5D8A"/>
+<rect x="1408.6" y="1046" width="99.9" height="34" fill="#FFFFFF" fill-opacity="0.55" stroke="#2F5D8A" stroke-width="1"/>
+<text x="1516.4583333333333" y="1069" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">1,145 ns</text>
+<text x="900" y="1132" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">M0, free transport</text>
+<rect x="1060" y="1108" width="372.1" height="34" fill="#7FA3C7"/>
+<text x="1440.0833333333333" y="1131" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">950 ns</text>
+<text x="900" y="1194" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">M2</text>
+<rect x="1060" y="1170" width="223.2" height="34" fill="#5B3F8C"/>
+<rect x="1277.0" y="1170" width="6.3" height="34" fill="#FFFFFF" fill-opacity="0.55" stroke="#5B3F8C" stroke-width="1"/>
+<text x="1291.25" y="1193" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="bold" fill="#1F2328" text-anchor="start">570 ns</text>
+<text x="900" y="1246" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">Light end of each bar: modelled transport the AICPU is held for --</text>
+<text x="900" y="1264" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">M0 ~255 ns (a push + 1.3 core reads at 195 ns), M2 ~16 ns</text>
+<text x="900" y="1282" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">(a submit + 1.1 register reads at 10 ns).</text>
+<text x="60" y="1260" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">Latencies from the GroupQueue model (asimgq_core.h) and the shared calibration; all figures on the model clock, measured 2026-10-07.</text>
+<text x="60" y="1282" font-family="Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" fill="#57606A" text-anchor="start">M2 against M0, device_wall: -47.9 % on paged_attention, +1.2 % on qwen (parity: qwen is bound by its cube cores' compute).</text>
+</svg>
