@@ -554,10 +554,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         asim::asim_poll_overrun(
             cores, static_cast<uint32_t>(core_num), &overrun_us, &overrun_calls, &poll_calls, &poll_work_us
         );
+        uint64_t push_overrun_us = 0, push_overrun_calls = 0;
+        asim::asim_push_overrun(cores, static_cast<uint32_t>(core_num), &push_overrun_us, &push_overrun_calls);
         LOG_INFO(
             "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d overrun_us=%" PRIu64
-            " polls=%" PRIu64 " poll_work_us=%" PRIu64,
-            thread_idx, cycles_to_us(busy), dispatches, core_num, overrun_us, poll_calls, poll_work_us
+            " polls=%" PRIu64 " poll_work_us=%" PRIu64 " push_overrun_us=%" PRIu64,
+            thread_idx, cycles_to_us(busy), dispatches, core_num, overrun_us, poll_calls, poll_work_us,
+            push_overrun_us
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};

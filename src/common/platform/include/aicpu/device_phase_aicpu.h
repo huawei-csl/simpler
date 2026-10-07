@@ -64,14 +64,6 @@ inline AicpuPhaseRecord *aicpu_phase_self_records() {
     return aicpu_phase_records(get_platform_phase_base(), platform_aicpu_affinity_thread_idx());
 }
 
-// Whether a reported window excludes the model's own excess. On by default: a
-// window that includes it describes the cost of modelling rather than the design.
-// Switched off only to measure the correction itself, by running the same source
-// both ways.
-#ifndef SIM_WINDOW_CORRECTION
-#define SIM_WINDOW_CORRECTION 1
-#endif
-
 uint64_t simulated_device_self_overrun_ticks();
 
 #ifdef __SIMULATED_DEVICE__
@@ -113,6 +105,12 @@ inline void aicpu_phase_end(AicpuPhase phase) {
     // that fitted the modelled latency is already hidden by the spin to its
     // deadline; the excess is not, so it is removed here rather than left for
     // whoever reads the number to remember to subtract.
+    //
+    // The removal is exact only because each simulated device runs this thread's
+    // cores on a model clock offset by the same excess: while the model overruns,
+    // its cores do not move. A device whose cores ran on the real clock would keep
+    // computing through the excess, and removing it would delete time they spent
+    // -- enough, on a busy-core case, to report less than the work they carried.
     const int t = platform_aicpu_affinity_thread_idx();
     const uint64_t before =
         (t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) ? g_sim_self_at_phase_start[t][static_cast<int>(phase)] : 0;

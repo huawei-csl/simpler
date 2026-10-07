@@ -14,6 +14,7 @@
 
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_time.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 
@@ -49,6 +50,10 @@ struct alignas(64) SimCore {
     // just replace one bias with another.
     uint64_t poll_overrun_total = 0;
     uint64_t poll_overrun_calls = 0;
+    // The same, for a push: its 5 ns models a posted write, which drawing a
+    // compute sample and updating the pipeline can exceed.
+    uint64_t push_overrun_total = 0;
+    uint64_t push_overrun_calls = 0;
 
     uint64_t residency_total = 0;
     uint64_t residency_max = 0;
@@ -63,6 +68,22 @@ struct alignas(64) SimCore {
 
 std::vector<SimCore> g_cores;
 uint64_t g_reg_base = 0;
+
+// What modelling has cost, per scheduler thread, in counter ticks: every access's
+// work beyond the latency it models. It accumulates monotonically across runs, for
+// the same reason as the GroupQueue's ledger -- the phase recorder subtracts the
+// growth inside a phase -- and it is the thread's clock offset. A thread's cores
+// run on real time less this, so they stand still while the model works past
+// the latency it charges, and subtracting that excess from the reported window
+// removes exactly time the modelled world did not use.
+uint64_t g_self_overrun_ticks[PLATFORM_MAX_AICPU_THREADS] = {};
+
+// The calling thread's ledger slot. Every core is accessed by its owning thread
+// alone, so its model clock is that thread's.
+uint64_t *self_ledger() {
+    const int t = platform_aicpu_affinity_thread_idx();
+    return (t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) ? &g_self_overrun_ticks[t] : nullptr;
+}
 
 // The swimlane record a real core writes per task: start and end from its own
 // clock, and the identity it copied out of the payload. No kernel runs here, so
@@ -316,15 +337,16 @@ uint32_t core_index_for_addr(uint64_t reg_addr) {
     return static_cast<uint32_t>((reg_addr - g_reg_base) / ASIM_REG_BLOCK_SIZE);
 }
 
-// Both calls follow the same shape so aSim's own work is *absorbed inside* the
-// modeled latency and adds no unaccounted overhead: capture t0 at entry, do the
-// (O(1)) state work against the logical completion time `deadline = t0 + lat`,
-// then active-wait to `deadline`. Total wall time == the modeled latency (aSim's
-// few ns of work hide under the ~64/77 ns spin), so the measured makespan
-// reflects only the modeled costs.
+// Both calls follow the same shape: capture t0 at entry, do the (O(1)) state work
+// against the logical completion time `deadline` -- t0 + lat on the thread's model
+// clock -- then hold the caller to t0 + lat in real time. Work that fits is
+// absorbed by the hold; work that does not is added to the thread's ledger, which
+// holds its model clock back by the same amount.
 
 void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw) {
-    const uint64_t deadline = get_sys_cnt_aicpu() + g_push_ticks;
+    const uint64_t release = get_sys_cnt_aicpu() + g_push_ticks;
+    uint64_t *ledger = self_ledger();
+    const uint64_t deadline = release - (ledger != nullptr ? *ledger : 0);
     SimCore &c = g_cores[core_idx];
     const uint64_t dur = sample_compute_ticks(c, func_id);
     c.busy += dur;
@@ -357,24 +379,49 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
             c.active_fin_at + dur
         );
     }
-    wait_until(deadline);
+    const uint64_t done_at = get_sys_cnt_aicpu();
+    if (done_at > release) {
+        c.push_overrun_total += done_at - release;
+        ++c.push_overrun_calls;
+        if (ledger != nullptr) {
+            *ledger += done_at - release;
+        }
+    }
+    wait_until(release);
 }
 
 uint32_t asim_read_status(uint32_t core_idx) {
     const uint64_t entered_at = get_sys_cnt_aicpu();
-    const uint64_t deadline = entered_at + g_read_ticks;
+    const uint64_t release = entered_at + g_read_ticks;
+    uint64_t *ledger = self_ledger();
+    const uint64_t deadline = release - (ledger != nullptr ? *ledger : 0);
     SimCore &c = g_cores[core_idx];
     advance(c, deadline);
     *cond_slot(core_idx) = c.cond_word;
     const uint64_t done_at = get_sys_cnt_aicpu();
     c.poll_work_total += done_at - entered_at;
     ++c.poll_work_calls;
-    if (done_at > deadline) {
-        c.poll_overrun_total += done_at - deadline;
+    if (done_at > release) {
+        c.poll_overrun_total += done_at - release;
         ++c.poll_overrun_calls;
+        if (ledger != nullptr) {
+            *ledger += done_at - release;
+        }
     }
-    wait_until(deadline);
+    wait_until(release);
     return c.cond_word;
+}
+
+void asim_push_overrun(const int32_t *core_ids, uint32_t n_cores, uint64_t *total_us, uint64_t *calls) {
+    uint64_t total = 0, count = 0;
+    for (uint32_t k = 0; k < n_cores; ++k) {
+        const int32_t i = core_ids[k];
+        if (i < 0 || static_cast<size_t>(i) >= g_cores.size()) continue;
+        total += g_cores[i].push_overrun_total;
+        count += g_cores[i].push_overrun_calls;
+    }
+    *calls = count;
+    *total_us = total * 1000000ULL / get_sys_cnt_aicpu_frequency_hz();
 }
 
 // Compute issued to this core range, in ticks. Comparing it across an A/B is
@@ -456,7 +503,10 @@ uint64_t asim_finish_ts(uint32_t core_idx) {
 
 }  // namespace asim
 
-// aSim's per-core model does its work inside a 92-195 ns read, which it fits, so
-// there is nothing to remove. The hook exists because the phase recorder calls it
-// unconditionally under __SIMULATED_DEVICE__.
-uint64_t simulated_device_self_overrun_ticks() { return 0; }
+// The calling thread's ledger, which the phase recorder subtracts from the window
+// it reports. Exact because this thread's cores run on the clock the ledger
+// offsets: the excess it removes is time in which they did not move.
+uint64_t simulated_device_self_overrun_ticks() {
+    const uint64_t *ledger = asim::self_ledger();
+    return ledger != nullptr ? *ledger : 0;
+}

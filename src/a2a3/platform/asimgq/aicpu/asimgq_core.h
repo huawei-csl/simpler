@@ -38,9 +38,12 @@
 //   submit(queue, task)        — hand a ready task to the queue
 //   read_queue_status(queue)   — its completed prefix, and what it holds
 //
-// Timing is real wall-clock (Mode A): each call busy-spins its modeled latency,
-// and a task's compute elapses because its end is scheduled at
-// `start + ack + compute` while real time passes as the scheduler works. Nothing
+// Timing is real time less the model's own excess (Mode A): each call holds its
+// caller for its modeled latency in real time, and a task's compute elapses
+// because its end is scheduled at `start + ack + compute` while the scheduler
+// works. Model times are on the queue's clock -- real time less every tick its
+// model has spent beyond the latencies it charged -- so the cores stand still
+// while the model overruns. Nothing
 // is simulated in between: a task's end is computed once, when it is pushed to a
 // core, so a poll compares the clock against the soonest end rather than replaying
 // an interval.
@@ -331,8 +334,9 @@ struct SimQueueStatus {
     uint32_t held_room;
 };
 
-// Start every cohort member this queue holds, no earlier than `at` and no earlier
-// than the core it sits on comes free. The manager calls this
+// Start every cohort member this queue holds, no earlier than `at` -- an instant on
+// the real clock, which the queue converts to its own -- and no earlier than the
+// core it sits on comes free. The manager calls this
 // once the cohort is placed device-wide; until then the members occupy their
 // cores without running, which is what co-residency costs. Charged as a posted
 // write into the queue, like submitting an entry.

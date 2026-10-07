@@ -64,7 +64,7 @@ sequence, timed by §4a.
 
 On real hardware both ops are *passive* accesses to mapped addresses — a plain
 load/store the driver’s MMIO fabric services. aSim cannot be passive: the
-status read must *do work* (evaluate `cntvct`, advance the core state machine,
+status read must *do work* (evaluate the model clock, advance the core state machine,
 return the maybe-updated word). So the seam is replaced by **function calls** —
 the single sanctioned change to the scheduler’s device-access layer:
 
@@ -114,7 +114,7 @@ aSim must reflect the Ascend compute-core state machine faithfully; this is the
 heart of the device model. Each core is a **2-deep pipeline**: it holds at most
 an **active** task and a **pushed** (pipelined) task. Per core, aSim tracks:
 
-- `active`  = `{task_id, ack_at, fin_at}` (absolute `cntvct` deadlines) or empty
+- `active`  = `{task_id, ack_at, fin_at}` (absolute deadlines on the thread's model clock — §3 of [DESIGN.md](DESIGN.md)) or empty
 - `pushed`  = `{task_id, admitted_at}` or empty
 - the status register it exposes: `(last_updated_task_id, status ∈ {Uninit,
   Acknowledged, Finished})`

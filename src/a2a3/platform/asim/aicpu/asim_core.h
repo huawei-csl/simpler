@@ -22,11 +22,13 @@
 //   asim_push(core, task_id)   — dispatch: admit the task, schedule its ACK/FIN
 //   asim_read_status(core)     — poll: advance the machine to `now`, return COND
 //
-// Timing is real wall-clock (Mode A): the injected MMIO latency is a cntvct
-// busy-spin inside each call, and a task's compute duration elapses because its
-// FIN deadline is `now + submit + compute` and real time passes while the
-// scheduler does other work. No per-core thread runs; the machine is advanced
-// lazily whenever the scheduler reads it. The returned word is bit-identical to
+// Timing is real time less the model's own excess (Mode A): each call holds its
+// caller for the injected latency in real time, and a task's compute elapses
+// because its FIN deadline is `now + submit + compute` while the scheduler does
+// other work. `now` is the calling thread's model clock -- real time less every
+// tick this thread's model has spent beyond the latencies it charged -- so the
+// cores stand still while the model overruns. No per-core thread runs; the
+// machine is advanced lazily whenever the scheduler reads it. The returned word is bit-identical to
 // the real COND encoding: [bit 31 state | bits 30..0 task_id], ACK=0 / FIN=1.
 
 namespace asim {
@@ -91,6 +93,11 @@ uint32_t asim_read_status(uint32_t core_idx);
 // corrected by -- measured here rather than assumed to be zero.
 // Cores are handed to a thread round-robin, so the caller names them explicitly:
 // a contiguous window would report some other thread's cores.
+// Push work that did not fit inside the modelled push latency, summed over the
+// named cores. Like the poll's, it is on the thread's ledger rather than in the
+// window.
+void asim_push_overrun(const int32_t *core_ids, uint32_t n_cores, uint64_t *total_us, uint64_t *calls);
+
 void asim_poll_overrun(
     const int32_t *core_ids, uint32_t n_cores, uint64_t *total_us, uint64_t *calls, uint64_t *poll_calls,
     uint64_t *poll_work_us
