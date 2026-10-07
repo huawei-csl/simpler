@@ -211,6 +211,11 @@ public:
 public:
     static_assert(MAX_CORE_PER_THREAD <= 128, "CoreTracker state bits must fit BitStates::Storage");
 
+    // Diagnostic reads for the stall dump: which offsets hold a pending-occupied
+    // mark, and whether an offset is idle.
+    BitStates debug_pending_occupied() const { return pending_occupied_; }
+    bool debug_is_idle(int32_t bit_offset) const { return (core_states_ & BitStates::bit(bit_offset)).has_value(); }
+
     void init(int32_t cluster_count) {
         always_assert(
             cluster_count >= 0 && cluster_count <= MAX_CLUSTERS && "cluster_count outside CoreTracker capacity"
