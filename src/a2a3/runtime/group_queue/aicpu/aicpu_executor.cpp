@@ -447,38 +447,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 run_rc = completed;
             } else {
                 LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
-#ifdef __SIMULATED_DEVICE__
-                // The simulator's own cost is only hidden while it fits inside the
-                // latency it models. What does not fit is added to the window this
-                // arm reports, so it is measured rather than assumed: a delta
-                // against another arm is only the structure once this is subtracted.
-                {
-                    LOG_ERROR(
-                        "[SIM_WINCORR] thread=%d subtracted_ticks=%llu", thread_idx,
-                        static_cast<unsigned long long>(g_sim_last_correction[thread_idx])
-                    );
-                    uint64_t pov = 0, pcalls = 0, pwork = 0;
-                    asimgq::queue_push_overrun(static_cast<uint32_t>(thread_idx), &pov, &pcalls, &pwork);
-                    LOG_ERROR(
-                        "[ASIM_PUSHOV] thread=%d calls=%llu total_us=%llu mean_work_ns=%llu", thread_idx,
-                        static_cast<unsigned long long>(pcalls), static_cast<unsigned long long>(pov),
-                        static_cast<unsigned long long>(pwork)
-                    );
-                    uint64_t ov = 0, ocalls = 0;
-                    asimgq::queue_poll_overrun(static_cast<uint32_t>(thread_idx), &ov, &ocalls);
-                    LOG_ERROR(
-                        "[ASIM_OVERRUN] thread=%d calls=%llu total_us=%llu", thread_idx,
-                        static_cast<unsigned long long>(ocalls), static_cast<unsigned long long>(ov)
-                    );
-                    uint64_t rns = 0, sns = 0, pc = 0;
-                    asimgq::queue_poll_profile(static_cast<uint32_t>(thread_idx), &rns, &sns, &pc);
-                    LOG_ERROR(
-                        "[ASIM_PROF] thread=%d calls=%llu retire_ns=%llu status_ns=%llu", thread_idx,
-                        static_cast<unsigned long long>(pc), static_cast<unsigned long long>(rns),
-                        static_cast<unsigned long long>(sns)
-                    );
-                }
-#endif
             }
         }
     }

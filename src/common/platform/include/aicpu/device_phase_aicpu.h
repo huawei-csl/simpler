@@ -71,9 +71,6 @@ uint64_t simulated_device_self_overrun_ticks();
 // subtract only what accrued inside it. This remembers the total as each phase
 // opened; one slot per phase per thread, written and read by that thread alone.
 inline uint64_t g_sim_self_at_phase_start[PLATFORM_MAX_AICPU_THREADS][NUM_AICPU_PHASES] = {};
-// What the last RunWall close actually subtracted, per thread, so the executor
-// can report it from a scope that has a logger.
-inline uint64_t g_sim_last_correction[PLATFORM_MAX_AICPU_THREADS] = {};
 #endif
 
 /** Stamp the start cycle of `phase` for this thread. No-op if capture is off. */
@@ -118,9 +115,6 @@ inline void aicpu_phase_end(AicpuPhase phase) {
     const uint64_t self = now > before ? now - before : 0;
     const uint64_t start = records[static_cast<int>(phase)].start_cycle;
     end = (end > start + self) ? end - self : start;
-    if (phase == AicpuPhase::RunWall && t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) {
-        g_sim_last_correction[t] = self;
-    }
 #endif
     records[static_cast<int>(phase)].end_cycle = end;
 }

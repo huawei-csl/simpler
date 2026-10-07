@@ -679,20 +679,34 @@ that was dispatched there. Every field is private to one thread — deliberately
 since the scheduler's serial fraction is already 14.5% and translation work on
 shared state would be divided by nothing as thread count rises.
 
-An index also names storage: the payload and the deferred-completion slab
-travel with the queue entry. The manager's own cores back that storage,
-`GQ_PAYLOAD_BUFS` entries per core, and the live index window is that product.
+The live window is 32 positions (`SIM_HELD_CAP`). A position is held from submit
+until the manager **learns** its task finished -- from the prefix or from the
+look-ahead bits, whichever comes first -- and it is retired at that moment:
+retiring releases its consumers and returns its capacity token, so one long task at
+the prefix does not hold back everything behind it. Every subtask takes a position,
+so a dispatch pass offers no more cores than the window has positions for.
 
-It is 2, matching what a core's own 2-deep pipeline holds, and **widening it is a
-regression**. An index is claimed at submit, not at placement, so a task waiting in
-the ring holds one while occupying no core — which looks like a reason to give the
-ring its own headroom. Measured, doubling to 4 took qwen from 48.7 ms to 64.3 ms.
+Capacity is also bounded per core: **two entries, one running and one behind it**,
+which is what a core's own 2-deep pipeline holds. The controller drives the cores'
+registers and pipelines an entry behind running work itself, so a core's second
+slot is open as soon as the controller holds the first entry -- the manager waits
+for no ACK, which it would never see. Tokens return by count, an offset holding two
+giving back its second first. Without the second slot every task waits out a
+refill when the one ahead of it ends: on qwen, 0 % of cube tasks then started back
+to back against M0's 94 %.
 
-Submitting binds a task to one manager's 18 cores, so the window is a **commitment
-horizon**, not just storage: a deeper one commits more work to a manager before it
-can be known which manager will have a core free. Per-manager task counts spread
-from 8% to 47% at 4, against 10% for `scan_and_claim`, which places each task on a
-core it owns and so never commits work it cannot start.
+An entry's payload is built in one of its placeholder core's two buffers, and two
+entries a core can retire in either order, so a buffer can be rebuilt while the
+entry built in it is still in flight. Nothing on the simulated device reads a
+payload, so no timing can see it; real hardware would need payload storage named
+by position, as the index already is.
+
+Submitting binds a task to one manager's 18 cores, so depth is a **commitment
+horizon** as well as capacity: a deeper one commits more work to a manager before
+it can be known which manager will have a core free. In an earlier build, four
+entries per core took qwen from 48.7 ms to 64.3 ms, with per-manager task counts
+spreading from 8% to 47% against 10% for `scan_and_claim`, which places each task
+on a core it owns and so never commits work it cannot start.
 
 ### A require_sync_start cohort is gated, then released
 

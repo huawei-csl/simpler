@@ -169,11 +169,21 @@ log lands in a directory shared with every other user on the box.
 
 | marker | arm | what it settles |
 | ------ | --- | --------------- |
-| `[ASIM_WORK]` | M0 | compute issued, dispatches, poll overrun |
-| `[GQ_WORK]` | M2 | compute issued by shape, look-ahead depth, poll and push overrun, steal counters |
-| `[M0_DONE]` / `[M2_DONE]` | both | tasks completed against tasks total |
+| `[ASIM_WORK]` | M0 | compute issued, dispatches, poll and push overrun |
+| `[GQ_WORK]` | M2 | compute issued by shape, positions issued, poll and push overrun, look-ahead depth, cube idle by cause, held entries, steals |
+| `[M0_DONE]` / `[M2_DONE]` | both | tasks completed against tasks total; M2's also gives how many durations came from the calibration rather than a default, and why the grouping path passed tasks over |
 | `[M0_HIST]` / `[M2_HIST]` | both | compute samples per `func_id` |
-| `[GQ_CALIB]` | M2 | share of tasks whose duration came from the calibration rather than a default |
+
+`[GQ_WORK]`'s `aic_idle_us` is cube-core time spent free, split by what was
+waiting at the time: `drain_us`, a sync-start drain holding dispatch;
+`intake_us`, cube work in the software ready queue; `stranded_us`, cube work
+committed to a peer queue; `none_us`, nothing. A core holding an unreleased cohort
+member is not free and is not counted.
+
+**Both arms print the same amount**: one work line per thread and two per run.
+These lines are written inside `device_wall`, so an arm that printed more would
+carry the difference into its measurement -- M2 once printed three times as many
+and paid ~0.36 ms a run for it.
 
 Compare compute issued across the arms before trusting any delta. On the two
 cases it matches to 0.08 % and 0.005 % — though for qwen those figures come from
@@ -213,14 +223,16 @@ These are not style preferences; each one was learned from a wrong number.
   real time less the thread's ledger of work beyond the latencies it models --
   and the phase recorder removes the same ledger from `device_wall`, so
   `device_wall` describes the modelled design ([DESIGN.md](DESIGN.md) §3).
-  `[SIM_WINCORR] subtracted_ticks=` (M2) and `[ASIM_WORK] overrun_us` plus
-  `push_overrun_us` (M0) report the ledger per thread. The
+  `poll_overrun_us` plus `push_overrun_us` -- in `[GQ_WORK]` for M2, with
+  `overrun_us` in place of the first in `[ASIM_WORK]` for M0 -- is each thread's
+  ledger for the run. The
   `sched_start..sched_end` lines are real time and include it, so compare
   `device_wall` across arms, never raw windows. Two checks before quoting a
   simulated number: it must not be below the busiest core's summed compute,
   which no schedule can beat; and the threads' ledgers must not diverge by more
-  than a few percent of the window, because that divergence is the one residue a
-  per-thread clock cannot remove.
+  than a few percent of the window, because coupling through that divergence is
+  the one effect a per-thread clock does not remove (DESIGN.md §3 has the check
+  that showed it small).
 
 ## Calibration
 

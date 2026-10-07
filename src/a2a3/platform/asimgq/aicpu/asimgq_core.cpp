@@ -394,6 +394,10 @@ struct alignas(64) SimQueue {
     uint64_t aic_idle_ticks = 0;
     uint64_t aic_idle_ticks_gated = 0;
     uint64_t gated_ticks = 0;
+    uint64_t aic_idle_drain_ticks = 0;
+    uint64_t aic_idle_intake_ticks = 0;
+    uint64_t aic_idle_stranded_ticks = 0;
+    uint64_t aic_idle_none_ticks = 0;
 
     // How long finished work waits before a poll makes it legible to the manager,
     // summed and worst-case. A core cannot be given its next task until the
@@ -421,6 +425,31 @@ struct alignas(64) SimQueue {
 };
 
 SimQueue g_queues[SIM_MAX_QUEUES];
+
+ReadyBacklogProbe g_backlog_probe = nullptr;
+void *g_backlog_ctx = nullptr;
+
+// Cube work a peer queue holds committed but not running: ring entries, and tasks
+// pipelined behind a running one. Read without synchronisation from the peer's
+// own state as of its last access, so it is a diagnostic snapshot only.
+bool peers_hold_cube(const SimQueue &self) {
+    const uint32_t rc = static_cast<uint32_t>(SimTaskType::Cube);
+    for (uint32_t i = 0; i < SIM_MAX_QUEUES; ++i) {
+        const SimQueue &p = g_queues[i];
+        if (&p == &self || p.package_count == 0) {
+            continue;
+        }
+        if (__atomic_load_n(&p.push[rc], __ATOMIC_RELAXED) != __atomic_load_n(&p.pop[rc], __ATOMIC_RELAXED)) {
+            return true;
+        }
+        const uint64_t w0 = __atomic_load_n(&p.full_m.w[0], __ATOMIC_RELAXED) & p.aic_m.w[0];
+        const uint64_t w1 = __atomic_load_n(&p.full_m.w[1], __ATOMIC_RELAXED) & p.aic_m.w[1];
+        if ((w0 | w1) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Which queue this is. A controller needs its own index to tag the work it places,
 // so a completion can be published to the queue that owns the position.
@@ -1344,25 +1373,6 @@ bool submit_grouped(
     return true;
 }
 
-void queue_debug(
-    uint32_t queue_idx, uint64_t *watermark, uint64_t *high_water, uint32_t *packages, uint32_t *free_packages,
-    uint64_t *ring_push, uint64_t *ring_pop
-) {
-    if (queue_idx >= SIM_MAX_QUEUES) return;
-    SimQueue &q = g_queues[queue_idx];
-    *watermark = q.watermark;
-    *high_water = q.high_water;
-    *packages = q.package_count;
-    *free_packages = q.free_package_count;
-    uint64_t push = 0, pop = 0;
-    for (uint32_t r = 0; r < 3; ++r) {
-        push += q.push[r];
-        pop += q.pop[r];
-    }
-    *ring_push = push;
-    *ring_pop = pop;
-}
-
 void func_hist(uint64_t *out, uint32_t n) {
     for (uint32_t i = 0; i < n && i < 16; ++i) out[i] = g_func_hist[i];
     if (n > 6) out[6] = g_func_other;
@@ -1459,6 +1469,18 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
         if (q.gated_entries != 0) {
             q.aic_idle_ticks_gated += n * dt;
             q.gated_ticks += dt;
+        } else if (n != 0) {
+            bool drain = false;
+            const uint32_t ready = g_backlog_probe != nullptr ? g_backlog_probe(g_backlog_ctx, &drain) : 0;
+            if (drain) {
+                q.aic_idle_drain_ticks += n * dt;
+            } else if (ready != 0) {
+                q.aic_idle_intake_ticks += n * dt;
+            } else if (peers_hold_cube(q)) {
+                q.aic_idle_stranded_ticks += n * dt;
+            } else {
+                q.aic_idle_none_ticks += n * dt;
+            }
         }
     }
     q.last_poll_at = legible;
@@ -1665,6 +1687,26 @@ void queue_aic_idle(uint32_t queue_idx, uint64_t *idle_us, uint64_t *idle_gated_
     *idle_us = q.aic_idle_ticks * 1000000ULL / hz;
     *idle_gated_us = q.aic_idle_ticks_gated * 1000000ULL / hz;
     *gated_us = q.gated_ticks * 1000000ULL / hz;
+}
+
+void set_ready_backlog_probe(ReadyBacklogProbe probe, void *ctx) {
+    g_backlog_ctx = ctx;
+    g_backlog_probe = probe;
+}
+
+void queue_aic_idle_split(
+    uint32_t queue_idx, uint64_t *drain_us, uint64_t *intake_us, uint64_t *stranded_us, uint64_t *none_us
+) {
+    if (queue_idx >= SIM_MAX_QUEUES) {
+        *drain_us = *intake_us = *stranded_us = *none_us = 0;
+        return;
+    }
+    const SimQueue &q = g_queues[queue_idx];
+    const uint64_t hz = get_sys_cnt_aicpu_frequency_hz();
+    *drain_us = q.aic_idle_drain_ticks * 1000000ULL / hz;
+    *intake_us = q.aic_idle_intake_ticks * 1000000ULL / hz;
+    *stranded_us = q.aic_idle_stranded_ticks * 1000000ULL / hz;
+    *none_us = q.aic_idle_none_ticks * 1000000ULL / hz;
 }
 
 uint64_t queue_finish_ts(uint32_t queue_idx, uint64_t index) {

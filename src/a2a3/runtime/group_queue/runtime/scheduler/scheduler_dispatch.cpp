@@ -266,6 +266,8 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
         &slot_state,
         subslot,
         subslot == SubtaskSlot::AIC,
+        !to_pending && !force_gate,
+        !to_pending && force_gate,
 #endif
     };
 }
@@ -359,6 +361,21 @@ void SchedulerContext::dispatch_shape(
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
 #ifdef __SIMULATED_DEVICE__
+        {
+            // Every subtask dispatched takes a position, and a position the window
+            // cannot issue would be lost. Blocks are claimed against `cores`, so
+            // the pass offers only as many cores as the window has positions for;
+            // a mix cluster takes one per core.
+            const int per = is_mix ? SUBTASK_SLOT_COUNT : 1;
+            const int room = static_cast<int>(gq_index_[thread_idx].room()) / per;
+            if (room <= 0) break;
+            CoreTracker::BitStates beyond = cores;
+            for (int k = 0; k < room && beyond.has_value(); ++k)
+                beyond.pop_first();
+            while (beyond.has_value())
+                cores.clear_bit(beyond.pop_first());
+            want = cores.count();
+        }
         if (gq_group::ENABLED) {
             // A grouped submit whose in-group producers have not retired occupies a
             // hold entry until they do, so the controller's spare hold entries bound
@@ -779,6 +796,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     CoreTracker::BitStates cores =
         is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
     if (!cores.has_value()) return 0;
+#ifdef __SIMULATED_DEVICE__
+    // A pass may stage onto every core it found, and each subtask takes a position;
+    // one the window cannot issue would be lost, so stage nothing until it can.
+    if (static_cast<int>(gq_index_[thread_idx].room()) < cores.count() * (is_mix ? SUBTASK_SLOT_COUNT : 1)) return 0;
+#endif
 
     int32_t total_staged = 0;
     ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];

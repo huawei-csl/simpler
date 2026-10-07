@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 #pragma once
 
 #include <stdint.h>
@@ -40,6 +50,9 @@ class alignas(64) GqIndexSpace {
         // holds it until its producers retire and places it itself, so there is
         // nothing for the manager to give back.
         int32_t capacity_token;
+        // The entry took the running slot and kept the pending slot shut behind
+        // it, so it holds both of its offset's tokens and returns both.
+        bool guarded;
     };
 
     void init(uint32_t capacity) {
@@ -86,7 +99,7 @@ class alignas(64) GqIndexSpace {
     uint64_t reserve() {
         if (room() == 0) return UINT64_MAX;
         const uint64_t idx = push_index_++;
-        owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1};
+        owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false};
         return idx;
     }
 
@@ -98,7 +111,7 @@ class alignas(64) GqIndexSpace {
     void unreserve(uint64_t idx) {
         if (push_index_ > 0 && idx == push_index_ - 1) {
             --push_index_;
-            owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1};
+            owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false};
         }
     }
 

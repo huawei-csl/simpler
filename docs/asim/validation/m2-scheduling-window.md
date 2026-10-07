@@ -294,9 +294,10 @@ per-poll work from ~2 000 ns to ~1 600 ns and moved Case1 from +1.7 % to
 −0.5 %..−2.3 %. What remains is structural: closing it means moving retirement off
 the measured thread, not optimising it further.
 
-**Read `[ASIM_OVERRUN]` before quoting any M2 number**, and prefer it to
-`[ASIM_POLL]`: the latter reports total work, which over-states the problem where
-the work fits and says nothing about where it does not.
+**Read the overrun before quoting any M2 number** -- `poll_overrun_us` and
+`push_overrun_us` in `[GQ_WORK]`, printed as `[ASIM_OVERRUN]` when this campaign
+ran -- and prefer it to the total work (`[ASIM_POLL]` then): total work over-states
+the problem where the work fits and says nothing about where it does not.
 
 ## MIX is modelled; sync_start is what qwen needed
 

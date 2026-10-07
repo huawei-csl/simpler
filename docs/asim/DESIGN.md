@@ -77,10 +77,11 @@ less than the work they carried.
 
 The clocks are per thread, which makes them exact for everything a thread's own
 cores do. A thread can still be delayed by another thread's excess, through the
-shared state the scheduler threads coordinate on; that residue is bounded by how
-far the threads' ledgers diverge, which `[SIM_WINCORR]` and `[ASIM_WORK]` report
-per thread. Measured on the two in-scope cases it is 0.2–0.4 ms per round, about
-1–2 % of the window.
+shared state the scheduler threads coordinate on. No counter bounds that residue,
+so it was tested instead: adding 150 or 400 ns of simulator work to every access
+-- which multiplies each thread's ledger, and how far the threads' ledgers drift
+apart -- moved qwen's `device_wall` by at most 1 % and left paged_attention within
+its noise. `[ASIM_WORK]` and `[GQ_WORK]` report each thread's ledger.
 
 ### What Mode A measures — and what it cannot
 

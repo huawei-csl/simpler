@@ -333,6 +333,12 @@ private:
         ChipTaskSlotState *slot;
         SubtaskSlot subslot;
         bool is_cube;
+        // Whether the dispatch leaves the core's pending slot open behind it: an
+        // ordinary dispatch into the running slot. A pending dispatch fills that
+        // slot, and a gated member taking the running slot keeps it shut so no
+        // core stacks two -- that member is then the core's only entry.
+        bool frees_pending;
+        bool guarded;
 #endif
     };
 
@@ -348,11 +354,21 @@ private:
         return h.is_cube ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
     }
 
+    // What the queue's idle-cube accounting asks of the software: cube tasks in
+    // the ready queues, and whether a sync-start drain is holding dispatch.
+    static uint32_t ready_backlog_probe(void *ctx, bool *drain_active) {
+        SchedulerContext *self = static_cast<SchedulerContext *>(ctx);
+        *drain_active = self->drain_state_.sync_start_pending.load(std::memory_order_relaxed) != 0;
+        return self->sched_ != nullptr ?
+                   static_cast<uint32_t>(self->sched_->ready_depth(static_cast<int32_t>(ResourceShape::AIC))) :
+                   0;
+    }
+
     inline void submit_to_queue(const PublishHandle &h, int32_t thread_idx) {
         GqIndexSpace &space = gq_index_[thread_idx];
-        const GqIndexSpace::Owner owner{
-            h.slot, static_cast<int32_t>(h.reg_task_id), h.subslot, h.core_offset, h.core_offset
-        };
+        const GqIndexSpace::Owner owner{h.slot,        static_cast<int32_t>(h.reg_task_id),
+                                        h.subslot,     h.core_offset,
+                                        h.core_offset, h.guarded};
         const bool from_group = gq_group::active() && h.local_id >= 0 &&
                                 gq_group::group_is_opened(gq_group::group_of(h.local_id));
         // An opened group reserved this position when it was queued, ascending
@@ -386,6 +402,11 @@ private:
             // only grows between the read and the submit, so this cannot fire.
             LOG_ERROR("Thread %d: GroupQueue refused a submit -- dispatch outran the ring", thread_idx);
         }
+        // The controller drives the core's registers and pipelines an entry behind
+        // running work itself, so the core's pending slot does not wait for an ACK
+        // the manager never sees: it is open as soon as the controller holds the
+        // entry. A core therefore carries two capacity tokens, as on silicon.
+        if (h.frees_pending) core_trackers_[thread_idx].clear_pending_occupied(h.core_offset);
     }
 #endif
 

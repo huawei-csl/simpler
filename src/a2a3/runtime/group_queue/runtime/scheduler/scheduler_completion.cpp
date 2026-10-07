@@ -291,14 +291,16 @@ void SchedulerContext::check_running_cores_for_completion(
     {
         GqIndexSpace &space = gq_index_[thread_idx];
         const asimgq::SimQueueStatus st = asimgq::read_queue_status(static_cast<uint32_t>(thread_idx));
-        space.advance_watermark(st.watermark);
-        for (uint64_t rest = st.ahead_bits; rest != 0; rest &= rest - 1) {
-            space.note_early(st.watermark + 1 + static_cast<uint64_t>(__builtin_ctzll(rest)));
-        }
-        uint64_t pos = 0;
-        while (space.next_retired(&pos)) {
+        // A finished position is retired the first time the manager learns of it,
+        // whether through the prefix or the look-ahead: retiring is what releases
+        // its consumers and returns its capacity token, so holding a finish above
+        // the watermark until the prefix catches up would let one long task stall
+        // every later task's dependents and the group's whole intake. A position
+        // is retired once: its owner's slot is cleared, and the prefix skips it
+        // when it later passes.
+        auto retire = [&](uint64_t pos) {
             GqIndexSpace::Owner &o = space.owner_of(pos);
-            if (o.slot == nullptr) continue;
+            if (o.slot == nullptr) return;
             made_progress = true;
             complete_slot_task(
                 *o.slot, o.reg_task_id, o.subslot, thread_idx, o.core_id, hank, completed_this_turn
@@ -310,15 +312,33 @@ void SchedulerContext::check_running_cores_for_completion(
             ++cur_thread_completed;
             // The controller chose which core ran this entry, so the offset the
             // manager recorded is a capacity token rather than a placement. It is
-            // still what bounds intake -- a group may hold 18 cores' worth of work --
-            // so returning it is what lets the next pass dispatch.
+            // still what bounds intake -- a group holds at most two entries per
+            // core, one running and one behind it -- so returning it is what lets
+            // the next pass dispatch. Tokens are counted, not matched to entries:
+            // an offset holding two gives up its pending one first, and goes idle
+            // only when nothing of its is left in flight. A guarded entry is its
+            // offset's only one, so it leaves the offset idle.
             CoreTracker &tracker = core_trackers_[thread_idx];
             const int32_t off = o.capacity_token;
             if (off >= 0) {
-                tracker.change_core_state(off);
-                tracker.clear_pending_occupied(off);
+                if (o.guarded || !tracker.is_pending_occupied(off)) {
+                    tracker.change_core_state(off);
+                    tracker.clear_pending_occupied(off);
+                } else {
+                    tracker.clear_pending_occupied(off);
+                }
             }
             o.slot = nullptr;
+        };
+        space.advance_watermark(st.watermark);
+        uint64_t pos = 0;
+        while (space.next_retired(&pos)) {
+            retire(pos);
+        }
+        for (uint64_t rest = st.ahead_bits; rest != 0; rest &= rest - 1) {
+            const uint64_t idx = st.watermark + 1 + static_cast<uint64_t>(__builtin_ctzll(rest));
+            space.note_early(idx);
+            retire(idx);
         }
     }
     return;

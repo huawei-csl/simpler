@@ -527,7 +527,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
         // capacity_token is -1: this entry took nothing out of the thread's core
         // budget. The controller holds it until its producers retire and places it
         // itself, so there is no token for completion to give back.
-        space.set_owner(idx, GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, subslot, book_core, -1});
+        space.set_owner(idx, GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, subslot, book_core, -1, false});
         note_task_position(f.id, idx);
 
         uint64_t deps[asimgq::SIM_HELD_MAX_DEPS];
@@ -594,6 +594,7 @@ void SchedulerContext::gq_prepare_run() {
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         gq_index_[i].init(asimgq::SIM_HELD_CAP);
     }
+    asimgq::set_ready_backlog_probe(&SchedulerContext::ready_backlog_probe, this);
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
     // Seeding first: the partition below applies only to a run that declared
@@ -896,40 +897,55 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
 #endif
 #ifdef __SIMULATED_DEVICE__
     {
-        // Compute the controller actually issued. Compared across an A/B this is
-        // what says both legs ran the same graph, which a skip-golden run cannot.
+        // One line per thread and two per run, the same as the M0 arm prints: these
+        // lines are written inside the device_wall the arm reports, so an arm that
+        // printed more would carry the difference into its measurement.
+        //
+        // The compute issued, compared across an A/B, is what says both legs ran
+        // the same graph, which a skip-golden run cannot. poll_overrun_us plus
+        // push_overrun_us is the model's excess this run: exactly what the phase
+        // recorder removes from this thread's window.
+        const uint32_t q = static_cast<uint32_t>(thread_idx);
         uint64_t aic = 0, aiv = 0;
-        asimgq::queue_busy_ticks(static_cast<uint32_t>(thread_idx), &aic, &aiv);
+        asimgq::queue_busy_ticks(q, &aic, &aiv);
         uint32_t ahead_hw = 0;
         uint64_t ahead_dropped = 0;
-        asimgq::queue_ahead_stats(static_cast<uint32_t>(thread_idx), &ahead_hw, &ahead_dropped);
-        // The simulator's own work overruns a modelled deadline when it costs more
-        // than the access it stands for, and that excess lands in the measured
-        // window. Reported here so an A/B against ASIM_WORK compares like for like.
+        asimgq::queue_ahead_stats(q, &ahead_hw, &ahead_dropped);
         uint64_t poll_over_us = 0, poll_over_calls = 0;
-        asimgq::queue_poll_overrun(static_cast<uint32_t>(thread_idx), &poll_over_us, &poll_over_calls);
+        asimgq::queue_poll_overrun(q, &poll_over_us, &poll_over_calls);
         uint64_t steals_tried = 0, steals_won = 0;
         int64_t steal_gain_us = 0;
-        asimgq::queue_steal_stats(
-            static_cast<uint32_t>(thread_idx), &steals_tried, &steals_won, &steal_gain_us
-        );
+        asimgq::queue_steal_stats(q, &steals_tried, &steals_won, &steal_gain_us);
         uint64_t work_total = 0, work_max = 0, work_calls = 0;
-        asimgq::queue_poll_work(static_cast<uint32_t>(thread_idx), &work_total, &work_max, &work_calls);
+        asimgq::queue_poll_work(q, &work_total, &work_max, &work_calls);
         uint64_t push_over_us = 0, push_over_calls = 0, push_mean_ns = 0;
-        asimgq::queue_push_overrun(
-            static_cast<uint32_t>(thread_idx), &push_over_us, &push_over_calls, &push_mean_ns
-        );
+        asimgq::queue_push_overrun(q, &push_over_us, &push_over_calls, &push_mean_ns);
+        uint64_t idle = 0, idle_gated = 0, gated = 0, drain = 0, intake = 0, stranded = 0, none = 0;
+        asimgq::queue_aic_idle(q, &idle, &idle_gated, &gated);
+        asimgq::queue_aic_idle_split(q, &drain, &intake, &stranded, &none);
+        uint64_t admitted = 0, promoted = 0, refused = 0;
+        uint32_t held_high = 0;
+        asimgq::queue_group_stats(q, &admitted, &promoted, &refused, &held_high);
         LOG_INFO(
-            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f ahead_high=%u ahead_dropped=%llu "
-            "poll_overrun_us=%" PRIu64 " push_overrun_us=%" PRIu64 " polls=%" PRIu64
-            " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
-            " steals_tried=%" PRIu64 " steals_won=%" PRIu64 " steal_gain_us=%" PRId64,
-            thread_idx, cycles_to_us(aic), cycles_to_us(aiv), ahead_hw, (unsigned long long)ahead_dropped,
-            poll_over_us, push_over_us, work_calls,
-            work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
-            (uint64_t)(cycles_to_us(work_max) * 1000.0),
-            steals_tried, steals_won, steal_gain_us
+            "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f positions=%" PRIu64 " poll_overrun_us=%" PRIu64
+            " push_overrun_us=%" PRIu64 " polls=%" PRIu64 " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
+            " ahead_high=%u ahead_dropped=%" PRIu64 " aic_idle_us=%" PRIu64 " gated_us=%" PRIu64 " drain_us=%" PRIu64
+            " intake_us=%" PRIu64 " stranded_us=%" PRIu64 " none_us=%" PRIu64 " held_admitted=%" PRIu64
+            " held_promoted=%" PRIu64 " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64
+            " steals_won=%" PRIu64 " steal_gain_us=%" PRId64,
+            thread_idx, cycles_to_us(aic), cycles_to_us(aiv), gq_index_[thread_idx].push_index(), poll_over_us,
+            push_over_us, work_calls, work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
+            (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, idle, idle_gated, drain, intake,
+            stranded, none, admitted, promoted, refused, held_high, steals_tried, steals_won, steal_gain_us
         );
+#if ASIMGQ_SELF_PROFILE
+        uint64_t retire_ns = 0, status_ns = 0, profiled = 0;
+        asimgq::queue_poll_profile(q, &retire_ns, &status_ns, &profiled);
+        LOG_INFO(
+            "[ASIM_PROF] thread=%d calls=%" PRIu64 " retire_ns=%" PRIu64 " status_ns=%" PRIu64, thread_idx, profiled,
+            retire_ns, status_ns
+        );
+#endif
         if (thread_idx == 0) {
             uint64_t h[8] = {};
             asimgq::func_hist(h, 8);
@@ -939,49 +955,18 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
                 h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
                 h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
             );
-            LOG_INFO("[M2_DONE] completed_tasks=%d total=%d",
-                     completed_tasks_.load(std::memory_order_relaxed), total_tasks_);
-        }
-        if (thread_idx == 0) {
+            // Completion, the share of durations the calibration supplied, and why
+            // the grouping path passed tasks over, in the run's second line.
             uint64_t hits = 0, misses = 0;
             asimgq::calib_coverage(&hits, &misses);
             LOG_INFO(
-                "[GQ_CALIB] calibrated=%" PRIu64 " default=%" PRIu64 " (%.1f%% calibrated)", hits, misses,
-                (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0
-            );
-        }
-    }
-    if (gq_group::ENABLED) {
-        uint64_t admitted = 0, promoted = 0, refused = 0;
-        uint32_t high = 0;
-        asimgq::queue_group_stats(static_cast<uint32_t>(thread_idx), &admitted, &promoted, &refused, &high);
-        LOG_INFO(
-            "[GQ_GROUP thread=%d] admitted=%" PRIu64 " promoted=%" PRIu64 " refused=%" PRIu64 " held_high=%u",
-            thread_idx, admitted, promoted, refused, high
-        );
-        {
-            uint64_t wm = 0, hw = 0, rpush = 0, rpop = 0;
-            uint32_t pkg = 0, freepkg = 0;
-            asimgq::queue_debug(static_cast<uint32_t>(thread_idx), &wm, &hw, &pkg, &freepkg, &rpush, &rpop);
-            LOG_INFO(
-                "[GQ_DEV thread=%d] wm=%" PRIu64 " high_water=%" PRIu64 " packages=%u free=%u ring_push=%" PRIu64
-                " ring_pop=%" PRIu64,
-                thread_idx, wm, hw, pkg, freepkg, rpush, rpop
-            );
-        }
-        LOG_INFO(
-            "[GQ_IDX thread=%d] push=%" PRIu64 " watermark=%" PRIu64 " room=%u",
-            thread_idx, gq_index_[thread_idx].push_index(), gq_index_[thread_idx].watermark(),
-            gq_index_[thread_idx].room()
-        );
-        if (thread_idx == 0) {
-            LOG_INFO(
-                "[GQ_WHY] skip_fired=%" PRIu64 " skip_unclaimed=%" PRIu64 " skip_nopos=%" PRIu64
-                " deps_named=%" PRIu64 " deps_allcomplete=%" PRIu64 " deps_bailed=%" PRIu64 " deps_toomany=%" PRIu64,
+                "[M2_DONE] completed_tasks=%d total=%d calibrated=%" PRIu64 " default=%" PRIu64 " skip_fired=%" PRIu64
+                " skip_unclaimed=%" PRIu64 " skip_nopos=%" PRIu64 " deps_named=%" PRIu64 " deps_allcomplete=%" PRIu64
+                " deps_bailed=%" PRIu64 " deps_toomany=%" PRIu64,
+                completed_tasks_.load(std::memory_order_relaxed), total_tasks_, hits, misses,
                 g_gq_skip_fired.load(std::memory_order_relaxed), g_gq_skip_unclaimed.load(std::memory_order_relaxed),
                 g_gq_skip_nopos.load(std::memory_order_relaxed), g_gq_deps_named.load(std::memory_order_relaxed),
-                g_gq_deps_allcomplete.load(std::memory_order_relaxed),
-                g_gq_deps_bailed.load(std::memory_order_relaxed),
+                g_gq_deps_allcomplete.load(std::memory_order_relaxed), g_gq_deps_bailed.load(std::memory_order_relaxed),
                 g_gq_deps_toomany.load(std::memory_order_relaxed)
             );
         }
