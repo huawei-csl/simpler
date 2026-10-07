@@ -50,10 +50,17 @@ to expand. Both simulated arms run on the per-thread model clock described in
 [DESIGN.md](../DESIGN.md) §3, so their `device_wall` excludes the simulator's own
 work exactly.
 
-| case | base (silicon) | sim (M0) | simgc (M2) | M0 error | M2 vs M0 | M2 vs silicon |
-| ---- | -------------- | -------- | ---------- | -------- | -------- | ------------- |
-| paged_attention Case1 | 21.249 ms | 21.775 ms | 11.327 ms | **+2.5 %** | -48.0 % | **-46.7 %** |
-| qwen3-14B decode, 40L | 34.551 ms | 33.116 ms | 37.424 ms | **-4.2 %** | +13.0 % | **+8.3 %** |
+| case | base (silicon) | sim (M0) | M0 error |
+| ---- | -------------- | -------- | -------- |
+| paged_attention Case1 | 21.249 ms | 21.775 ms | **+2.5 %** |
+| qwen3-14B decode, 40L | 34.551 ms | 33.116 ms | **-4.2 %** |
+
+The simgc arm ran the GroupQueue manager before it was fixed to retire on notice
+and pipeline a second task per core, so its figures are superseded; M2 against M0
+and against silicon is in
+[validation.md](../validation.md#what-the-groupqueue-is-worth). A second session
+that afternoon, for the fixed manager, read M0 at +3.6 % and -4.4 % against
+silicon, so the error repeats to about a point.
 
 **The error changes sign between the cases, so it is not a bias that cancels.**
 aSim's M0 runs 2.5 % slow on paged_attention and 4.2 % fast on qwen. Mixed signs
@@ -61,14 +68,14 @@ are the good case -- a uniform bias is the signature of a term the model is
 missing -- but the magnitude is several times the ±0.5 % the `scan_and_claim`
 gate above recorded, and because it differs per case it does not cancel in an
 M0-vs-M2 delta. The correction from "against M0" to "against hardware" therefore
-runs in opposite directions on the two cases; the last column is the one to quote
-about hardware.
+runs in opposite directions on the two cases, which is why validation.md quotes M2
+against silicon alongside M2 against M0.
 
 On paged_attention the error is **in the scheduling window, not in fixed cost**.
 M0's window is on its model clock -- the raw window less the thread's ledger:
 
-| case | | base | sim (M0) | error |
-| ---- | - | ---- | -------- | ----- |
+| case | metric | base | sim (M0) | error |
+| ---- | ------ | ---- | -------- | ----- |
 | paged_attention | `device_wall` | 21.249 ms | 21.775 ms | +2.5 % |
 | | scheduling window | 18.176 ms | 18.575 ms | +2.2 % |
 | | remainder | 3.073 ms | 3.200 ms | 0.13 ms apart |
@@ -95,12 +102,13 @@ M0 is 97 % compute. So M0 holding -4.2 % there is the validation of the
 pipelined, saturated regime that paged_attention, with its cores ~90 % idle,
 cannot give. It also bounds what any scheduler can gain on qwen: a few percent.
 
-Work equivalence holds on both cases -- compute issued, M0 against M2:
+Work equivalence holds on both cases -- compute issued, M0 against the fixed M2,
+from the afternoon session:
 
 | case | M0 | M2 | delta | completed |
 | ---- | -- | -- | ----- | --------- |
-| paged_attention Case1 | 91.130 ms | 91.091 ms | -0.043 % | 65,792 / 65,792 |
-| qwen3-14B decode, 40L | 746.107 ms | 746.578 ms | +0.063 % | 11,087 / 11,087 |
+| paged_attention Case1 | 91.134 ms | 91.082 ms | -0.06 % | 65,792 / 65,792 |
+| qwen3-14B decode, 40L | 746.367 ms | 746.190 ms | -0.02 % | 11,087 / 11,087 |
 
 ## Residuals and known blind spots
 
@@ -128,6 +136,7 @@ Work equivalence holds on both cases -- compute issued, M0 against M2:
    varies with configuration does not cancel in an M0-vs-M2 delta.
 5. **The model clock is per thread.** It is exact for everything a thread's own
    cores do; a thread delayed by another thread's simulator work, through state
-   the scheduler threads share, is not corrected. The threads' ledgers diverge by
-   at most 0.02 ms (M0) and 0.37 ms (M2) per round on these cases, which bounds
-   that residue at about 1-2 % of the window.
+   the scheduler threads share, is not corrected, and no counter bounds it. It
+   was tested instead: adding 150 or 400 ns of simulator work to every access,
+   which widens how far the threads' ledgers drift apart, moved qwen by at most
+   1 % and left paged_attention within its noise ([DESIGN.md](../DESIGN.md) §3).

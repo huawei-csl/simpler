@@ -200,10 +200,10 @@ These are not style preferences; each one was learned from a wrong number.
 
   | case | arm | repeatability |
   | ---- | --- | ------------- |
-  | qwen-40L | silicon, M0 | 0.7-0.8 % over three interleaved reps |
-  | qwen-40L | M2 (`a2a3asimgq`) | 1.6 % over three reps |
-  | PA Case1 | silicon, M0 | 1.4 % over four reps |
-  | PA Case1 | **M2 (`a2a3asimgq`)** | **6.5 % over four reps** |
+  | qwen-40L | silicon, M0 | 0.6-0.9 % over three interleaved reps |
+  | qwen-40L | M2 (`a2a3asimgq`) | 1.5 % over three reps |
+  | PA Case1 | silicon, M0 | 0.7-1.7 % over four reps |
+  | PA Case1 | **M2 (`a2a3asimgq`)** | **7.6 % over four reps** |
 
   The spread is a property of the arm and the case together, not of the arm.
   Before the model clock PA's M2 arm spanned 13.7-17.6 %: the simulator's own

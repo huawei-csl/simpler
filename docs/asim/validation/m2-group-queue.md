@@ -8,7 +8,7 @@
 > of this campaign's method and of the grouping contract; for what the GroupQueue
 > is worth, use the current measurement in
 > [validation.md](../validation.md#what-the-groupqueue-is-worth) -- paged_attention
-> -48.0 %, qwen +13.0 % against M0.
+> -47.9 %, qwen +1.2 % against M0.
 
 What the task-grouping contract is worth, measured as **`device_wall`** against an
 M0 of `host_build_graph` + simulated cores (`a2a3asim`). Method and fidelity:

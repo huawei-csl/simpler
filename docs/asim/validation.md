@@ -5,6 +5,11 @@
 > correction removed simulator work the cores had computed through. Current
 > figures are in [What the GroupQueue is worth](#what-the-groupqueue-is-worth);
 > earlier ones are kept below for their method and marked superseded.
+>
+> **The first model-clock figures, the same day, under-state it on qwen** (M2
+> +13.0 %): their manager retired a finish only in prefix order and never put a
+> second task behind a running core. Both are fixed; the figures below are on the
+> fixed manager.
 
 ## The gate is the scheduling window, not `device_wall`
 
@@ -68,8 +73,8 @@ The short version, for reading the deltas below:
 
 | case | M0 error vs silicon | M2 vs M0 | M2 vs silicon |
 | ---- | ------------------- | -------- | ------------- |
-| paged_attention Case1 | +2.5 % (M0 slow) | -48.0 % | **-46.7 %** |
-| qwen3-14B decode, 40L | -4.2 % (M0 fast) | +13.0 % | **+8.3 %** |
+| paged_attention Case1 | +3.6 % (M0 slow) | -47.9 % | **-46.1 %** |
+| qwen3-14B decode, 40L | -4.4 % (M0 fast) | +1.2 % | **-3.3 %** |
 
 **The error changes sign between the cases, so it does not cancel in a delta.**
 Every GroupQueue figure in this document is quoted against M0; the last column is
@@ -82,211 +87,85 @@ does not transfer -- see the subdoc.
 
 ## What the GroupQueue is worth
 
-Measured 2026-10-07 on the model clock, all three arms interleaved inside one
-device lock -- 48 samples per arm on paged_attention, 36 on qwen. qwen is the
-in-repo expanded 40-layer orchestration.
+Measured 2026-10-07 on the model clock and the fixed manager, all arms
+interleaved inside one device lock -- 48 samples per arm on paged_attention, 33-36
+on qwen. qwen is the in-repo expanded 40-layer orchestration.
 
 | case | silicon | M0 | M2 | M2 vs M0 | M2 vs silicon |
 | ---- | ------- | -- | -- | -------- | ------------- |
-| paged_attention Case1, 65,792 tasks | 21.249 ms | 21.775 ms | 11.327 ms | **-48.0 %** | **-46.7 %** |
-| qwen3-14B decode, 40 layers | 34.551 ms | 33.116 ms | 37.424 ms | **+13.0 %** | **+8.3 %** |
+| paged_attention Case1, 65,792 tasks | 21.256 ms | 22.012 ms | 11.465 ms | **-47.9 %** | **-46.1 %** |
+| qwen3-14B decode, 40 layers | 34.673 ms | 33.143 ms | 33.527 ms | **+1.2 %** | **-3.3 %** |
 
-**paged_attention: the GroupQueue nearly halves the time.** Its cores sit ~90 %
-idle under M0, because the AICPU scheduler cannot feed them faster than ~1.1 us a
-task; the GroupQueue takes readiness, completion and placement off that path.
+**paged_attention: the GroupQueue halves the time.** Its cores sit ~90 % idle
+under M0, because the AICPU scheduler cannot feed them faster than ~1.1 us a task;
+the GroupQueue takes readiness, completion and placement off that path. What it
+leaves is balance across groups: its cube cores spend ~1.2 ms a round idle while
+a peer queue holds cube work they cannot take (`stranded_us` in `[GQ_WORK]`).
 
-**qwen: the GroupQueue loses.** qwen is bound by its cube cores' compute: the
-busiest one carries 30.8 ms of work, and M0 finishes within ~4 % of that, so no
-scheduler has more than a few percent to gain. M2 lands 13 % above M0. Why M2
-spends that extra time on a compute-bound graph has not been traced yet.
+**qwen: parity.** qwen is bound by its cube cores' compute -- the busiest carries
+30.8 ms of work and M0 finishes within ~4 % of that -- and it declares no groups,
+so M2's manager does the same software job as M0's scheduler. The two arms'
+scheduling windows agree to 0.4 %; the rest of M2's 1.2 % lies outside the
+window, in setup and teardown.
+
+**The first model-clock measurement had M2 13 % slower on qwen**, from two defects
+in the manager rather than the controller:
+
+- **It retired a finish only once every earlier position had.** A task that
+  finished ahead of the prefix kept its consumers waiting and its capacity token
+  out until the oldest unfinished task completed -- the prefix stall
+  [the readiness investigation](../investigations/2026-09-groupqueue-watermark-readiness.md)
+  measured on the controller side. Worth ~4.5 points.
+- **It never put a second task behind a running core.** The core tracker it shares
+  with `host_build_graph` reopens a core's pending slot on the running task's ACK,
+  which the GroupQueue manager never reads. M0 starts 94 % of its 665 cube tasks
+  per core back to back; M2 started none, each waiting ~3.7 us for a refill.
+  Worth ~6.5 points.
+
+Cutting M2's end-of-run logging to M0's volume took about one point more, since
+those lines are written inside `device_wall`. paged_attention did not move under
+either fix: its grouped entries take no capacity token.
 
 **The paged_attention gain is not the cost of transport.** Give M0 a zero-latency
 connection to the AICores -- free send, free status read, instant completion
-notice -- and it is still 1.63x the time of an unmodified M2; free transport
-closes 30 % of the gap. The ablation and the mechanism are in
+notice -- and it is still 1.64x the time of M2; free transport closes 30 % of the
+gap. The ablation and the mechanism are in
 [validation/transport-ablation.md](validation/transport-ablation.md).
 
-Compute issued agrees between the arms to 0.04 % (paged_attention) and 0.06 %
-(qwen), and every task completes in every run.
+Compute issued agrees between the arms to 0.06 % (paged_attention) and 0.02 %
+(qwen), and every M2 round completes every task. One of the three qwen M0 runs
+stalled in its twelfth round: a ready sync-start cohort the drain never
+dispatched, every core idle, until the scheduler timeout. M0's code did not change,
+so the defect is in the sync-start drain the two runtimes share; the run's eleven
+completed rounds are kept, and dropping them moves M0's median by 2 us.
 
-### Superseded: the 2026-09-21 campaign
+## Is an M0-vs-M2 delta an artefact?
 
-> Measured before the model clock. Every M2 figure in this subsection and the two
-> that follow over-states the GroupQueue -- on qwen, past what its compute allows.
-> They are kept for the method, the graph-shape facts, and the grouping
-> question; do not quote the M2 percentages.
-
-Two cases carry the campaign. Both arms of each pair run back to back in one
-submission on one held card, so the delta is free of the ~3 % session drift.
-paged_attention's figure is the pooled median of **eight interleaved reps**: its
-M0 arm holds to 0.7 %, but its M2 arm spans 13.7 %, so a single pair cannot place
-it closer than a few points. Every one of those eight reps fell between -58.1 %
-and -52.0 %.
-
-| case | M0 | M2 | vs M0 |
-| ---- | -- | -- | ----- |
-| paged_attention Case1, 65,792 tasks, grouped 32/4 | 22.285 ms | 9.776 ms | **-56.1 %** |
-| qwen3-14b `decode_fwd`, 40 layers (pypto-lib) | 28.423 ms | 18.989 ms | **-33.2 %** |
-
-The in-repo expanded 40-layer qwen, a separate orchestration of the same model,
-independently measures -32.6 %, so the qwen figure reproduces across two
-codegen paths.
-
-Sweeping `--fwd-layers` on the qwen case gives a flat per-layer cost in each arm
--- M0 ~710 us, M2 ~475 us -- so the ratio is a property of the runtime rather
-than of the graph, and it asymptotes at 0.668 once there is enough work to reach
-it.
-
-> **The qwen arm is not established as ungrouped, so -33 % must not be read as
-> the bare throughput gain.** An earlier version of this section split the two
-> results that way, attributing PA's further -22 points to declared grouping.
-> The pypto codegen patch was live for these runs and the generated qwen
-> orchestration carries **6 `rt_group_begin()` calls**, so the graph reached the
-> runtime with declarations on it. Whether the runtime resolved them or dropped
-> them -- it drops a declaration that holds no internal edge, and earlier qwen
-> declarations measured `deps_named=0`, so dropping is likely -- is unverified,
-> because the `[GQ_GROUP]` counter that would settle it is not readable on the
-> pypto path (see [patches/README.md](patches/README.md)). Until it is read,
-> -33.2 % is "qwen-40L with declarations emitted, resolution status unknown",
-> and the grouping-versus-throughput split is an open question rather than a
-> result. The in-repo expanded orchestration is a separate path whose
-> declarations are controlled directly, and it is the cleaner place to settle
-> the split.
-
-### The two cases are opposite graph shapes
-
-Both are recorded by dep-gen and profiled the same way: level = longest path in
-edges, width = tasks at that level, "fillable" = a level wide enough to occupy
-all 72 cores.
-
-| property | paged_attention Case1 | qwen3-14B decode |
-| -------- | --------------------- | ---------------- |
-| tasks | 65,792 | 11,085 |
-| components | **256, disjoint** | **1** |
-| critical path | 33 levels | 195 levels (pypto path) |
-| mean width | — | 22.7 |
-| work at fillable levels | — | 15 % |
-| maximum fan-in | **3** | **86** |
-
-paged_attention is wide and shallow, in 256 pieces that share no edge. qwen is a
-single long thin chain. Nearly every difference between the two — which one
-rewards grouping, which one triggers the steal path, which one can be expressed
-with four dependency comparators — follows from that one contrast, so it is worth
-checking a new case's shape before predicting how it will behave.
-
-**Width does not predict the sign of the M0-vs-M2 delta**, which was tested and
-falsified: the 16-layer qwen graph is 195 levels deep and 22.8 wide with only 15 %
-of its work at fillable levels, and it still wins 32.7 %. What width predicts is
-*which mechanism* pays.
-
-One caveat on the recorded graphs. The in-repo expanded qwen orchestration emits
-40 layers in a loop, yet its recorded longest path is 32 — and forty chained
-layers cannot have a path shorter than 40. So dep-gen under-records some
-cross-layer edges, and a width read off `deps.json` is an upper bound. It does
-not affect any timing here: both arms execute the runtime's real dependencies,
-not the recording.
-
-### The break-even is about 1 ms of device work
-
-M2 carries a fixed setup cost, so below roughly 1 ms it loses. Measured on one
-case and one code path, varying only the work:
-
-| qwen `--fwd-layers` | M0 | M2 vs M0 |
-| ------------------- | -- | -------- |
-| 1 | 841 us | +4.3 % |
-| 2 | 1.55 ms | -13.4 % |
-| 4 | 2.97 ms | -23.3 % |
-| 16 | 11.4 ms | -32.7 % |
-| 40 | 28.4 ms | -33.2 % |
-
-Everything the campaign measured falls on this curve, including the two cases
-dropped from scope on 2026-09-21 for being too small to matter: deepseek v4
-`expert_routed` (615 us, +5.0 %) and the bare qwen invocation (824 us, +7.5 %).
-Their regressions are the threshold, not a defect peculiar to them.
-
-Two earlier readings of the same data were wrong and are recorded here so they
-are not re-derived. **Graph size does not predict the sign** -- qwen at
-`--fwd-layers 2` is ~1,100 tasks and wins, while the 4,470-task bare invocation
-loses. **Width does not predict it either** -- the 16-layer graph is 195 levels
-deep and 22.8 wide, with only 15 % of its work at levels able to fill 72 cores,
-and it wins -32.7 % all the same. Width still describes *how* the two in-scope
-cases differ (PA's 256 disjoint groups against qwen's long thin chain), which is
-why PA is the one that rewards grouping; it just does not set the sign.
-
-## Is an M0-vs-M2 delta an artefact? (audit, 2026-09-17)
-
-> **Resolved 2026-10-07.** The audit's conclusion -- that the fix is virtual time
-> rather than a faster simulator -- is what now runs: each simulated device keeps
-> a per-thread ledger of its work beyond the latencies it models and runs that
-> thread's cores on real time less it, so the phase recorder's removal of the
-> same ledger is exact ([DESIGN.md](DESIGN.md) §3). Its reading that M2's deltas
-> were **lower** bounds was wrong: the overrun it describes as inflating M2's
-> window had already been subtracted, cores' compute included, which made the
-> deltas over-statements. The text below is the audit as written.
-
-The M2 wins are large enough that the burden is on the simulator to show it is
-not handing them out. Everything below was checked with the two arms running the
-same graph back to back on one locked card.
-
-**Symmetric, and therefore not a source of advantage:**
-
-| property | M0 (`asim`) | M2 (`asimgq`) |
-| -------- | ----------- | ------------- |
-| compute issued/round, PA | 91,128 us | 91,051 us (-0.08 %) |
-| compute issued/round, qwen | 746,555 us | 746,519 us (-0.005 %) |
-| tasks completed | 65,792 / 11,087 | 65,792 / 11,087 |
-| cores | 72, from `get_worker_count()` | 72, same call |
-| compute draw | table + bounded Irwin-Hall | same code, same calib |
-| slots per core | 2 (`active` + `pushed`) | 2 (`outstanding 0..2`) |
-| submit -> work starts | 1008 ns | 1038 ns |
-
-M2's dispatch is the longer of the two: it pays the die crossing to reach its
-controller *and* the controller-to-core link, where M0 crosses once.
-
-**The one large asymmetry runs against M2.** M0's modelled status read (195 ns)
-exceeds what the simulator costs to execute one, so it never overshoots and its
-window is model-faithful: overrun is 0-4 us per thread per round. M2's modelled
-poll (5-10 ns) is *below* its own cost, so nearly every poll overshoots and the
-excess lands in the measured window -- 15,211 us per thread per round on qwen,
-about 65 % of it. The published deltas are therefore **lower bounds**.
-
-**Cheapening the simulator does not fix it, because the poll count is
-demand-driven.** Cutting the poll from 136 ns to 117 ns raised the count from
-104k to 114k and left wall-per-poll at 210 -> 206 ns; only ~120 ns of that is the
-simulator, the rest being the scheduler's own loop. Since `asimgq` spins to a
-real-time deadline, a faithful window needs modelled latency >= the real
-per-poll cost (~200 ns). At 10 ns it is 20x under, so the loop outruns the model
-and the window measures the host. The fix is virtual time -- advancing a model
-clock instead of spinning -- not a faster simulator.
-
-**What this licenses.** Rankings and the direction of an M0-vs-M2 delta are
-sound. M2's absolute `device_wall` is not: it is a floor set by simulator plus
-scheduler cost, which is also why qwen barely moves between a 5 ns and a 10 ns
-read model -- both sit under the floor. Only a 30 ns *per word* read (~300 ns on
-a ten-deep scan) rises above it and moves the number.
-
-**Measurement discipline this established.** Three consecutive runs of one
-binary agree to 0.55 %; the same build an hour later differs ~3 %, with the card
-held throughout. Compare arms back to back inside one submission. The
-`[GQ_WORK]` counters themselves cost ~1.3 % of `device_wall`, so an instrumented
-run is its own baseline.
+The 2026-09-17 audit checked the two arms for asymmetries that could hand M2 its
+wins: what it found symmetric, the one large asymmetry it measured, and the
+measurement discipline it established are in
+[validation/artefact-audit.md](validation/artefact-audit.md). The fix it called
+for, virtual time, is the model clock that now runs ([DESIGN.md](DESIGN.md) §3).
 
 ## The M2 campaigns
 
-What the GroupQueue is worth has been measured three times, against different
+What the GroupQueue is worth has been measured four times, against different
 baselines and gates. They are kept apart because their figures do not compare:
 
 | campaign | gate | M0 | headline |
 | -------- | ---- | -- | -------- |
 | [2026-09-04](validation/m2-scheduling-window.md) | scheduling window (`sched_cost=`), raw | `scan_and_claim` | qwen +4.6 %, paged_attention −11.8 % |
 | [2026-09-14](validation/m2-group-queue.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −55 %, qwen a loss at every group size |
-| [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | paged_attention −48.0 %, qwen +13.0 % |
+| [2026-09-21](validation/m2-campaign-2026-09-21.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −56.1 %, qwen −33.2 % |
+| [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock, fixed manager | `host_build_graph` (`a2a3asim`) | paged_attention −47.9 %, qwen +1.2 % |
 
 The raw window of the first campaign includes the simulator's own work, which
-inflates M2; the second removed that work including the part the cores computed
-through, which over-states M2. The third runs the cores on a model clock so the
-removal is exact, and is the one to quote.
+inflates M2; the second and third removed that work including the part the cores
+computed through, which over-states M2. The fourth runs the cores on a model clock
+so the removal is exact, on the manager fixed to retire on notice and pipeline a
+second task per core, and is the one to quote.
 
-The second and third add the task-grouping contract: the ready queue holds groups
-rather than tasks, and a controller resolves a group's internal edges. It wins where
-groups are independent of each other and loses where they are chained.
+From the second on, the campaigns carry the task-grouping contract: the ready queue
+holds groups rather than tasks, and a controller resolves a group's internal edges.
+It wins where groups are independent of each other and loses where they are
+chained.

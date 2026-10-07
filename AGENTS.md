@@ -26,17 +26,19 @@ the unmodified `host_build_graph` scheduler on the same graph.
 
 > **M2 figures dated before 2026-10-07 over-state the GroupQueue** -- the window
 > correction removed simulator work the cores had computed through. The
-> simulated cores now run on a model clock that makes it exact. Current result:
-> paged_attention -48.0 % against M0, qwen +13.0 % (a loss: qwen is bound by its
-> cube cores' compute). Quote only figures dated 2026-10-07 or later.
+> simulated cores now run on a model clock that makes it exact, and the
+> GroupQueue manager retires finishes on notice and pipelines a second task per
+> core (the first model-clock figures, qwen +13.0 %, predate that). Current
+> result: paged_attention -47.9 % against M0, qwen +1.2 % (parity: qwen is bound
+> by its cube cores' compute). Quote only figures from commit e637e436 or later.
 
 Read in this order:
 
 1. [docs/asim/validation.md](docs/asim/validation.md) — what it is worth, what
    the numbers do and do not license, and the audit that rules out a simulation
-   artefact. **Start here.** The headline is paged_attention Case1 −48.0 %
-   against the simulated baseline (−46.7 % against real silicon) and qwen3-14B
-   40-layer decode +13.0 % (+8.3 %);
+   artefact. **Start here.** The headline is paged_attention Case1 −47.9 %
+   against the simulated baseline (−46.1 % against real silicon) and qwen3-14B
+   40-layer decode +1.2 % (−3.3 %);
    [validation/fidelity.md](docs/asim/validation/fidelity.md) gives the
    simulated baseline's own error against silicon.
 2. [docs/asim/validation/transport-ablation.md](docs/asim/validation/transport-ablation.md)
