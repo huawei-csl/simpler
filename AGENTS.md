@@ -24,6 +24,14 @@ the manager stops choosing which core runs a task and stops polling each core to
 learn it finished. It is measured on an AICPU-hosted simulated device, against
 the unmodified `host_build_graph` scheduler on the same graph.
 
+> **Caveat (2026-10-07):** every published M2 `device_wall` has the simulator's
+> whole self-overrun subtracted, including overrun the simulated cores computed
+> through. The qwen gains are an artefact (M0 is within 4 % of qwen's cube-work
+> floor), and paged_attention's true gain lies between -25 % (raw scheduler
+> window) and the published figure. Each affected page carries the details at
+> its top. Compare raw `sched_start..sched_end` windows, not M2 `device_wall`,
+> until the correction is fixed.
+
 Read in this order:
 
 1. [docs/asim/validation.md](docs/asim/validation.md) — what it is worth, what

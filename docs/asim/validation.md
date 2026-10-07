@@ -1,5 +1,22 @@
 # aSim validation — method, cases, fidelity, and measured deltas
 
+> **Caveat (2026-10-07) — the M2 figures on this page overstate the GroupQueue.**
+> Every M2 `device_wall` here has the simulator's entire self-overrun subtracted
+> (`SIM_WINDOW_CORRECTION` in `src/common/platform/include/aicpu/device_phase_aicpu.h`,
+> on since 2026-09-14), including the part the simulated cores were computing
+> through. On qwen that puts M2 below the physical floor: M0's busiest cube core
+> carries 30.8 ms of work in a 32.0 ms window, so no scheduler can gain more than a
+> few percent there, and the qwen gains quoted here are an artefact. Raw scheduler
+> windows, same session: paged_attention M0 19.11 -> M2 14.25 ms (-25 %); qwen
+> M0 32.00 -> M2 36.83 ms (+15 %). paged_attention's true gain lies between the
+> raw -25 % and the corrected figure until the correction is fixed. M0 figures,
+> including M0's fidelity against silicon, are unaffected.
+>
+> Affected below: the headline table, the summary under *Fidelity against
+> silicon*, and the transport claim. The audit's reading that M2's deltas are
+> *lower* bounds was wrong for the same reason -- the overrun it cited as
+> inflating M2 had already been subtracted.
+
 How M0 is judged, which workloads can judge it, where the model stands, and
 what the GroupQueue is worth against it. Landing page: [DESIGN.md](DESIGN.md).
 

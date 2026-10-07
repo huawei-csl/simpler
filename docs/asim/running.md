@@ -213,8 +213,12 @@ These are not style preferences; each one was learned from a wrong number.
   baseline and must not be compared against an uninstrumented one.
 - **Read `[GQ_WORK] poll_overrun_us` before quoting an M2 number.** The
   simulator overruns the latency it models whenever its own work costs more than
-  the access it stands for, and that excess lands inside the measured window.
-  See the audit in [validation.md](validation.md).
+  the access it stands for. M2's `device_wall` already has that overrun
+  subtracted -- `[SIM_WINCORR] subtracted_ticks=` reports how much per thread --
+  and the subtraction over-corrects wherever the simulated cores were computing
+  through it. Compare the raw `sched_start..sched_end` window across arms, and
+  check any M2 figure against the busiest core's summed compute, which no
+  schedule can beat. See the caveat in [validation.md](validation.md).
 
 ## Calibration
 

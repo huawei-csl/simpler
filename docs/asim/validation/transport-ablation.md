@@ -1,5 +1,25 @@
 # Why the GroupQueue wins even against free transport
 
+> **Caveat (2026-10-07) — the M2 figures on this page overstate the GroupQueue.**
+> Every M2 `device_wall` here has the simulator's entire self-overrun subtracted
+> (`SIM_WINDOW_CORRECTION` in `src/common/platform/include/aicpu/device_phase_aicpu.h`,
+> on since 2026-09-14), including the part the simulated cores were computing
+> through. On qwen that puts M2 below the physical floor: M0's busiest cube core
+> carries 30.8 ms of work in a 32.0 ms window, so no scheduler can gain more than a
+> few percent there, and the qwen gains quoted here are an artefact. Raw scheduler
+> windows, same session: paged_attention M0 19.11 -> M2 14.25 ms (-25 %); qwen
+> M0 32.00 -> M2 36.83 ms (+15 %). paged_attention's true gain lies between the
+> raw -25 % and the corrected figure until the correction is fixed. M0 figures,
+> including M0's fidelity against silicon, are unaffected.
+>
+> **This page's qwen half is void**, and so is its claim about qwen's mechanism:
+> a critical-path trace shows qwen M0's critical path is 97 % compute, not
+> scheduler hops. On paged_attention the measured M0 mechanism stands -- 86 % of
+> its critical path is the scheduler holding a ready task beside an idle core,
+> with transport free or not -- but against raw M2, free-transport M0 (15.68 ms)
+> is 1.1x M2, not 2.0x. How much of that stall the GroupQueue recovers is the
+> open number.
+
 **The claim this page carries:** the GroupQueue's advantage over the AICPU
 scheduler is not the cost of moving data between the AICPU and the AICores. Give
 M0 a zero-latency connection -- free task send, free status read, instant

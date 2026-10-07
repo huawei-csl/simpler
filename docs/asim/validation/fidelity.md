@@ -1,5 +1,20 @@
 # aSim fidelity — how close the simulated device is to the real one
 
+> **Caveat (2026-10-07) — the M2 figures on this page overstate the GroupQueue.**
+> Every M2 `device_wall` here has the simulator's entire self-overrun subtracted
+> (`SIM_WINDOW_CORRECTION` in `src/common/platform/include/aicpu/device_phase_aicpu.h`,
+> on since 2026-09-14), including the part the simulated cores were computing
+> through. On qwen that puts M2 below the physical floor: M0's busiest cube core
+> carries 30.8 ms of work in a 32.0 ms window, so no scheduler can gain more than a
+> few percent there, and the qwen gains quoted here are an artefact. Raw scheduler
+> windows, same session: paged_attention M0 19.11 -> M2 14.25 ms (-25 %); qwen
+> M0 32.00 -> M2 36.83 ms (+15 %). paged_attention's true gain lies between the
+> raw -25 % and the corrected figure until the correction is fixed. M0 figures,
+> including M0's fidelity against silicon, are unaffected.
+>
+> On this page that affects the M2-vs-M0 and M2-vs-silicon columns; the M0 error
+> against silicon is measured without any correction and stands.
+
 Two baselines have been checked against silicon, and they are different numbers
 measuring different things. Which one applies depends on which M0 a figure was
 taken against. Method and run commands are in [running.md](../running.md); the
