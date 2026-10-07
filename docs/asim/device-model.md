@@ -540,8 +540,9 @@ does not remove it. The totals reconcile with the calibration —
 **The GroupQueue does not save the arrival term; it adds to it.** The 30 ns link
 replaces the 310 ns arrival only on the *controller-to-core* leg, and a submit
 still crosses the die to reach the controller first — `SIM_QUEUE_ARRIVAL_NS` is
-that same 310 ns. So the dispatch path is 5 + 310 + 30 + 318 + 375 against
-5 + 310 + 318 + 375: **about 30 ns longer, not 280 ns shorter.** Measured by
+that same 310 ns. So the dispatch path is 5 + 310 + 30 + 318 + 491 against
+5 + 310 + 318 + 491 on paged_attention (581 for the pick-up on qwen): **30 ns
+longer, not 280 ns shorter.** Measured by
 nulling the term, it moves the workload 0.37 %, inside run spread. Dispatch
 latency is not where this structure earns anything; the completion path is.
 
@@ -583,7 +584,7 @@ flowchart LR
     AICK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     AIVK -- "FIN · 80–140 ns raised<br/>+ 30 ns link" --> CTRL
     CTRL -- "update · 80–140 ns<br/><i>across the die into the AICPU package</i>" --> STAT
-    STAT -- "<b>read_queue_status&#40;&#41; · 5 ns</b><br/><b>one word, whatever finished out of order</b><br/><i>local to the package</i>" --> MGR
+    STAT -- "<b>read_queue_status&#40;&#41; · 10 ns</b><br/><b>one word, whatever finished out of order</b><br/><i>local to the package</i>" --> MGR
 ```
 
 | Path | ns | Anchor | Who pays |
@@ -597,12 +598,12 @@ flowchart LR
 | controller ↔ AIC/AIV, cancellation | 30 each way | the same controller-to-core message | a core that has gone idle, waiting on the answer |
 | AIC/AIV → controller, FIN | 80 (Case1) / 140 (qwen) raised, + 30 link | the calibrated `notice` is what raising a FIN costs the core; the signal then crosses the same link every other controller-core message takes | nobody — device-internal |
 | controller → status register, update | 80 (Case1) / 140 (qwen) | the calibrated `notice`: the write crosses the die into the AICPU package, so it costs what an AICPU↔AICPU hop costs | nobody — the controller writes it |
-| status register → manager, `read_queue_status()` | **5** | an MMIO-class access to a register in this package, so the manager reads it locally; the watermark and the published look-ahead share one word, so the cost does not grow with how much finished out of order | **the AICPU** — the only occupancy on the completion path |
+| status register → manager, `read_queue_status()` | **10** | an MMIO-class access to a register in this package, so the manager reads it locally; the watermark and the published look-ahead share one word, so the cost does not grow with how much finished out of order | **the AICPU** — the only occupancy on the completion path |
 
 The watermark and the look-ahead buffer are **not** on the queue's side of the
 die. They sit in the AICPU package, and the controller pays the cross-die cost to
 update them. That is what makes the completion path cheap for the manager: it
-reads its own package, at 5 ns and 2 ns a word thereafter, however far away the
+reads its own package, in one 10 ns access, however far away the
 cores that produced the finishes are.
 
 Charging each word a full access instead — 30 ns apiece, taken one at a time —
@@ -659,7 +660,7 @@ The completion path is where the structural difference is large.
 `scan_and_claim` reads **one core per 195 ns access**, so learning what finished
 costs the manager 195 ns × cores. (195 is the in-situ poll cost, the model's one
 fitted parameter; the raw nGnRE LDR measures 92 ns.) The GroupQueue reads a
-watermark **once** for 5 ns, from a register in its own package, and retires
+watermark **once** for 10 ns, from a register in its own package, and retires
 everything it covers, plus whatever the published look-ahead names beside it in
 the same word.
 
