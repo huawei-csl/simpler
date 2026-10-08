@@ -604,7 +604,7 @@ inline void tracr_core_span(
     // reached ~16 ms on qwen). Add the offset back, or the core lanes drift
     // progressively earlier than the AICPU lanes beside them.
     const uint32_t qi = static_cast<uint32_t>(&q - g_queues);
-    const uint64_t ofs = qi < SIM_MAX_QUEUES ? g_self_overrun_ticks[qi] : 0;
+    const uint64_t ofs = qi < SIM_MAX_QUEUES ? g_ledger[qi].overrun_ticks : 0;
     tracrThread->store_trace(
         TraCR::Payload{channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)}
     );
