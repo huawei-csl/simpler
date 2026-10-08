@@ -88,14 +88,16 @@ removal is exact per thread, but the residue above grows with the ledger, and a
 ledger as large as the window doubles the real time a run takes. So nothing that
 only reports runs inside an access: the GroupQueue's status read assembles only
 the fields a manager reads, a held entry is woken by the producer that retires
-rather than rescanned on every retirement, and each queue's ledger has a cache
-line of its own. Measured 2026-10-08 against the earlier poll path, each arm on
-both the model clock and the raw one:
+rather than rescanned on every retirement, a retirement replay reads what came
+due once from one array rather than rescanning every core per retirement, and
+each queue's ledger has a cache line of its own. Measured 2026-10-08 in
+interleaved sessions against the earlier poll path, each arm on both the model
+clock and the raw one:
 
 | M2 case | ledger per thread per round | raw `device_wall` | model clock |
 | ------- | --------------------------- | ----------------- | ----------- |
-| paged_attention Case1 | 12.9 -> 4.4 ms | 23.8 -> 15.4 ms | 11.32 -> 11.05 ms |
-| qwen3-14B decode, 40 layers | 14.6 -> 3.9 ms | 48.1 -> 37.4 ms | 33.55 -> 33.56 ms |
+| paged_attention Case1 | 12.9 -> 4.1 ms | 23.8 -> 15.1 ms | 11.32 -> 11.03 ms |
+| qwen3-14B decode, 40 layers | 14.6 -> 3.7 ms | 48.1 -> 37.2 ms | 33.55 -> 33.55 ms |
 
 The model-clock results did not move beyond their noise, which is the point:
 they never depended on how fast the model ran. What remains is mostly model work

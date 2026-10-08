@@ -259,9 +259,11 @@ struct alignas(64) SimQueue {
     // priority encode instead of a walk over every package on every task.
     CoreMask free_m;
     CoreMask pipe_m;
-    // Cores with a committed end that will come due. A gated member has none, so
-    // it is absent here and the event scans skip it without testing for it.
-    CoreMask evt_m;
+    // When each core's oldest committed end becomes legible to the manager, or
+    // UINT64_MAX for a core with none -- an idle core, or one holding a member that
+    // has not started. One contiguous array, so finding what came due reads a few
+    // cache lines rather than one per core. Valid for slots below `core_count`.
+    uint64_t evt_at[SIM_QUEUE_MAX_PACKAGES * 3] = {};
     // Cores running one task with another already behind it. Only these can have a
     // task cancelled, so a queue with none can skip the victim search outright --
     // on a workload that never fills a pipeline slot that search would otherwise
@@ -532,7 +534,6 @@ void refresh_core(SimQueue &q, uint32_t slot) {
     const SimCore &c = q.cores[slot];
     q.free_m.clear(slot);
     q.pipe_m.clear(slot);
-    q.evt_m.clear(slot);
     q.full_m.clear(slot);
     // A core holding a member that has not started takes nothing further: there
     // is no end to queue behind.
@@ -543,9 +544,8 @@ void refresh_core(SimQueue &q, uint32_t slot) {
             q.pipe_m.set(slot);
         }
     }
-    if (c.outstanding > 0 && c.finish[0] != SIM_GATED) {
-        q.evt_m.set(slot);
-    }
+    q.evt_at[slot] =
+        (c.outstanding > 0 && c.finish[0] != SIM_GATED) ? c.finish[0] + g_fin_ticks + g_link_ticks : UINT64_MAX;
     if (c.outstanding == 2 && c.gated_count == 0 && c.pipe_stealable) {
         q.full_m.set(slot);
     }
@@ -898,22 +898,14 @@ bool try_steal(SimQueue &q, uint32_t free_slot, uint64_t at) {
 // schedule changes, so an ordinary poll is one compare rather than a sweep.
 void refresh_next_event(SimQueue &q) {
     uint64_t soonest = UINT64_MAX;
-    // Only cores with an end that will come due. A member that has not started
-    // has none, and its marker is UINT64_MAX, so adding the notice delay to it
-    // would wrap and make it look due at once — it is absent from the set.
-    for_each_core(q.evt_m, [&](uint32_t i) {
-        const uint64_t evt = q.cores[i].finish[0] + g_fin_ticks + g_link_ticks;
-        if (evt < soonest) {
-            soonest = evt;
+    for (uint32_t i = 0; i < q.core_count; ++i) {
+        if (q.evt_at[i] < soonest) {
+            soonest = q.evt_at[i];
         }
-    });
+    }
     q.next_event = soonest;
 }
 
-// Retire every committed end legible by `upto`, oldest first. A core's FIN is
-// what moves it back into a set the controller can draw from, and the head is
-// pushed to it at the instant it freed. Work is proportional to what actually
-// ended, not to the size of the group.
 // Move a prepared entry into its ring. `at` is when it is legible to the
 // controller: the arrival of a fresh submit, or the retirement instant for an entry
 // the controller already held. Returns false when the ring is full.
@@ -963,51 +955,83 @@ void promote_held(SimQueue &q, uint64_t at) {
     }
 }
 
+// The cores whose oldest end is legible by `upto`, in the order they retire: by
+// time, and by core among equal times -- the order repeatedly taking the minimum
+// would visit them in. Returns how many.
+uint32_t collect_due(const SimQueue &q, uint64_t upto, uint32_t *due) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < q.core_count; ++i) {
+        const uint64_t at = q.evt_at[i];
+        if (at > upto) {
+            continue;
+        }
+        uint32_t j = n++;
+        while (j > 0 && q.evt_at[due[j - 1]] > at) {
+            due[j] = due[j - 1];
+            --j;
+        }
+        due[j] = i;
+    }
+    return n;
+}
+
+// Retire one core's oldest end at the instant it became legible.
+void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] uint64_t upto) {
+#if ASIMGQ_SELF_PROFILE
+    const uint64_t lag = upto - due_at;
+    q.retire_lag_total += lag;
+    if (lag > q.retire_lag_max) {
+        q.retire_lag_max = lag;
+    }
+    ++q.retire_n;
+#endif
+    SimCore &c = q.cores[core];
+#if ASIMGQ_SELF_PROFILE
+    if (c.index[0] != UINT64_MAX) {
+        q.finish_at[c.index[0] & (SIM_FINISH_TS_SLOTS - 1)] = c.finish[0];
+    }
+#endif
+    mark_queue_done(q, c.index[0]);
+    // The producers that have finished are now recorded, so anything held for
+    // them can be placed -- before the core below is refreshed, so a core freed
+    // by this same retirement can take it in the same step.
+    promote_held(q, due_at);
+    c.finish[0] = c.finish[1];
+    c.index[0] = c.index[1];
+    --c.outstanding;
+    refresh_core(q, core);
+    dispatch_pending(q, due_at);
+    // The core may have come fully free with nothing to give it. Ask a core
+    // that is still holding an unacknowledged task to hand it over.
+    if (q.free_m.test(core)) {
+        try_steal(q, core, due_at);
+    }
+}
+
+// Retire every committed end legible by `upto`, oldest first. A core's FIN is
+// what moves it back into a set the controller can draw from, and the head is
+// pushed to it at the instant it freed. Work is proportional to what actually
+// ended, not to the size of the group.
+//
+// What is due is read once and retired in order. A retirement changes no other
+// due core's oldest end, so the order stands unless the retirement itself made
+// something due inside the interval -- the task pipelined behind the one that
+// ended, or one placed on a core it freed -- and only then is it read again.
+// Placing lowers `next_event`, which is how such an end shows itself.
 void retire_due(SimQueue &q, uint64_t upto) {
     if (q.next_event > upto) {
         return;
     }
-    while (true) {
-        uint32_t due = UINT32_MAX;
-        uint64_t due_at = UINT64_MAX;
-        for_each_core(q.evt_m, [&](uint32_t i) {
-            const uint64_t evt = q.cores[i].finish[0] + g_fin_ticks + g_link_ticks;
-            if (evt <= upto && evt < due_at) {
-                due = i;
-                due_at = evt;
-            }
-        });
-        if (due == UINT32_MAX) {
-            break;
-        }
-#if ASIMGQ_SELF_PROFILE
-        const uint64_t lag = upto - due_at;
-        q.retire_lag_total += lag;
-        if (lag > q.retire_lag_max) {
-            q.retire_lag_max = lag;
-        }
-        ++q.retire_n;
-#endif
-        SimCore &c = q.cores[due];
-#if ASIMGQ_SELF_PROFILE
-        if (c.index[0] != UINT64_MAX) {
-            q.finish_at[c.index[0] & (SIM_FINISH_TS_SLOTS - 1)] = c.finish[0];
-        }
-#endif
-        mark_queue_done(q, c.index[0]);
-        // The producers that have finished are now recorded, so anything held for
-        // them can be placed -- before the core below is refreshed, so a core freed
-        // by this same retirement can take it in the same step.
-        promote_held(q, due_at);
-        c.finish[0] = c.finish[1];
-        c.index[0] = c.index[1];
-        --c.outstanding;
-        refresh_core(q, due);
-        dispatch_pending(q, due_at);
-        // The core may have come fully free with nothing to give it. Ask a core
-        // that is still holding an unacknowledged task to hand it over.
-        if (q.free_m.test(due)) {
-            try_steal(q, due, due_at);
+    uint32_t due[SIM_QUEUE_MAX_PACKAGES * 3];
+    uint32_t n = collect_due(q, upto, due);
+    uint32_t k = 0;
+    while (k < n) {
+        const uint32_t core = due[k++];
+        q.next_event = UINT64_MAX;
+        retire_core(q, core, q.evt_at[core], upto);
+        if (q.next_event <= upto || q.evt_at[core] <= upto) {
+            n = collect_due(q, upto, due);
+            k = 0;
         }
     }
     refresh_next_event(q);
