@@ -92,6 +92,21 @@ endif()
 if(ASIM_DEVICE)
     target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asim")
 endif()
+if(ASIM_DEVICE)
+    # Per-core TraCR lanes from the aSim model, the same mechanism the GroupQueue
+    # arm uses. With it on, the host_build_graph manager's own Running_Task_* marks
+    # are compiled out here: both would write the same channel. Opt-in for the same
+    # reason as the GroupQueue one -- two stores per task inside the measured window.
+    option(ASIM_TRACR_CORE_LANES "Emit per-core TraCR lanes from the aSim model" OFF)
+    if(DEFINED ENV{ASIM_TRACR_CORE_LANES})
+        set(ASIM_TRACR_CORE_LANES $ENV{ASIM_TRACR_CORE_LANES})
+    endif()
+    if(BUILD_TRACR AND ASIM_TRACR_CORE_LANES)
+        message(STATUS "Enabling aSim per-core TraCR lanes")
+        target_compile_definitions(aicpu_kernel PRIVATE ASIM_TRACR_CORE_LANES=1)
+    endif()
+endif()
+
 if(ASIMGQ_DEVICE)
     # Per-core TraCR lanes for the GroupQueue. Only the controller knows which core
     # ran a grouped task, so the spans are emitted from the device model rather than

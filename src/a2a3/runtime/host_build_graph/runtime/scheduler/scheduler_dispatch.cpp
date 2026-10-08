@@ -218,15 +218,25 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // traces record task identity (which kernel ran). subslot selects this
     // core's kernel_id (AIC vs AIV for a paired task); post-processing maps
     // func_id -> kernel name via the run's kernel_config.py.
-    const uint32_t tracr_func_id =
+    [[maybe_unused]] const uint32_t tracr_func_id =
         static_cast<uint32_t>(slot_state.to_descriptor().kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
+#if !(defined(__SIMULATED_DEVICE__) && ASIM_TRACR_CORE_LANES)
+        // Suppressed when the aSim model writes these lanes itself: both would
+        // write the same channel, and interleaved spans on one lane cannot be
+        // reconstructed by the per-channel pairing in tracr_process.
         INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Pair, tracr_func_id);
+#endif
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
+#if !(defined(__SIMULATED_DEVICE__) && ASIM_TRACR_CORE_LANES)
+        // Suppressed when the aSim model writes these lanes itself: both would
+        // write the same channel, and interleaved spans on one lane cannot be
+        // reconstructed by the per-channel pairing in tracr_process.
         INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Single, tracr_func_id);
+#endif
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);

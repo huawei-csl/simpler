@@ -164,6 +164,13 @@ void asim_bringup(Runtime *runtime) {
     // aicore_done, so a peer that observes the readiness flag finds a coherent
     // register file.
     asim::configure(base, static_cast<uint32_t>(num_cores));
+    // TraCR lane layout: channels run AICPU_0.. then the cores, so core 0 sits at
+    // the AICPU thread count. Same convention the GroupQueue arm uses.
+    {
+        int32_t nthreads = runtime->aicpu_thread_num;
+        if (nthreads == 0) nthreads = 1;
+        asim::set_tracr_core_lane_base(static_cast<uint32_t>(nthreads));
+    }
     // Injected MMIO latencies: from the calib file's LAT line if present, else
     // a2a3-measured defaults — posted doorbell write ~5 ns, nGnRE COND read
     // ~92 ns, push->core-latch ~633 ns (so ack = 633 - push). See DESIGN.md §5a.

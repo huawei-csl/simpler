@@ -17,6 +17,11 @@
 #include "aicpu/platform_aicpu_affinity.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
+#if ASIM_TRACR_CORE_LANES
+#include <tracr/tracr.hpp>
+
+#include <tracr_simpler_markers.hpp>
+#endif
 
 namespace asim {
 
@@ -343,6 +348,38 @@ uint32_t core_index_for_addr(uint64_t reg_addr) {
 // absorbed by the hold; work that does not is added to the thread's ledger, which
 // holds its model clock back by the same amount.
 
+#if ASIM_TRACR_CORE_LANES
+// Channel base, set at bring-up. UINT32_MAX means "not configured": emit nothing
+// rather than onto channel 0, which is an AICPU thread's lane.
+uint32_t g_tracr_lane_base = UINT32_MAX;
+
+// Push one core-lane span straight into this thread's TraCR buffer -- the same
+// mechanism asimgq_core.cpp uses. INSTRUMENTATION_MARK_SET stamps "now", which is
+// wrong here: the span is a simulated interval that has not happened yet in wall
+// time. The Payload carries its own timestamp, so the pair is stored directly and
+// TRACR_FINALIZE sorts the buffer before handing it over.
+//
+// `begin`/`end` are on this thread's model clock (real time less its ledger), while
+// every other marker in the buffer is stamped on the real counter, so the ledger is
+// added back here -- otherwise the core lanes drift progressively earlier than the
+// AICPU lanes beside them.
+inline void tracr_core_span(uint32_t core_idx, uint32_t func_id, uint64_t begin_ticks, uint64_t end_ticks) {
+    if (g_tracr_lane_base == UINT32_MAX || !tracrThread) {
+        return;
+    }
+    const uint64_t *ledger = self_ledger();
+    const uint64_t ofs = ledger != nullptr ? *ledger : 0;
+    const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + core_idx);
+    tracrThread->store_trace(TraCR::Payload{
+        channel, static_cast<uint16_t>(Running_Task_Single), func_id,
+        sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+    });
+    tracrThread->store_trace(TraCR::Payload{
+        channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+    });
+}
+#endif
+
 void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw) {
     const uint64_t release = get_sys_cnt_aicpu() + g_push_ticks;
     uint64_t *ledger = self_ledger();
@@ -360,6 +397,10 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
         emit_record(
             core_idx, task_token_raw, static_cast<uint32_t>(task_id), deadline, c.active_ack_at, c.active_fin_at
         );
+#if ASIM_TRACR_CORE_LANES
+        // The kernel body only, as the GroupQueue arm records it: ack -> finish.
+        tracr_core_span(core_idx, static_cast<uint32_t>(func_id), c.active_ack_at, c.active_fin_at);
+#endif
     } else {
         // Partially Free -> Fully Busy: the pipelined task is auto-acked only
         // when the active task finishes. (The scheduler never pushes before the
@@ -378,6 +419,11 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
             core_idx, task_token_raw, static_cast<uint32_t>(task_id), c.active_fin_at, c.active_fin_at,
             c.active_fin_at + dur
         );
+#if ASIM_TRACR_CORE_LANES
+        // Promoted at the active task's finish with no latch of its own, so that
+        // instant is both its start and the previous span's end: the lane abuts.
+        tracr_core_span(core_idx, static_cast<uint32_t>(func_id), c.active_fin_at, c.active_fin_at + dur);
+#endif
     }
     const uint64_t done_at = get_sys_cnt_aicpu();
     if (done_at > release) {
@@ -492,6 +538,14 @@ void asim_residency(uint32_t first_core, uint32_t n_cores, uint64_t *mean_ns, ui
     *n = count;
     *mean_ns = count ? total * 1000000000ULL / hz / count : 0;
     *max_ns = worst * 1000000000ULL / hz;
+}
+
+void set_tracr_core_lane_base(uint32_t channel_base) {
+#if ASIM_TRACR_CORE_LANES
+    g_tracr_lane_base = channel_base;
+#else
+    (void)channel_base;
+#endif
 }
 
 uint64_t asim_finish_ts(uint32_t core_idx) {
