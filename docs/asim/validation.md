@@ -100,7 +100,9 @@ on qwen. qwen is the in-repo expanded 40-layer orchestration.
 under M0, because the AICPU scheduler cannot feed them faster than ~1.1 us a task;
 the GroupQueue takes readiness, completion and placement off that path. What it
 leaves is balance across groups: its cube cores spend ~1.2 ms a round idle while
-a peer queue holds cube work they cannot take (`stranded_us` in `[GQ_WORK]`).
+a peer queue holds cube work they cannot take. That was measured on 2026-10-07 by
+a per-poll classification the simulator no longer carries, because its cost
+landed in the overrun the model clock has to remove.
 
 **qwen: parity.** qwen is bound by its cube cores' compute -- the busiest carries
 30.8 ms of work and M0 finishes within ~4 % of that -- and it declares no groups,

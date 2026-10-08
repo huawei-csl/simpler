@@ -226,21 +226,16 @@ bool submit_grouped(
 // the AICPU did not have to do.
 void queue_group_stats(uint32_t queue_idx, uint64_t *admitted, uint64_t *promoted, uint64_t *refused, uint32_t *high);
 
-// The core the controller placed `index` on. Placement is the controller's
-// choice; this is how the manager learns it for the bookkeeping it keys by core.
-uint32_t queue_entry_core(uint32_t queue_idx, uint64_t index);
-
 // How many compute samples came from the calibration table versus the default.
 void calib_coverage(uint64_t *hits, uint64_t *misses);
 
 // Dispatches charged per func_id -- compared across models, says whether both ran the same work.
 void func_hist(uint64_t *out, uint32_t n);
 
-// What one read of a queue's status register yields. The completed prefix is
-// what a manager needs on every pass; the other two are what it needs to assemble
-// a cohort, and they ride the same read because they are the same register file.
-// Carrying them here is what keeps cohort assembly from costing a manager any
-// access it was not already making.
+// What one read of a queue's status register yields: the completed prefix and the
+// finishes past it, which a manager needs on every pass, and the room left for
+// held entries, which it sizes its intake by. Only what a manager reads is
+// assembled; anything more would be simulator work inside the poll.
 // Positions a queue can report as finished ahead of its prefix, held as one bit
 // each: bit i is the completion of `watermark + 1 + i`. The watermark's own
 // position is not stored -- it is not complete by definition, or the prefix would
@@ -289,38 +284,14 @@ constexpr uint32_t SIM_AHEAD_WORDS = SIM_AHEAD_HORIZON / 64;
 constexpr uint32_t SIM_AHEAD_PUBLISHED = 32;
 
 struct SimQueueStatus {
-    uint64_t watermark;       // contiguous completed prefix
-    uint64_t gated_ready_at;  // when the last of this queue's gated members could start
-    uint32_t free_packages;   // packages with all three cores free
-    uint32_t staged_cohort;   // cohort entries placed but not started
-    // Finished positions past the watermark, ascending: ahead[0] is the lowest
-    // finished position above it, ahead[1] the next, and so on. An entry at or
-    // below the watermark is stale and ends the list, so the scan terminates
-    // itself and no count register is needed — and because the watermark is the
-    // contiguous prefix, position `watermark` is by definition unfinished, so
-    // every live entry is strictly greater and zero is a safe empty fill.
+    uint64_t watermark;  // contiguous completed prefix
+    // Finished positions past the watermark: bit i is set when `watermark + 1 + i`
+    // has finished, over the first SIM_AHEAD_PUBLISHED positions above it.
     //
     // Without these a task that finishes out of order cannot retire until
     // everything before it has, so it cannot release its consumers either: one
     // long task holds up every shorter one behind it.
     uint32_t ahead_bits;
-    // Entries each ring can still take, indexed by SimTaskType. A manager sizes
-    // its pop from the shared ready queues by this, so it never claims work its
-    // group has nowhere to put. Only the owning manager fills a ring, so a reading
-    // can only become stale in the safe direction -- the device drains entries out
-    // between the read and the submit, never in.
-    uint32_t ring_room[4];
-    // What this group can seat right now, by shape. `free_slots` are cores (for
-    // mix, packages) holding nothing, which can start a task immediately;
-    // `pipe_slots` are those running one task with the pipeline slot still open,
-    // which can hold a task to start next. A manager publishes both so its peers
-    // can see whether it still has somewhere better to put work than they do.
-    uint32_t free_slots[4];
-    uint32_t pipe_slots[4];
-    // Tasks this group holds of each shape: resident on its cores plus queued.
-    // Free slots say whether a manager can take work; this says how much it has
-    // already taken, which is what decides whether it should take more.
-    uint32_t load[4];
     // Entries the controller can still hold for tasks whose in-group producers
     // have not retired. A manager sizes its intake by this, so it never offers
     // work the controller has nowhere to put -- overflow is prevented on the
@@ -409,11 +380,6 @@ void queue_poll_profile(uint32_t queue_idx, uint64_t *retire_ns, uint64_t *statu
 // structure or the simulator.
 void queue_poll_work(uint32_t queue_idx, uint64_t *total_ticks, uint64_t *max_ticks, uint64_t *calls);
 
-// Why a queue is not placing work. `polls` is every status read; `stalled` are
-// those where entries were waiting and none could be pushed; `stall_idle_cores`
-// sums the cores standing idle at those moments, and `stall_mix_head` counts how
-// many had a mix group at the head. Idle cores behind an unplaceable head are the
-// cost of pushing only the head, and this is what measures it.
 // Core time this queue's cores have actually been committed to work, split by
 // type, in counter ticks. Against the scheduling window it says whether a group
 // is saturated or starved — and which half of it.
@@ -449,28 +415,6 @@ void queue_steal_stats(uint32_t queue_idx, uint64_t *tried, uint64_t *won, int64
 // task is handed to the queue.
 void queue_residency(uint32_t queue_idx, uint64_t *ring_ns, uint64_t *bound_ns, uint64_t *n);
 
-// Cube-core idle time this queue accumulated, in core-microseconds, integrated
-// over the manager's polls: the total, the part falling while the queue holds an
-// unstarted cohort member, and the wall time it held one. A cohort blocks every
-// core it is staged on until the whole cohort is released device-wide, so these
-// say how much of the group's starvation that barrier owns.
-void queue_aic_idle(uint32_t queue_idx, uint64_t *idle_us, uint64_t *idle_gated_us, uint64_t *gated_us);
-
-// Diagnostic: how a queue that finds cube cores idle asks the software what was
-// waiting -- cube tasks in the managers' ready queues, and whether a sync-start
-// drain was holding dispatch. Called from inside a status read, only when a cube
-// core is idle, so its cost is the model's excess rather than the manager's.
-using ReadyBacklogProbe = uint32_t (*)(void *ctx, bool *drain_active);
-void set_ready_backlog_probe(ReadyBacklogProbe probe, void *ctx);
-
-// Ungated cube idle, in core-microseconds, split by what was waiting when the
-// core stood idle: a drain held dispatch; cube work sat in the shared software
-// queue; cube work sat committed in a peer queue (its ring, or pipelined behind
-// a running task); or nothing at all.
-void queue_aic_idle_split(
-    uint32_t queue_idx, uint64_t *drain_us, uint64_t *intake_us, uint64_t *stranded_us, uint64_t *none_us
-);
-
 // When the core running `index` ended, in the manager's own clock domain. This is
 // a diagnostic read of state the queue already holds, not a modelled access: it
 // charges nothing, because no hardware register carries it and a design that
@@ -489,15 +433,9 @@ void queue_retire_lag(uint32_t queue_idx, uint64_t *mean_ns, uint64_t *max_ns, u
 // a position past the horizon cannot be recorded at all.
 void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *overflow);
 
-void queue_stall_stats(
-    uint32_t queue_idx, uint64_t *polls, uint64_t *stalled, uint64_t *stall_idle_cores, uint64_t *stall_mix_head,
-    uint64_t *stall_cube_head, uint64_t *stall_idle_aic, uint64_t *stall_idle_aiv
-);
-
 // Poll a GroupQueue's status register: charge the read, retire what has become
-// legible, offer the head to a controller, and report the register. One read can
-// retire many positions, which is the whole point of a watermark — the manager no
-// longer asks each core in turn.
+// legible, and report the register. One read can retire many positions, which is
+// the whole point of a watermark — the manager no longer asks each core in turn.
 SimQueueStatus read_queue_status(uint32_t queue_idx);
 
 }  // namespace asimgq

@@ -33,7 +33,6 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
-
 // =============================================================================
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
@@ -428,9 +427,6 @@ void SchedulerContext::log_shutdown_stall_snapshot(
     }
 }
 
-
-
-
 // Whether every producer that reaches `group` from outside it has retired.
 //
 // Edges run forward and a group is a contiguous id range, so a group's external
@@ -486,8 +482,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             // Judging a group ready walks its fanin, so re-ask only when the scan
             // point moved or something retired -- otherwise an idle thread spends
             // the window it is meant to be measuring.
-            if (from == f.probed_group && epoch == f.probed_epoch &&
-                ++f.probe_skips < GroupFeed::kProbeStaleLimit) {
+            if (from == f.probed_group && epoch == f.probed_epoch && ++f.probe_skips < GroupFeed::kProbeStaleLimit) {
                 return progress;
             }
             f.probed_group = from;
@@ -618,8 +613,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
             (subslot == SubtaskSlot::AIC) ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
         if (!asimgq::submit_grouped(
                 static_cast<uint32_t>(thread_idx), &idx, &fid, 1,
-                static_cast<int32_t>(slot.to_descriptor().task_id.raw), ring, deps,
-                static_cast<uint32_t>(dep_n)
+                static_cast<int32_t>(slot.to_descriptor().task_id.raw), ring, deps, static_cast<uint32_t>(dep_n)
             )) {
             // Ordinary back-pressure: the controller's ring is full, or it has no
             // hold entry left. Give the position back rather than leaving it
@@ -669,7 +663,6 @@ void SchedulerContext::gq_prepare_run() {
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         gq_index_[i].init(asimgq::SIM_HELD_CAP);
     }
-    asimgq::set_ready_backlog_probe(&SchedulerContext::ready_backlog_probe, this);
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
     // Seeding first: the partition below applies only to a run that declared
@@ -694,7 +687,8 @@ void SchedulerContext::partition_ready_queues_by_owner() {
         // push_tagged's claim test indexes with a mask, so a span must be a power
         // of two; round down to the largest one that fits.
         uint64_t pow2 = 1;
-        while (pow2 * 2 <= span) pow2 *= 2;
+        while (pow2 * 2 <= span)
+            pow2 *= 2;
         span = pow2;
         for (int32_t t = 0; t < MAX_AICPU_THREADS; ++t) {
             ChipReadyQueue &q = sched_->ready_queues_gq[t][shape];
@@ -733,16 +727,15 @@ int32_t SchedulerContext::handle_timeout_exit(
         );
         LOG_ERROR(
             "[GQ_STUCK thread=%d] group=%d id=%d block=%d sub=%d head=%d room=%u heldroom=%u push=%" PRIu64
-            " wm=%" PRIu64
-            " named=%" PRIu64 " toomany=%" PRIu64 " bailed=%" PRIu64 " bail_task=%d bail_prod=%d bail_kind=%d",
+            " wm=%" PRIu64 " named=%" PRIu64 " toomany=%" PRIu64 " bailed=%" PRIu64
+            " bail_task=%d bail_prod=%d bail_kind=%d",
             thread_idx, group_feed_[thread_idx].group, group_feed_[thread_idx].id, group_feed_[thread_idx].block,
             group_feed_[thread_idx].sub, gq_group::g_scan_from.load(std::memory_order_relaxed),
             gq_index_[thread_idx].room(), asimgq::read_queue_status(static_cast<uint32_t>(thread_idx)).held_room,
-            gq_index_[thread_idx].push_index(),
-            gq_index_[thread_idx].watermark(), g_gq_deps_named.load(std::memory_order_relaxed),
-            g_gq_deps_toomany.load(std::memory_order_relaxed), g_gq_deps_bailed.load(std::memory_order_relaxed),
-            g_gq_bail_task.load(std::memory_order_relaxed), g_gq_bail_prod.load(std::memory_order_relaxed),
-            g_gq_bail_kind.load(std::memory_order_relaxed)
+            gq_index_[thread_idx].push_index(), gq_index_[thread_idx].watermark(),
+            g_gq_deps_named.load(std::memory_order_relaxed), g_gq_deps_toomany.load(std::memory_order_relaxed),
+            g_gq_deps_bailed.load(std::memory_order_relaxed), g_gq_bail_task.load(std::memory_order_relaxed),
+            g_gq_bail_prod.load(std::memory_order_relaxed), g_gq_bail_kind.load(std::memory_order_relaxed)
         );
         if (sched_->task_view.tasks != nullptr) {
             // Why the scan point cannot advance: name the first external producer of
@@ -779,8 +772,8 @@ int32_t SchedulerContext::handle_timeout_exit(
                 SharedMemoryTaskHeader &tk = *sched_->task_view.tasks;
                 ChipTaskSlotState &bs = tk.get_slot_state_by_task_id(bp);
                 LOG_ERROR(
-                    "[GQ_BAILPROD] prod=%d blocks=%d kind=%d shape=%d completed=%d published=%d pos=%llu",
-                    bp, static_cast<int>(bs.logical_block_num), static_cast<int>(bs.task_kind),
+                    "[GQ_BAILPROD] prod=%d blocks=%d kind=%d shape=%d completed=%d published=%d pos=%llu", bp,
+                    static_cast<int>(bs.logical_block_num), static_cast<int>(bs.task_kind),
                     static_cast<int>(bs.active_mask.to_shape()), tk.is_completed(bp) ? 1 : 0,
                     tk.is_published(bp) ? 1 : 0, (unsigned long long)task_position(bp)
                 );
@@ -995,23 +988,19 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         asimgq::queue_poll_work(q, &work_total, &work_max, &work_calls);
         uint64_t push_over_us = 0, push_over_calls = 0, push_mean_ns = 0;
         asimgq::queue_push_overrun(q, &push_over_us, &push_over_calls, &push_mean_ns);
-        uint64_t idle = 0, idle_gated = 0, gated = 0, drain = 0, intake = 0, stranded = 0, none = 0;
-        asimgq::queue_aic_idle(q, &idle, &idle_gated, &gated);
-        asimgq::queue_aic_idle_split(q, &drain, &intake, &stranded, &none);
         uint64_t admitted = 0, promoted = 0, refused = 0;
         uint32_t held_high = 0;
         asimgq::queue_group_stats(q, &admitted, &promoted, &refused, &held_high);
         LOG_INFO(
             "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f positions=%" PRIu64 " poll_overrun_us=%" PRIu64
             " push_overrun_us=%" PRIu64 " polls=%" PRIu64 " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
-            " ahead_high=%u ahead_dropped=%" PRIu64 " aic_idle_us=%" PRIu64 " gated_us=%" PRIu64 " drain_us=%" PRIu64
-            " intake_us=%" PRIu64 " stranded_us=%" PRIu64 " none_us=%" PRIu64 " held_admitted=%" PRIu64
-            " held_promoted=%" PRIu64 " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64
-            " steals_won=%" PRIu64 " steal_gain_us=%" PRId64,
+            " ahead_high=%u ahead_dropped=%" PRIu64 " held_admitted=%" PRIu64 " held_promoted=%" PRIu64
+            " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64 " steals_won=%" PRIu64
+            " steal_gain_us=%" PRId64,
             thread_idx, cycles_to_us(aic), cycles_to_us(aiv), gq_index_[thread_idx].push_index(), poll_over_us,
             push_over_us, work_calls, work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
-            (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, idle, idle_gated, drain, intake,
-            stranded, none, admitted, promoted, refused, held_high, steals_tried, steals_won, steal_gain_us
+            (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, admitted, promoted, refused,
+            held_high, steals_tried, steals_won, steal_gain_us
         );
 #if ASIMGQ_SELF_PROFILE
         uint64_t retire_ns = 0, status_ns = 0, profiled = 0;
@@ -1025,10 +1014,9 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             uint64_t h[8] = {};
             asimgq::func_hist(h, 8);
             LOG_INFO(
-                "[M2_HIST] f0=%" PRIu64 " f1=%" PRIu64 " f2=%" PRIu64 " f3=%" PRIu64 " f4=%" PRIu64
-                " f5=%" PRIu64 " OTHER=%" PRIu64 " maxid=%" PRIu64 " sum=%" PRIu64,
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-                h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
+                "[M2_HIST] f0=%" PRIu64 " f1=%" PRIu64 " f2=%" PRIu64 " f3=%" PRIu64 " f4=%" PRIu64 " f5=%" PRIu64
+                " OTHER=%" PRIu64 " maxid=%" PRIu64 " sum=%" PRIu64,
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
             );
             // Completion, the share of durations the calibration supplied, and why
             // the grouping path passed tasks over, in the run's second line.

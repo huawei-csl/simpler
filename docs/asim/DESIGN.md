@@ -83,6 +83,26 @@ so it was tested instead: adding 150 or 400 ns of simulator work to every access
 apart -- moved qwen's `device_wall` by at most 1 % and left paged_attention within
 its noise. `[ASIM_WORK]` and `[GQ_WORK]` report each thread's ledger.
 
+**The model keeps its own work small, so that little needs removing.** The
+removal is exact per thread, but the residue above grows with the ledger, and a
+ledger as large as the window doubles the real time a run takes. So nothing that
+only reports runs inside an access: the GroupQueue's status read assembles only
+the fields a manager reads, a held entry is woken by the producer that retires
+rather than rescanned on every retirement, and each queue's ledger has a cache
+line of its own. Measured 2026-10-08 against the earlier poll path, each arm on
+both the model clock and the raw one:
+
+| M2 case | ledger per thread per round | raw `device_wall` | model clock |
+| ------- | --------------------------- | ----------------- | ----------- |
+| paged_attention Case1 | 12.9 -> 4.4 ms | 23.8 -> 15.4 ms | 11.32 -> 11.05 ms |
+| qwen3-14B decode, 40 layers | 14.6 -> 3.9 ms | 48.1 -> 37.4 ms | 33.55 -> 33.56 ms |
+
+The model-clock results did not move beyond their noise, which is the point:
+they never depended on how fast the model ran. What remains is mostly model work
+proper -- replaying retirements and placing entries -- plus two clock reads per
+access against a status read charged at 10 ns. M0's ledger is 0.7 ms a round on
+paged_attention and 0.3 ms on qwen.
+
 ### What Mode A measures — and what it cannot
 
 On `scan_and_claim` the overhead splits differently than it did on hbg, and the

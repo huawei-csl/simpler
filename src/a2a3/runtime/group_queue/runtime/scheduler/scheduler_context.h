@@ -233,13 +233,13 @@ private:
     // same step: the manager retires by contiguous prefix, so a position reserved
     // and left empty would stop the prefix at itself forever.
     struct GroupFeed {
-        int32_t group = -1;     // -1 when this thread holds no group
-        int32_t id = 0;         // task being fed
-        int32_t mi = 0;         // its position in the group's member list
-        int32_t members = 0;    // how many the group holds
-        int32_t block = 0;      // logical block within the task
-        int32_t sub = 0;        // subtask slot within the block
-        bool accounted = false; // this task's blocks are counted for publication
+        int32_t group = -1;      // -1 when this thread holds no group
+        int32_t id = 0;          // task being fed
+        int32_t mi = 0;          // its position in the group's member list
+        int32_t members = 0;     // how many the group holds
+        int32_t block = 0;       // logical block within the task
+        int32_t sub = 0;         // subtask slot within the block
+        bool accounted = false;  // this task's blocks are counted for publication
         // What the last unsuccessful readiness probe saw. Deciding a group's
         // external producers have retired costs a walk of its whole fanin, so it
         // is re-asked only when the head of the queue moved or something retired.
@@ -354,23 +354,13 @@ private:
         return h.is_cube ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
     }
 
-    // What the queue's idle-cube accounting asks of the software: cube tasks in
-    // the ready queues, and whether a sync-start drain is holding dispatch.
-    static uint32_t ready_backlog_probe(void *ctx, bool *drain_active) {
-        SchedulerContext *self = static_cast<SchedulerContext *>(ctx);
-        *drain_active = self->drain_state_.sync_start_pending.load(std::memory_order_relaxed) != 0;
-        return self->sched_ != nullptr ?
-                   static_cast<uint32_t>(self->sched_->ready_depth(static_cast<int32_t>(ResourceShape::AIC))) :
-                   0;
-    }
-
     inline void submit_to_queue(const PublishHandle &h, int32_t thread_idx) {
         GqIndexSpace &space = gq_index_[thread_idx];
         const GqIndexSpace::Owner owner{h.slot,        static_cast<int32_t>(h.reg_task_id),
                                         h.subslot,     h.core_offset,
                                         h.core_offset, h.guarded};
-        const bool from_group = gq_group::active() && h.local_id >= 0 &&
-                                gq_group::group_is_opened(gq_group::group_of(h.local_id));
+        const bool from_group =
+            gq_group::active() && h.local_id >= 0 && gq_group::group_is_opened(gq_group::group_of(h.local_id));
         // An opened group reserved this position when it was queued, ascending
         // over its members; taking a fresh one here would put the consumer ahead
         // of producers that already hold theirs.

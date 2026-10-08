@@ -37,14 +37,25 @@ std::vector<uint64_t> g_func_compute_ticks;        // index = func_id, value = m
 std::vector<uint64_t> g_func_compute_sigma_ticks;  // index = func_id, value = compute stddev ticks
 uint64_t g_default_compute_ticks = 0;
 
-// What modelling has cost, per queue, in counter ticks. Deliberately outside
-// SimQueue: a run resets the device being modelled, but the cost of running the
-// model is the simulator's own ledger and must accumulate monotonically. Resetting
-// it inside a measured phase makes the phase's delta go negative, and the window
-// then silently keeps the overhead it was supposed to shed.
-// It is also the queue's clock offset: the model reads real time less this, so it
-// must only ever grow while a run is in flight.
-uint64_t g_self_overrun_ticks[SIM_MAX_QUEUES] = {};
+// What modelling has cost, per queue, in counter ticks, and the per-task tallies
+// the end-of-run lines report. Deliberately outside SimQueue: a run resets the
+// device being modelled, but the cost of running the model is the simulator's own
+// ledger and must accumulate monotonically. Resetting it inside a measured phase
+// makes the phase's delta go negative, and the window then silently keeps the
+// overhead it was supposed to shed.
+// `overrun_ticks` is also the queue's clock offset: the model reads real time less
+// it, so it must only ever grow while a run is in flight. Each queue's ledger is
+// written by its own scheduler thread on every access, so each has a cache line of
+// its own.
+struct alignas(64) SimLedger {
+    uint64_t overrun_ticks = 0;
+    uint64_t calib_hits = 0;
+    uint64_t calib_misses = 0;
+    uint64_t func_hist[16] = {};
+    uint64_t func_other = 0;
+    int32_t func_max = -1;
+};
+SimLedger g_ledger[SIM_MAX_QUEUES];
 
 // Register backing, written only at bring-up: the handshake reads each core's
 // COND to see an initialised, idle fabric. Nothing reads it afterwards, because
@@ -143,10 +154,6 @@ void for_each_core(const CoreMask &m, F f) {
     }
 }
 
-uint32_t popcount_mask(const CoreMask &m) {
-    return static_cast<uint32_t>(__builtin_popcountll(m.w[0]) + __builtin_popcountll(m.w[1]));
-}
-
 CoreMask mask_and(const CoreMask &a, const CoreMask &b) {
     CoreMask r;
     r.w[0] = a.w[0] & b.w[0];
@@ -186,25 +193,27 @@ struct SimPackage {
 // writes any of it. That is the point of the design rather than an incidental
 // property — a structure shared between schedulers would need a lock to arbitrate,
 // and a lock between AICPUs costs more than the work it protects.
-// One task waiting on producers in its own group. `dep` names their positions;
-// a retirement clears whichever have gone and the entry is placed when none
-// remain.
+// One task waiting on producers in its own group, in a fixed slot so the waiter
+// table can name it.
 struct SimHeld {
     SimQueueEntryStore e;
-    uint64_t dep[SIM_HELD_MAX_DEPS];
-    uint32_t dep_n;
+    uint64_t seq;        // admission order, which is the order held entries are placed in
+    uint32_t remaining;  // producers that have not finished
 };
+
+// Held entries are tracked in 32-bit masks, one bit per slot.
+static_assert(SIM_HELD_CAP <= 32, "held-slot masks are 32 bits wide");
+
+// Waiter-table keys. A producer a held entry can still be waiting on lies within
+// the look-ahead horizon of the watermark, so positions twice that far apart
+// never share a key.
+constexpr uint32_t SIM_HELD_WAIT_SLOTS = 2 * SIM_AHEAD_HORIZON;
 
 struct alignas(64) SimQueue {
     // Completion accounting. A position's bit is set when the core running it
     // finishes; the watermark is the contiguous prefix over those bits, which is
     // the single value the manager reads instead of polling every core.
     uint64_t watermark = 0;
-    uint64_t high_water = 0;
-    // Which core the controller placed each position on. The manager does not
-    // choose it -- placement is the controller's -- but its per-task bookkeeping
-    // is indexed by core, so the choice has to be reported back.
-    uint16_t index_core[SIM_QUEUE_WINDOW] = {};
 
     // One ready ring per shape. Only the head of a ring is pushed, so a head that
     // has nowhere to go stalls that ring behind it — but a cube that cannot be
@@ -263,31 +272,22 @@ struct alignas(64) SimQueue {
     CoreMask aic_m;
     CoreMask aiv_m;
 
-    // Which package each core belongs to, so a core's state change can update
-    // its package's wholly-free bit without a search.
-    uint32_t pkg_of_core[SIM_QUEUE_MAX_PACKAGES * 3] = {};
-    // Packages whose three cores are all free, and how many. A cohort member
-    // needs one of these, and the manager reads the count on every status poll —
-    // maintained here so that read is a load rather than a sweep of the group.
-    uint64_t pkg_free_bits = 0;
-    uint32_t free_package_count = 0;
-
     // The soonest committed finish becoming legible. A poll landing before it can
     // return the watermark it already holds: replaying an interval in which
     // nothing happens yields what is already there. This is what makes the common
     // poll a single compare instead of a sweep of the group.
     uint64_t next_event = UINT64_MAX;
 
-    // Cohort entries placed on this queue's cores but not started, and when the
-    // last of them could start. Maintained as they are placed and released so
-    // reading them is a load, not a sweep.
-    uint32_t gated_entries = 0;
-    uint64_t gated_floor_max = 0;
-
-    // Tasks handed over before their in-group producers finished. Kept dense:
-    // `held_n` is the count in use and the array is compacted on placement.
+    // Tasks handed over before their in-group producers finished, one slot each.
+    // A retiring producer finds the entries waiting on it in `held_waiters`, keyed
+    // by its position, so placing them costs what retired rather than a pass over
+    // everything held.
     SimHeld held[SIM_HELD_CAP] = {};
+    uint32_t held_used = 0;   // slots occupied
+    uint32_t held_ready = 0;  // slots whose producers have all finished, not yet in a ring
     uint32_t held_n = 0;
+    uint64_t held_seq = 0;
+    uint32_t held_waiters[SIM_HELD_WAIT_SLOTS] = {};
     uint32_t held_high = 0;
     uint64_t held_admitted = 0;
     uint64_t held_promoted = 0;
@@ -323,13 +323,6 @@ struct alignas(64) SimQueue {
     uint64_t poll_work_max = 0;
     uint64_t poll_work_calls = 0;
 
-    // Head-of-line accounting: see queue_stall_stats.
-    uint64_t stalled_polls = 0;
-    uint64_t stall_idle_cores = 0;
-    uint64_t stall_mix_head = 0;
-    uint64_t stall_cube_head = 0;
-    uint64_t stall_idle_aic = 0;
-    uint64_t stall_idle_aiv = 0;
     // Core time committed to work, by type. See queue_busy_ticks.
     uint64_t busy_aic = 0;
     uint64_t busy_aiv = 0;
@@ -344,11 +337,6 @@ struct alignas(64) SimQueue {
     // it is supposed to be modelling.
     uint64_t finish_at[SIM_FINISH_TS_SLOTS] = {};
 
-    // Cube-core idle time, integrated over the polls the manager makes, and the
-    // part of it that falls while this queue holds a cohort member that has not
-    // started. A cohort blocks every core it is staged on until the whole cohort
-    // is released device-wide, so this says how much of the group's starvation
-    // that barrier owns.
     // How long an entry sits between reaching the queue and starting on a core.
     // The manager's own ready -> submit link cannot see this: it ends when the
     // task is handed to the queue, and the wait for a core happens after that.
@@ -390,15 +378,6 @@ struct alignas(64) SimQueue {
     uint64_t imb_starved = 0;
     uint32_t imb_tick = 0;
 
-    uint64_t last_poll_at = 0;
-    uint64_t aic_idle_ticks = 0;
-    uint64_t aic_idle_ticks_gated = 0;
-    uint64_t gated_ticks = 0;
-    uint64_t aic_idle_drain_ticks = 0;
-    uint64_t aic_idle_intake_ticks = 0;
-    uint64_t aic_idle_stranded_ticks = 0;
-    uint64_t aic_idle_none_ticks = 0;
-
     // How long finished work waits before a poll makes it legible to the manager,
     // summed and worst-case. A core cannot be given its next task until the
     // manager reacts to the one that ended, so this is the slack between a core
@@ -426,31 +405,6 @@ struct alignas(64) SimQueue {
 
 SimQueue g_queues[SIM_MAX_QUEUES];
 
-ReadyBacklogProbe g_backlog_probe = nullptr;
-void *g_backlog_ctx = nullptr;
-
-// Cube work a peer queue holds committed but not running: ring entries, and tasks
-// pipelined behind a running one. Read without synchronisation from the peer's
-// own state as of its last access, so it is a diagnostic snapshot only.
-bool peers_hold_cube(const SimQueue &self) {
-    const uint32_t rc = static_cast<uint32_t>(SimTaskType::Cube);
-    for (uint32_t i = 0; i < SIM_MAX_QUEUES; ++i) {
-        const SimQueue &p = g_queues[i];
-        if (&p == &self || p.package_count == 0) {
-            continue;
-        }
-        if (__atomic_load_n(&p.push[rc], __ATOMIC_RELAXED) != __atomic_load_n(&p.pop[rc], __ATOMIC_RELAXED)) {
-            return true;
-        }
-        const uint64_t w0 = __atomic_load_n(&p.full_m.w[0], __ATOMIC_RELAXED) & p.aic_m.w[0];
-        const uint64_t w1 = __atomic_load_n(&p.full_m.w[1], __ATOMIC_RELAXED) & p.aic_m.w[1];
-        if ((w0 | w1) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 // Which queue this is. A controller needs its own index to tag the work it places,
 // so a completion can be published to the queue that owns the position.
 // xorshift64: 3 shifts + 3 xors, cheap enough to hide inside a modeled latency.
@@ -471,19 +425,13 @@ uint64_t next_rand(SimQueue &q) {
 // A func_id absent from the calibration table is charged the default duration
 // rather than a measured one, which is silent in the result. Counted so a run can
 // say how much of its compute was actually calibrated.
-uint64_t g_calib_hits = 0;
-uint64_t g_calib_misses = 0;
-
-uint64_t g_func_hist[16] = {};
-uint64_t g_func_other = 0;
-int32_t g_func_max = -1;
-
 uint64_t sample_compute_ticks(SimQueue &q, int32_t func_id) {
+    SimLedger &l = g_ledger[&q - &g_queues[0]];
     if (func_id >= 0 && func_id < 16) {
-        ++g_func_hist[func_id];
+        ++l.func_hist[func_id];
     } else {
-        ++g_func_other;
-        if (func_id > g_func_max) g_func_max = func_id;
+        ++l.func_other;
+        if (func_id > l.func_max) l.func_max = func_id;
     }
     uint64_t mean = g_default_compute_ticks;
     uint64_t sigma = 0;
@@ -499,9 +447,9 @@ uint64_t sample_compute_ticks(SimQueue &q, int32_t func_id) {
         }
     }
     if (calibrated) {
-        ++g_calib_hits;
+        ++l.calib_hits;
     } else {
-        ++g_calib_misses;
+        ++l.calib_misses;
     }
     if (sigma == 0) {
         return mean;
@@ -520,6 +468,20 @@ uint64_t sample_compute_ticks(SimQueue &q, int32_t func_id) {
     return static_cast<uint64_t>(dur);
 }
 
+// A producer has finished: count it off every held entry waiting on it.
+void wake_held(SimQueue &q, uint64_t index) {
+    uint32_t &slot = q.held_waiters[index & (SIM_HELD_WAIT_SLOTS - 1)];
+    uint32_t m = slot;
+    slot = 0;
+    while (m != 0) {
+        const uint32_t s = static_cast<uint32_t>(__builtin_ctz(m));
+        m &= m - 1;
+        if (--q.held[s].remaining == 0) {
+            q.held_ready |= 1u << s;
+        }
+    }
+}
+
 // Record that `index` finished. A position below the watermark is already
 // covered by the prefix; the watermark's own position advances it; anything
 // above sets its bit.
@@ -531,6 +493,7 @@ void mark_queue_done(SimQueue &q, uint64_t index) {
     if (index == UINT64_MAX || index < q.watermark) {
         return;
     }
+    wake_held(q, index);
     if (index > q.watermark) {
         const uint64_t off = index - q.watermark - 1;
         if (off >= SIM_AHEAD_HORIZON) {
@@ -562,23 +525,6 @@ void mark_queue_done(SimQueue &q, uint64_t index) {
     q.ahead_base = (q.ahead_base + run + 1) & (SIM_AHEAD_HORIZON - 1);
 }
 
-// status poll, so the count is maintained rather than swept for.
-void update_package_free(SimQueue &q, uint32_t pi) {
-    const SimPackage &p = q.packages[pi];
-    const bool now_free = q.free_m.test(p.aic) && q.free_m.test(p.aiv0) && q.free_m.test(p.aiv1);
-    const bool was_free = ((q.pkg_free_bits >> pi) & 1ULL) != 0;
-    if (now_free == was_free) {
-        return;
-    }
-    if (now_free) {
-        q.pkg_free_bits |= (1ULL << pi);
-        ++q.free_package_count;
-    } else {
-        q.pkg_free_bits &= ~(1ULL << pi);
-        --q.free_package_count;
-    }
-}
-
 // Move a core into the set its state puts it in. Every path that commits work to
 // a core, retires work from it, or starts a cohort member on it ends here, which
 // is what keeps the sets and the cores from disagreeing.
@@ -603,7 +549,6 @@ void refresh_core(SimQueue &q, uint32_t slot) {
     if (c.outstanding == 2 && c.gated_count == 0 && c.pipe_stealable) {
         q.full_m.set(slot);
     }
-    update_package_free(q, q.pkg_of_core[slot]);
 }
 
 // Commit one entry to a core, starting no earlier than the core is free and no
@@ -619,21 +564,20 @@ void commit(
     if (e.enqueued_at > start) {
         start = e.enqueued_at;
     }
-    q.index_core[e.index[part] & (SIM_QUEUE_WINDOW - 1)] = static_cast<uint16_t>(core_slot);
     const uint64_t dur = sample_compute_ticks(q, e.func_id[part]);
     const bool pipelined = (c.outstanding > 0);
+#if ASIMGQ_SELF_PROFILE
     {
         const uint64_t ring = pushed_at > e.enqueued_at ? pushed_at - e.enqueued_at : 0;
         const uint64_t bound = start > pushed_at ? start - pushed_at : 0;
         q.ring_wait_total += ring;
         q.bound_wait_total += bound;
-#if ASIMGQ_SELF_PROFILE
         if (ring + bound > q.residency_max) {
             q.residency_max = ring + bound;
         }
         ++q.residency_n;
-#endif
     }
+#endif
     // Cube cores are the first of each package's three.
     if ((core_slot % 3) == 0) {
         q.busy_aic += dur;
@@ -650,10 +594,6 @@ void commit(
         c.index[c.outstanding] = e.index[part];
         ++c.outstanding;
         ++c.gated_count;
-        ++q.gated_entries;
-        if (start > q.gated_floor_max) {
-            q.gated_floor_max = start;
-        }
         refresh_core(q, core_slot);
         return;
     }
@@ -766,8 +706,7 @@ bool place_single(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     // scan on the package boundary, and a vector scan on one of that package's two
     // vector slots in turn, so both are offered work.
     const uint32_t base = (q.rr * 3) % q.core_count;
-    const uint32_t from =
-        (e.type == SimTaskType::Cube) ? base : (base + 1 + (q.vrr & 1u)) % q.core_count;
+    const uint32_t from = (e.type == SimTaskType::Cube) ? base : (base + 1 + (q.vrr & 1u)) % q.core_count;
     const uint32_t idle = select_rotating(mask_and(q.free_m, type_m), from, q.core_count);
     if (idle != UINT32_MAX) {
         commit(q, idle, e, 0, at, at);
@@ -792,6 +731,13 @@ bool place_single(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     q.rr = (q.rr + 1) % q.package_count;
     if (e.type != SimTaskType::Cube) ++q.vrr;
     return true;
+}
+
+bool rings_hold_work(const SimQueue &q) {
+    for (uint32_t r = 0; r < SIM_RING_COUNT; ++r) {
+        if (q.push[r] != q.pop[r]) return true;
+    }
+    return false;
 }
 
 // Push each ring's head out until nothing more can be placed.
@@ -979,11 +925,6 @@ bool enqueue_entry(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     SimQueueEntryStore &dst = q.ring[r][q.push[r] % SIM_QUEUE_DEPTH];
     dst = e;
     dst.enqueued_at = at;
-    for (uint32_t i = 0; i < dst.parts; ++i) {
-        if (dst.index[i] != UINT64_MAX && dst.index[i] >= q.high_water) {
-            q.high_water = dst.index[i] + 1;
-        }
-    }
     ++q.push[r];
     return true;
 }
@@ -1000,35 +941,26 @@ bool position_done(const SimQueue &q, uint64_t index) {
     return (q.ahead_bits[slot >> 6] & (1ULL << (slot & 63))) != 0;
 }
 
-// Drop the producers that have finished and say whether any remain. The test is
-// against this queue's completed state rather than against whichever position just
-// retired, so a producer that finished before the entry was admitted is
-// recognised -- the case an edge-triggered match strands forever.
-bool held_settle(const SimQueue &q, SimHeld &h) {
-    uint32_t w = 0;
-    for (uint32_t d = 0; d < h.dep_n; ++d) {
-        if (!position_done(q, h.dep[d])) h.dep[w++] = h.dep[d];
-    }
-    h.dep_n = w;
-    return w == 0;
-}
-
-// Re-examine everything held and place what is now free to run. Called on each
-// retirement and once at admission, so an entry can never be left waiting on a
-// position that has already gone.
+// Place every held entry whose producers have all finished, oldest admission
+// first, while its shape's ring has room. One that does not fit stays ready and is
+// offered again at the next retirement or admission.
 void promote_held(SimQueue &q, uint64_t at) {
-    if (q.held_n == 0) return;
-    uint32_t w = 0;
-    for (uint32_t rd = 0; rd < q.held_n; ++rd) {
-        SimHeld &h = q.held[rd];
-        if (held_settle(q, h) && enqueue_entry(q, h.e, at > h.e.enqueued_at ? at : h.e.enqueued_at)) {
-            ++q.held_promoted;
-            continue;  // dropped from the array
+    uint32_t pending = q.held_ready;
+    while (pending != 0) {
+        uint32_t s = static_cast<uint32_t>(__builtin_ctz(pending));
+        for (uint32_t m = pending & (pending - 1); m != 0; m &= m - 1) {
+            const uint32_t t = static_cast<uint32_t>(__builtin_ctz(m));
+            if (q.held[t].seq < q.held[s].seq) s = t;
         }
-        if (w != rd) q.held[w] = q.held[rd];
-        ++w;
+        pending &= ~(1u << s);
+        SimHeld &h = q.held[s];
+        if (enqueue_entry(q, h.e, at > h.e.enqueued_at ? at : h.e.enqueued_at)) {
+            q.held_ready &= ~(1u << s);
+            q.held_used &= ~(1u << s);
+            --q.held_n;
+            ++q.held_promoted;
+        }
     }
-    q.held_n = w;
 }
 
 void retire_due(SimQueue &q, uint64_t upto) {
@@ -1151,20 +1083,6 @@ uint32_t queued_depth(const SimQueue &q) {
     }
 }
 
-// What a submit's own work cost against the 5 ns it models. Only the excess
-// inflates a measurement; work that fits is hidden by the spin to the deadline,
-// exactly as on the poll path.
-void record_push_work(SimQueue &q, uint64_t entered_at, uint64_t deadline) {
-    const uint64_t now = get_sys_cnt_aicpu();
-    q.push_work_total += now > entered_at ? now - entered_at : 0;
-    ++q.push_calls;
-    if (now > deadline) {
-        q.push_overrun_total += now - deadline;
-        g_self_overrun_ticks[static_cast<uint32_t>(&q - &g_queues[0])] += now - deadline;
-        ++q.push_overrun_calls;
-    }
-}
-
 // One manager access to a queue. The manager is held for the modelled latency in
 // real time. The queue's model runs on its own clock: real time less everything
 // this queue's model has overrun so far. So the modelled cores stand still while
@@ -1180,17 +1098,42 @@ struct Access {
 
 Access begin_access(uint32_t queue_idx, uint64_t latency) {
     const uint64_t now = get_sys_cnt_aicpu();
-    const uint64_t ofs = queue_idx < SIM_MAX_QUEUES ? g_self_overrun_ticks[queue_idx] : 0;
+    const uint64_t ofs = queue_idx < SIM_MAX_QUEUES ? g_ledger[queue_idx].overrun_ticks : 0;
     return Access{now, now + latency, now - ofs + latency};
 }
 
-void record_poll_work(SimQueue &q, uint64_t entered_at) {
-    const uint64_t work = get_sys_cnt_aicpu() - entered_at;
+// Close an access: charge the simulator's own work against the latency the call
+// models, add any excess to the queue's clock offset, and otherwise hold the
+// manager until the modelled latency is up. Only the excess inflates a
+// measurement; work that fits is hidden by the wait. One clock read serves all of
+// it.
+uint64_t close_access(uint32_t queue_idx, const Access &a, uint64_t &overrun_total, uint64_t &overrun_calls) {
+    const uint64_t now = get_sys_cnt_aicpu();
+    if (now > a.release) {
+        overrun_total += now - a.release;
+        ++overrun_calls;
+        g_ledger[queue_idx].overrun_ticks += now - a.release;
+    } else {
+        wait_until(a.release);
+    }
+    return now - a.entered;
+}
+
+void finish_poll(SimQueue &q, uint32_t queue_idx, const Access &a) {
+    const uint64_t work = close_access(queue_idx, a, q.poll_overrun_total, q.poll_overrun_calls);
     q.poll_work_total += work;
     if (work > q.poll_work_max) {
         q.poll_work_max = work;
     }
     ++q.poll_work_calls;
+}
+
+// A submit models a 5 ns posted write, but the controller work it triggers --
+// settling held entries and placing whatever that frees -- is a loop here and a
+// single clock in hardware.
+void finish_push(SimQueue &q, uint32_t queue_idx, const Access &a) {
+    q.push_work_total += close_access(queue_idx, a, q.push_overrun_total, q.push_overrun_calls);
+    ++q.push_calls;
 }
 
 }  // namespace
@@ -1277,7 +1220,6 @@ void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, ui
     q.aiv_m.set(p.aiv0);
     q.aiv_m.set(p.aiv1);
     for (uint32_t core : {p.aic, p.aiv0, p.aiv1}) {
-        q.pkg_of_core[core] = pi;
         refresh_core(q, core);
     }
     q.ring_cap[ring_of(SimTaskType::Cube)] = q.package_count * SIM_RING_CAP_PER_CUBE_CORE;
@@ -1290,7 +1232,6 @@ bool submit(
     SimTaskType type, bool gated
 ) {
     const Access a = begin_access(queue_idx, g_push_ticks);
-    const uint64_t entered_at = a.entered;
     const uint64_t deadline = a.release;
     if (queue_idx >= SIM_MAX_QUEUES || type == SimTaskType::Empty || parts == 0) {
         wait_until(deadline);
@@ -1318,8 +1259,7 @@ bool submit(
     // the manager's next poll would invent idle time the hardware does not have,
     // and that gap falls exactly where cores are idle and work is scarce.
     dispatch_pending(q, a.at);
-    record_push_work(q, entered_at, deadline);
-    wait_until(deadline);
+    finish_push(q, queue_idx, a);
     return true;
 }
 
@@ -1329,7 +1269,6 @@ bool submit_grouped(
 ) {
     if (dep_n == 0) return submit(queue_idx, gq_index, func_id, parts, task_id, type, false);
     const Access a = begin_access(queue_idx, g_push_ticks);
-    const uint64_t entered_at = a.entered;
     const uint64_t deadline = a.release;
     if (queue_idx >= SIM_MAX_QUEUES || type == SimTaskType::Empty || parts == 0) {
         wait_until(deadline);
@@ -1344,49 +1283,69 @@ bool submit_grouped(
         wait_until(deadline);
         return false;
     }
-    SimHeld &h = q.held[q.held_n];
+    const uint32_t s = static_cast<uint32_t>(__builtin_ctz(~q.held_used));
+    SimHeld &h = q.held[s];
     h.e = SimQueueEntryStore{};
     h.e.parts = parts > SIM_MIX_MAX_ENTRIES ? SIM_MIX_MAX_ENTRIES : parts;
     for (uint32_t i = 0; i < h.e.parts; ++i) {
         h.e.index[i] = gq_index[i];
         h.e.func_id[i] = func_id[i];
-        if (gq_index[i] != UINT64_MAX && gq_index[i] >= q.high_water) q.high_water = gq_index[i] + 1;
     }
     h.e.task_id = task_id;
     h.e.type = type;
     h.e.gated = false;
-    h.dep_n = 0;
-    for (uint32_t i = 0; i < dep_n; ++i) h.dep[h.dep_n++] = dep_index[i];
     // Legible to the controller once the posted store completes, the same arrival
     // every submitted entry pays; nothing can be placed before that.
     h.e.enqueued_at = a.at + g_arrive_ticks;
+    h.seq = q.held_seq++;
+    // The manager named these from its own view, which lags the controller's: any
+    // of them may have retired while this call was in flight, and those are not
+    // waited for. A producer named twice is waited for once.
+    h.remaining = 0;
+    for (uint32_t i = 0; i < dep_n; ++i) {
+        if (position_done(q, dep_index[i])) continue;
+        uint32_t &w = q.held_waiters[dep_index[i] & (SIM_HELD_WAIT_SLOTS - 1)];
+        if ((w & (1u << s)) == 0) {
+            w |= 1u << s;
+            ++h.remaining;
+        }
+    }
+    q.held_used |= 1u << s;
+    if (h.remaining == 0) {
+        q.held_ready |= 1u << s;
+    }
     ++q.held_n;
     if (q.held_n > q.held_high) q.held_high = q.held_n;
     ++q.held_admitted;
-    // The manager named these from its own view, which lags the controller's: any
-    // of them may have retired while this call was in flight. Settling now is what
-    // keeps such an entry from waiting on a retirement that already happened.
     promote_held(q, h.e.enqueued_at);
     dispatch_pending(q, h.e.enqueued_at);
-    record_push_work(q, entered_at, deadline);
-    wait_until(deadline);
+    finish_push(q, queue_idx, a);
     return true;
 }
 
 void func_hist(uint64_t *out, uint32_t n) {
-    for (uint32_t i = 0; i < n && i < 16; ++i) out[i] = g_func_hist[i];
-    if (n > 6) out[6] = g_func_other;
-    if (n > 7) out[7] = static_cast<uint64_t>(g_func_max + 1);
+    uint64_t hist[16] = {};
+    uint64_t other = 0;
+    int32_t max_id = -1;
+    for (const SimLedger &l : g_ledger) {
+        for (uint32_t i = 0; i < 16; ++i)
+            hist[i] += l.func_hist[i];
+        other += l.func_other;
+        if (l.func_max > max_id) max_id = l.func_max;
+    }
+    for (uint32_t i = 0; i < n && i < 16; ++i)
+        out[i] = hist[i];
+    if (n > 6) out[6] = other;
+    if (n > 7) out[7] = static_cast<uint64_t>(max_id + 1);
 }
 
 void calib_coverage(uint64_t *hits, uint64_t *misses) {
-    *hits = g_calib_hits;
-    *misses = g_calib_misses;
-}
-
-uint32_t queue_entry_core(uint32_t queue_idx, uint64_t index) {
-    if (queue_idx >= SIM_MAX_QUEUES || index == UINT64_MAX) return 0;
-    return g_queues[queue_idx].index_core[index & (SIM_QUEUE_WINDOW - 1)];
+    *hits = 0;
+    *misses = 0;
+    for (const SimLedger &l : g_ledger) {
+        *hits += l.calib_hits;
+        *misses += l.calib_misses;
+    }
 }
 
 void queue_group_stats(uint32_t queue_idx, uint64_t *admitted, uint64_t *promoted, uint64_t *refused, uint32_t *high) {
@@ -1399,11 +1358,9 @@ void queue_group_stats(uint32_t queue_idx, uint64_t *admitted, uint64_t *promote
 
 SimQueueStatus read_queue_status(uint32_t queue_idx) {
     const Access a = begin_access(queue_idx, g_queue_poll_ticks);
-    const uint64_t entered_at = a.entered;
-    const uint64_t deadline = a.release;
     if (queue_idx >= SIM_MAX_QUEUES) {
-        wait_until(deadline);
-        return SimQueueStatus{0, 0, 0, 0, {}, {}, {}, {}, {}, 0};
+        wait_until(a.release);
+        return SimQueueStatus{0, 0, 0};
     }
     SimQueue &q = g_queues[queue_idx];
     // What the manager can see lags what has happened by the report path: a core
@@ -1411,127 +1368,25 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
     // register. Reading as of `report` before the access completes is that
     // propagation — the register shows the queue as it was, not as it is.
     const uint64_t legible = a.at > g_report_ticks ? a.at - g_report_ticks : 0;
-    // Retire first, then push: the interval is replayed in time order, so an entry
-    // placed on a slot that freed inside it starts when the slot freed rather than
-    // at the end of the interval.
+    // The interval is replayed in time order: each end that came due is retired at
+    // the instant it freed its core, and work waiting for that core starts then.
 #if ASIMGQ_SELF_PROFILE
     const uint64_t t_retire0 = get_sys_cnt_aicpu();
 #endif
     retire_due(q, legible);
 #if ASIMGQ_SELF_PROFILE
-    const uint64_t t_retire1 = get_sys_cnt_aicpu();
-    q.poll_retire_ticks += t_retire1 - t_retire0;
+    q.poll_retire_ticks += get_sys_cnt_aicpu() - t_retire0;
 #endif
-    uint32_t popped_before = 0;
-    uint32_t queued_before = 0;
-    for (uint32_t r = 0; r < SIM_RING_COUNT; ++r) {
-        popped_before += q.pop[r];
-        queued_before += q.push[r] - q.pop[r];
+    // Entries are placed as they arrive and as each retirement frees a core, so the
+    // rings are normally empty by now and this costs four compares.
+    if (rings_hold_work(q)) {
+        dispatch_pending(q, legible);
     }
-    dispatch_pending(q, legible);
-    uint32_t popped_after = 0;
-    for (uint32_t r = 0; r < SIM_RING_COUNT; ++r) {
-        popped_after += q.pop[r];
-    }
-    if (queued_before != 0 && popped_after == popped_before) {
-        // Entries are waiting and no ring head could be placed. Count the cores
-        // standing idle behind them.
-        ++q.stalled_polls;
-        for (uint32_t i = 0; i < q.package_count; ++i) {
-            const SimPackage &p = q.packages[i];
-            if (q.cores[p.aic].outstanding == 0) {
-                ++q.stall_idle_cores;
-                ++q.stall_idle_aic;
-            }
-            for (uint32_t v : {p.aiv0, p.aiv1}) {
-                if (q.cores[v].outstanding == 0) {
-                    ++q.stall_idle_cores;
-                    ++q.stall_idle_aiv;
-                }
-            }
-        }
-        const uint32_t rc = ring_of(SimTaskType::Cube);
-        const uint32_t rm = ring_of(SimTaskType::Mix);
-        if (q.push[rm] != q.pop[rm]) {
-            ++q.stall_mix_head;
-        }
-        if (q.push[rc] != q.pop[rc]) {
-            ++q.stall_cube_head;
-        }
-    }
-    // Cube cores standing idle, integrated between polls. A popcount over sets the
-    // controller already maintains, so sampling it costs the poll nothing.
-    if (q.last_poll_at != 0 && legible > q.last_poll_at) {
-        const uint64_t dt = legible - q.last_poll_at;
-        const CoreMask idle = mask_and(q.free_m, q.aic_m);
-        const uint64_t n = static_cast<uint64_t>(__builtin_popcountll(idle.w[0]) + __builtin_popcountll(idle.w[1]));
-        q.aic_idle_ticks += n * dt;
-        if (q.gated_entries != 0) {
-            q.aic_idle_ticks_gated += n * dt;
-            q.gated_ticks += dt;
-        } else if (n != 0) {
-            bool drain = false;
-            const uint32_t ready = g_backlog_probe != nullptr ? g_backlog_probe(g_backlog_ctx, &drain) : 0;
-            if (drain) {
-                q.aic_idle_drain_ticks += n * dt;
-            } else if (ready != 0) {
-                q.aic_idle_intake_ticks += n * dt;
-            } else if (peers_hold_cube(q)) {
-                q.aic_idle_stranded_ticks += n * dt;
-            } else {
-                q.aic_idle_none_ticks += n * dt;
-            }
-        }
-    }
-    q.last_poll_at = legible;
 #if ASIMGQ_SELF_PROFILE
     const uint64_t t_status0 = get_sys_cnt_aicpu();
     sample_imbalance(q);
 #endif
-    SimQueueStatus st{q.watermark, q.gated_floor_max, q.free_package_count, q.gated_entries, {}, {}, {}, {}, {}, 0};
-    st.held_room = SIM_HELD_CAP > q.held_n ? SIM_HELD_CAP - q.held_n : 0;
-    for (uint32_t r = 0; r < SIM_RING_COUNT; ++r) {
-        const uint32_t held = q.push[r] - q.pop[r];
-        st.ring_room[r] = q.ring_cap[r] > held ? q.ring_cap[r] - held : 0;
-    }
-    // What this group can seat right now, by shape: cores holding nothing, and
-    // cores running one task with their pipeline slot still open. Popcounts over
-    // the sets the controller already maintains, so the poll pays nothing for them.
-    const CoreMask free_aic = mask_and(q.free_m, q.aic_m);
-    const CoreMask free_aiv = mask_and(q.free_m, q.aiv_m);
-    const CoreMask pipe_aic = mask_and(q.pipe_m, q.aic_m);
-    const CoreMask pipe_aiv = mask_and(q.pipe_m, q.aiv_m);
-    st.free_slots[ring_of(SimTaskType::Cube)] = popcount_mask(free_aic);
-    st.free_slots[ring_of(SimTaskType::Vector)] = popcount_mask(free_aiv);
-    st.pipe_slots[ring_of(SimTaskType::Cube)] = popcount_mask(pipe_aic);
-    st.pipe_slots[ring_of(SimTaskType::Vector)] = popcount_mask(pipe_aiv);
-    // A mix group needs a whole package, so its slots are packages: free ones can
-    // seat it now, and ones with a slot on every core can seat it behind what they
-    // are running.
-    uint32_t mix_free = 0;
-    uint32_t mix_pipe = 0;
-    for (uint32_t i = 0; i < q.package_count; ++i) {
-        const SimPackage &p = q.packages[i];
-        const bool all_free = q.free_m.test(p.aic) && q.free_m.test(p.aiv0) && q.free_m.test(p.aiv1);
-        if (all_free) {
-            ++mix_free;
-        } else if (package_has_room(q, p)) {
-            ++mix_pipe;
-        }
-    }
-    st.free_slots[ring_of(SimTaskType::Mix)] = mix_free;
-    st.pipe_slots[ring_of(SimTaskType::Mix)] = mix_pipe;
-    // What this group is holding, by shape: every slot is free, running one task,
-    // or running one with a second behind it, so two per slot less what is still
-    // open gives the tasks resident -- plus whatever is still queued. This is what
-    // peers compare against, because it says how far ahead a manager has taken
-    // work, which free slots alone cannot.
-    const uint32_t slots[SIM_RING_COUNT] = {0, popcount_mask(q.aiv_m), popcount_mask(q.aic_m), q.package_count};
-    for (uint32_t r = 1; r < SIM_RING_COUNT; ++r) {
-        const uint32_t open2 = 2 * st.free_slots[r] + st.pipe_slots[r];
-        const uint32_t resident = 2 * slots[r] > open2 ? 2 * slots[r] - open2 : 0;
-        st.load[r] = resident + (q.push[r] - q.pop[r]);
-    }
+    SimQueueStatus st{q.watermark, 0, SIM_HELD_CAP > q.held_n ? SIM_HELD_CAP - q.held_n : 0};
     // The published window spans at most two words of the rotating buffer, so it
     // is two reads and a splice rather than a walk.
     {
@@ -1547,18 +1402,8 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
     q.poll_status_ticks += get_sys_cnt_aicpu() - t_status0;
 #endif
     // The status read is one access: the watermark and the published look-ahead
-    // share a register, where a list of indices took one further word per live
-    // entry. The poll latency above is the whole of it.
-    record_poll_work(q, entered_at);
-    {
-        const uint64_t now = get_sys_cnt_aicpu();
-        if (now > deadline) {
-            q.poll_overrun_total += now - deadline;
-            g_self_overrun_ticks[static_cast<uint32_t>(&q - &g_queues[0])] += now - deadline;
-            ++q.poll_overrun_calls;
-        }
-    }
-    wait_until(deadline);
+    // share a register. The poll latency above is the whole of it.
+    finish_poll(q, queue_idx, a);
     return st;
 }
 
@@ -1572,7 +1417,7 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
     }
     SimQueue &q = g_queues[queue_idx];
     // The caller's instant is on the real clock; the cohort starts on the queue's.
-    const uint64_t ofs = g_self_overrun_ticks[queue_idx];
+    const uint64_t ofs = g_ledger[queue_idx].overrun_ticks;
     const uint64_t at = at_real > ofs ? at_real - ofs : 0;
     for (uint32_t i = 0; i < q.core_count; ++i) {
         SimCore &c = q.cores[i];
@@ -1593,14 +1438,12 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             // already there and its startup has overlapped.
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
-            --q.gated_entries;
         }
         c.gated_count = 0;
         // The core is free when the last of its committed work ends.
         c.ready_at = c.finish[c.outstanding - 1];
         refresh_core(q, i);
     }
-    q.gated_floor_max = 0;
     refresh_next_event(q);
     wait_until(deadline);
 }
@@ -1614,25 +1457,6 @@ void queue_busy_ticks(uint32_t queue_idx, uint64_t *aic_busy, uint64_t *aiv_busy
     }
     *aic_busy = g_queues[queue_idx].busy_aic;
     *aiv_busy = g_queues[queue_idx].busy_aiv;
-}
-
-void queue_stall_stats(
-    uint32_t queue_idx, uint64_t *polls, uint64_t *stalled, uint64_t *stall_idle_cores, uint64_t *stall_mix_head,
-    uint64_t *stall_cube_head, uint64_t *stall_idle_aic, uint64_t *stall_idle_aiv
-) {
-    if (queue_idx >= SIM_MAX_QUEUES) {
-        *polls = *stalled = *stall_idle_cores = *stall_mix_head = 0;
-        *stall_cube_head = *stall_idle_aic = *stall_idle_aiv = 0;
-        return;
-    }
-    const SimQueue &q = g_queues[queue_idx];
-    *polls = q.poll_work_calls;
-    *stalled = q.stalled_polls;
-    *stall_idle_cores = q.stall_idle_cores;
-    *stall_mix_head = q.stall_mix_head;
-    *stall_cube_head = q.stall_cube_head;
-    *stall_idle_aic = q.stall_idle_aic;
-    *stall_idle_aiv = q.stall_idle_aiv;
 }
 
 void queue_steal_stats(uint32_t queue_idx, uint64_t *tried, uint64_t *won, int64_t *gain_us) {
@@ -1677,38 +1501,6 @@ void queue_residency(uint32_t queue_idx, uint64_t *mean_ns, uint64_t *max_ns, ui
     *max_ns = q.residency_n ? q.bound_wait_total * 1000000000ULL / hz / q.residency_n : 0;
 }
 
-void queue_aic_idle(uint32_t queue_idx, uint64_t *idle_us, uint64_t *idle_gated_us, uint64_t *gated_us) {
-    if (queue_idx >= SIM_MAX_QUEUES) {
-        *idle_us = *idle_gated_us = *gated_us = 0;
-        return;
-    }
-    const SimQueue &q = g_queues[queue_idx];
-    const uint64_t hz = get_sys_cnt_aicpu_frequency_hz();
-    *idle_us = q.aic_idle_ticks * 1000000ULL / hz;
-    *idle_gated_us = q.aic_idle_ticks_gated * 1000000ULL / hz;
-    *gated_us = q.gated_ticks * 1000000ULL / hz;
-}
-
-void set_ready_backlog_probe(ReadyBacklogProbe probe, void *ctx) {
-    g_backlog_ctx = ctx;
-    g_backlog_probe = probe;
-}
-
-void queue_aic_idle_split(
-    uint32_t queue_idx, uint64_t *drain_us, uint64_t *intake_us, uint64_t *stranded_us, uint64_t *none_us
-) {
-    if (queue_idx >= SIM_MAX_QUEUES) {
-        *drain_us = *intake_us = *stranded_us = *none_us = 0;
-        return;
-    }
-    const SimQueue &q = g_queues[queue_idx];
-    const uint64_t hz = get_sys_cnt_aicpu_frequency_hz();
-    *drain_us = q.aic_idle_drain_ticks * 1000000ULL / hz;
-    *intake_us = q.aic_idle_intake_ticks * 1000000ULL / hz;
-    *stranded_us = q.aic_idle_stranded_ticks * 1000000ULL / hz;
-    *none_us = q.aic_idle_none_ticks * 1000000ULL / hz;
-}
-
 uint64_t queue_finish_ts(uint32_t queue_idx, uint64_t index) {
     if (queue_idx >= SIM_MAX_QUEUES) {
         return 0;
@@ -1740,9 +1532,7 @@ void queue_ahead_stats(uint32_t queue_idx, uint32_t *high_water, uint64_t *overf
 
 uint64_t queue_self_overrun_ticks(uint32_t queue_idx) {
     if (queue_idx >= SIM_MAX_QUEUES) return 0;
-    const SimQueue &q = g_queues[queue_idx];
-    (void)q;
-    return g_self_overrun_ticks[queue_idx];
+    return g_ledger[queue_idx].overrun_ticks;
 }
 
 void queue_push_overrun(uint32_t queue_idx, uint64_t *total_us, uint64_t *calls, uint64_t *mean_work_ns) {

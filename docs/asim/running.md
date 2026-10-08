@@ -170,15 +170,9 @@ log lands in a directory shared with every other user on the box.
 | marker | arm | what it settles |
 | ------ | --- | --------------- |
 | `[ASIM_WORK]` | M0 | compute issued, dispatches, poll and push overrun |
-| `[GQ_WORK]` | M2 | compute issued by shape, positions issued, poll and push overrun, look-ahead depth, cube idle by cause, held entries, steals |
+| `[GQ_WORK]` | M2 | compute issued by shape, positions issued, poll and push overrun, look-ahead depth, held entries, steals |
 | `[M0_DONE]` / `[M2_DONE]` | both | tasks completed against tasks total; M2's also gives how many durations came from the calibration rather than a default, and why the grouping path passed tasks over |
 | `[M0_HIST]` / `[M2_HIST]` | both | compute samples per `func_id` |
-
-`[GQ_WORK]`'s `aic_idle_us` is cube-core time spent free, split by what was
-waiting at the time: `drain_us`, a sync-start drain holding dispatch;
-`intake_us`, cube work in the software ready queue; `stranded_us`, cube work
-committed to a peer queue; `none_us`, nothing. A core holding an unreleased cohort
-member is not free and is not counted.
 
 **Both arms print the same amount**: one work line per thread and two per run.
 These lines are written inside `device_wall`, so an arm that printed more would
