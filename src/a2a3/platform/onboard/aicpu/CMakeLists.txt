@@ -107,6 +107,22 @@ if(ASIM_DEVICE)
     endif()
 endif()
 
+# Report the simulated window WITHOUT removing the model's own excess. Applies
+# to every simulated device, so an A/B run of the two builds says how much
+# aicpu_phase_end() subtracts -- which is otherwise unreadable, because the
+# [ASIM_WORK]/[GQ_WORK] counters that carry it are device-side LOG_INFO and
+# never reach any captured log on this path.
+if(ASIM_DEVICE OR ASIMGQ_DEVICE)
+    option(SIM_REPORT_RAW_WINDOW "Leave the model's own excess in the reported window" OFF)
+    if(DEFINED ENV{SIM_REPORT_RAW_WINDOW})
+        set(SIM_REPORT_RAW_WINDOW $ENV{SIM_REPORT_RAW_WINDOW})
+    endif()
+    if(SIM_REPORT_RAW_WINDOW)
+        message(STATUS "Reporting RAW simulated windows (no overrun subtraction)")
+        target_compile_definitions(aicpu_kernel PRIVATE SIM_REPORT_RAW_WINDOW=1)
+    endif()
+endif()
+
 if(ASIMGQ_DEVICE)
     # Per-core TraCR lanes for the GroupQueue. Only the controller knows which core
     # ran a grouped task, so the spans are emitted from the device model rather than
