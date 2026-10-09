@@ -110,6 +110,13 @@ so M2's manager does the same software job as M0's scheduler. The two arms'
 scheduling windows agree to 0.4 %; the rest of M2's 1.2 % lies outside the
 window, in setup and teardown.
 
+What cube idle qwen has is mostly its 40 sync-start cohorts a round: 0.61 of the
+0.78 ms each cube core stands idle in the window falls while a cohort waits for
+the device to empty. Releasing cohorts from the queues instead of draining the
+device from the AICPU ([device-model.md](device-model.md)) measured level with
+the drain, -0.4 % and -0.1 % in two sessions: the wait is for every core to finish
+what it was running, which no release scheme removes.
+
 **The first model-clock measurement had M2 13 % slower on qwen**, from two defects
 in the manager rather than the controller:
 

@@ -721,26 +721,46 @@ on each other, so a block that is not resident is a peer that never arrives. On
 this device that means 24 MIX blocks — every cluster — so a cohort spans all four
 queues and no queue can see whether it is complete.
 
-The queue does the placing; the managers agree on the moment. A cohort's group is
-marked **gated**: a controller takes it only onto a **wholly idle** package (a
-slot queued behind running work is not co-residency), and then holds those cores
-without running anything. The queue's status register reports how many gated
-entries it holds. When the count across the four queues reaches the cohort's size,
-the first manager to see it stamps a release instant, and each manager starts its
-own share from that same instant.
+The queue does the placing; the managers agree on the moment. Each manager
+claims as many of the cohort's blocks as it holds idle clusters for and hands
+them over **gated**: a controller places a gated entry only on an **idle** core
+(a slot queued behind running work is not co-residency) and holds it there
+without running. The queue's status register reports how many gated entries it
+holds. When the count across the four queues reaches the cohort's size, the
+first manager to see it stamps a release instant, and each manager starts its own
+share from that same instant. While a cohort assembles, regular dispatch stands
+aside, as it does while the AICPU drain holds the device, so the cores the cohort
+needs come free as soon as the work already on them ends.
 
-Two properties are load-bearing:
+A mix block's three parts are separate entries here, each held on an idle core of
+its type, so this model does not keep them inside one package.
+
+Four properties are load-bearing:
 
 - **A manager releases on seeing the stamp, not on recounting.** The count falls
   as managers release, so a late reader would never observe the target met and
   would hold its blocks forever.
-- **A manager caps its share at its own package count, remembering what it
-  claimed.** A claim is not visible as a placement until its entries are granted,
-  so re-reading the free-package count lets one manager claim the same idle
-  packages twice — blocks it can never place, which deadlocks the cohort.
+- **A manager caps its share at its own cluster count, remembering what it
+  claimed.** A claim is not visible as a placement until its entries are placed,
+  so re-reading idle capacity lets one manager claim the same cores twice —
+  blocks it can never place, which deadlocks the cohort.
+- **A manager picks the clusters for its share from its own core states, not
+  from its dispatch pass's candidates.** A pass trims its candidate clusters to
+  the index window's room by lowest offset; the members a cohort already holds
+  keep that room low until the release, so the trim can hide the one idle
+  cluster the cohort is still waiting for.
+- **A stamp and a close are for the cohort still named.** A manager finishing
+  its service of a cohort that another manager has meanwhile closed must not
+  stamp or close the next one.
 
 Completion is unchanged: a cohort block retires through its own manager's
 watermark like any other, so nothing crosses queues except the rendezvous.
+
+Measured on qwen (40 cohorts a round, 48 rounds per arm, two interleaved
+sessions), the release is level with the AICPU drain: -0.4 % and -0.1 % of
+`device_wall`. A whole-device cohort cannot start until every core has finished
+what it was running, ~190 us from claim to release in real time, and both schemes
+pay that; what the release removes is only the drain's coordination on top of it.
 
 ### Out of scope
 

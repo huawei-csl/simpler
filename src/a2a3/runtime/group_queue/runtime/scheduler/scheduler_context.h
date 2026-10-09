@@ -161,6 +161,28 @@ private:
     SyncStartDrainState drain_state_;
     std::atomic<uint64_t> drain_ack_tokens_[MAX_AICPU_THREADS]{};
 
+#ifdef __SIMULATED_DEVICE__
+    // On the simulated GroupQueue a sync_start cohort is assembled in the queues
+    // rather than by draining the device: see SyncStartCohort.
+    SyncStartCohort cohort_;
+    // The cohort this manager last claimed blocks of, and how many. A claim is not
+    // visible as a held member until the controller places it, so a manager caps
+    // its share by what it has claimed rather than by re-reading idle capacity,
+    // which would let it claim the same cores twice.
+    uint64_t cohort_claim_tid_[MAX_AICPU_THREADS]{};
+    int32_t cohort_claim_n_[MAX_AICPU_THREADS]{};
+    // Queue entries this manager has handed over for that cohort, and how many of
+    // them its queue last reported held. Once every one is held the count cannot
+    // rise again until the release, so it need not be read.
+    int32_t cohort_claim_entries_[MAX_AICPU_THREADS]{};
+    int32_t cohort_held_seen_[MAX_AICPU_THREADS]{};
+    // Per manager: cohorts it stamped, their claim-to-stamp time in counter ticks,
+    // and the blocks it held.
+    uint64_t cohort_stamped_[MAX_AICPU_THREADS]{};
+    uint64_t cohort_assembly_ticks_[MAX_AICPU_THREADS]{};
+    uint64_t cohort_blocks_[MAX_AICPU_THREADS]{};
+#endif
+
 #if SIMPLER_DFX
     SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
     // Cached once at init() from get_chip_swimlane_level(), AFTER
@@ -339,6 +361,9 @@ private:
         // core stacks two -- that member is then the core's only entry.
         bool frees_pending;
         bool guarded;
+        // A sync_start cohort member: the controller holds it on its core, not
+        // started, until the cohort is released device-wide.
+        bool cohort;
 #endif
     };
 
@@ -384,10 +409,16 @@ private:
             if (d > 0) dep_n = d;
         }
         if (!from_group) note_task_position(h.local_id, idx);
-        if (!asimgq::submit_grouped(
-                static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
-                queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
-            )) {
+        const bool accepted =
+            h.cohort ? asimgq::submit(
+                           static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                           queue_ring_for(h), /*gated=*/true
+                       ) :
+                       asimgq::submit_grouped(
+                           static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                           queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
+                       );
+        if (!accepted) {
             // Callers size their dispatch by the room the queue reported, which
             // only grows between the read and the submit, so this cannot fire.
             LOG_ERROR("Thread %d: GroupQueue refused a submit -- dispatch outran the ring", thread_idx);
@@ -543,6 +574,22 @@ private:
     // Tier-0 analog of has_residual_mix for the ready sync_start lane: true if MIX
     // sync_start cohorts remain queued, so the Tier-0 pass keeps MIX strict priority
     // over its own AIC/AIV sync work. Same relaxed-size snapshot caveat.
+#ifdef __SIMULATED_DEVICE__
+    // Publish how many cohort members this manager's queue holds, stamp the release
+    // once the device-wide count is met, start this manager's share from the
+    // stamp, and close the cohort once every share has started. One load when no
+    // cohort is assembling.
+    void service_cohort(int32_t thread_idx);
+
+    // A cohort is claimed and not yet stamped. Regular dispatch stands aside so the
+    // cores the cohort needs come free as soon as the work already on them ends,
+    // as it does while a drain holds the device.
+    bool cohort_assembling() const {
+        return cohort_.task_id.load(std::memory_order_acquire) != 0 &&
+               cohort_.release_at.load(std::memory_order_acquire) == 0;
+    }
+#endif
+
     bool has_residual_sync_mix() const {
         return sched_->ready_sync_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
     }

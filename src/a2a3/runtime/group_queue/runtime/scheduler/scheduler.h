@@ -499,16 +499,16 @@ inline constexpr int32_t kPositionSlots = 1 << 17;
 // Why the grouping contract does or does not bite, counted rather than reasoned
 // about: how often a consumer was released early because an in-group producer
 // was already submitted, and what the submit then found.
-inline std::atomic<uint64_t> g_gq_skip_fired{0};      // classify skipped an in-group producer
-inline std::atomic<uint64_t> g_gq_skip_unclaimed{0};  // would have skipped; group not yet claimed
-inline std::atomic<uint64_t> g_gq_skip_nopos{0};      // would have skipped; producer had no position
-inline std::atomic<uint64_t> g_gq_deps_named{0};      // submit named >=1 in-group producer
-inline std::atomic<uint64_t> g_gq_deps_allcomplete{0};// submit found every producer already retired
-inline std::atomic<uint64_t> g_gq_deps_bailed{0};     // submit found a producer it could not name
-inline std::atomic<int32_t> g_gq_bail_task{-1};      // first task that could not be expressed
-inline std::atomic<int32_t> g_gq_bail_prod{-1};      // and the producer it named
-inline std::atomic<int32_t> g_gq_bail_kind{0};       // 1 = cross-group unmet, 2 = in-group unpositioned
-inline std::atomic<uint64_t> g_gq_deps_toomany{0};    // more unmet producers than comparators; task held back
+inline std::atomic<uint64_t> g_gq_skip_fired{0};        // classify skipped an in-group producer
+inline std::atomic<uint64_t> g_gq_skip_unclaimed{0};    // would have skipped; group not yet claimed
+inline std::atomic<uint64_t> g_gq_skip_nopos{0};        // would have skipped; producer had no position
+inline std::atomic<uint64_t> g_gq_deps_named{0};        // submit named >=1 in-group producer
+inline std::atomic<uint64_t> g_gq_deps_allcomplete{0};  // submit found every producer already retired
+inline std::atomic<uint64_t> g_gq_deps_bailed{0};       // submit found a producer it could not name
+inline std::atomic<int32_t> g_gq_bail_task{-1};         // first task that could not be expressed
+inline std::atomic<int32_t> g_gq_bail_prod{-1};         // and the producer it named
+inline std::atomic<int32_t> g_gq_bail_kind{0};          // 1 = cross-group unmet, 2 = in-group unpositioned
+inline std::atomic<uint64_t> g_gq_deps_toomany{0};      // more unmet producers than comparators; task held back
 inline uint64_t g_task_position[kPositionSlots] = {};
 
 // Entries carry the run that wrote them, so a run starts by bumping the epoch
@@ -527,8 +527,7 @@ inline constexpr uint64_t kPositionMask = (1ULL << 40) - 1;
 
 inline void note_task_position(int32_t local_id, uint64_t pos) {
     if (local_id < 0 || local_id >= kPositionSlots) return;
-    g_task_position[local_id] =
-        (pos == kNoPosition) ? 0 : ((g_position_epoch << 40) | ((pos + 1) & kPositionMask));
+    g_task_position[local_id] = (pos == kNoPosition) ? 0 : ((g_position_epoch << 40) | ((pos + 1) & kPositionMask));
 }
 
 inline uint64_t task_position(int32_t local_id) {
@@ -595,7 +594,8 @@ struct SchedulerState {
     uint64_t ready_depth(int32_t shape) {
         if (!gq_group::active()) return ready_queues[shape].size();
         uint64_t n = 0;
-        for (int32_t t = 0; t < PLATFORM_MAX_AICPU_THREADS; ++t) n += ready_queues_gq[t][shape].size();
+        for (int32_t t = 0; t < PLATFORM_MAX_AICPU_THREADS; ++t)
+            n += ready_queues_gq[t][shape].size();
         return n;
     }
 
@@ -1016,6 +1016,11 @@ struct SchedulerState {
     // to the release path's NONE->DISPATCHED and is dropped here. A failed
     // push returns the claim so readiness takes the ordinary queue path.
     inline void enqueue_early_dispatch_candidate(ChipTaskSlotState &consumer) {
+#ifdef __SIMULATED_DEVICE__
+        // On the simulated GroupQueue a sync_start cohort is assembled in the queues
+        // once it is ready, so it is never pre-staged.
+        if (consumer.task_attrs.requires_sync_start()) return;
+#endif
         uint8_t expected = EARLY_DISPATCH_NONE;
         if (!consumer.to_payload().early_dispatch_state.compare_exchange_strong(
                 expected, EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
