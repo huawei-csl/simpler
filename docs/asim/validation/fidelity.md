@@ -44,9 +44,7 @@ share a session and cancel its drift:
 
 paged_attention ran 4 reps of 14 rounds, qwen 3; the first two rounds of every
 run are dropped, giving 48 and 36 samples per arm. qwen is the in-repo expanded
-orchestration (11,087 tasks), which the simulated arms require -- the shipped one
-submits each layer as a Graph that a GroupQueue controller has no Graph Execution
-to expand. Both simulated arms run on the per-thread model clock described in
+orchestration (11,087 tasks). Both simulated arms run on the per-thread model clock described in
 [DESIGN.md](../DESIGN.md) §3, so their `device_wall` excludes the simulator's own
 work exactly.
 
@@ -54,6 +52,17 @@ work exactly.
 | ---- | -------------- | -------- | -------- |
 | paged_attention Case1 | 21.249 ms | 21.775 ms | **+2.5 %** |
 | qwen3-14B decode, 40L | 34.551 ms | 33.116 ms | **-4.2 %** |
+| qwen3-14B decode, 40L, Graph orchestration (2026-10-09) | 38.297 ms | 38.230 ms | **-0.2 %** |
+
+**The error tracks how much of the window is AICPU software, not which case it
+is.** The third row is the same network through its shipped Graph orchestration,
+where the manager handles 47 tasks a round instead of 11,085 because the device
+Scheduler expands each layer: almost all of that window is compute the model
+draws from the calibration, and the agreement is an order of magnitude tighter.
+The two 40-layer rows are not the same workload -- the Graph form issues 1,308 ms
+of core time a round against 746 -- so they are separate cases, not a
+before-and-after. M2 on that row reads -0.4 % against silicon and -0.2 % against
+M0 ([validation.md](../validation.md#a-second-qwen-shape-the-graph-orchestration)).
 
 The simgc arm ran the GroupQueue manager before it was fixed to retire on notice
 and pipeline a second task per core, so its figures are superseded; M2 against M0

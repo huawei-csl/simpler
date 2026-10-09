@@ -148,6 +148,48 @@ dispatched, every core idle, until the scheduler timeout. M0's code did not chan
 so the defect is in the sync-start drain the two runtimes share; the run's eleven
 completed rounds are kept, and dropping them moves M0's median by 2 us.
 
+## A second qwen shape: the Graph orchestration
+
+The in-repo qwen case ships two orchestrations of the same network. Every figure
+above uses `decode_fwd_layers_expanded.cpp`, which submits all 11,085 tasks, so
+the manager sees the whole graph. The shipped `decode_fwd_layers.cpp` instead
+submits each of the 40 layers as **one Graph task the device Scheduler expands**,
+which the manager never sees the inside of. Measured 2026-10-09, all three arms
+interleaved in one device lock, 48 samples each:
+
+| arm | `device_wall` | scheduling window | vs silicon |
+| --- | ------------- | ----------------- | ---------- |
+| silicon | 38.297 ms | 37.399 ms | — |
+| M0 | 38.230 ms | 37.272 ms | **-0.2 %** |
+| M2 | 38.136 ms | 36.959 ms | **-0.4 %** |
+
+**This is the simulator's closest agreement with hardware on any case** -- both
+baselines inside half a percent, where the expanded orchestration sits at ~4 %
+([validation/fidelity.md](validation/fidelity.md)). The manager handles 47 tasks
+a round instead of 11,085, so almost none of the window is the AICPU software
+this model does not reproduce; what is left is compute, which it draws from the
+same calibration. A case whose scheduling is nearly free is the one a device
+model can match, and that is also why it cannot discriminate between designs:
+
+**M2 is level with M0 here too, at -0.2 %.** Its cube cores are 87 % busy (32.1
+of 37.0 ms a round) against 11.2 ms on the vector cores, so this shape is
+cube-bound like the expanded one -- and the GroupQueue has even less to win,
+because the dependency hops it removes happen inside the Scheduler's graph
+expansion rather than on the manager's path.
+
+The two orchestrations are **not the same workload**: the Graph form issues 1,308
+ms of core time a round against the expanded form's 746 ms, and runs 38.3 ms
+against 34.7 ms on silicon. Quote them separately. Compute issued agrees between
+the arms to 0.01 %, and every round of both arms completed every task.
+
+Two mechanical notes for reproducing it. The driver lives in the
+`tensormap_and_ringbuffer` case but its copy of this source does not compile
+against the `host_build_graph` orchestration API, so the `host_build_graph`
+copy is the one to pass. And `deps.json` cannot name the func_id of a task the
+device expands, so the calibration comes from the swimlane's own per-task kernel
+ids -- `asim_gen_calib.py` already prefers them, and takes `-` in place of a
+dep-gen round.
+
 ## Is an M0-vs-M2 delta an artefact?
 
 The 2026-09-17 audit checked the two arms for asymmetries that could hand M2 its

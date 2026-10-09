@@ -142,9 +142,23 @@ Two things the pypto path does not do for itself:
 The in-repo `examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode` with
 `decode_fwd_layers_expanded.cpp` is a second, independent path to the same model
 and measures within 0.6 points of the pypto one. Use it when the cross-repo
-setup is not worth standing up. Its shipped (non-expanded) orchestration submits
-each layer as a Graph, which `group_queue` cannot expand — pass the expanded
-source.
+setup is not worth standing up.
+
+Its shipped (non-expanded) orchestration submits each layer as one Graph task the
+device Scheduler expands, and **both runtimes run it** -- a claim that
+`group_queue` could not expand a Graph was wrong. It is a separate, heavier
+workload rather than another path to the same number (1,308 ms of core time a
+round against 746, and 38.3 ms against 34.7 on silicon), and the simulator's
+closest agreement with hardware:
+[validation.md](validation.md#a-second-qwen-shape-the-graph-orchestration). Two
+things to get right on that path:
+
+- Pass the **`host_build_graph` copy** of `decode_fwd_layers.cpp`. The driver
+  lives in the `tensormap_and_ringbuffer` case, whose own copy does not compile
+  against the `host_build_graph` orchestration API.
+- Calibrate from the swimlane's recorded per-task kernel ids, passing `-` in
+  place of a dep-gen round: `deps.json` cannot name the func_id of a task the
+  device expands.
 
 **The base arm has to take that in-repo path.** The pypto runner picks its own
 platform and would need the wrapper rebuilt around a real device, so the
