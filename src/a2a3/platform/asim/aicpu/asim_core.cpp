@@ -363,16 +363,22 @@ uint32_t g_tracr_lane_base = UINT32_MAX;
 // every other marker in the buffer is stamped on the real counter, so the ledger is
 // added back here -- otherwise the core lanes drift progressively earlier than the
 // AICPU lanes beside them.
-inline void tracr_core_span(uint32_t core_idx, uint32_t func_id, uint64_t begin_ticks, uint64_t end_ticks) {
+inline void tracr_core_span(
+    uint32_t core_idx, uint32_t func_id, bool pipelined, uint64_t begin_ticks, uint64_t end_ticks
+) {
     if (g_tracr_lane_base == UINT32_MAX || !tracrThread) {
         return;
     }
     const uint64_t *ledger = self_ledger();
     const uint64_t ofs = ledger != nullptr ? *ledger : 0;
     const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + core_idx);
+    // Pair marks a task that landed behind running work, the same thing the
+    // host_build_graph manager's `to_pending` Pair meant before the model took
+    // these lanes over: it pays no handshake, so the split is what says whether
+    // the cores were fed or starved.
+    const uint16_t event = static_cast<uint16_t>(pipelined ? Running_Task_Pair : Running_Task_Single);
     tracrThread->store_trace(TraCR::Payload{
-        channel, static_cast<uint16_t>(Running_Task_Single), func_id,
-        sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+        channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
     });
     tracrThread->store_trace(TraCR::Payload{
         channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
@@ -399,7 +405,7 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
         );
 #if ASIM_TRACR_CORE_LANES
         // The kernel body only, as the GroupQueue arm records it: ack -> finish.
-        tracr_core_span(core_idx, static_cast<uint32_t>(func_id), c.active_ack_at, c.active_fin_at);
+        tracr_core_span(core_idx, static_cast<uint32_t>(func_id), false, c.active_ack_at, c.active_fin_at);
 #endif
     } else {
         // Partially Free -> Fully Busy: the pipelined task is auto-acked only
@@ -422,7 +428,9 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
 #if ASIM_TRACR_CORE_LANES
         // Promoted at the active task's finish with no latch of its own, so that
         // instant is both its start and the previous span's end: the lane abuts.
-        tracr_core_span(core_idx, static_cast<uint32_t>(func_id), c.active_fin_at, c.active_fin_at + dur);
+        tracr_core_span(
+            core_idx, static_cast<uint32_t>(func_id), true, c.active_fin_at, c.active_fin_at + dur
+        );
 #endif
     }
     const uint64_t done_at = get_sys_cnt_aicpu();
