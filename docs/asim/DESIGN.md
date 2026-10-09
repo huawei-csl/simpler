@@ -103,7 +103,10 @@ The model-clock results did not move beyond their noise, which is the point:
 they never depended on how fast the model ran. What remains is mostly model work
 proper -- replaying retirements and placing entries -- plus two clock reads per
 access against a status read charged at 10 ns. M0's ledger is 0.7 ms a round on
-paged_attention and 0.3 ms on qwen.
+paged_attention and 0.3 ms on qwen. Releasing sync-start cohorts from the queues
+([device-model.md](device-model.md)) puts ~1.4 ms back on qwen's: while a cohort
+assembles, regular dispatch stands aside and the managers' loops spin through
+more polls.
 
 ### What Mode A measures — and what it cannot
 

@@ -268,6 +268,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
         subslot == SubtaskSlot::AIC,
         !to_pending && !force_gate,
         !to_pending && force_gate,
+        false,
 #endif
     };
 }
@@ -474,6 +475,102 @@ void SchedulerContext::dispatch_shape(
 
         for (int bi = 0; bi < got; bi++) {
             ChipTaskSlotState *slot_state = batch[bi];
+#ifdef __SIMULATED_DEVICE__
+            if (slot_state->task_attrs.requires_sync_start()) {
+                if (is_pending) {
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    continue;
+                }
+                // The GroupQueue holds a cohort's members on their cores until every
+                // queue has its share placed, so no drain is entered. This manager
+                // claims as many blocks as it has idle units for -- capped at what its
+                // queue serves over the whole cohort -- hands them over held, and
+                // returns the task for the other managers to claim the rest.
+                flush_publish();
+                const uint64_t tid = static_cast<uint64_t>(slot_state->to_descriptor().task_id.raw);
+                uint64_t owner = cohort_.task_id.load(std::memory_order_acquire);
+                if (owner == 0) {
+                    uint64_t expected = 0;
+                    if (cohort_.task_id.compare_exchange_strong(
+                            expected, tid, std::memory_order_acq_rel, std::memory_order_acquire
+                        )) {
+                        // Counted in queue entries, which is what a queue reports: a mix
+                        // block holds one per core it uses.
+                        const int32_t entries = is_mix ? __builtin_popcount(slot_state->active_mask.core_mask()) : 1;
+                        cohort_.target.store(slot_state->logical_block_num * entries, std::memory_order_relaxed);
+                        cohort_.claimed_at.store(asimgq::now_ticks(), std::memory_order_relaxed);
+                        cohort_.release_at.store(0, std::memory_order_relaxed);
+                        cohort_.state.store(SyncStartCohort::kAssembling, std::memory_order_release);
+                        owner = tid;
+                    } else {
+                        owner = expected;
+                    }
+                }
+                if (owner != tid || cohort_.state.load(std::memory_order_acquire) != SyncStartCohort::kAssembling) {
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    continue;
+                }
+                if (cohort_claim_tid_[thread_idx] != tid) {
+                    cohort_claim_tid_[thread_idx] = tid;
+                    cohort_claim_n_[thread_idx] = 0;
+                    cohort_claim_entries_[thread_idx] = 0;
+                    cohort_held_seen_[thread_idx] = 0;
+                }
+                // Selected from the tracker rather than from this pass's `cores`: those are
+                // trimmed to the index window's room by lowest offset, and the members a
+                // cohort already holds keep that room low until it is released, so the
+                // trim could hide the very units the rest of the cohort needs.
+                const int32_t per_block = is_mix ? __builtin_popcount(slot_state->active_mask.core_mask()) : 1;
+                CoreTracker::BitStates units =
+                    is_mix ? tracker.get_mix_cluster_offset_states(
+                                 slot_state->active_mask.core_mask(), CoreTracker::MixPlacement::RUNNING
+                             ) :
+                             tracker.get_dispatchable_cores(shape, phase);
+                const int32_t capacity =
+                    (shape == ResourceShape::AIV) ? 2 * tracker.get_cluster_count() : tracker.get_cluster_count();
+                int32_t available = units.count();
+                if (available > capacity - cohort_claim_n_[thread_idx]) {
+                    available = capacity - cohort_claim_n_[thread_idx];
+                }
+                const int32_t room_blocks = static_cast<int32_t>(gq_index_[thread_idx].room()) / per_block;
+                if (available > room_blocks) {
+                    available = room_blocks;
+                }
+                int32_t start = 0;
+                const int32_t claim =
+                    slot_state->claim_block_range(slot_state->logical_block_num, available > 0 ? available : 0, start);
+                if (start + claim < slot_state->logical_block_num) {
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                }
+                if (claim == 0) continue;
+                cohort_claim_n_[thread_idx] += claim;
+                cohort_claim_entries_[thread_idx] += claim * per_block;
+                cohort_blocks_[thread_idx] += static_cast<uint64_t>(claim);
+                dispatched_any = true;
+                try_pushed = true;
+                published_list[published_n] = slot_state;
+                published_counts[published_n] = static_cast<int16_t>(claim);
+                published_n++;
+                for (int32_t b = 0; b < claim; b++) {
+                    const auto core_offset = units.pop_first();
+                    cores.clear_bit(core_offset);
+                    const int n = prepare_block_for_dispatch(
+                        thread_idx, core_offset, *slot_state, shape, /*to_pending=*/false, start + b,
+                        &handles[handle_count]
+                    );
+                    for (int k = handle_count; k < handle_count + n; ++k) {
+                        // Held on its core, a member is the core's only entry until it
+                        // runs, so the core's pending slot stays shut behind it.
+                        handles[k].cohort = true;
+                        handles[k].frees_pending = false;
+                        handles[k].guarded = true;
+                    }
+                    handle_count += n;
+                }
+                flush_publish();
+                continue;
+            }
+#endif
             CoreTracker::BitStates selected_mix_clusters(0ULL);
 
             if (is_mix) {
@@ -633,6 +730,71 @@ void SchedulerContext::run_staging_order(
     }
 }
 
+#ifdef __SIMULATED_DEVICE__
+void SchedulerContext::service_cohort(int32_t thread_idx) {
+    const uint64_t tid = cohort_.task_id.load(std::memory_order_acquire);
+    if (tid == 0 || cohort_.state.load(std::memory_order_acquire) != SyncStartCohort::kAssembling) {
+        return;
+    }
+    const uint32_t q = static_cast<uint32_t>(thread_idx);
+    // The queue is read only while members this manager handed over may still be
+    // waiting for a core; after that its count cannot change before the release.
+    const bool mine_pending =
+        cohort_claim_tid_[thread_idx] == tid && cohort_held_seen_[thread_idx] < cohort_claim_entries_[thread_idx];
+    const int32_t mine =
+        mine_pending ? static_cast<int32_t>(asimgq::read_cohort_staged(q)) : cohort_held_seen_[thread_idx];
+    if (cohort_claim_tid_[thread_idx] == tid) {
+        cohort_held_seen_[thread_idx] = mine;
+    }
+    cohort_.staged_by[thread_idx].store(mine, std::memory_order_release);
+    uint64_t at = cohort_.release_at.load(std::memory_order_acquire);
+    if (at == 0) {
+        // The cohort this call began serving may have been released, closed and
+        // replaced by another manager meanwhile; a stamp is only ever for the
+        // cohort still named, and only once its target is set.
+        const int32_t target = cohort_.target.load(std::memory_order_acquire);
+        if (target == 0 || cohort_.staged_total() < target || cohort_.task_id.load(std::memory_order_acquire) != tid) {
+            return;
+        }
+        uint64_t expected = 0;
+        const uint64_t now = asimgq::now_ticks();
+        if (cohort_.release_at.compare_exchange_strong(
+                expected, now, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            at = now;
+            ++cohort_stamped_[thread_idx];
+            cohort_assembly_ticks_[thread_idx] += now - cohort_.claimed_at.load(std::memory_order_relaxed);
+        } else {
+            at = expected;
+        }
+    }
+    // A manager releases on seeing the stamp, never on recounting: the count falls
+    // as managers release, so a late reader would not see the target met again.
+    if (mine > 0) {
+        asimgq::release_cohort(q, at);
+        cohort_.staged_by[thread_idx].store(0, std::memory_order_release);
+        cohort_held_seen_[thread_idx] = 0;
+        cohort_claim_entries_[thread_idx] = 0;
+    }
+    // Every share has started once nothing is held anywhere. The CAS picks one
+    // closer, which clears the fields before freeing `task_id`, so a new claimer
+    // never finds this cohort's leftovers.
+    if (cohort_.staged_total() == 0 && cohort_.release_at.load(std::memory_order_acquire) != 0 &&
+        cohort_.task_id.load(std::memory_order_acquire) == tid) {
+        int32_t expected = SyncStartCohort::kAssembling;
+        if (cohort_.state.compare_exchange_strong(
+                expected, SyncStartCohort::kClosing, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            cohort_.target.store(0, std::memory_order_relaxed);
+            cohort_.claimed_at.store(0, std::memory_order_relaxed);
+            cohort_.release_at.store(0, std::memory_order_relaxed);
+            cohort_.state.store(SyncStartCohort::kIdle, std::memory_order_release);
+            cohort_.task_id.store(0, std::memory_order_release);
+        }
+    }
+}
+#endif
+
 void SchedulerContext::dispatch_ready_tasks(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
@@ -657,6 +819,9 @@ void SchedulerContext::dispatch_ready_tasks(
         }
     );
     if (entered_drain) return;
+#ifdef __SIMULATED_DEVICE__
+    if (cohort_assembling()) return;
+#endif
 
     // Tier 1: regular ready work.
     run_staging_order(
@@ -891,6 +1056,9 @@ int32_t SchedulerContext::try_early_dispatch(
     //     regular ready_queues) strictly precedes early — there is no real ready task
     //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
+#ifdef __SIMULATED_DEVICE__
+    if (cohort_assembling()) return 0;
+#endif
     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_depth(s) > 0) return 0;
     }
@@ -1321,6 +1489,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         bool try_pushed = false;
+
+#ifdef __SIMULATED_DEVICE__
+        service_cohort(thread_idx);
+#endif
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {

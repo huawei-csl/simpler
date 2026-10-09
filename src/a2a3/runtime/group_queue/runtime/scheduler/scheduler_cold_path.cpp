@@ -665,6 +665,21 @@ void SchedulerContext::gq_prepare_run() {
     }
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
+    cohort_.task_id.store(0, std::memory_order_relaxed);
+    cohort_.state.store(SyncStartCohort::kIdle, std::memory_order_relaxed);
+    cohort_.target.store(0, std::memory_order_relaxed);
+    cohort_.release_at.store(0, std::memory_order_relaxed);
+    cohort_.claimed_at.store(0, std::memory_order_relaxed);
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
+        cohort_.staged_by[i].store(0, std::memory_order_relaxed);
+        cohort_claim_tid_[i] = 0;
+        cohort_claim_n_[i] = 0;
+        cohort_claim_entries_[i] = 0;
+        cohort_held_seen_[i] = 0;
+        cohort_stamped_[i] = 0;
+        cohort_assembly_ticks_[i] = 0;
+        cohort_blocks_[i] = 0;
+    }
     // Seeding first: the partition below applies only to a run that declared
     // groups, and that is what seeding determines.
     seed_ready_groups();
@@ -996,11 +1011,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             " push_overrun_us=%" PRIu64 " polls=%" PRIu64 " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
             " ahead_high=%u ahead_dropped=%" PRIu64 " held_admitted=%" PRIu64 " held_promoted=%" PRIu64
             " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64 " steals_won=%" PRIu64
-            " steal_gain_us=%" PRId64,
+            " steal_gain_us=%" PRId64 " cohorts=%" PRIu64 " cohort_blocks=%" PRIu64 " cohort_assembly_us=%.1f"
+            " cohort_piped=%" PRIu64,
             thread_idx, cycles_to_us(aic), cycles_to_us(aiv), gq_index_[thread_idx].push_index(), poll_over_us,
             push_over_us, work_calls, work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
             (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, admitted, promoted, refused,
-            held_high, steals_tried, steals_won, steal_gain_us
+            held_high, steals_tried, steals_won, steal_gain_us, cohort_stamped_[thread_idx], cohort_blocks_[thread_idx],
+            cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q)
         );
 #if ASIMGQ_SELF_PROFILE
         uint64_t retire_ns = 0, status_ns = 0, profiled = 0;

@@ -594,6 +594,41 @@ static_assert(offsetof(SyncStartDrainState, pending_task) == 8);
 static_assert(offsetof(SyncStartDrainState, drain_attempt) == 16);
 static_assert(offsetof(SyncStartDrainState, drain_stage_go) == 24);
 
+#ifdef __SIMULATED_DEVICE__
+// A require_sync_start cohort assembling across the GroupQueues. Every block of
+// such a task has to begin at one instant -- its blocks wait on each other -- and a
+// cohort spans every queue, so the managers agree on the moment while each queue
+// does its own placing: a member is held on its core, not started, until the
+// device-wide count of held members meets `target`, and every manager then starts
+// its own share from the instant the first to see it stamped.
+//
+// One cohort assembles at a time. `state` orders the hand-offs: a claimer sets the
+// fields before opening the cohort, the stamp is a CAS on `release_at`, and closing
+// is a CAS on `state`, after which the closer clears the fields and only then frees
+// `task_id` for the next claimer.
+struct alignas(64) SyncStartCohort {
+    static constexpr int32_t kIdle = 0;
+    static constexpr int32_t kAssembling = 1;
+    static constexpr int32_t kClosing = 2;
+
+    std::atomic<uint64_t> task_id{0};  // cohort being assembled; 0 = none
+    std::atomic<int32_t> state{kIdle};
+    std::atomic<int32_t> target{0};       // queue entries it needs held, not blocks
+    std::atomic<uint64_t> release_at{0};  // real-clock instant its members start; 0 = not yet
+    std::atomic<uint64_t> claimed_at{0};  // real-clock instant the first share was claimed
+    // Members each manager's queue currently holds placed but not started.
+    std::atomic<int32_t> staged_by[MAX_AICPU_THREADS]{};
+
+    int32_t staged_total() const {
+        int32_t n = 0;
+        for (int32_t i = 0; i < MAX_AICPU_THREADS; ++i) {
+            n += staged_by[i].load(std::memory_order_acquire);
+        }
+        return n;
+    }
+};
+#endif
+
 constexpr uint64_t SYNC_START_DRAIN_ACK_SUBTREE_READY = uint64_t{1} << 63;
 constexpr uint64_t SYNC_START_DRAIN_ATTEMPT_MASK = ~SYNC_START_DRAIN_ACK_SUBTREE_READY;
 

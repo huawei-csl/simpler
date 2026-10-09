@@ -289,6 +289,13 @@ struct alignas(64) SimQueue {
     uint32_t held_ready = 0;  // slots whose producers have all finished, not yet in a ring
     uint32_t held_n = 0;
     uint64_t held_seq = 0;
+
+    // Cohort members placed on this queue's cores and not yet started, and how many
+    // members over the run had to sit behind running work rather than on an idle
+    // core -- a manager offers a cohort only cores it holds idle, so that count
+    // says how often the two views of a core disagreed.
+    uint32_t cohort_staged = 0;
+    uint64_t cohort_piped = 0;
     uint32_t held_waiters[SIM_HELD_WAIT_SLOTS] = {};
     uint32_t held_high = 0;
     uint64_t held_admitted = 0;
@@ -594,6 +601,10 @@ void commit(
         c.index[c.outstanding] = e.index[part];
         ++c.outstanding;
         ++c.gated_count;
+        ++q.cohort_staged;
+        if (pipelined) {
+            ++q.cohort_piped;
+        }
         refresh_core(q, core_slot);
         return;
     }
@@ -713,6 +724,12 @@ bool place_single(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
         q.rr = (q.rr + 1) % q.package_count;
         if (e.type != SimTaskType::Cube) ++q.vrr;
         return true;
+    }
+    // A cohort member is placed only on an idle core: one queued behind running work
+    // would start when that work ends rather than with its peers, which is not
+    // co-residency. It waits at the head of its ring for a core to come free.
+    if (e.gated) {
+        return false;
     }
     const CoreMask pipe = mask_and(q.pipe_m, type_m);
     uint32_t best = UINT32_MAX;
@@ -1434,9 +1451,9 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
 void release_cohort(uint32_t queue_idx, uint64_t at_real) {
     // A posted write into the queue, the same class of access as submitting an
     // entry, so it is charged the same.
-    const uint64_t deadline = get_sys_cnt_aicpu() + g_push_ticks;
+    const Access a = begin_access(queue_idx, g_push_ticks);
     if (queue_idx >= SIM_MAX_QUEUES) {
-        wait_until(deadline);
+        wait_until(a.release);
         return;
     }
     SimQueue &q = g_queues[queue_idx];
@@ -1455,13 +1472,12 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             // No earlier than the cohort begins, and no earlier than this core
             // finishes what it was already running.
             const uint64_t start = at > c.gated_floor[k] ? at : c.gated_floor[k];
-            // Same rule as an ordinary placement: a member sitting behind running
-            // work is already at its core when that work ends.
             // Same rule as an ordinary placement: the first member reaches its core
             // over the link and then starts up; one sitting behind running work is
             // already there and its startup has overlapped.
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
+            --q.cohort_staged;
         }
         c.gated_count = 0;
         // The core is free when the last of its committed work ends.
@@ -1469,7 +1485,26 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
         refresh_core(q, i);
     }
     refresh_next_event(q);
-    wait_until(deadline);
+    finish_push(q, queue_idx, a);
+}
+
+uint32_t read_cohort_staged(uint32_t queue_idx) {
+    const Access a = begin_access(queue_idx, g_queue_poll_ticks);
+    if (queue_idx >= SIM_MAX_QUEUES) {
+        wait_until(a.release);
+        return 0;
+    }
+    SimQueue &q = g_queues[queue_idx];
+    // As of the same propagation delay as the status read: a member the controller
+    // placed from its ring inside the interval is counted once it is replayed.
+    retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
+    const uint32_t n = q.cohort_staged;
+    finish_poll(q, queue_idx, a);
+    return n;
+}
+
+uint64_t queue_cohort_piped(uint32_t queue_idx) {
+    return queue_idx < SIM_MAX_QUEUES ? g_queues[queue_idx].cohort_piped : 0;
 }
 
 uint64_t now_ticks() { return get_sys_cnt_aicpu(); }

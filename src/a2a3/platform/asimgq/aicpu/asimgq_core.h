@@ -307,6 +307,15 @@ struct SimQueueStatus {
 // write into the queue, like submitting an entry.
 void release_cohort(uint32_t queue_idx, uint64_t at);
 
+// Cohort members this queue holds placed but not started: a field of the status
+// register, read on its own while a cohort assembles so the ordinary poll does not
+// carry it. Charged as a status read.
+uint32_t read_cohort_staged(uint32_t queue_idx);
+
+// Cohort members this queue had to place behind running work rather than on an
+// idle core, over the run.
+uint64_t queue_cohort_piped(uint32_t queue_idx);
+
 // The clock a manager reads to stamp a release.
 uint64_t now_ticks();
 
