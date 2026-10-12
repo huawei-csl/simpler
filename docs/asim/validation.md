@@ -50,14 +50,16 @@ check can never pass (see [calibration.md](calibration.md)).
 
 ## Case selection
 
-Two representative cases. Both have to be large enough that the scheduling
-window dominates, and between them they have to span homogeneous and
-heterogeneous work.
+Cases have to be large enough that the scheduling window dominates, and between
+them they have to span homogeneous and heterogeneous work. The first two carry
+the campaigns above; `deepseek_v4_flash_decode` was added 2026-10-09 and is the
+only case that separates M0 from M2 at all.
 
 | case | tasks | kernels | character |
 | ---- | ----- | ------- | --------- |
 | `paged_attention` Case1 | 65 536 | 4 | homogeneous, AICPU-bound, cores 86 % idle |
 | `qwen3_14b_decode` | 19 179 | 36 | heterogeneous; SPMD `block_num` 5–50, whole-device sync-start cohorts |
+| `deepseek_v4_flash_decode` | ~29 000 per rank | 368 | two dies, EP2/TP2 comm domain, dispatch predicates, Graph-expanded layers; **critical-path bound, cores 98 % idle** |
 
 **Cases that cannot measure anything, and must not be quoted:** `benchmark_bgemm`
 (128 tasks) and `paged_attention` small1 (**4 tasks**) have windows of 40–100 µs,
@@ -190,6 +192,22 @@ device expands, so the calibration comes from the swimlane's own per-task kernel
 ids -- `asim_gen_calib.py` already prefers them, and takes `-` in place of a
 dep-gen round.
 
+## Where the GroupQueue loses: deepseek_v4_flash_decode
+
+The only case that separates the two designs, and it separates them the wrong
+way: **M2 is 3.3-4.8 % slower than M0**, replicated over two sessions
+(silicon 35.7-36.2 ms, M0 36.6-36.7 ms, M2 37.9-38.4 ms).
+
+The reason is that this case is **critical-path bound** -- 43 layers of serial
+chain, cube cores 3.3 % busy -- where paged_attention was throughput bound, and
+that the mechanism which would shorten a chain never engages (`deps_named=0`).
+**Grouping is structurally unreachable on any graph-execution case**, because a
+group is declared over a range of host-side task ids and in-graph tasks are
+created on device. The measurement, the decomposition, the two routes to an
+improvement, and why this case is a scheduler benchmark rather than a fidelity
+reference are in
+**[validation/deepseek-v4.md](validation/deepseek-v4.md)**.
+
 ## Is an M0-vs-M2 delta an artefact?
 
 The 2026-09-17 audit checked the two arms for asymmetries that could hand M2 its
@@ -209,6 +227,7 @@ baselines and gates. They are kept apart because their figures do not compare:
 | [2026-09-14](validation/m2-group-queue.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −55 %, qwen a loss at every group size |
 | [2026-09-21](validation/m2-campaign-2026-09-21.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −56.1 %, qwen −33.2 % |
 | [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock, fixed manager | `host_build_graph` (`a2a3asim`) | paged_attention −47.9 %, qwen +1.2 % |
+| [2026-10-09/12](validation/deepseek-v4.md) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 **+3.3 to +4.8 %**, the first loss |
 
 The raw window of the first campaign includes the simulator's own work, which
 inflates M2; the second and third removed that work including the part the cores
