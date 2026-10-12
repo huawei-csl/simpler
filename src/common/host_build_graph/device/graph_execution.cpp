@@ -38,6 +38,7 @@ GraphExecution *acquire_execution_storage(
     execution->task_tensor_pool = reinterpret_cast<simpler::hbg::Tensor *>(base + layout.tensors_offset);
     execution->task_scalar_pool = reinterpret_cast<uint64_t *>(base + layout.scalars_offset);
     execution->task_states = reinterpret_cast<std::atomic<ChipTaskState> *>(base + layout.states_offset);
+    execution->task_positions = reinterpret_cast<uint64_t *>(base + layout.positions_offset);
     return execution;
 }
 

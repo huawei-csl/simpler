@@ -279,6 +279,8 @@ protected:
     std::unique_ptr<ChipTaskStorage[]> storage;
     // The execution's readiness array, allocated with the storage it indexes.
     std::unique_ptr<std::atomic<ChipTaskState>[]> states;
+    // And its position array, which the real storage carries beside the states.
+    std::unique_ptr<uint64_t[]> positions;
     std::vector<int32_t> fanin_offsets;
     std::vector<uint16_t> fanin_indices;
 
@@ -303,7 +305,9 @@ protected:
     void build(const std::vector<std::vector<uint16_t>> &rows) {
         storage = std::make_unique<ChipTaskStorage[]>(rows.size());
         states = std::make_unique<std::atomic<ChipTaskState>[]>(rows.size());
+        positions = std::make_unique<uint64_t[]>(rows.size());
         execution.task_states = states.get();
+        execution.task_positions = positions.get();
         fanin_offsets.assign(1, 0);
         for (size_t i = 0; i < rows.size(); ++i) {
             fanin_indices.insert(fanin_indices.end(), rows[i].begin(), rows[i].end());

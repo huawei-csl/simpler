@@ -37,6 +37,9 @@ inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 // ample for a body bounded at MAX_IN_GRAPH_TASKS, and a body that declares more
 // records the rest ungrouped rather than failing.
 inline constexpr int32_t GRAPH_NO_GROUP = 255;
+// An in-graph task that holds no GroupQueue position. Distinct from a valid
+// position, which a controller may legitimately assign as 0.
+inline constexpr uint64_t kNoGraphPosition = ~0ULL;
 inline constexpr int32_t GRAPH_MAX_GROUPS = 255;
 
 enum class GraphTensorSourceKind : uint8_t {
@@ -415,6 +418,16 @@ struct GraphExecution {
     // read-mostly — each byte is written once per execution at completion —
     // so concurrent scanners share those lines rather than contend for them.
     std::atomic<ChipTaskState> *task_states{nullptr};
+    // The GroupQueue position each in-graph task was submitted on, as position + 1
+    // so a zeroed entry reads as "no position". A grouped member names its in-group
+    // producers by position, and a producer's own position is only known once it has
+    // been submitted, so one manager records it here for its consumers to find.
+    //
+    // Per execution rather than in the runtime's flat table, which is keyed by the
+    // global local id a Graph body's task never takes: two executions of one
+    // Definition hold the same in-graph ids and would otherwise overwrite each
+    // other's entries.
+    uint64_t *task_positions{nullptr};
     // This execution's task argument pools, in the storage tail past task_storage.
     // Every task payload's tensor and scalar deltas point here; its pool position is
     // the Definition's tensor_offset / scalar_offset.
@@ -443,7 +456,18 @@ struct GraphExecution {
 
     void reset_task_state(int32_t index) const {
         task_states[index].store(CHIP_TASK_PENDING, std::memory_order_relaxed);
+        task_positions[index] = 0;
     }
+
+    // The position this task was submitted on, or kNoGraphPosition before it was.
+    // Only the manager that owns the task's group reads or writes it, so the array
+    // needs no synchronisation of its own.
+    uint64_t position_of(int32_t index) const {
+        const uint64_t v = task_positions[index];
+        return v == 0 ? kNoGraphPosition : v - 1;
+    }
+
+    void note_position(int32_t index, uint64_t position) const { task_positions[index] = position + 1; }
 };
 
 static_assert(std::is_trivially_destructible_v<ChipTaskStorage>);
@@ -486,6 +510,7 @@ struct GraphExecutionStorageLayout {
     size_t tensors_offset;
     size_t scalars_offset;
     size_t states_offset;
+    size_t positions_offset;
     size_t total_bytes;
 };
 
@@ -505,7 +530,12 @@ inline bool graph_execution_storage_layout(
     // offset. Every other region is entered through a typed pointer whose
     // alignment the base already guarantees.
     out->states_offset = out->scalars_offset + static_cast<size_t>(scalar_arg_count) * sizeof(uint64_t);
-    out->total_bytes = out->states_offset + static_cast<size_t>(task_count) * sizeof(std::atomic<ChipTaskState>);
+    // The byte-wide state array disturbs no alignment, so the position array that
+    // follows it rounds back up to its own.
+    const size_t states_end = out->states_offset + static_cast<size_t>(task_count) * sizeof(std::atomic<ChipTaskState>);
+    constexpr size_t POSITION_ALIGN = alignof(uint64_t);
+    out->positions_offset = (states_end + POSITION_ALIGN - 1) & ~(POSITION_ALIGN - 1);
+    out->total_bytes = out->positions_offset + static_cast<size_t>(task_count) * sizeof(uint64_t);
     return true;
 }
 

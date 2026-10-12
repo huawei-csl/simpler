@@ -784,6 +784,58 @@ struct SchedulerState {
         return static_cast<int>(n);
     }
 
+    // The in-graph twin of group_deps. A Graph body's dependencies live in its
+    // Definition's fanin CSR and its completions in the execution's own state array,
+    // so neither the task table nor the runtime's flat position table applies: both
+    // are keyed by a global local id a recorded task never takes.
+    //
+    // Two in-graph tasks are in one group when their Definition entries' `group`
+    // fields match. An ungrouped task is its own group and therefore names nothing,
+    // which is what a body carrying no declaration gets.
+    int in_graph_group_deps(ChipTaskSlotState *s, uint64_t *out, uint32_t max_out) const {
+        if (s == nullptr) return kDepsUnexpressable;
+        auto *execution = static_cast<GraphExecution *>(s->graph_context);
+        const int32_t self = s->in_graph_local_id;
+        if (execution == nullptr || self < 0 || self >= execution->task_count) return kDepsUnexpressable;
+        const GraphDefinition *definition = execution->definition;
+        if (definition == nullptr || execution->fanin_offsets == nullptr) return kDepsUnexpressable;
+        const auto *tasks = graph_definition_array<InGraphTaskDefinition>(
+            *definition, definition->off_in_graph_tasks, definition->task_count
+        );
+        if (tasks == nullptr) return kDepsUnexpressable;
+        const uint8_t group = tasks[self].group;
+        if (group == GRAPH_NO_GROUP) return kDepsUnexpressable;
+        uint32_t n = 0;
+        const int32_t begin = execution->fanin_offsets[self];
+        const int32_t end = execution->fanin_offsets[self + 1];
+        for (int32_t k = begin; k < end; ++k) {
+            const int32_t prod = execution->fanin_indices[k];
+            if (execution->is_completed(prod)) continue;  // retired: nothing to wait on
+            if (prod >= definition->task_count || tasks[prod].group != group) {
+                g_gq_deps_bailed.fetch_add(1, std::memory_order_relaxed);
+                g_gq_bail_kind.store(1, std::memory_order_relaxed);  // cross-group, unmet
+                return kDepsUnexpressable;
+            }
+            const uint64_t pos = execution->position_of(prod);
+            if (pos == kNoGraphPosition) {
+                g_gq_deps_bailed.fetch_add(1, std::memory_order_relaxed);
+                g_gq_bail_kind.store(2, std::memory_order_relaxed);  // in-group, no position
+                return kDepsUnexpressable;
+            }
+            if (n >= max_out) {
+                g_gq_deps_toomany.fetch_add(1, std::memory_order_relaxed);
+                return kDepsTooMany;
+            }
+            out[n++] = pos;
+        }
+        if (n > 0) {
+            g_gq_deps_named.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_gq_deps_allcomplete.fetch_add(1, std::memory_order_relaxed);
+        }
+        return static_cast<int>(n);
+    }
+
     int classify_fanin_state(ChipTaskSlotState *s) const {
         const TaskPayload &p = s->to_payload();
         const SharedMemoryTaskHeader &tasks = *task_view.tasks;

@@ -321,10 +321,15 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     EXPECT_EQ(layout.tensors_offset, layout.tasks_offset + TASK_COUNT * sizeof(ChipTaskStorage));
     EXPECT_EQ(layout.tensors_offset % alignof(simpler::hbg::Tensor), 0U);
     EXPECT_EQ(layout.scalars_offset, layout.tensors_offset + TENSOR_ARGS * sizeof(simpler::hbg::Tensor));
-    // The state array is last and byte-aligned, so it starts exactly where the
-    // scalar pool ends and closes the image.
+    // The state array is byte-aligned, so it starts exactly where the scalar pool
+    // ends; the position array after it rounds back up to its own alignment and
+    // closes the image.
     EXPECT_EQ(layout.states_offset, layout.scalars_offset + SCALAR_ARGS * sizeof(uint64_t));
-    EXPECT_EQ(layout.total_bytes, layout.states_offset + TASK_COUNT * sizeof(std::atomic<ChipTaskState>));
+    const size_t states_end = layout.states_offset + TASK_COUNT * sizeof(std::atomic<ChipTaskState>);
+    EXPECT_GE(layout.positions_offset, states_end);
+    EXPECT_LT(layout.positions_offset - states_end, alignof(uint64_t));
+    EXPECT_EQ(layout.positions_offset % alignof(uint64_t), 0U);
+    EXPECT_EQ(layout.total_bytes, layout.positions_offset + TASK_COUNT * sizeof(uint64_t));
 }
 
 // The outer Graph payload's tensor region is counted in simpler::hbg::Tensor pool slots but
