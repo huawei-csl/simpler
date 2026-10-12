@@ -41,7 +41,7 @@ and never pass through that range. The same holds for qwen's Graph orchestration
 above. **No graph-execution case can declare a group today**, which is why the
 GroupQueue's central mechanism is dormant on both.
 
-## The expanded form, and an early-dispatch artefact
+## The expanded form
 
 `kernels/orchestration/decode_fwd_expanded.cpp` in the `host_build_graph`
 example calls each Graph body where the Graph was submitted -- the path
@@ -51,32 +51,31 @@ it runs to completion on silicon on both ranks with the real fixture uploaded (t
 case has no golden), and the same kernels reach cores the same number of times as
 in the Graph form (5,175 tasks on rank 0 in both).
 
-Arms interleaved per job, two reps of eight rounds, first two dropped (n=12):
+Arms interleaved per job, two reps of eight rounds, first two dropped (n=12),
+early dispatch on as the case ships it:
 
-| arm | early dispatch on (as shipped) | early dispatch off |
-| --- | ------------------------------ | ------------------ |
-| silicon | 32.19 ms | 32.86 ms |
-| M0 | 26.27 ms | 33.36 ms (+1.5 % vs silicon) |
-| M2 | 24.09 ms | 34.51 ms |
-| **M2 vs M0** | **-8.3 %** (window -10.9 %) | **+3.5 %** (window +1.9 %) |
+| arm | device_wall | window | vs silicon |
+| --- | ----------- | ------ | ---------- |
+| silicon | 32.75 ms | 29.68 ms | |
+| M0 | 32.27 ms | 30.93 ms | -1.5 % |
+| M2 | 33.80 ms | 31.88 ms | +3.2 % |
+| **M2 vs M0** | **+4.7 %** | window +3.1 % | |
 
-**The -8.3 % is an artefact of the simulator, not a GroupQueue win.** Both arms
-start an early-dispatched consumer when it is published rather than when its
-doorbell rings, so a pre-staged task can compute before its producers finish:
-M0 in `asim_push`, M2 because `try_early_dispatch` submits the pre-stage to the
-controller ungated. Early dispatch is worth ~2 % on silicon here, and 21 % in M0
-and 30 % in M2. Turning it off in the orchestration -- every
-`set_allow_early_resolve(true)`, 148 sites, made `false` -- brings M0 to +1.5 % of
-silicon and M2 back to +3.5 %, the Graph form's verdict. Graph-body tasks never
-carry the early-resolve bit, which is why the Graph form tracked silicon and the
-expanded form, with early dispatch on, read M0 20 % fast.
+**Expanding the graph does not turn the result.** M2 loses by about what it lost
+on the Graph form, and for the same reason: the controller resolves no edge, so
+it adds its indirection to every hop of a chain-bound round.
 
-Two further checks rule out the alternatives. Transport is not it: zeroing M0's
-send latency is worth -3.1 %, and zeroing every modelled latency -2.9 %, against
-M2's -8.3 %. And the calibration only changes the size: the v3 table's means are
-tail-inflated (a few slow instances in one cold round), and a table of the
-expanded run's per-kernel medians gives M2 -4.2 % with early dispatch on, the same
-artefact.
+**Before 2026-10-12 this table read M2 -8.3 %, and that was the simulator.** Both
+arms started an early-dispatched consumer at publish rather than at its doorbell,
+so a pre-staged task computed before its producers finished, and M2 profited
+more: early dispatch was worth 21 % in M0 and 30 % in M2 against ~2 % on silicon.
+The expanded form pre-stages ~600 blocks a thread a round, where a Graph body
+carries no early-resolve bit at all, which is why the Graph form tracked silicon
+and this one did not -- M0 read 20 % fast. Both arms now hold a gated task until
+its doorbell lands ([../device-model.md](../device-model.md#a-gated-task-holds-its-core-until-its-doorbell)).
+The cross-check from before the fix still stands: with every
+`set_allow_early_resolve(true)` -- 148 sites -- made `false` in the orchestration,
+M0 read +1.5 % against silicon and M2 +3.5 % against M0.
 
 ## Why no group helps
 
@@ -111,13 +110,6 @@ of this network's stage transitions are all-to-all, which no such split keeps
 inside a group.
 
 ## Caveats
-
-**Early dispatch must be off for any M0-vs-M2 delta on this case.** Both
-simulators start a pre-staged consumer at publish, not at its doorbell, and the
-two arms profit unequally; with early dispatch on, the delta measures that
-defect -- `asim_push` in M0, `submit_to_queue` handing the pre-stage over ungated
-in M2. Until it is fixed, the early dispatch silicon uses here cannot be modelled
-at all.
 
 **Two caveats on the absolute numbers, neither of which explains a delta**
 (both arms share them). The per-rank asymmetry silicon shows -- 32,273 against

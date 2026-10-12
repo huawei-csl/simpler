@@ -78,9 +78,7 @@ queue. A layer-sized group runs the whole layer on a quarter of the device.
 ## What would say it worked
 
 `deps_named` > 0 is the precondition, not the result: it only says the contract
-was expressible. The result is M2's window against M0's, with early dispatch off:
-both simulators start an early-dispatched consumer at publish rather than at its
-doorbell, so with it on the delta measures that defect instead.
+was expressible. The result is M2's window against M0's.
 
 The ceiling on deepseek_v4 is the critical path's producer-to-consumer gaps,
 8.9 ms of a ~31 ms silicon round, and the partition already costs more than that.
