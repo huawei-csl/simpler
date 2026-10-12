@@ -21,6 +21,7 @@
 //
 //   asim_push(core, task_id)   — dispatch: admit the task, schedule its ACK/FIN
 //   asim_read_status(core)     — poll: advance the machine to `now`, return COND
+//   asim_doorbell(core, token) — release a gated task waiting on that core
 //
 // Timing is real time less the model's own excess (Mode A): each call holds its
 // caller for the injected latency in real time, and a task's compute elapses
@@ -79,7 +80,22 @@ uint32_t core_index_for_addr(uint64_t reg_addr);
 // table. Admits the task into the 2-deep pipeline and schedules its deadlines.
 // When chip swimlane is recording, it also writes the swimlane record a real
 // core would write for this task, identified by `task_token_raw`.
-void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw);
+//
+// `gated` is a dispatch whose payload carries a non-zero `src_payload`: an
+// early-dispatch pre-stage or a sync_start cohort member. Such a task occupies
+// the core but does not acknowledge or start until asim_doorbell() rings it, as a
+// real core spins on DATA_MAIN_BASE's high half before its ACK.
+void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw, bool gated);
+
+// Doorbell: the scheduler wrote `token` to core `core_idx`'s DATA_MAIN_BASE high
+// half, releasing the gated task holding that core (running or pipelined) whose
+// task id is `token`. The store lands after the core-arrival latency; the task
+// then pays the core's startup and runs. A doorbell that names no gated task on
+// the core is counted and otherwise ignored.
+void asim_doorbell(uint32_t core_idx, uint32_t token);
+
+// Doorbells rung so far, and how many named no gated task, over the named cores.
+void asim_doorbell_counts(const int32_t *core_ids, uint32_t n_cores, uint64_t *rung, uint64_t *unmatched);
 
 // Poll: advance core `core_idx`'s state machine to the current clock and return
 // its COND word (the last ACK/FIN event reached by `now`). Charges the read

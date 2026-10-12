@@ -37,6 +37,15 @@
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
+#ifdef __SIMULATED_DEVICE__
+// The simulated device takes the doorbell instead of a register (aicpu/asim_core.h).
+// Declared rather than included: the host build of this runtime sees this header
+// for its layout reservation but has no AICPU include path, and never rings.
+namespace asim {
+uint32_t core_index_for_addr(uint64_t reg_addr);
+void asim_doorbell(uint32_t core_idx, uint32_t token);
+}  // namespace asim
+#endif
 #include "async_wait.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/task_id.h"
@@ -784,9 +793,15 @@ struct SchedulerState {
 #endif
 
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
+#ifdef __SIMULATED_DEVICE__
+        // No AICore spins on this register here: the simulated device holds the
+        // gated task and is told that its doorbell was rung.
+        asim::asim_doorbell(asim::core_index_for_addr(reg_addr), token);
+#else
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+#endif
     }
 
     inline void ring_staged_doorbell_bits(int word, uint64_t bits) {

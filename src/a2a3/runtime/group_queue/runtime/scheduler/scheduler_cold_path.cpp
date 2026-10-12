@@ -597,7 +597,7 @@ bool SchedulerContext::feed_open_groups(int32_t thread_idx) {
         // capacity_token is -1: this entry took nothing out of the thread's core
         // budget. The controller holds it until its producers retire and places it
         // itself, so there is no token for completion to give back.
-        space.set_owner(idx, GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, subslot, book_core, -1, false});
+        space.set_owner(idx, GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, subslot, book_core, -1, false, false});
         note_task_position(f.id, idx);
 
         uint64_t deps[asimgq::SIM_HELD_MAX_DEPS];
@@ -662,6 +662,10 @@ void SchedulerContext::gq_prepare_run() {
 #ifdef __SIMULATED_DEVICE__
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         gq_index_[i].init(asimgq::SIM_HELD_CAP);
+        for (int32_t off = 0; off < kGqOffsets; off++) {
+            belled_held_[i][off] = 0;
+            belled_deferred_[i][off] = 0;
+        }
     }
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
@@ -1006,19 +1010,26 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         uint64_t admitted = 0, promoted = 0, refused = 0;
         uint32_t held_high = 0;
         asimgq::queue_group_stats(q, &admitted, &promoted, &refused, &held_high);
+        uint64_t bells = 0, bells_waiting = 0;
+        asimgq::doorbell_counts(q, &bells, &bells_waiting);
         LOG_INFO(
             "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f positions=%" PRIu64 " poll_overrun_us=%" PRIu64
             " push_overrun_us=%" PRIu64 " polls=%" PRIu64 " poll_mean_ns=%" PRIu64 " poll_max_ns=%" PRIu64
             " ahead_high=%u ahead_dropped=%" PRIu64 " held_admitted=%" PRIu64 " held_promoted=%" PRIu64
             " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64 " steals_won=%" PRIu64
             " steal_gain_us=%" PRId64 " cohorts=%" PRIu64 " cohort_blocks=%" PRIu64 " cohort_assembly_us=%.1f"
-            " cohort_piped=%" PRIu64,
+            " cohort_piped=%" PRIu64 " bells=%" PRIu64 " bells_waiting=%" PRIu64,
             thread_idx, cycles_to_us(aic), cycles_to_us(aiv), gq_index_[thread_idx].push_index(), poll_over_us,
             push_over_us, work_calls, work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
             (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, admitted, promoted, refused,
             held_high, steals_tried, steals_won, steal_gain_us, cohort_stamped_[thread_idx], cohort_blocks_[thread_idx],
-            cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q)
+            cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q), bells, bells_waiting
         );
+        if (bells_waiting > 0) {
+            char bell_buf[768];
+            asimgq::describe_waiting_bells(q, bell_buf, sizeof(bell_buf));
+            LOG_INFO("[GQ_BELLS thread=%d] %s", thread_idx, bell_buf);
+        }
 #if ASIMGQ_SELF_PROFILE
         uint64_t retire_ns = 0, status_ns = 0, profiled = 0;
         asimgq::queue_poll_profile(q, &retire_ns, &status_ns, &profiled);

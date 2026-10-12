@@ -631,23 +631,25 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         );
         uint64_t push_overrun_us = 0, push_overrun_calls = 0;
         asim::asim_push_overrun(cores, static_cast<uint32_t>(core_num), &push_overrun_us, &push_overrun_calls);
+        uint64_t doorbells = 0, doorbells_unmatched = 0;
+        asim::asim_doorbell_counts(cores, static_cast<uint32_t>(core_num), &doorbells, &doorbells_unmatched);
         LOG_INFO(
-            "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d overrun_us=%" PRIu64
-            " polls=%" PRIu64 " poll_work_us=%" PRIu64 " push_overrun_us=%" PRIu64,
-            thread_idx, cycles_to_us(busy), dispatches, core_num, overrun_us, poll_calls, poll_work_us,
-            push_overrun_us
+            "[ASIM_WORK thread=%d] busy_us=%.1f dispatches=%" PRIu64 " cores=%d overrun_us=%" PRIu64 " polls=%" PRIu64
+            " poll_work_us=%" PRIu64 " push_overrun_us=%" PRIu64 " doorbells=%" PRIu64 " doorbells_unmatched=%" PRIu64,
+            thread_idx, cycles_to_us(busy), dispatches, core_num, overrun_us, poll_calls, poll_work_us, push_overrun_us,
+            doorbells, doorbells_unmatched
         );
         if (thread_idx == 0) {
             uint64_t h[8] = {};
             asim::asim_func_hist(h, 8);
             LOG_INFO(
-                "[M0_HIST] f0=%" PRIu64 " f1=%" PRIu64 " f2=%" PRIu64 " f3=%" PRIu64 " f4=%" PRIu64
-                " f5=%" PRIu64 " OTHER=%" PRIu64 " maxid=%" PRIu64 " sum=%" PRIu64,
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-                h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
+                "[M0_HIST] f0=%" PRIu64 " f1=%" PRIu64 " f2=%" PRIu64 " f3=%" PRIu64 " f4=%" PRIu64 " f5=%" PRIu64
+                " OTHER=%" PRIu64 " maxid=%" PRIu64 " sum=%" PRIu64,
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[0] + h[1] + h[2] + h[3] + h[4] + h[5] + h[6]
             );
-            LOG_INFO("[M0_DONE] completed_tasks=%d total=%d",
-                     completed_tasks_.load(std::memory_order_relaxed), total_tasks_);
+            LOG_INFO(
+                "[M0_DONE] completed_tasks=%d total=%d", completed_tasks_.load(std::memory_order_relaxed), total_tasks_
+            );
         }
     }
 #endif

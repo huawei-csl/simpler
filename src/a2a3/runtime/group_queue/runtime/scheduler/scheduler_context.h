@@ -364,6 +364,9 @@ private:
         // A sync_start cohort member: the controller holds it on its core, not
         // started, until the cohort is released device-wide.
         bool cohort;
+        // The payload carries a src_payload gate. Outside a cohort that is an
+        // early-dispatch pre-stage, which its doorbell releases.
+        bool gated;
 #endif
     };
 
@@ -373,6 +376,17 @@ private:
     // prefix back into tasks.
     GqIndexSpace gq_index_[MAX_AICPU_THREADS];
 
+    // Early-dispatch pre-stages in flight on each tracker offset, and the token
+    // returns those pre-stages are holding back. A real core spinning on its gate
+    // never acknowledges, so its pending slot stays shut until the gated task has
+    // run; the manager here learns only of retirements, so an offset holding a
+    // pre-stage keeps everything it holds until that pre-stage retires. Without
+    // this the offset would take a second dispatch behind an unreleased one, and
+    // the per-core doorbell table, which holds one token per core, would lose it.
+    static constexpr int32_t kGqOffsets = CoreTracker::MAX_CLUSTERS * 3;
+    uint8_t belled_held_[MAX_AICPU_THREADS][kGqOffsets]{};
+    uint8_t belled_deferred_[MAX_AICPU_THREADS][kGqOffsets]{};
+
     // Which ring an entry joins. A queue keeps one per shape so a cube at the head
     // cannot hold up queued vector work.
     static asimgq::SimTaskType queue_ring_for(const PublishHandle &h) {
@@ -381,9 +395,13 @@ private:
 
     inline void submit_to_queue(const PublishHandle &h, int32_t thread_idx) {
         GqIndexSpace &space = gq_index_[thread_idx];
-        const GqIndexSpace::Owner owner{h.slot,        static_cast<int32_t>(h.reg_task_id),
-                                        h.subslot,     h.core_offset,
-                                        h.core_offset, h.guarded};
+        const bool belled = h.gated && !h.cohort;
+        const GqIndexSpace::Owner owner{
+            h.slot, static_cast<int32_t>(h.reg_task_id), h.subslot, h.core_offset, h.core_offset, h.guarded, belled
+        };
+        if (belled && h.core_offset >= 0 && h.core_offset < kGqOffsets) {
+            ++belled_held_[thread_idx][h.core_offset];
+        }
         const bool from_group =
             gq_group::active() && h.local_id >= 0 && gq_group::group_is_opened(gq_group::group_of(h.local_id));
         // An opened group reserved this position when it was queued, ascending
@@ -409,15 +427,21 @@ private:
             if (d > 0) dep_n = d;
         }
         if (!from_group) note_task_position(h.local_id, idx);
+        // A pre-stage waits on its doorbell, not on named producers: those are what
+        // the doorbell is rung for.
         const bool accepted =
             h.cohort ? asimgq::submit(
                            static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
                            queue_ring_for(h), /*gated=*/true
                        ) :
-                       asimgq::submit_grouped(
-                           static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
-                           queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
-                       );
+            h.gated ? asimgq::submit_belled(
+                          static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                          queue_ring_for(h), asimgq::core_index_for_addr(h.reg_addr), h.reg_task_id
+                      ) :
+                      asimgq::submit_grouped(
+                          static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                          queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
+                      );
         if (!accepted) {
             // Callers size their dispatch by the room the queue reported, which
             // only grows between the read and the submit, so this cannot fire.

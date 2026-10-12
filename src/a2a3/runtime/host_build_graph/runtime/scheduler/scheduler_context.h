@@ -273,6 +273,9 @@ private:
         // The task's identity, which a real AICore copies from the payload into
         // its swimlane record. The simulated device writes that record itself.
         uint64_t task_token_raw;
+        // The payload carries a src_payload gate: the core must hold the task,
+        // unacknowledged, until its doorbell is rung.
+        bool gated;
 #endif
     };
 
@@ -298,7 +301,8 @@ private:
         // simulated device, which schedules its completion and publishes the
         // core's COND itself.
         asim::asim_push(
-            asim::core_index_for_addr(h.reg_addr), static_cast<int32_t>(h.reg_task_id), h.func_id, h.task_token_raw
+            asim::core_index_for_addr(h.reg_addr), static_cast<int32_t>(h.reg_task_id), h.func_id, h.task_token_raw,
+            h.gated
         );
 #else
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));

@@ -269,6 +269,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
         !to_pending && !force_gate,
         !to_pending && force_gate,
         false,
+        payload.src_payload != 0,
 #endif
     };
 }

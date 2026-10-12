@@ -263,6 +263,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 #ifdef __SIMULATED_DEVICE__
         slot_state.to_descriptor().kernel_id[static_cast<int32_t>(subslot)],
         slot_state.to_descriptor().task_id.raw,
+        payload.src_payload != 0,
 #endif
     };
 }

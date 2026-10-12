@@ -11,6 +11,9 @@
 #include "aicpu/asimgq_core.h"
 #include "aicpu/platform_aicpu_affinity.h"
 
+#include <atomic>
+#include <cstdio>
+#include <memory>
 #include <vector>
 
 #include "aicpu/device_time.h"
@@ -98,6 +101,13 @@ struct SimCore {
     // was placed, so a member may sit behind running work and still be co-resident
     // once the cohort's release passes that point.
     uint64_t gated_floor[2] = {0, 0};
+    // A gated slot holding an early-dispatch pre-stage carries its doorbell key;
+    // a cohort member's is SIM_NO_BELL, and only release_cohort() starts those.
+    uint32_t bell_core[2] = {SIM_NO_BELL, SIM_NO_BELL};
+    uint32_t bell_token[2] = {0, 0};
+    // When the pre-stage is on its core and spinning on its gate: after the link
+    // and the core's poll on an idle core, at the running task's end behind one.
+    uint64_t bell_ready[2] = {0, 0};
     // How many of this core's slots hold a member that has not started. A core
     // holding one takes nothing further, and `ready_at` stays the real end of its
     // running work rather than being poisoned with a sentinel: the sentinel is a
@@ -296,6 +306,10 @@ struct alignas(64) SimQueue {
     // says how often the two views of a core disagreed.
     uint32_t cohort_staged = 0;
     uint64_t cohort_piped = 0;
+    // Early-dispatch pre-stages held here, placed or still in a ring, whose
+    // doorbell has not been taken. Zero lets an access skip the doorbell check.
+    uint32_t belled_outstanding = 0;
+    uint64_t bells_taken = 0;
     uint32_t held_waiters[SIM_HELD_WAIT_SLOTS] = {};
     uint32_t held_high = 0;
     uint64_t held_admitted = 0;
@@ -591,19 +605,29 @@ void commit(
     } else {
         q.busy_aiv += dur;
     }
-    if (e.gated) {
-        // Placed, holding its core, but not running: it waits for the rest of its
-        // cohort. Its duration is drawn now because that is when the entry was
-        // read; only its start is deferred.
+    if (e.gated || e.bell_core != SIM_NO_BELL) {
+        // Placed, holding its core, but not running: a cohort member waits for the
+        // rest of its cohort, a pre-stage for its doorbell. Its duration is drawn
+        // now because that is when the entry was read; only its start is deferred.
         c.finish[c.outstanding] = SIM_GATED;
         c.gated_dur[c.outstanding] = dur;
         c.gated_floor[c.outstanding] = start;
+        c.bell_core[c.outstanding] = e.bell_core;
+        c.bell_token[c.outstanding] = e.bell_token;
+        c.bell_ready[c.outstanding] = pipelined ? start : start + g_link_ticks + g_core_poll_ticks;
+        // A held task cannot be stolen, and this slot's pipeline record describes
+        // whatever sat here before it.
+        if (pipelined) {
+            c.pipe_stealable = false;
+        }
         c.index[c.outstanding] = e.index[part];
         ++c.outstanding;
         ++c.gated_count;
-        ++q.cohort_staged;
-        if (pipelined) {
-            ++q.cohort_piped;
+        if (e.gated) {
+            ++q.cohort_staged;
+            if (pipelined) {
+                ++q.cohort_piped;
+            }
         }
         refresh_core(q, core_slot);
         return;
@@ -1013,8 +1037,16 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
     // them can be placed -- before the core below is refreshed, so a core freed
     // by this same retirement can take it in the same step.
     promote_held(q, due_at);
+    // Every per-slot field moves with the slot: a held task pipelined behind the
+    // one retiring becomes the core's first, and keeps what it was placed with.
     c.finish[0] = c.finish[1];
     c.index[0] = c.index[1];
+    c.gated_dur[0] = c.gated_dur[1];
+    c.gated_floor[0] = c.gated_floor[1];
+    c.bell_core[0] = c.bell_core[1];
+    c.bell_token[0] = c.bell_token[1];
+    c.bell_ready[0] = c.bell_ready[1];
+    c.bell_core[1] = SIM_NO_BELL;
     --c.outstanding;
     refresh_core(q, core);
     dispatch_pending(q, due_at);
@@ -1179,9 +1211,113 @@ void finish_push(SimQueue &q, uint32_t queue_idx, const Access &a) {
 
 }  // namespace
 
+namespace {
+
+// A doorbell is rung from whichever scheduler thread completed the producer, but
+// a queue is owned -- read and written -- by one thread. So the ringer only posts
+// it here, under the manager's core, and the queue holding that pre-stage takes it
+// on its next access. Slots are indexed by the token's low bits: a manager core
+// carries at most a running and a pending dispatch, consecutive in token, so two
+// outstanding doorbells never share a slot.
+struct alignas(64) SimBell {
+    std::atomic<uint32_t> posted{0};
+    std::atomic<uint32_t> token[4] = {};
+    std::atomic<uint64_t> real_lands[4] = {};
+};
+std::unique_ptr<SimBell[]> g_bells;
+uint32_t g_bell_count = 0;
+
+// Take the doorbell keyed (core, token) if it has been posted, returning when it
+// reached the controller on this queue's clock.
+bool take_bell(uint32_t queue_idx, uint32_t core, uint32_t token, uint64_t &lands) {
+    if (core >= g_bell_count) {
+        return false;
+    }
+    SimBell &b = g_bells[core];
+    const uint32_t k = token & 3U;
+    if ((b.posted.load(std::memory_order_acquire) & (1U << k)) == 0 ||
+        b.token[k].load(std::memory_order_relaxed) != token) {
+        return false;
+    }
+    const uint64_t real = b.real_lands[k].load(std::memory_order_relaxed);
+    b.posted.fetch_and(~(1U << k), std::memory_order_acq_rel);
+    const uint64_t ofs = g_ledger[queue_idx].overrun_ticks;
+    lands = real > ofs ? real - ofs : 0;
+    return true;
+}
+
+// Start every pre-stage this queue holds whose doorbell has been posted. A placed
+// one starts once it is on its core and the doorbell has crossed the controller's
+// link to it, plus the core's startup; one still in a ring loses its gate and is
+// placed as an ordinary entry, no earlier than the doorbell arrived.
+void take_bells(SimQueue &q, uint32_t queue_idx) {
+    if (q.belled_outstanding == 0) {
+        return;
+    }
+    bool changed_any = false;
+    for (uint32_t i = 0; i < q.core_count && q.belled_outstanding > 0; ++i) {
+        SimCore &c = q.cores[i];
+        if (c.gated_count == 0) {
+            continue;
+        }
+        bool changed = false;
+        for (uint32_t k = 0; k < c.outstanding; ++k) {
+            if (c.finish[k] != SIM_GATED || c.bell_core[k] == SIM_NO_BELL) {
+                continue;
+            }
+            uint64_t lands = 0;
+            if (!take_bell(queue_idx, c.bell_core[k], c.bell_token[k], lands)) {
+                continue;
+            }
+            const uint64_t released = lands + g_link_ticks;
+            const uint64_t from = c.bell_ready[k] > released ? c.bell_ready[k] : released;
+            c.finish[k] = from + g_pickup_ticks + c.gated_dur[k];
+            c.bell_core[k] = SIM_NO_BELL;
+            --c.gated_count;
+            --q.belled_outstanding;
+            ++q.bells_taken;
+            changed = true;
+        }
+        if (changed) {
+            if (c.gated_count == 0) {
+                c.ready_at = c.finish[c.outstanding - 1];
+            }
+            refresh_core(q, i);
+            changed_any = true;
+        }
+    }
+    for (uint32_t r = 0; r < SIM_RING_COUNT && q.belled_outstanding > 0; ++r) {
+        for (uint64_t p = q.pop[r]; p != q.push[r]; ++p) {
+            SimQueueEntryStore &e = q.ring[r][p % SIM_QUEUE_DEPTH];
+            if (e.bell_core == SIM_NO_BELL) {
+                continue;
+            }
+            uint64_t lands = 0;
+            if (!take_bell(queue_idx, e.bell_core, e.bell_token, lands)) {
+                continue;
+            }
+            e.bell_core = SIM_NO_BELL;
+            if (lands > e.enqueued_at) {
+                e.enqueued_at = lands;
+            }
+            --q.belled_outstanding;
+            ++q.bells_taken;
+        }
+    }
+    if (changed_any) {
+        refresh_next_event(q);
+    }
+}
+
+}  // namespace
+
 void configure(uint64_t reg_base, uint32_t num_cores) {
     g_reg_base = reg_base;
     g_num_cores = num_cores;
+    if (g_bell_count != num_cores) {
+        g_bells = std::make_unique<SimBell[]>(num_cores);
+        g_bell_count = num_cores;
+    }
 }
 
 void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint64_t notice_ns) {
@@ -1268,9 +1404,10 @@ void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, ui
     q.ring_cap[ring_of(SimTaskType::Mix)] = q.package_count * SIM_RING_CAP_PER_PACKAGE;
 }
 
-bool submit(
+namespace {
+bool submit_entry(
     uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, uint32_t parts, int32_t task_id,
-    SimTaskType type, bool gated
+    SimTaskType type, bool gated, uint32_t bell_core, uint32_t bell_token
 ) {
     const Access a = begin_access(queue_idx, g_push_ticks);
     const uint64_t deadline = a.release;
@@ -1288,6 +1425,8 @@ bool submit(
     e.task_id = task_id;
     e.type = type;
     e.gated = gated;
+    e.bell_core = bell_core;
+    e.bell_token = bell_token;
     // The push is posted, so the manager is released after `deadline`; the entry
     // itself is not legible to the controller until the store completes, which is
     // the earliest a core can be given it.
@@ -1295,6 +1434,10 @@ bool submit(
         wait_until(deadline);
         return false;  // ordinary back-pressure: the manager retries later
     }
+    if (bell_core != SIM_NO_BELL) {
+        ++q.belled_outstanding;
+    }
+    take_bells(q, queue_idx);
     // The controller pushes as soon as it has somewhere to push to, so an entry
     // arriving while a core of its type is free starts there at once. Waiting for
     // the manager's next poll would invent idle time the hardware does not have,
@@ -1302,6 +1445,21 @@ bool submit(
     dispatch_pending(q, a.at);
     finish_push(q, queue_idx, a);
     return true;
+}
+}  // namespace
+
+bool submit(
+    uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, uint32_t parts, int32_t task_id,
+    SimTaskType type, bool gated
+) {
+    return submit_entry(queue_idx, gq_index, func_id, parts, task_id, type, gated, SIM_NO_BELL, 0);
+}
+
+bool submit_belled(
+    uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, uint32_t parts, int32_t task_id,
+    SimTaskType type, uint32_t bell_core, uint32_t bell_token
+) {
+    return submit_entry(queue_idx, gq_index, func_id, parts, task_id, type, false, bell_core, bell_token);
 }
 
 bool submit_grouped(
@@ -1397,6 +1555,72 @@ void queue_group_stats(uint32_t queue_idx, uint64_t *admitted, uint64_t *promote
     *high = q.held_high;
 }
 
+void post_doorbell(uint32_t bell_core, uint32_t token) {
+    // A posted store, charged like a submit: it reaches the controller after the
+    // same arrival latency as an entry.
+    const uint64_t entered = get_sys_cnt_aicpu();
+    const uint64_t release = entered + g_push_ticks;
+    if (bell_core < g_bell_count) {
+        SimBell &b = g_bells[bell_core];
+        const uint32_t k = token & 3U;
+        b.token[k].store(token, std::memory_order_relaxed);
+        b.real_lands[k].store(release + g_arrive_ticks, std::memory_order_relaxed);
+        b.posted.fetch_or(1U << k, std::memory_order_release);
+    }
+    wait_until(release);
+}
+
+uint32_t core_index_for_addr(uint64_t reg_addr) {
+    return static_cast<uint32_t>((reg_addr - g_reg_base) / ASIMGQ_REG_BLOCK_SIZE);
+}
+
+int describe_waiting_bells(uint32_t queue_idx, char *buf, uint32_t cap) {
+    if (queue_idx >= SIM_MAX_QUEUES || cap == 0) {
+        return 0;
+    }
+    const SimQueue &q = g_queues[queue_idx];
+    int n = snprintf(buf, cap, "waiting=%u", q.belled_outstanding);
+    auto mailbox = [&](uint32_t core) {
+        if (core >= g_bell_count || n <= 0 || static_cast<uint32_t>(n) >= cap) return;
+        const SimBell &b = g_bells[core];
+        n += snprintf(
+            buf + n, cap - n, "[posted=%x tok=%u,%u,%u,%u]", b.posted.load(), b.token[0].load(), b.token[1].load(),
+            b.token[2].load(), b.token[3].load()
+        );
+    };
+    for (uint32_t i = 0; i < q.core_count; ++i) {
+        const SimCore &c = q.cores[i];
+        for (uint32_t k = 0; k < c.outstanding; ++k) {
+            if (c.finish[k] == SIM_GATED && c.bell_core[k] != SIM_NO_BELL && n > 0 && static_cast<uint32_t>(n) < cap) {
+                n += snprintf(
+                    buf + n, cap - n, " placed(slot=%u k=%u key=%u/%u)", i, k, c.bell_core[k], c.bell_token[k]
+                );
+                mailbox(c.bell_core[k]);
+            }
+        }
+    }
+    for (uint32_t r = 0; r < SIM_RING_COUNT; ++r) {
+        for (uint64_t p = q.pop[r]; p != q.push[r]; ++p) {
+            const SimQueueEntryStore &e = q.ring[r][p % SIM_QUEUE_DEPTH];
+            if (e.bell_core != SIM_NO_BELL && n > 0 && static_cast<uint32_t>(n) < cap) {
+                n += snprintf(buf + n, cap - n, " ring(r=%u key=%u/%u)", r, e.bell_core, e.bell_token);
+                mailbox(e.bell_core);
+            }
+        }
+    }
+    return n;
+}
+
+void doorbell_counts(uint32_t queue_idx, uint64_t *taken, uint64_t *waiting) {
+    if (queue_idx >= SIM_MAX_QUEUES) {
+        *taken = 0;
+        *waiting = 0;
+        return;
+    }
+    *taken = g_queues[queue_idx].bells_taken;
+    *waiting = g_queues[queue_idx].belled_outstanding;
+}
+
 SimQueueStatus read_queue_status(uint32_t queue_idx) {
     const Access a = begin_access(queue_idx, g_queue_poll_ticks);
     if (queue_idx >= SIM_MAX_QUEUES) {
@@ -1404,6 +1628,7 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
         return SimQueueStatus{0, 0, 0};
     }
     SimQueue &q = g_queues[queue_idx];
+    take_bells(q, queue_idx);
     // What the manager can see lags what has happened by the report path: a core
     // finishing, its controller telling the queue, and the queue writing the
     // register. Reading as of `report` before the access completes is that
@@ -1465,8 +1690,10 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
         if (c.gated_count == 0) {
             continue;
         }
+        bool released = false;
         for (uint32_t k = 0; k < c.outstanding; ++k) {
-            if (c.finish[k] != SIM_GATED) {
+            // A pre-stage is not a cohort member: its doorbell starts it.
+            if (c.finish[k] != SIM_GATED || c.bell_core[k] != SIM_NO_BELL) {
                 continue;
             }
             // No earlier than the cohort begins, and no earlier than this core
@@ -1478,10 +1705,16 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
             --q.cohort_staged;
+            --c.gated_count;
+            released = true;
         }
-        c.gated_count = 0;
+        if (!released) {
+            continue;
+        }
         // The core is free when the last of its committed work ends.
-        c.ready_at = c.finish[c.outstanding - 1];
+        if (c.gated_count == 0) {
+            c.ready_at = c.finish[c.outstanding - 1];
+        }
         refresh_core(q, i);
     }
     refresh_next_event(q);

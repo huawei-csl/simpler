@@ -220,6 +220,32 @@ bool submit_grouped(
     SimTaskType type, const uint64_t *dep_index, uint32_t dep_n
 );
 
+// Hand the controller an early-dispatch pre-stage: a task staged before its
+// producers finish, whose payload is gated on a doorbell. It is placed as soon as
+// a core can take it and then holds that core, not started, until post_doorbell()
+// names (bell_core, bell_token) -- the manager's core and dispatch token.
+bool submit_belled(
+    uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, uint32_t parts, int32_t task_id,
+    SimTaskType type, uint32_t bell_core, uint32_t bell_token
+);
+
+// The manager rang the doorbell of `token` on its core `bell_core`. Callable from
+// any scheduler thread: it only posts the doorbell, which the queue holding the
+// pre-stage takes on its next access. The store reaches the controller after the
+// queue-arrival latency and the core one link later.
+void post_doorbell(uint32_t bell_core, uint32_t token);
+
+// Map a per-core register base address to the index post_doorbell() takes.
+uint32_t core_index_for_addr(uint64_t reg_addr);
+
+// Doorbells this queue took, and how many of its pre-stages still wait for one.
+// Any left waiting at the end of a run is a pre-stage that never started.
+void doorbell_counts(uint32_t queue_idx, uint64_t *taken, uint64_t *waiting);
+
+// For the stall diagnostics: each pre-stage of this queue still waiting, with its
+// key and what the mailbox of its manager core holds. Returns the length written.
+int describe_waiting_bells(uint32_t queue_idx, char *buf, uint32_t cap);
+
 // How the hold array is being used: entries admitted with unmet in-group
 // producers, how many the controller later placed itself, and how many it refused
 // for want of room. `promoted` against `admitted` is the direct measure of work
@@ -344,6 +370,9 @@ constexpr uint32_t SIM_QUEUE_MAX_PACKAGES = 32;
 // task, which the controller expands onto the three cores of one package, so
 // `index` and `func_id` carry one element per subtask. A cube or vector entry uses
 // element 0 only.
+// No doorbell: an entry that is not an early-dispatch pre-stage.
+constexpr uint32_t SIM_NO_BELL = UINT32_MAX;
+
 struct SimQueueEntryStore {
     uint64_t index[SIM_MIX_MAX_ENTRIES];
     int32_t func_id[SIM_MIX_MAX_ENTRIES];
@@ -357,6 +386,13 @@ struct SimQueueEntryStore {
     // block of a require_sync_start task has to begin together, because the
     // kernel's blocks wait on each other and a missing peer never arrives.
     bool gated;
+    // An early-dispatch pre-stage: placed like any other entry, but its slot holds
+    // without starting until the doorbell keyed (bell_core, bell_token) is rung --
+    // the manager's core and dispatch token, because the manager does not know
+    // which core the controller chose. If the doorbell is rung before the entry is
+    // placed, it is placed as an ordinary entry.
+    uint32_t bell_core = SIM_NO_BELL;
+    uint32_t bell_token = 0;
 };
 
 // Work that did not fit inside the latency a poll models, summed, and how many

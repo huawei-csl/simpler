@@ -10,6 +10,8 @@
  */
 #include "aicpu/asim_core.h"
 
+#include <atomic>
+#include <memory>
 #include <vector>
 
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -60,13 +62,42 @@ struct alignas(64) SimCore {
     uint64_t residency_n = 0;
     int32_t pushed_id = AICPU_TASK_INVALID;  // pipelined task, or none
     uint64_t pushed_dur = 0;                 // pushed task's compute duration (ticks)
-    uint64_t busy = 0;                       // compute this core has been given, in ticks
-    uint64_t dispatches = 0;                 // entries pushed to this core
-    uint32_t cond_word = 0;                  // last published COND word
-    uint64_t rng = 0;                        // per-core PRNG state (compute sampling)
+    uint64_t pushed_token = 0;               // its swimlane identity, recorded when it starts
+    // A gated task -- one whose payload carries a src_payload gate -- holds its
+    // core without acknowledging until its doorbell lands; only then do its ACK,
+    // its compute and its FIN follow. `*_released_at` is that landing, kNotRung
+    // until the scheduler rings it. The pipelined slot can hold one too: it is
+    // taken when the running task finishes, and then waits the same way.
+    bool active_gated = false;
+    bool pushed_gated = false;
+    uint64_t active_ready_at = 0;  // the gated task is on the core and spinning on its gate
+    uint64_t active_dur = 0;       // its compute, which starts only once it is released
+    uint64_t active_released_at = 0;
+    uint64_t pushed_released_at = 0;
+    uint64_t active_token = 0;
+    uint64_t doorbells = 0;
+    uint64_t doorbells_unmatched = 0;
+    uint64_t busy = 0;        // compute this core has been given, in ticks
+    uint64_t dispatches = 0;  // entries pushed to this core
+    uint32_t cond_word = 0;   // last published COND word
+    uint64_t rng = 0;         // per-core PRNG state (compute sampling)
 };
 
 std::vector<SimCore> g_cores;
+
+// A doorbell is rung from whichever scheduler thread completed the producer, but
+// a core is owned -- read and written -- by one thread only. So the ringer never
+// touches the core: it posts the token and its landing time here, and the owner
+// takes them the next time it advances or pushes to that core. Slots are indexed
+// by the token's low bits: a core holds at most a running and a pipelined task,
+// consecutive in task id, so two outstanding doorbells never share a slot.
+struct alignas(64) SimBell {
+    std::atomic<uint32_t> posted{0};  // bit k: slot k holds a doorbell not yet taken
+    std::atomic<uint32_t> token[4] = {};
+    std::atomic<uint64_t> real_lands[4] = {};
+    std::atomic<uint64_t> overwritten{0};
+};
+std::unique_ptr<SimBell[]> g_bells;
 uint64_t g_reg_base = 0;
 
 // What modelling has cost, per scheduler thread, in counter ticks: every access's
@@ -136,7 +167,18 @@ void emit_record(
 uint64_t g_push_ticks = 0;
 uint64_t g_read_ticks = 0;
 uint64_t g_ack_ticks = 0;
-uint64_t g_notice_ticks = 0;                       // FIN write -> AICPU-observable delay
+uint64_t g_notice_ticks = 0;  // FIN write -> AICPU-observable delay
+// The calibrated `ack` spans push to kernel start on the AICPU-to-core path: the
+// store landing on the core (310 ns), the core's spin loop reading it (318 ns),
+// then the core's own startup -- dcci, ack and kernel entry. The split is anchored
+// on the same MMIO microbenchmark as the GroupQueue arm's (asimgq_core.h). A
+// doorbell is a store down the same path to a core already spinning on its gate,
+// so it pays the landing and then the startup.
+constexpr uint64_t ASIM_CORE_ARRIVAL_NS = 310;
+constexpr uint64_t ASIM_CORE_POLL_NS = 318;
+uint64_t g_startup_ticks = 0;   // ack less arrival and poll
+uint64_t g_doorbell_ticks = 0;  // a doorbell store's landing on the core
+constexpr uint64_t kNotRung = UINT64_MAX;
 std::vector<uint64_t> g_func_compute_ticks;        // index = func_id, value = mean compute ticks
 std::vector<uint64_t> g_func_compute_sigma_ticks;  // index = func_id, value = compute stddev ticks
 uint64_t g_default_compute_ticks = 0;              // fallback for a func_id with no table entry
@@ -228,15 +270,71 @@ uint64_t sample_compute_ticks(SimCore &c, int32_t func_id) {
     return static_cast<uint64_t>(dur);
 }
 
+uint32_t core_index_of(const SimCore &c) { return static_cast<uint32_t>(&c - g_cores.data()); }
+
+// Apply every doorbell posted for this core since the owner last looked. A landing
+// time was taken on the real clock; the core runs on the owner's model clock.
+void take_bells(SimCore &c) {
+    SimBell &b = g_bells[core_index_of(c)];
+    uint32_t posted = b.posted.load(std::memory_order_acquire);
+    if (posted == 0) {
+        return;
+    }
+    posted = b.posted.exchange(0, std::memory_order_acq_rel);
+    const uint64_t *ledger = self_ledger();
+    const uint64_t behind = ledger != nullptr ? *ledger : 0;
+    while (posted != 0) {
+        const uint32_t k = static_cast<uint32_t>(__builtin_ctz(posted));
+        posted &= posted - 1;
+        const uint32_t token = b.token[k].load(std::memory_order_relaxed);
+        const uint64_t real = b.real_lands[k].load(std::memory_order_relaxed);
+        const uint64_t lands = real > behind ? real - behind : 0;
+        const auto id = static_cast<int32_t>(token);
+        ++c.doorbells;
+        if (c.active_gated && c.active_id == id && c.active_released_at == kNotRung) {
+            c.active_released_at = lands;
+        } else if (c.pushed_gated && c.pushed_id == id && c.pushed_released_at == kNotRung) {
+            c.pushed_released_at = lands;
+        } else {
+            ++c.doorbells_unmatched;
+        }
+    }
+}
+
+// A released gated task starts once it is both on its core and released, plus the
+// core's startup; the moment it could begin is what its record reports as receive.
+void start_gated(SimCore &c) {
+    const uint64_t landed = c.active_released_at;
+    const uint64_t from = c.active_ready_at > landed ? c.active_ready_at : landed;
+    c.active_ack_at = from + g_startup_ticks;
+    c.active_fin_at = c.active_ack_at + c.active_dur;
+    c.active_gated = false;
+    emit_record(
+        core_index_of(c), c.active_token, static_cast<uint32_t>(c.active_id), from, c.active_ack_at, c.active_fin_at
+    );
+}
+
 // Advance one core's state machine to `now`, updating its published COND word to
 // the latest ACK/FIN event reached, subject to the FIN notice delay. Publishes only ACK/FIN events; when the
-// active task finishes while a pushed task waits, the core auto-acks the pushed
-// task and never shows the bare FIN of the active one (the forbidden Fully
-// Busy -> Partially Busy transition). O(1): at most one promotion.
+// active task finishes while an ungated pushed task waits, the core auto-acks the
+// pushed task and never shows the bare FIN of the active one (the forbidden Fully
+// Busy -> Partially Busy transition). A gated pushed task cannot be acknowledged
+// before its doorbell, so that finish does show its FIN. O(1): at most one
+// promotion and one release.
 void advance(SimCore &c, uint64_t now) {
+    take_bells(c);
     while (c.active_id != AICPU_TASK_INVALID) {
+        if (c.active_gated) {
+            // Spinning on its gate: no ACK until the doorbell lands, so COND keeps
+            // whatever the core showed last.
+            if (c.active_released_at == kNotRung) {
+                return;
+            }
+            start_gated(c);
+            continue;
+        }
         if (now >= c.active_fin_at) {
-            if (c.pushed_id != AICPU_TASK_INVALID) {
+            if (c.pushed_id != AICPU_TASK_INVALID && !c.pushed_gated) {
                 // Active finished with a pipelined task waiting: auto-ack it at
                 // the instant the active one finished; it becomes active.
                 const uint64_t promoted_ack = c.active_fin_at;
@@ -244,8 +342,15 @@ void advance(SimCore &c, uint64_t now) {
                 c.active_id = c.pushed_id;
                 c.active_ack_at = promoted_ack;
                 c.active_fin_at = promoted_ack + c.pushed_dur;
+                c.active_token = c.pushed_token;
                 c.pushed_id = AICPU_TASK_INVALID;
                 c.pushed_dur = 0;
+                // Promoted with no latch of its own, so that instant is both its
+                // receive and its start.
+                emit_record(
+                    core_index_of(c), c.active_token, static_cast<uint32_t>(c.active_id), promoted_ack, promoted_ack,
+                    c.active_fin_at
+                );
                 continue;
             }
             // The core writes FIN at active_fin_at, but the AICPU cannot
@@ -258,6 +363,20 @@ void advance(SimCore &c, uint64_t now) {
             }
             c.last_fin_at = c.active_fin_at;
             c.cond_word = static_cast<uint32_t>(MAKE_FIN_VALUE(c.active_id));
+            if (c.pushed_id != AICPU_TASK_INVALID) {
+                // A gated pipelined task: the core shows the finished task's FIN,
+                // takes the gated one at that finish, and spins on its doorbell.
+                c.active_id = c.pushed_id;
+                c.active_gated = true;
+                c.active_ready_at = c.last_fin_at;
+                c.active_dur = c.pushed_dur;
+                c.active_released_at = c.pushed_released_at;
+                c.active_token = c.pushed_token;
+                c.pushed_id = AICPU_TASK_INVALID;
+                c.pushed_dur = 0;
+                c.pushed_gated = false;
+                continue;
+            }
             c.active_id = AICPU_TASK_INVALID;
             return;
         }
@@ -277,6 +396,7 @@ void configure(uint64_t reg_base, uint32_t num_cores) {
     // would write the same state twice on every run.
     if (g_cores.size() != num_cores) {
         g_cores.assign(num_cores, SimCore{});
+        g_bells = std::make_unique<SimBell[]>(num_cores);
     }
 }
 
@@ -285,6 +405,9 @@ void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint6
     g_read_ticks = ns_to_ticks(read_ns);
     g_ack_ticks = ns_to_ticks(ack_ns);
     g_notice_ticks = ns_to_ticks(notice_ns);
+    const uint64_t to_core = ns_to_ticks(ASIM_CORE_ARRIVAL_NS + ASIM_CORE_POLL_NS);
+    g_startup_ticks = g_ack_ticks > to_core ? g_ack_ticks - to_core : 0;
+    g_doorbell_ticks = ns_to_ticks(ASIM_CORE_ARRIVAL_NS);
 }
 
 void set_compute_ns_table(
@@ -343,41 +466,52 @@ uint32_t core_index_for_addr(uint64_t reg_addr) {
 // absorbed by the hold; work that does not is added to the thread's ledger, which
 // holds its model clock back by the same amount.
 
-void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw) {
+void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t task_token_raw, bool gated) {
     const uint64_t release = get_sys_cnt_aicpu() + g_push_ticks;
     uint64_t *ledger = self_ledger();
     const uint64_t deadline = release - (ledger != nullptr ? *ledger : 0);
     SimCore &c = g_cores[core_idx];
+    take_bells(c);
     const uint64_t dur = sample_compute_ticks(c, func_id);
     c.busy += dur;
     ++c.dispatches;
     if (c.active_id == AICPU_TASK_INVALID) {
         // Fully Free -> Partially Busy: an idle core latches and acks quickly.
         c.active_id = task_id;
-        c.active_ack_at = deadline + g_ack_ticks;
-        c.active_fin_at = c.active_ack_at + dur;
         ++c.residency_n;
-        emit_record(
-            core_idx, task_token_raw, static_cast<uint32_t>(task_id), deadline, c.active_ack_at, c.active_fin_at
-        );
+        if (gated) {
+            // On the core once the store lands and its spin reads it; it then fills
+            // its arguments and spins on its gate instead of acknowledging.
+            c.active_gated = true;
+            c.active_ready_at = deadline + g_ack_ticks - g_startup_ticks;
+            c.active_dur = dur;
+            c.active_released_at = kNotRung;
+            c.active_token = task_token_raw;
+        } else {
+            c.active_ack_at = deadline + g_ack_ticks;
+            c.active_fin_at = c.active_ack_at + dur;
+            emit_record(
+                core_idx, task_token_raw, static_cast<uint32_t>(task_id), deadline, c.active_ack_at, c.active_fin_at
+            );
+        }
     } else {
-        // Partially Free -> Fully Busy: the pipelined task is auto-acked only
-        // when the active task finishes. (The scheduler never pushes before the
-        // active task is acked, so the pushed slot is empty here.)
+        // Partially Free -> Fully Busy: the pipelined task is taken only when the
+        // active task finishes, and its record is written then. (The scheduler
+        // never pushes before the active task is acked -- a gated one is not
+        // until its doorbell -- so the pushed slot is empty here.)
         c.pushed_id = task_id;
         c.pushed_dur = dur;
-        const uint64_t sit = c.active_fin_at > deadline ? c.active_fin_at - deadline : 0;
-        c.residency_total += sit;
-        if (sit > c.residency_max) {
-            c.residency_max = sit;
+        c.pushed_token = task_token_raw;
+        c.pushed_gated = gated;
+        c.pushed_released_at = kNotRung;
+        if (!c.active_gated) {
+            const uint64_t sit = c.active_fin_at > deadline ? c.active_fin_at - deadline : 0;
+            c.residency_total += sit;
+            if (sit > c.residency_max) {
+                c.residency_max = sit;
+            }
         }
         ++c.residency_n;
-        // advance() promotes it at the active task's finish with no latch of its
-        // own, so that instant is both its receive and its start.
-        emit_record(
-            core_idx, task_token_raw, static_cast<uint32_t>(task_id), c.active_fin_at, c.active_fin_at,
-            c.active_fin_at + dur
-        );
     }
     const uint64_t done_at = get_sys_cnt_aicpu();
     if (done_at > release) {
@@ -388,6 +522,40 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
         }
     }
     wait_until(release);
+}
+
+void asim_doorbell(uint32_t core_idx, uint32_t token) {
+    // A posted store, like a push: the caller is held for the push latency, and
+    // the store reaches the core after the arrival latency. Posted to the core's
+    // owner rather than applied here -- see SimBell.
+    const uint64_t entered = get_sys_cnt_aicpu();
+    const uint64_t release = entered + g_push_ticks;
+    SimBell &b = g_bells[core_idx];
+    const uint32_t k = token & 3U;
+    if ((b.posted.load(std::memory_order_acquire) & (1U << k)) != 0) {
+        b.overwritten.fetch_add(1, std::memory_order_relaxed);
+    }
+    b.token[k].store(token, std::memory_order_relaxed);
+    b.real_lands[k].store(release + g_doorbell_ticks, std::memory_order_relaxed);
+    b.posted.fetch_or(1U << k, std::memory_order_release);
+    wait_until(release);
+}
+
+void asim_doorbell_counts(const int32_t *core_ids, uint32_t n_cores, uint64_t *rung, uint64_t *unmatched) {
+    uint64_t r = 0;
+    uint64_t u = 0;
+    for (uint32_t i = 0; i < n_cores; ++i) {
+        const int32_t id = core_ids[i];
+        if (id < 0 || static_cast<size_t>(id) >= g_cores.size()) {
+            continue;
+        }
+        r += g_cores[id].doorbells;
+        // A doorbell posted over one not yet taken is lost as surely as one that
+        // names no gated task.
+        u += g_cores[id].doorbells_unmatched + g_bells[id].overwritten.load(std::memory_order_relaxed);
+    }
+    *rung = r;
+    *unmatched = u;
 }
 
 uint32_t asim_read_status(uint32_t core_idx) {
@@ -427,7 +595,8 @@ void asim_push_overrun(const int32_t *core_ids, uint32_t n_cores, uint64_t *tota
 // Compute issued to this core range, in ticks. Comparing it across an A/B is
 // what says two runs executed the same graph, which a skip-golden run cannot.
 void asim_func_hist(uint64_t *out, uint32_t n) {
-    for (uint32_t i = 0; i < n && i < 16; ++i) out[i] = g_func_hist[i];
+    for (uint32_t i = 0; i < n && i < 16; ++i)
+        out[i] = g_func_hist[i];
     if (n > 6) out[6] = g_func_other;
     if (n > 7) out[7] = static_cast<uint64_t>(g_func_max + 1);
 }

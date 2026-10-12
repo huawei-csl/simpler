@@ -52,8 +52,10 @@ exact same 32-bit `COND` word the real AICore writes, and decode the same
 
 **Push register (`DATA_MAIN_BASE`)**, 64-bit. Low 32 carry the dispatched task
 id (or a sentinel above); `0` means the window is closed (core waits). The
-high 32 are the early-dispatch doorbell (`== task_id` releases a gated task) —
-**out of scope for M0.**
+high 32 are the early-dispatch doorbell (`== task_id` releases a gated task); a
+dispatch is gated when its payload carries a non-zero `src_payload`. Both arms
+model the gate — see [§4a](#a-gated-task-holds-its-core-until-its-doorbell) and
+[§5](#an-early-dispatch-pre-stage-is-held-until-its-doorbell).
 
 Real sequence per task (aicore_executor.cpp): scheduler writes
 `DATA_MAIN_BASE = task_id`; core writes `COND = MAKE_ACK_VALUE(task_id)`, runs,
@@ -99,7 +101,7 @@ Enumerated from the scheduler tree (the AICore side, `aicore/aicore_executor
 | `scheduler_context.h:346` `write_reg(DATA_MAIN_BASE, reg_task_id)` | push (dispatch) | via `write_reg` | yes |
 | `scheduler_cold_path.cpp:155` `read_reg(COND)` | status read (cold / handshake) | via `read_reg` | yes |
 | `scheduler_cold_path.cpp:671` `st.cond_ptr = get_reg_ptr(reg_addr, COND)` | resolve the per-core status handle once | `get_reg_ptr` | yes — repoint to the aSim core handle |
-| `scheduler.h:721` `*dmb = …` (`get_reg_ptr(DATA_MAIN_BASE)`) | early-dispatch doorbell (high-32) | direct passive write | no — early-dispatch off at M0 |
+| `scheduler.h` `ring_one_doorbell` (`get_reg_ptr(DATA_MAIN_BASE)`) | early-dispatch doorbell (high-32) | direct passive write | yes — `asim_doorbell(core, token)` |
 
 `core.cond_ptr` is `volatile uint32_t*` (`scheduler_types.h:120`), resolved once
 per core in the handshake, then hot-derefed each poll (the raw deref at :289 is
@@ -165,6 +167,28 @@ The pipelining rule — *a new task may be pushed only after the prior is
 acknowledged* — is exactly what the injected ~64 ns/77 ns latencies make worth
 modeling: ACK lets the next push overlap the active task’s compute (Fig.
 “pipelinedTask”).
+
+### A gated task holds its core until its doorbell
+
+A gated dispatch — an early-dispatch pre-stage or a sync_start cohort member —
+lands on its core, which fills its arguments and spins on `DATA_MAIN_BASE`'s high
+half instead of acknowledging. aSim models it with the push's `gated` flag:
+
+- **Idle core:** the task is on the core after the store lands and the core's spin
+  reads it (310 + 318 ns, the AICPU-to-core split of the calibrated `ack`), and
+  shows nothing — no ACK — until released.
+- **Pipelined behind a running task:** the core cannot auto-ack it, so the running
+  task's **FIN** becomes visible and the gated task is taken at that finish. This
+  is the one transition a gated slot adds; the scheduler promotes on that FIN.
+- **Release:** `asim_doorbell(core, token)` lands 310 ns after it is rung; the task
+  starts at the later of being on the core and the landing, plus the core's
+  startup (`ack` less 628 ns), and its swimlane record is written then.
+
+A doorbell is rung from whichever scheduler thread completed the producer, while
+a core is owned by one thread, so the ringer only posts the token to a per-core
+mailbox; the owner applies it on its next access, on its own model clock.
+Starting a gated task at its push instead — what aSim did before 2026-10-12 —
+lets a pre-staged consumer compute before its producers finish.
 
 ## 4b. How the platform backends work (what aSim builds on)
 
@@ -713,6 +737,26 @@ it can be known which manager will have a core free. In an earlier build, four
 entries per core took qwen from 48.7 ms to 64.3 ms, with per-manager task counts
 spreading from 8% to 47% against 10% for `scan_and_claim`, which places each task
 on a core it owns and so never commits work it cannot start.
+
+### An early-dispatch pre-stage is held until its doorbell
+
+The manager stages a consumer on a core of its tracker before the consumer's
+producers finish, and rings that core's doorbell when they do. Under the
+GroupQueue the controller, not the manager, picks the core, so the pre-stage is
+submitted **belled**: keyed by the manager's core and dispatch token. The
+controller places it like any entry — idle core or behind running work — and the
+slot holds without starting. `post_doorbell` posts the key to a mailbox from any
+thread; the owning queue takes it on its next access, and the task starts at the
+later of being on its core and the doorbell reaching it (queue arrival plus one
+link), plus the core's startup. A pre-stage released before it is placed is
+placed as an ordinary entry.
+
+The manager's capacity accounting has to agree. A real core spinning on its gate
+never acknowledges, so its pending slot stays shut; here the manager learns only
+of retirements, so a tracker offset holding a pre-stage keeps everything it holds
+until that pre-stage retires. Without that, the offset takes a second dispatch
+behind an unreleased one, and the per-core doorbell table — one token per core —
+loses the first.
 
 ### A require_sync_start cohort is gated, then released
 

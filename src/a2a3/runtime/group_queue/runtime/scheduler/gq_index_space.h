@@ -34,7 +34,7 @@
 // window slides over an unbounded position space.
 // =============================================================================
 class alignas(64) GqIndexSpace {
-  public:
+public:
     static constexpr uint32_t WINDOW = 4096;
 
     // What the manager must recover from a reported position to finish the
@@ -53,6 +53,9 @@ class alignas(64) GqIndexSpace {
         // The entry took the running slot and kept the pending slot shut behind
         // it, so it holds both of its offset's tokens and returns both.
         bool guarded;
+        // An early-dispatch pre-stage, held by its doorbell. While one is on an
+        // offset, nothing the offset holds is given back -- see belled_held_.
+        bool belled;
     };
 
     void init(uint32_t capacity) {
@@ -61,7 +64,8 @@ class alignas(64) GqIndexSpace {
         retired_cursor_ = 0;
         capacity_ = (capacity == 0 || capacity > WINDOW) ? WINDOW : capacity;
         early_n_ = 0;
-        for (uint32_t i = 0; i < WINDOW / 64; ++i) early_[i] = 0;
+        for (uint32_t i = 0; i < WINDOW / 64; ++i)
+            early_[i] = 0;
     }
 
     // How many further dispatches this manager may hand out before a position has
@@ -80,9 +84,7 @@ class alignas(64) GqIndexSpace {
         const uint32_t held = static_cast<uint32_t>(push_index_ - watermark_) - early_n_;
         const uint32_t by_capacity = capacity_ > held ? capacity_ - held : 0;
         const uint32_t spread = static_cast<uint32_t>(push_index_ - watermark_);
-        const uint32_t by_horizon = asimgq::SIM_AHEAD_HORIZON > spread
-                                        ? asimgq::SIM_AHEAD_HORIZON - spread
-                                        : 0;
+        const uint32_t by_horizon = asimgq::SIM_AHEAD_HORIZON > spread ? asimgq::SIM_AHEAD_HORIZON - spread : 0;
         return by_capacity < by_horizon ? by_capacity : by_horizon;
     }
     uint64_t push_index() const { return push_index_; }
@@ -99,7 +101,7 @@ class alignas(64) GqIndexSpace {
     uint64_t reserve() {
         if (room() == 0) return UINT64_MAX;
         const uint64_t idx = push_index_++;
-        owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false};
+        owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false, false};
         return idx;
     }
 
@@ -111,7 +113,7 @@ class alignas(64) GqIndexSpace {
     void unreserve(uint64_t idx) {
         if (push_index_ > 0 && idx == push_index_ - 1) {
             --push_index_;
-            owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false};
+            owner_[idx & (WINDOW - 1)] = Owner{nullptr, 0, SubtaskSlot::AIC, -1, -1, false, false};
         }
     }
 
@@ -159,7 +161,7 @@ class alignas(64) GqIndexSpace {
         return true;
     }
 
-  private:
+private:
     uint64_t push_index_{0};
     uint64_t watermark_{0};
     uint64_t retired_cursor_{0};

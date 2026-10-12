@@ -321,7 +321,22 @@ void SchedulerContext::check_running_cores_for_completion(
             CoreTracker &tracker = core_trackers_[thread_idx];
             const int32_t off = o.capacity_token;
             if (off >= 0) {
-                if (o.guarded || !tracker.is_pending_occupied(off)) {
+                // A pre-stage still on the offset holds it whole: a token returned
+                // ahead of it is deferred, and once the last pre-stage retires with
+                // tokens deferred, nothing of the offset's is left in flight.
+                const bool tracked = off < kGqOffsets;
+                uint8_t *held = tracked ? &belled_held_[thread_idx][off] : nullptr;
+                uint8_t *deferred = tracked ? &belled_deferred_[thread_idx][off] : nullptr;
+                if (o.belled && held != nullptr && *held > 0) {
+                    --*held;
+                }
+                if (!o.belled && held != nullptr && *held > 0) {
+                    ++*deferred;
+                } else if (deferred != nullptr && *deferred > 0) {
+                    *deferred = 0;
+                    tracker.change_core_state(off);
+                    tracker.clear_pending_occupied(off);
+                } else if (o.guarded || !tracker.is_pending_occupied(off)) {
                     tracker.change_core_state(off);
                     tracker.clear_pending_occupied(off);
                 } else {
@@ -788,8 +803,8 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
                     last_block = block_num;
                     ++reports;
                     LOG_ERROR(
-                        "[GQ_DRAIN] insufficient: available=%d block_num=%d shape=%d gated=%d",
-                        available, block_num, static_cast<int32_t>(shape), gated ? 1 : 0
+                        "[GQ_DRAIN] insufficient: available=%d block_num=%d shape=%d gated=%d", available, block_num,
+                        static_cast<int32_t>(shape), gated ? 1 : 0
                     );
                 }
             }
