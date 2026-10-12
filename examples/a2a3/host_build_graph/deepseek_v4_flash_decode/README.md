@@ -41,6 +41,16 @@ Eight Definitions cover all 43 layers:
   constant (32 at layer 0, 64 at layer 1) where the loop's variants take it as a
   scalar.
 
+`kernels/orchestration/decode_fwd_expanded.cpp` is the same source with each
+Graph submission replaced by a direct call of its body — the path
+`rt_submit_graph` takes itself whenever the boundary args are not cacheable — so
+the host submits the pass's tasks individually and the whole graph is visible to
+the scheduler and to dep-gen at submit time. `main.py` does not point at it; pass
+it as `orchestration_source` to the shared driver's `run()`. It exists for the
+GroupQueue study in
+[docs/asim/validation/deepseek-v4.md](../../../../docs/asim/validation/deepseek-v4.md),
+which needs host-declarable task groups and a `deps.json` that names every task.
+
 The read that used to force a rewrite was `recv_count_out[expert][0]`, driving
 the ten MoE per-expert tile loops. HBG builds the whole graph before the device
 runs anything, so a read of a **task-produced** tensor has no value to return
