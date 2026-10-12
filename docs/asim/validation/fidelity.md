@@ -64,6 +64,15 @@ of core time a round against 746 -- so they are separate cases, not a
 before-and-after. M2 on that row reads -0.4 % against silicon and -0.2 % against
 M0 ([validation.md](../validation.md#a-second-qwen-shape-the-graph-orchestration)).
 
+The rows differ in a second way that confounds that attribution: **no Graph-body
+task carries the early-resolve bit**, while the expanded qwen orchestration sets it
+on 17 sites a layer. Both simulators start an early-dispatched consumer at publish
+rather than at its doorbell, so it can compute before its producers finish. On
+deepseek_v4's expanded orchestration that one switch moves M0 from +1.5 % against
+silicon (early dispatch off) to -20 % (on)
+([validation/deepseek-v4.md](deepseek-v4.md#the-expanded-form-and-an-early-dispatch-artefact)),
+which makes it the leading candidate for qwen's -4.2 % as well.
+
 The simgc arm ran the GroupQueue manager before it was fixed to retire on notice
 and pipeline a second task per core, so its figures are superseded; M2 against M0
 and against silicon is in
@@ -143,7 +152,11 @@ from the afternoon session:
    parallel −16.2 %), which is what identified the poll cost as the cause. Any
    future regression should be re-checked the same way, because a bias that
    varies with configuration does not cancel in an M0-vs-M2 delta.
-5. **The model clock is per thread.** It is exact for everything a thread's own
+5. **Early dispatch starts at publish.** A pre-staged consumer starts when it is
+   published, not when its doorbell rings, in M0 (`asim_push`) and in M2 (the
+   pre-stage reaches the controller ungated). Any case that sets
+   `allow_early_resolve` is affected; paged_attention sets it nowhere.
+6. **The model clock is per thread.** It is exact for everything a thread's own
    cores do; a thread delayed by another thread's simulator work, through state
    the scheduler threads share, is not corrected, and no counter bounds it. It
    was tested instead: adding 150 or 400 ns of simulator work to every access,

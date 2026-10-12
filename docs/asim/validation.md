@@ -59,7 +59,7 @@ only case that separates M0 from M2 at all.
 | ---- | ----- | ------- | --------- |
 | `paged_attention` Case1 | 65 536 | 4 | homogeneous, AICPU-bound, cores 86 % idle |
 | `qwen3_14b_decode` | 19 179 | 36 | heterogeneous; SPMD `block_num` 5–50, whole-device sync-start cohorts |
-| `deepseek_v4_flash_decode` | ~29 000 per rank | 368 | two dies, EP2/TP2 comm domain, dispatch predicates, Graph-expanded layers; **critical-path bound, cores 98 % idle** |
+| `deepseek_v4_flash_decode` | ~16 000 per rank | 368 | two dies, EP2/TP2 comm domain, dispatch predicates, Graph-expanded layers; **critical-path bound**, cube cores ~26 % busy |
 
 **Cases that cannot measure anything, and must not be quoted:** `benchmark_bgemm`
 (128 tasks) and `paged_attention` small1 (**4 tasks**) have windows of 40–100 µs,
@@ -198,14 +198,25 @@ The only case that separates the two designs, and it separates them the wrong
 way: **M2 is 3.3-4.8 % slower than M0**, replicated over two sessions
 (silicon 35.7-36.2 ms, M0 36.6-36.7 ms, M2 37.9-38.4 ms).
 
-The reason is that this case is **critical-path bound** -- 43 layers of serial
-chain, cube cores 3.3 % busy -- where paged_attention was throughput bound, and
-that the mechanism which would shorten a chain never engages (`deps_named=0`).
-**Grouping is structurally unreachable on any graph-execution case**, because a
-group is declared over a range of host-side task ids and in-graph tasks are
-created on device. The measurement, the decomposition, the two routes to an
-improvement, and why this case is a scheduler benchmark rather than a fidelity
-reference are in
+The case is **critical-path bound** -- 43 layers of serial chain, cube cores ~26 %
+busy -- where paged_attention was throughput bound, and its Graph form leaves the
+GroupQueue's mechanism dormant (`deps_named=0`): a group is declared over host-side
+task ids, and in-graph tasks are created on device.
+
+**No change to how the case submits its work turns that.** An expanded
+orchestration that submits every task from the host makes grouping declarable,
+and then:
+
+- **Any declared group costs +105 %.** It partitions the ready queues per Scheduler
+  thread, which pins the chain and its 16-64-block tasks to one thread's 18 cores.
+  The most grouping could recover is the critical path's 8.9 ms of hop gaps.
+- **Ungrouped, M2 reads -8.3 % -- an artefact.** Both simulators start an
+  early-dispatched consumer at publish rather than at its doorbell, and M2 profits
+  more. With early dispatch off, M0 lands at +1.5 % of silicon and M2 at **+3.5 %**,
+  the Graph form's verdict.
+
+The measurements, the critical-path accounting, and the one test-case route left
+(splitting wide tasks into per-queue pieces) are in
 **[validation/deepseek-v4.md](validation/deepseek-v4.md)**.
 
 ## Is an M0-vs-M2 delta an artefact?
@@ -228,6 +239,7 @@ baselines and gates. They are kept apart because their figures do not compare:
 | [2026-09-21](validation/m2-campaign-2026-09-21.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −56.1 %, qwen −33.2 % |
 | [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock, fixed manager | `host_build_graph` (`a2a3asim`) | paged_attention −47.9 %, qwen +1.2 % |
 | [2026-10-09/12](validation/deepseek-v4.md) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 **+3.3 to +4.8 %**, the first loss |
+| [2026-10-12](validation/deepseek-v4.md#the-expanded-form-and-an-early-dispatch-artefact) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 expanded: **+3.5 %** with early dispatch off; -8.3 % with it on is an artefact; one group **+105 %** |
 
 The raw window of the first campaign includes the simulator's own work, which
 inflates M2; the second and third removed that work including the part the cores

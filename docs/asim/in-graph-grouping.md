@@ -57,27 +57,30 @@ are inert, so it wants a session of its own.
 
 ## The constraint that decides the grain
 
-**A group is confined to one queue**, which serves 18 of the 72 cores. Declaring a
-whole layer as one group would therefore run that layer on a quarter of the
-device. On deepseek_v4 that is probably harmless -- its cube cores are 3.3 % busy
-and the wall is a dependency chain, so there is no throughput to lose -- but it is
-a real risk on any case that is not.
+**A group is confined to one queue**, which serves 18 of the 72 cores -- and
+declaring any group confines everything else too. Grouping makes every Scheduler
+thread pop only its own span of the ready queues, and routes a task outside every
+group to the thread that released it, so only a claimed group ever moves work
+between threads.
 
-So the first grain to try is the **MoE expert tile**: six tasks, all consuming one
-`dispatch_gather` output, which is how the case's README already describes them.
-That is close to paged_attention's pattern, and it lets several tiles run on
-different queues concurrently. A layer-sized group is the experiment to run
-second, against the tile-sized one, not the one to build first.
+On deepseek_v4 that is not harmless. Measured on the expanded orchestration, one
+3-task group costs **+105 %** against M0: the critical chain and its 16-64-block
+tasks end up on one thread's 18 cores, and a round's ~227 ms of cube work is a
+quarter of all 24 cube cores' time
+([validation/deepseek-v4.md](validation/deepseek-v4.md#why-no-group-helps)).
+In-graph grouping would turn on the same partition, so on this case it cannot pay
+unless the Definition also splits its wide tasks into per-queue pieces.
+
+So the first grain to try is the **MoE expert tile** -- six tasks, all consuming
+one `dispatch_gather` output -- only on a case whose wide tasks already fit one
+queue. A layer-sized group runs the whole layer on a quarter of the device.
 
 ## What would say it worked
 
 `deps_named` > 0 is the precondition, not the result: it only says the contract
-was expressible. The result is M2's window against M0's on deepseek_v4, which is
-currently +2.7 % to +3.4 %. Grouping removes the AICPU from a hop, so the figure
-to watch is the per-hop cost across the ~1,300 serial hops a round -- about 0.8 us
-each today.
+was expressible. The result is M2's window against M0's, with early dispatch off:
+both simulators start an early-dispatched consumer at publish rather than at its
+doorbell, so with it on the delta measures that defect instead.
 
-Two existing facts bound the expectation. Grouping is worth -48 % where it takes
-75 % of hops off the manager's path and the cores are starved. Here the cores are
-idle for a different reason -- the chain -- so the ceiling is the hop cost itself,
-not the idle time.
+The ceiling on deepseek_v4 is the critical path's producer-to-consumer gaps,
+8.9 ms of a ~31 ms silicon round, and the partition already costs more than that.
