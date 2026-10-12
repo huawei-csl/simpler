@@ -64,7 +64,7 @@ group to the thread that released it, so only a claimed group ever moves work
 between threads.
 
 On deepseek_v4 that is not harmless. Measured on the expanded orchestration, one
-3-task group costs **+105 %** against M0: the critical chain and its 16-64-block
+3-task group costs **+85 %** against M0: the critical chain and its 16-64-block
 tasks end up on one thread's 18 cores, and a round's ~227 ms of cube work is a
 quarter of all 24 cube cores' time
 ([validation/deepseek-v4.md](validation/deepseek-v4.md#why-no-group-helps)).

@@ -89,17 +89,19 @@ moves work between threads, by being claimed.
 
 On this case that pins the critical chain, and every wide task on it, to one
 thread's 18 cores. **One 3-task group resolving 4 edges -- a probe that changes
-nothing else -- takes M2 from 24.1 ms to 54.0 ms, +105 % against M0** (n=12,
-early dispatch on, same lock as the table above).
+nothing else -- takes M2 to 59.8 ms, +85 % against M0** (n=6, window +86 %).
 
 The silicon critical path says why no grouping can earn that back. On the
 expanded form's rank 0 it is 1,670 tasks: 18.7 ms of compute kernels, 3.5 ms of
 comm kernels, and **8.9 ms of producer-end to consumer-start gaps** (median
 3.7 us) -- the most grouping could ever recover. 330 of those tasks are 16-64
 blocks wide, and confined to one queue they run in up to six times the waves:
-~17 ms by wave count alone, +29.9 ms measured (24.1 -> 54.0 ms). The cube work
+~17 ms by wave count alone, +26.0 ms measured (33.8 -> 59.8 ms). The cube work
 alone does not fit: a round's ~227 ms of it is a quarter of all 24 cube cores'
 time, so one queue's six would have to be busy for the whole round.
+
+[../controller-oracle.md](../controller-oracle.md) prices what a controller
+that resolved this case's edges itself could win, and which changes it would take.
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
 split each into per-queue pieces declared in separate groups, so the four threads

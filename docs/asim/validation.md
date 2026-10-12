@@ -207,7 +207,7 @@ task ids, and in-graph tasks are created on device.
 orchestration that submits every task from the host makes grouping declarable,
 and then:
 
-- **Any declared group costs +105 %.** It partitions the ready queues per Scheduler
+- **Any declared group costs +85 %.** It partitions the ready queues per Scheduler
   thread, which pins the chain and its 16-64-block tasks to one thread's 18 cores.
   The most grouping could recover is the critical path's 8.9 ms of hop gaps.
 - **Ungrouped, M2 loses about as on the Graph form: +4.7 %.** It read -8.3 % until
@@ -238,7 +238,7 @@ baselines and gates. They are kept apart because their figures do not compare:
 | [2026-09-21](validation/m2-campaign-2026-09-21.md) | `device_wall`, over-corrected | `host_build_graph` (`a2a3asim`) | paged_attention −56.1 %, qwen −33.2 % |
 | [2026-10-07](#what-the-groupqueue-is-worth) | `device_wall`, model clock, fixed manager | `host_build_graph` (`a2a3asim`) | paged_attention −47.9 %, qwen +1.2 % |
 | [2026-10-09/12](validation/deepseek-v4.md) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 **+3.3 to +4.8 %**, the first loss |
-| [2026-10-12](validation/deepseek-v4.md#the-expanded-form) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 expanded, early-dispatch gate modelled: **+4.7 %**; one group **+105 %** |
+| [2026-10-12](validation/deepseek-v4.md#the-expanded-form) | `device_wall`, model clock | `host_build_graph` (`a2a3asim`) | deepseek_v4 expanded, early-dispatch gate modelled: **+4.7 %**; one group **+85 %** |
 
 The raw window of the first campaign includes the simulator's own work, which
 inflates M2; the second and third removed that work including the part the cores
