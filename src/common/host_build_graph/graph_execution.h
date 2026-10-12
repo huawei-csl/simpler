@@ -32,6 +32,13 @@ static_assert(
 static_assert(MAX_IN_GRAPH_TASKS - 1 < 0xFFFF, "a fanin CSR row index must fit ChipTaskSlotState::wake_scan_cursor");
 inline constexpr int32_t GRAPH_MATERIALIZE_SLICE_TASKS = 4;
 
+// A task no group declaration covered. Groups are numbered from 0 within their own
+// Definition and the field is a byte, so a body may declare at most 255 of them --
+// ample for a body bounded at MAX_IN_GRAPH_TASKS, and a body that declares more
+// records the rest ungrouped rather than failing.
+inline constexpr int32_t GRAPH_NO_GROUP = 255;
+inline constexpr int32_t GRAPH_MAX_GROUPS = 255;
+
 enum class GraphTensorSourceKind : uint8_t {
     BOUNDARY_EXACT = 0,
     BOUNDARY_VIEW = 1,
@@ -132,7 +139,13 @@ struct InGraphTaskDefinition {
     // the same meaning as ChipTaskSlotState::ed_flags, against the Definition's
     // fanin CSR instead of a payload fanin region.
     uint8_t ed_flags;
-    uint8_t reserved;
+    // The group this task was declared into, as an index within its own
+    // Definition, or GRAPH_NO_GROUP. A group's internal edges are the GroupQueue
+    // controller's to resolve, so two tasks are in one group when this field
+    // matches -- the id is the whole test, and no extent is stored. Decided once
+    // per recorded shape, like ed_flags above, because a body's structure is
+    // fixed by its Definition.
+    uint8_t group;
     int16_t logical_block_num;
     int16_t total_required_subtasks;
     // One-based index into the Definition's predicate array; 0 means the task

@@ -42,7 +42,8 @@ Two routes to a measurable improvement, in order of leverage:
 - **Let a Definition declare its tasks as a group**, so the Scheduler tags them
   at expansion. A Definition is already bounded, internally connected and
   replayed -- the shape a group wants. This is the only route that reaches any
-  graph-execution case.
+  graph-execution case; the five pieces it needs, and the grain to try first, are
+  in [../in-graph-grouping.md](../in-graph-grouping.md).
 - **A flat `host_build_graph` orchestration for this case**, which would make
   grouping declarable today. The existing flat source is the
   `tensormap_and_ringbuffer` one and does not compile against the

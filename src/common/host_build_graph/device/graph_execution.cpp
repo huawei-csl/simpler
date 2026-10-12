@@ -110,8 +110,9 @@ bool bind_graph_topology(GraphExecution &execution) {
             task.scalar_offset > definition.scalar_arg_count ||
             task.scalar_count > definition.scalar_arg_count - task.scalar_offset ||
             (task.active_mask & ~VALID_ACTIVE_MASK) != 0 ||
-            (task.ed_flags & ~(ED_FLAG_CANDIDATE | ED_FLAG_TRACKED)) != 0 || task.reserved != 0 ||
-            task.logical_block_num <= 0 || task.total_required_subtasks < 0) {
+            (task.ed_flags & ~(ED_FLAG_CANDIDATE | ED_FLAG_TRACKED)) != 0 ||
+            (task.group != GRAPH_NO_GROUP && task.group >= GRAPH_MAX_GROUPS) || task.logical_block_num <= 0 ||
+            task.total_required_subtasks < 0) {
             return false;
         }
         for (int32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot) {

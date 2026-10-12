@@ -312,6 +312,8 @@ struct RecordedInGraphTask {
     int32_t fanin_count{0};
     // Index into the recording's predicates, or -1 when the task carries none.
     int32_t predicate_index{-1};
+    // The group declaration open when this task recorded, or GRAPH_NO_GROUP.
+    int32_t group{GRAPH_NO_GROUP};
     ArgsDumpTaskMetadata dump_metadata;
 
     // Restore the state a freshly recorded task has, in a slot the previous body left
@@ -340,6 +342,7 @@ struct RecordedInGraphTask {
         fanin_offset = 0;
         fanin_count = 0;
         predicate_index = -1;
+        group = GRAPH_NO_GROUP;
         dump_metadata = {};
     }
 };
@@ -348,7 +351,7 @@ struct RecordedInGraphTask {
 // from the previous body into the next recording -- silently, as a Definition that body
 // never had. Adding a field changes this size, so the build stops here instead.
 static_assert(
-    sizeof(RecordedInGraphTask) == 104, "RecordedInGraphTask gained or lost a field: extend reset() to match, then "
+    sizeof(RecordedInGraphTask) == 112, "RecordedInGraphTask gained or lost a field: extend reset() to match, then "
                                         "update this size"
 );
 
@@ -384,6 +387,14 @@ struct GraphRecording {
     // boundary matching while this thread records.
     const GraphBoundary *boundary{nullptr};
     bool unsupported{false};
+    // The group declaration open in this recording, and how many it has closed.
+    // Recording-local rather than on OrchestratorState: a recording belongs to one
+    // thread, several record at once, and the ids they assign index their own
+    // Definition. `group_depth` absorbs a nested declaration, as the global path's
+    // does.
+    int32_t open_group{GRAPH_NO_GROUP};
+    int32_t group_depth{0};
+    int32_t declared_group_count{0};
     std::vector<RecordedInGraphTask> tasks;
     // How many of `tasks` this recording has filled. The array itself is never cleared
     // and graph_recording_reserve_storage sizes it to the in-graph task cap, so a body is
@@ -819,6 +830,12 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
     recording.unsupported = false;
     recording.scope_stack_top = -1;
     recording.manual_begin_depth = CHIP_MAX_SCOPE_DEPTH;
+    // A group id indexes the Definition it is recorded into, so the numbering starts
+    // again per body. The recording itself is reused by its thread, which is why this
+    // is reset here rather than left to construction.
+    recording.open_group = GRAPH_NO_GROUP;
+    recording.group_depth = 0;
+    recording.declared_group_count = 0;
     // clear() keeps each array's capacity, and the stand-up above reserved every one of
     // them to what a body at the cap needs, so no body a thread records can grow one.
     // tasks is deliberately not cleared: see GraphRecording::task_count.
@@ -1184,7 +1201,7 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
         // verdict, and only a consumer recorded later can add ED_FLAG_TRACKED to
         // it, which happens after this write.
         task.ed_flags = ed_candidate ? ED_FLAG_CANDIDATE : 0;
-        task.reserved = 0;
+        task.group = static_cast<uint8_t>(source.group);
         task.logical_block_num = source.logical_block_num;
         task.total_required_subtasks = source.total_required_subtasks;
         task.tensor_count = source.tensor_count;
@@ -2275,6 +2292,7 @@ TaskOutputTensors graph_record_submit_in_graph_task(
     if (task_index >= static_cast<int32_t>(recording.tasks.size())) recording.tasks.emplace_back();
     RecordedInGraphTask &task = recording.tasks[task_index];
     task.reset();
+    task.group = recording.open_group;
     task.kernel_ids[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_ids[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_ids[static_cast<int>(SubtaskSlot::AIV1)] = aiv1_kernel_id;
@@ -2829,6 +2847,15 @@ void OrchestratorState::graph_commit_inner() {
 // it, which is what an unclosed one means rather than an error.
 void OrchestratorState::begin_group() {
     if (is_fatal()) return;
+    // A declaration made while a body records names that body's tasks, which carry
+    // their own ids and never reach the task allocator. The recording keeps its own
+    // declaration state because several bodies record at once, one thread each.
+    if (GraphRecording *recording = active_graph_recording(this); recording != nullptr) {
+        if (recording->group_depth++ != 0) return;
+        recording->open_group =
+            (recording->declared_group_count < GRAPH_MAX_GROUPS) ? recording->declared_group_count : GRAPH_NO_GROUP;
+        return;
+    }
     if (group_depth++ != 0) return;  // absorbed by the group already open
     open_group = declared_group_count;
     open_group_first = task_allocator.active_count();
@@ -2838,7 +2865,17 @@ void OrchestratorState::begin_group() {
 // known until here, so it is back-filled -- over the group's own descriptors, on the
 // host, while the graph is still being built.
 void OrchestratorState::end_group() {
-    if (group_depth == 0 || --group_depth != 0) return;
+    if (GraphRecording *recording = active_graph_recording(this); recording != nullptr) {
+        if (recording->group_depth == 0) return;
+        --recording->group_depth;
+        if (recording->group_depth != 0) return;
+        if (recording->open_group != GRAPH_NO_GROUP) ++recording->declared_group_count;
+        recording->open_group = GRAPH_NO_GROUP;
+        return;
+    }
+    if (group_depth == 0) return;
+    --group_depth;
+    if (group_depth != 0) return;
     if (open_group == NO_TASK_GROUP) return;
     const int32_t first = open_group_first;
     const int32_t end = task_allocator.active_count();

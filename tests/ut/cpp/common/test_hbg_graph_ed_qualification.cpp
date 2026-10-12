@@ -404,3 +404,105 @@ TEST_F(HbgGraphWakeScanTest, MultiProducerWaiterReRegistersUntilItsRowClears) {
     EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(0)), 1u);
     EXPECT_EQ(pop_ready(), &consumer);
 }
+
+// =============================================================================
+// Group declaration inside a body
+// =============================================================================
+//
+// A group is the set of tasks whose internal edges the GroupQueue controller
+// resolves itself, declared by rt_group_begin / rt_group_end. The global path
+// back-fills a run of host-side task ids, which a recorded task never takes, so a
+// declaration made while a body records has to name the body's own tasks instead.
+// Two tasks are in one group when their `group` fields match; no extent is stored.
+using HbgGraphGroupTest = HbgGraphEdQualificationTest;
+
+TEST_F(HbgGraphGroupTest, DeclarationInsideABodyNumbersItsTasksAndLeavesTheRestUngrouped) {
+    GraphTaskArgs boundary_args;
+    const simpler::hbg::Tensor boundary = begin_body(0x6B0D9201, boundary_args);
+
+    const simpler::hbg::Tensor outside = record_task(boundary, /*flagged=*/false);
+    orch.begin_group();
+    const simpler::hbg::Tensor first = record_task(boundary, /*flagged=*/false);
+    ASSERT_TRUE(record_consumer(first, outside).is_valid());
+    orch.end_group();
+    const simpler::hbg::Tensor after = record_task(boundary, /*flagged=*/false);
+    (void)after;
+    ASSERT_TRUE(orch.graph_end());
+
+    const GraphDefinition *definition = published_definition();
+    ASSERT_NE(definition, nullptr);
+    ASSERT_EQ(definition->task_count, 4);
+    const auto *tasks = graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 4);
+    ASSERT_NE(tasks, nullptr);
+
+    EXPECT_EQ(tasks[0].group, GRAPH_NO_GROUP) << "recorded before the declaration opened";
+    EXPECT_EQ(tasks[1].group, 0) << "the body's first declaration is group 0 of its own Definition";
+    EXPECT_EQ(tasks[2].group, 0) << "the consumer recorded inside the same declaration joins it";
+    EXPECT_EQ(tasks[3].group, GRAPH_NO_GROUP) << "recorded after the declaration closed";
+}
+
+TEST_F(HbgGraphGroupTest, SuccessiveDeclarationsTakeSuccessiveIdsAndANestedOneIsAbsorbed) {
+    GraphTaskArgs boundary_args;
+    const simpler::hbg::Tensor boundary = begin_body(0x6B0D9202, boundary_args);
+
+    orch.begin_group();
+    const simpler::hbg::Tensor a = record_task(boundary, /*flagged=*/false);
+    // Groups do not nest: the inner pair is absorbed, so the task between them
+    // stays in the outer group and the inner close does not end it.
+    orch.begin_group();
+    ASSERT_TRUE(record_consumer(a, boundary).is_valid());
+    orch.end_group();
+    const simpler::hbg::Tensor still_outer = record_task(boundary, /*flagged=*/false);
+    (void)still_outer;
+    orch.end_group();
+
+    orch.begin_group();
+    const simpler::hbg::Tensor b = record_task(boundary, /*flagged=*/false);
+    (void)b;
+    orch.end_group();
+    ASSERT_TRUE(orch.graph_end());
+
+    const GraphDefinition *definition = published_definition();
+    ASSERT_NE(definition, nullptr);
+    ASSERT_EQ(definition->task_count, 4);
+    const auto *tasks = graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 4);
+    ASSERT_NE(tasks, nullptr);
+
+    EXPECT_EQ(tasks[0].group, 0);
+    EXPECT_EQ(tasks[1].group, 0) << "absorbed by the declaration already open";
+    EXPECT_EQ(tasks[2].group, 0) << "the inner close must not end the outer group";
+    EXPECT_EQ(tasks[3].group, 1) << "the next declaration of this body takes the next id";
+}
+
+TEST_F(HbgGraphGroupTest, BodiesNumberTheirGroupsIndependently) {
+    GraphTaskArgs first_args;
+    const simpler::hbg::Tensor first_boundary = begin_body(0x6B0D9203, first_args);
+    orch.begin_group();
+    const simpler::hbg::Tensor x = record_task(first_boundary, /*flagged=*/false);
+    (void)x;
+    orch.end_group();
+    ASSERT_TRUE(orch.graph_end());
+
+    GraphTaskArgs second_args;
+    const simpler::hbg::Tensor second_boundary = begin_body(0x6B0D9204, second_args);
+    orch.begin_group();
+    const simpler::hbg::Tensor y = record_task(second_boundary, /*flagged=*/false);
+    (void)y;
+    orch.end_group();
+    ASSERT_TRUE(orch.graph_end());
+
+    // A group id indexes its own Definition, so the second body starts again at 0
+    // rather than continuing the first body's numbering.
+    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.entries.size(), 2u);
+    for (const GraphHostDefinition &entry : published.entries) {
+        const auto *definition = reinterpret_cast<const GraphDefinition *>(
+            definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+        );
+        ASSERT_EQ(definition->task_count, 1);
+        const auto *tasks =
+            graph_definition_array<InGraphTaskDefinition>(*definition, definition->off_in_graph_tasks, 1);
+        ASSERT_NE(tasks, nullptr);
+        EXPECT_EQ(tasks[0].group, 0);
+    }
+}
