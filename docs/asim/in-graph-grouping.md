@@ -31,6 +31,30 @@ recorded once and replayed. This note is what it would take to say so.
 | 4 | **An in-graph `group_deps`.** The existing one walks the global fanin and tests `tasks.is_completed(prod)`. The in-graph variant walks `execution.fanin_offsets` / `fanin_indices` and tests `execution.task_states`, then maps each unmet same-group producer through (3). The comparator cap stays `SIM_HELD_MAX_DEPS` = 4. | `SchedulerState::group_deps`, `scheduler.h` |
 | 5 | **Group ownership.** A group is resolved by one controller, so one manager must own its members. `claim_group` keys on a group id today; an in-graph claim has to key on **(execution, group)**, because two run slots can hold executions of the same Definition at once. | `task_grouping.h`, `scheduler.h` |
 
+Pieces 1 to 4 have landed. Piece 5 is the one that turns them on, and it has a
+prerequisite the others did not.
+
+## What piece 5 has to decide first
+
+A grouped member is routed to its group owner's queue, `ready_queues_gq[owner]`,
+and those per-thread spans exist only after `partition_ready_queues_by_owner()`
+has cut them -- which returns early unless `gq_group::active()`, i.e. unless the
+**global** declaration scan found a group. A body's declaration never reaches
+that scan, so in-graph grouping cannot route anywhere until one of these is done:
+
+- **Let a Definition's declaration make grouping active**, and partition on that
+  too. The claim then lives in a per-execution owner array, which is the right
+  home anyway: a group id indexes its own Definition, and `g_group_first` /
+  `g_group_extent` describe contiguous runs of **global** ids that an in-graph
+  task does not have. This is the shape to build.
+- **Map each in-graph group into the global group id space**, so the existing
+  route, claim and partition all work untouched. Cheaper to write, but it gives a
+  per-execution thing a global name and has to invent extents for a run of ids
+  that does not exist.
+
+Either way piece 5 changes how a grouped run is scheduled, where pieces 1 to 4
+are inert, so it wants a session of its own.
+
 ## The constraint that decides the grain
 
 **A group is confined to one queue**, which serves 18 of the 72 cores. Declaring a
