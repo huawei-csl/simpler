@@ -112,6 +112,27 @@ four comparators waits for the manager, but nothing behind it in its silo does.
 There the window, the comparators, the feed order and up to 4 us of retirement
 latency each move the result by 0.1 % or less.
 
+## Launching partitions instead of feeding
+
+A variant of the design launches a *partition* -- a chunk of the graph in task
+order -- at once: every task of it is resident in its silo from the launch, and
+positions are numbered across the partition, so a spread producer is one range
+whatever silos ran it and costs one comparator. The oracle prices it with
+`PART`, `RESIDENT` and `LAUNCH_US`, at the simulator's hops with a 200 ns exchange
+(`H_IN=1.02 H_N=1.22`), predicates free, against 30.66 ms today:
+
+| partitions | makespan | vs today |
+| ---------- | -------- | -------- |
+| the whole graph | 27.24 ms | -11.2 % |
+| one layer each, one at a time | 28.74 ms | -6.3 % |
+| one layer each, two in flight | 27.25 ms | -11.1 % |
+| about a quarter layer each, four in flight | 27.22 ms | -11.2 % |
+
+A partition that waits for the one before it to finish drains the fabric at every
+boundary; two in flight hide it whatever the size. Residency is the price: a layer
+puts up to 184 tasks on one silo, a quarter layer 112. Inside a partition a task
+names at most eight producer supertasks, and 1-3 % of tasks name more than four.
+
 ## Limits
 
 - **Two hardware numbers are design parameters, not measurements**: the peer link

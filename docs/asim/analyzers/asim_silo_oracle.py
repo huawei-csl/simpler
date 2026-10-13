@@ -26,9 +26,15 @@ past it, the manager resolves the rest and the piece cannot start before MGR_US 
 the (n-C)-th of them finished. A task its dispatch predicate retires is a zero-length
 node; PRED adds a hop through it, for a predicate the manager evaluates.
 
+PART > 0 replaces the feed with partitions: the graph is cut into chunks of PART
+tasks in task order, every task of a chunk is resident in its silo from the chunk's
+launch, and a chunk launches LAUNCH_US after the chunk RESIDENT places before it
+has finished -- one at a time with RESIDENT=1, the next while the last runs with 2.
+
   usage: asim_silo_oracle.py <deps.json> <swimlane.json> <calib>
 Env: W (default 32), ORDER, H_IN (0.45), H_N (0.8), PRED (0), SPLIT_MIN (4), EDGE,
-C (unset = any), RETIRE_US (0), ENTER_US (0), RATE (6 tasks/us), SEEDS (3).
+C (unset = any), RETIRE_US (0), ENTER_US (0), PART (0), LAUNCH_US (1), RESIDENT (1),
+RATE (6 tasks/us), SEEDS (3).
 """
 
 import heapq
@@ -54,6 +60,9 @@ C = int(ENV["C"]) if ENV.get("C") else None
 RATE = float(ENV.get("RATE", "6"))
 RETIRE_US = float(ENV.get("RETIRE_US", "0"))
 ENTER_US = float(ENV.get("ENTER_US", "0"))
+PART = int(ENV.get("PART", "0"))
+LAUNCH_US = float(ENV.get("LAUNCH_US", "1"))
+RESIDENT = int(ENV.get("RESIDENT", "1"))
 SEEDS = int(ENV.get("SEEDS", "3"))
 
 deps = json.load(open(sys.argv[1]))
@@ -130,6 +139,18 @@ for n in real_nodes:
         named_by[d].append(n)
 
 
+# Chunks are numbered over those holding a task that reaches a core: one made only
+# of tasks a predicate retires has nothing to launch.
+chunk_of = {}
+if PART > 0:
+    for c, k in enumerate(sorted({order[n[1]] // PART for n in real_nodes})):
+        chunk_of[k] = c
+
+
+def part_of(n):
+    return chunk_of[order[n[1]] // PART] if PART > 0 else 0
+
+
 def shape(k):
     if k[0] >= 0 and (k[1] >= 0 or k[2] >= 0):
         return "mix"
@@ -179,7 +200,7 @@ class Cores:
 class Run:
     """One draw: an event schedule of finishes, entries and releases."""
 
-    FIN, FREE, ENT, REL = 0, 1, 2, 3
+    FIN, FREE, ENT, REL, LAUNCH = 0, 1, 2, 3, 4
 
     def __init__(self, seed):
         self.cores = Cores(random.Random(seed))
@@ -194,6 +215,11 @@ class Run:
             if self.unentered[n] == 0:
                 heapq.heappush(self.ready[gof(n)], (order[n[1]], n[2], n))
         self.ev, self.seq = [], itertools.count()
+        self.members = defaultdict(list)
+        for n in real_nodes:
+            self.members[part_of(n)].append(n)
+        self.part_left = {k: len(v) for k, v in self.members.items()}
+        self.launched = {}
 
     def push(self, t, kind, x):
         heapq.heappush(self.ev, (t, kind, next(self.seq), x))
@@ -257,14 +283,37 @@ class Run:
                     if gof(c) != g:
                         self.push(now, self.ENT, gof(c))
 
+    def launch(self, k, t):
+        if k in self.launched or k not in self.members:
+            return
+        self.launched[k] = t
+        for n in self.members[k]:
+            self.entered[n] = t + ENTER_US
+            if n in self.relmet:
+                self.push(max(self.relmet[n], self.entered[n]), self.REL, n)
+
+    def finished(self, x, t):
+        k = part_of(x)
+        self.part_left[k] -= 1
+        if self.part_left[k] == 0:
+            nxt = k + RESIDENT
+            at = max(t + LAUNCH_US, self.launched.get(nxt - 1, 0.0))
+            self.push(at, self.LAUNCH, nxt)
+
     def run(self):
         for n in [n for n in nodes if self.left[n] == 0]:
             self.deps_done(n)
-        for g in range(N_Q):
-            self.push(0.0, self.ENT, g)
+        if PART > 0:
+            for k in range(RESIDENT):
+                self.push(0.0, self.LAUNCH, k)
+        else:
+            for g in range(N_Q):
+                self.push(0.0, self.ENT, g)
         while self.ev:
             t, kind, _, x = heapq.heappop(self.ev)
-            if kind == self.ENT:
+            if kind == self.LAUNCH:
+                self.launch(x, t)
+            elif kind == self.ENT:
                 self.try_enter(x, t)
             elif kind == self.REL:
                 g = gof(x)
@@ -277,7 +326,9 @@ class Run:
                     self.left[s] -= 1
                     if self.left[s] == 0:
                         self.deps_done(s)
-            else:
+                if PART > 0:
+                    self.finished(x, t)
+            elif PART == 0:
                 self.pos[gof(x)] -= blocks(x)
                 self.try_enter(gof(x), t)
         return max(self.done.values())
@@ -285,6 +336,18 @@ class Run:
 
 spans = [Run(seed).run() for seed in range(SEEDS)]
 cross = sum(1 for n in real_nodes for d in named[n] if gof(d) != gof(n))
+if PART > 0:
+    # A producer in the same chunk is one range of chunk-wide positions however many
+    # silos ran it; one in an earlier chunk has finished by the launch.
+    per_piece = [len({d[1] for d in named[n] if part_of(d) == part_of(n)}) for n in real_nodes]
+    slots = defaultdict(int)
+    for n in real_nodes:
+        slots[(part_of(n), gof(n))] += blocks(n) * sum(1 for k in info[n[1]][0] if k >= 0)
+    print(
+        f"chunks={len({part_of(n) for n in real_nodes})} producers per task: max {max(per_piece)}, "
+        f"over 4 {sum(1 for x in per_piece if x > 4)} of {len(per_piece)}; "
+        f"tasks resident per silo per chunk: max {max(slots.values())}"
+    )
 print(
     f"{sum(spans) / len(spans) / 1e3:.3f} ms  W={W:g} ORDER={ORDER} H_IN={H_IN} H_N={H_N} PRED={PRED} "
     f"SPLIT_MIN={SPLIT_MIN:g} EDGE={EDGE} C={C} RETIRE_US={RETIRE_US} ENTER_US={ENTER_US}  "
