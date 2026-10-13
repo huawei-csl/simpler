@@ -16,10 +16,12 @@ No manager stands on any hop. The manager still has to hand the fabric every tas
 once, so tasks enter in submission order at a fixed rate.
 
 The GroupQueue's structure can be switched on: four controllers of six clusters
-(cluster `c` belongs to controller `c % 4`, as in M2), a hop costing `H_IN` inside
-a controller and `H_X` across one, and a task confined to the controller its last
-producer finished on unless its blocks may span controllers. A task whose blocks
-ran on more than one controller finishes in none, so every consumer pays `H_X`.
+(cluster `c` belongs to controller `c % 4`, as in M2), and a task confined to the
+controller its last producer finished on unless its blocks may span controllers. A
+block may start on a controller `H_IN` after a producer that finished there and
+`H_X` after one that finished anywhere else, so a block free to span weighs a
+nearby core against an earlier one. A task whose blocks ran on more than one
+controller finishes in none, so every consumer pays `H_X`.
 
 Inputs are the round's `deps.json` and a swimlane naming the tasks the simulator
 actually ran -- dispatch predicates retire the rest inline. The numbers below are
@@ -48,8 +50,8 @@ startup):
 | ------ | -------- | -------- |
 | today's hop on the whole chip (~ M0) | 30.66 ms | |
 | 4 controllers, wide tasks confined (either kind of cross hop) | 51.61 ms | +68 % |
-| wide tasks span controllers, cross hops via the manager | 29.25 ms | -4.6 % |
-| wide tasks span, cross hops in hardware at 0.8 us | 26.40 ms | **-13.9 %** |
+| wide tasks span controllers, cross hops via the manager | 28.73 ms | -6.3 % |
+| wide tasks span, cross hops in hardware at 0.8 us | 26.34 ms | **-14.1 %** |
 | ideal fabric: whole chip, every hop 0.45 us | 26.05 ms | -15.0 % |
 
 **Both changes are needed.** Confinement is the dominant term: 330 of the
@@ -58,11 +60,18 @@ run them in up to six times the waves, so a hardware cross hop alone changes
 nothing. Letting a wide task span controllers removes that, but its consumers
 then wait for a completion no single controller sees, so most of the hop saving
 needs a chip-wide completion signal as well. With both, the GroupQueue gets within
-1.5 % of the ideal fabric.
+1.1 % of the ideal fabric.
 
 **The cross-controller hop has a budget.** With both changes, a cross hop of
-0.45, 0.8, 1.5 and 2.5 us gives 26.05, 26.40, 27.08 and 28.07 ms: under ~1.5 us
-it keeps most of the win (-12 % or better), and by 2.5 us it is down to -8 %.
+0.45, 0.8, 1.5 and 2.5 us gives 26.05, 26.34, 26.89 and 27.73 ms: under ~1.5 us
+it keeps most of the win (-12 % or better), and by 2.5 us it is down to -10 %.
+
+**Four comparators are enough; leaving predicates with the manager is not
+free.** With both changes, a held task that may name at most four unfinished
+producers -- the manager resolving the rest -- gives 26.44 ms (-13.8 %). A task
+its dispatch predicate retires costs nothing above; if the manager still
+evaluates every predicate, each path through one pays a manager hop, and the win
+falls to 27.01 ms (-11.9 %), or 27.14 ms (-11.5 %) with four comparators as well.
 
 **paged_attention is indifferent.** Every variant lands at 11.0-11.3 ms: it is
 bound by how fast the manager hands tasks over, which none of these changes touch.
@@ -71,6 +80,13 @@ bound by how fast the manager hands tasks over, which none of these changes touc
 
 - Placement is greedy with perfect knowledge of every core, and blocks of one task
   start in parallel; a real controller pays something for both.
+- Every task is handed over in submission order and held without limit. That order
+  is costly to honour: a task submitted late but needed early forces everything
+  before it in, so on deepseek_v4 the fabric would hold ~3,000 tasks (~23,000
+  blocks) at once. Fed one dependency level ahead -- a task enters when its last
+  producer starts -- it holds at most 13 tasks (99 blocks) waiting, and at most 7
+  of a task's producers are unfinished when it enters. Both figures come from the
+  start and end times of one draw of the both-changes schedule.
 - A task's controller is where its last producer finished. A different affinity
   rule changes how many hops cross controllers, and so the value of the second
   change.
@@ -83,7 +99,8 @@ bound by how fast the manager hands tasks over, which none of these changes touc
 ```bash
 python docs/asim/analyzers/asim_oracle.py <deps.json> <chip_swimlane_records.json> <calib>
 # DRAW=0 uses plain means, RATE the hand-over rate, VARIANTS a JSON list of
-# [name, whole_chip, h_in_us, h_x_us, spread]
+# [name, whole_chip, h_in_us, h_x_us, spread] with optionally the producers a
+# held task can name (null = any) and the hop a predicate-retired task adds
 ```
 
 deepseek_v4's `deps.json` comes from a dep-gen round of the expanded

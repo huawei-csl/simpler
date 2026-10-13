@@ -18,17 +18,21 @@ which is what the manager has to sustain to hand the fabric every task once.
 
 The GroupQueue structure is modelled too: four controllers of six clusters
 (cluster c belongs to controller c % 4, as in M2). A task runs on the controller
-its last producer finished on unless SPREAD lets its blocks take any cluster; a
-dependency costs H_IN inside a controller and H_X across one, and a task whose
-blocks ran on more than one controller finishes in none, so every consumer pays
-H_X for it.
+its last producer finished on unless SPREAD lets its blocks take any cluster. A
+block may start on a controller H_IN after a producer that finished there and H_X
+after one that finished anywhere else, so a spread block weighs a nearby core
+against an earlier one. A task whose blocks ran on more than one controller
+finishes in none, so every consumer pays H_X for it.
 
   usage: asim_oracle.py <deps.json> <swimlane.json> <calib>
 The swimlane names the tasks the simulator actually ran: dispatch predicates
 retire the rest inline, and those are zero-length nodes here. Env: DRAW=0 uses
 the plain means, RATE (default 6) the hand-over rate, SEEDS the draws averaged,
 VARIANTS a JSON list of [name, whole_chip, h_in_us, h_x_us, spread] to run
-instead of the default ladder.
+instead of the default ladder. A variant may add two fields: how many unfinished
+producers a held task can name (null for any number; the manager resolves the
+rest, a MANAGER_HOP_US after them), and the hop a predicate-retired task adds
+between its producers and its consumers (us, default 0).
 """
 
 import heapq
@@ -62,6 +66,8 @@ for e in deps["edges"]:
 ids = sorted(set(info) | set(preds) | set(succs))
 order = {i: n for n, i in enumerate(ids)}
 N_CL, N_Q = 24, 4
+# Silicon's median producer-end to consumer-start gap on deepseek_v4's critical path.
+MANAGER_HOP_US = 3.7
 
 
 def shape(k):
@@ -86,20 +92,30 @@ class Cores:
             return m
         return max(0.001, m + sigma[fid] * sum(self.rng.uniform(-1.0, 1.0) for _ in range(3)))
 
-    def place(self, kernels, sh, release, clusters):
-        """Start one block on the first free cores of its type; return (end, cluster)."""
+    def place(self, kernels, sh, rel, clusters):
+        """Start one block where it can start soonest; return (end, cluster).
+
+        rel[q] is when the block may start on controller q's cores.
+        """
         if sh == "aic":
-            c = min(clusters, key=lambda x: self.aic[x])
-            st = max(release, self.aic[c])
+            c = min(clusters, key=lambda x: (max(rel[x % N_Q], self.aic[x]), self.aic[x]))
+            st = max(rel[c % N_Q], self.aic[c])
             self.aic[c] = st + self.dur(kernels[0])
             return self.aic[c], c
         if sh == "aiv":
-            v = min((2 * c + j for c in clusters for j in (0, 1)), key=lambda x: self.aiv[x])
-            st = max(release, self.aiv[v])
+            v = min(
+                (2 * c + j for c in clusters for j in (0, 1)),
+                key=lambda x: (max(rel[(x // 2) % N_Q], self.aiv[x]), self.aiv[x]),
+            )
+            st = max(rel[(v // 2) % N_Q], self.aiv[v])
             self.aiv[v] = st + self.dur(kernels[1] if kernels[1] >= 0 else kernels[2])
             return self.aiv[v], v // 2
-        c = min(clusters, key=lambda x: max(self.aic[x], self.aiv[2 * x], self.aiv[2 * x + 1]))
-        st = max(release, self.aic[c], self.aiv[2 * c], self.aiv[2 * c + 1])
+
+        def free(x):
+            return max(self.aic[x], self.aiv[2 * x], self.aiv[2 * x + 1])
+
+        c = min(clusters, key=lambda x: (max(rel[x % N_Q], free(x)), free(x)))
+        st = max(rel[c % N_Q], free(c))
         end = st
         for slot, core in ((0, None), (1, 2 * c), (2, 2 * c + 1)):
             if kernels[slot] < 0:
@@ -113,13 +129,13 @@ class Cores:
         return end, c
 
 
-def run_task(cores, task, release, q, chip, spread):
+def run_task(cores, task, rel, q, chip, spread):
     """Run every block of one task; return (end, the controller it finished in or -1)."""
     kernels, nb = info[task]
     clusters = range(N_CL) if (chip or spread) else [c for c in range(N_CL) if c % N_Q == q]
-    end, last_q, used = release, q, set()
+    end, last_q, used = 0.0, q, set()
     for _ in range(max(1, nb)):
-        e, c = cores.place(kernels, shape(kernels), release, clusters)
+        e, c = cores.place(kernels, shape(kernels), rel, clusters)
         used.add(c % N_Q)
         if e >= end:
             end, last_q = e, c % N_Q
@@ -128,37 +144,45 @@ def run_task(cores, task, release, q, chip, spread):
     return end, (last_q if len(used) == 1 else -1)
 
 
-def release_of(s, done, where, chip, h_in, h_x):
-    """When consumer s may start, and the controller its last producer finished in."""
+def release_of(s, done, where, chip, h_in, h_x, names):
+    """When consumer s may start on each controller, and where its last producer finished."""
     last = max(preds[s], key=lambda p: done[p])
     qs = where[last]
     if s not in ran:
-        return max(done[p] for p in preds[s]), qs
-    return max(done[p] + (h_in if (chip or (where[p] == qs and qs >= 0)) else h_x) for p in preds[s]), qs
+        return [max(done[p] for p in preds[s])] * N_Q, qs
+    rel = [max(done[p] + (h_in if (chip or where[p] == q) else h_x) for p in preds[s]) for q in range(N_Q)]
+    if names is not None and len(preds[s]) > names:
+        resolved = sorted(done[p] for p in preds[s])[len(preds[s]) - names - 1] + MANAGER_HOP_US
+        rel = [max(r, resolved) for r in rel]
+    return rel, qs
 
 
-def run(chip, h_in, h_x, spread, seed):
+def run(chip, h_in, h_x, spread, seed, names=None, pred_hop=0.0):
     cores = Cores(random.Random(seed))
     left = {i: len(preds[i]) for i in ids}
-    done, where = {}, {}
+    done, where, rel = {}, {}, {}
 
     def avail(i):
         return order[i] / RATE if RATE > 0 else 0.0
 
     ready = []
     for n, i in enumerate(i for i in ids if left[i] == 0):
+        rel[i] = [avail(i)] * N_Q
         heapq.heappush(ready, (avail(i), i, n % N_Q))
     while ready:
         r, i, q = heapq.heappop(ready)
+        rq = rel.pop(i)
         if i in ran and i in info:
-            done[i], where[i] = run_task(cores, i, r, q, chip, spread)
+            done[i], where[i] = run_task(cores, i, rq, q, chip, spread)
         else:
-            done[i], where[i] = r, q
+            done[i], where[i] = (r + pred_hop if preds[i] else r), q
         for s in succs[i]:
             left[s] -= 1
             if left[s] == 0:
-                rel, qs = release_of(s, done, where, chip, h_in, h_x)
-                heapq.heappush(ready, (max(avail(s), rel), s, qs if qs >= 0 else order[s] % N_Q))
+                at, qs = release_of(s, done, where, chip, h_in, h_x, names)
+                qs = qs if qs >= 0 else order[s] % N_Q
+                rel[s] = [max(avail(s), x) for x in at]
+                heapq.heappush(ready, (min(rel[s]) if (chip or spread) else rel[s][qs], s, qs))
     return max(done.values())
 
 
@@ -172,6 +196,6 @@ VARIANTS = [
 ]
 if os.environ.get("VARIANTS"):
     VARIANTS = [tuple(v) for v in json.loads(os.environ["VARIANTS"])]
-for name, chip, h_in, h_x, spread in VARIANTS:
-    vals = [run(chip, h_in, h_x, spread, s) for s in range(SEEDS)]
+for name, chip, h_in, h_x, spread, *extra in VARIANTS:
+    vals = [run(chip, h_in, h_x, spread, s, *extra) for s in range(SEEDS)]
     print(f"{sum(vals) / len(vals) / 1e3:7.3f} ms  {name}")
