@@ -290,6 +290,25 @@ static inline void rt_group_end() {
     rt->ops->group_end(rt);
 }
 
+/**
+ * Feed every task submitted from here on to a silo.
+ *
+ * A silo is one controller and the cores it serves. A task fed to one waits there
+ * for its producers wherever they were fed, so its start does not wait for an
+ * AICPU to see them finish. A task of at least TASK_SILO_SPREAD_MIN_BLOCKS blocks
+ * is split by block range across every silo; a narrower one runs in the silo of
+ * its latest producer that has one. A task with a dispatch predicate or a
+ * sync-start cohort keeps the ordinary path. A runtime without silos ignores the
+ * declaration, so the same graph runs unchanged on one that has none.
+ */
+static inline void rt_declare_silos() {
+    RuntimeContext *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->declare_silos == nullptr) {
+        return;
+    }
+    rt->ops->declare_silos(rt);
+}
+
 static inline void rt_orchestration_done() {
     rt_graph_commit();
     rt_submit_phase_state() = RtSubmitPhaseState{};

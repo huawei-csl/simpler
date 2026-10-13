@@ -35,6 +35,7 @@ uint64_t g_queue_poll_ticks = 0;   // one read of that register
 uint64_t g_mix_push_ticks = 0;     // controller's per-entry push of a mix group
 uint64_t g_mix_arrival_ticks = 0;  // controller -> core, per mix entry
 uint64_t g_cancel_ticks = 0;       // controller -> core, one way, for a cancellation
+uint64_t g_peer_link_ticks = 0;    // a queue's completion -> legible to another queue
 
 std::vector<uint64_t> g_func_compute_ticks;        // index = func_id, value = mean compute ticks
 std::vector<uint64_t> g_func_compute_sigma_ticks;  // index = func_id, value = compute stddev ticks
@@ -59,6 +60,22 @@ struct alignas(64) SimLedger {
     int32_t func_max = -1;
 };
 SimLedger g_ledger[SIM_MAX_QUEUES];
+
+// What each queue publishes for its peers: the instant each of its positions
+// becomes legible, on the real clock, which a peer converts to its own. A slot is
+// keyed by the position it holds and the run that wrote it. Positions are issued
+// within SIM_AHEAD_HORIZON of the watermark, so a slot is taken over only once the
+// position it held has long finished -- which is what a reader that finds a later
+// position there may conclude.
+constexpr uint32_t SIM_PUB_SLOTS = 2 * SIM_AHEAD_HORIZON;
+constexpr uint64_t SIM_PUB_POS_MASK = (1ULL << 40) - 1;
+struct SimPub {
+    std::atomic<uint64_t> tag{0};
+    std::atomic<uint64_t> real{0};
+};
+std::unique_ptr<SimPub[]> g_pub;
+uint64_t g_pub_epoch = 0;
+bool g_pub_on = false;
 
 // Register backing, written only at bring-up: the handshake reads each core's
 // COND to see an initialised, idle fabric. Nothing reads it afterwards, because
@@ -207,8 +224,30 @@ struct SimPackage {
 // table can name it.
 struct SimHeld {
     SimQueueEntryStore e;
-    uint64_t seq;        // admission order, which is the order held entries are placed in
-    uint32_t remaining;  // producers that have not finished
+    uint64_t seq;  // admission order, which is the order held entries are placed in
+    uint32_t ds;   // the dependency set it waits on
+};
+
+// A range of another queue's positions a dependency set waits on: `next` is the
+// first not yet seen published.
+struct SimPeerDep {
+    uint64_t next;
+    uint64_t end;
+    uint32_t queue;
+};
+
+// What held entries admitted together wait on. Every slot carries its own
+// comparators in hardware, but entries submitted for the same producers all fire
+// at once, so one record answers for all of them.
+struct SimDepSet {
+    uint32_t members = 0;    // hold slots waiting on this set
+    uint32_t remaining = 0;  // this queue's positions that have not finished
+    uint32_t peer_n = 0;
+    uint32_t peer_open = 0;  // ranges in other queues not yet wholly published
+    SimPeerDep peer[SIM_HELD_MAX_DEPS] = {};
+    uint64_t local_at = 0;             // when the last of this queue's positions finished
+    uint64_t peer_at = 0;              // when the last peer position became legible here
+    uint64_t release_at = UINT64_MAX;  // a release timed on a peer's completion
 };
 
 // Held entries are tracked in 32-bit masks, one bit per slot.
@@ -300,6 +339,30 @@ struct alignas(64) SimQueue {
     uint32_t held_n = 0;
     uint64_t held_seq = 0;
 
+    // Dependency sets: one per admission, named by each entry it admitted. A set
+    // lives while any of its entries is held, so there are never more than slots.
+    SimDepSet deps[SIM_HELD_CAP] = {};
+    uint32_t deps_used = 0;
+    uint32_t deps_peer_open = 0;  // sets still reading a peer's publications
+    uint32_t deps_armed = 0;      // sets whose release is timed on a peer's completion
+    // How far this queue's events have been replayed. A peer completion learned only
+    // after the replay passed it is placed here, late, rather than in the past.
+    uint64_t replayed_to = 0;
+    // Finishes recorded, and how many the manager had retired from at its last
+    // status_consumed(): a replay a submit ran, or a read made only to size a
+    // dispatch, records finishes the manager has not yet retired.
+    uint64_t finishes = 0;
+    uint64_t finishes_read = 0;
+    uint64_t peer_published = 0;
+    uint64_t peer_resolved = 0;
+    uint64_t peer_timed = 0;
+    uint64_t peer_late = 0;
+    uint64_t peer_late_ticks = 0;
+    // Admissions whose named producers had all become legible here before the
+    // entries arrived, and by how long in all: what feeding behind execution cost.
+    uint64_t admit_late = 0;
+    uint64_t admit_late_ticks = 0;
+
     // Cohort members placed on this queue's cores and not yet started, and how many
     // members over the run had to sit behind running work rather than on an idle
     // core -- a manager offers a cohort only cores it holds idle, so that count
@@ -310,6 +373,7 @@ struct alignas(64) SimQueue {
     // doorbell has not been taken. Zero lets an access skip the doorbell check.
     uint32_t belled_outstanding = 0;
     uint64_t bells_taken = 0;
+    // Dependency sets waiting on each of this queue's positions, keyed by position.
     uint32_t held_waiters[SIM_HELD_WAIT_SLOTS] = {};
     uint32_t held_high = 0;
     uint64_t held_admitted = 0;
@@ -428,6 +492,18 @@ struct alignas(64) SimQueue {
 
 SimQueue g_queues[SIM_MAX_QUEUES];
 
+// Publish, for the peers, when position `index` of this queue becomes legible.
+void publish(SimQueue &q, uint64_t index, uint64_t legible_at) {
+    if (!g_pub_on || index == UINT64_MAX) {
+        return;
+    }
+    const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
+    SimPub &p = g_pub[qi * SIM_PUB_SLOTS + (index & (SIM_PUB_SLOTS - 1))];
+    p.real.store(legible_at + g_ledger[qi].overrun_ticks, std::memory_order_relaxed);
+    p.tag.store((g_pub_epoch << 40) | ((index + 1) & SIM_PUB_POS_MASK), std::memory_order_release);
+    ++q.peer_published;
+}
+
 // Which queue this is. A controller needs its own index to tag the work it places,
 // so a completion can be published to the queue that owns the position.
 // xorshift64: 3 shifts + 3 xors, cheap enough to hide inside a modeled latency.
@@ -491,16 +567,34 @@ uint64_t sample_compute_ticks(SimQueue &q, int32_t func_id) {
     return static_cast<uint64_t>(dur);
 }
 
-// A producer has finished: count it off every held entry waiting on it.
-void wake_held(SimQueue &q, uint64_t index) {
+// Every producer of set `s` has finished, the last reaching this queue at the
+// later of its own and its peers' instants. Its entries are placeable at once if
+// that is no later than `now`, else on a release timed for that instant.
+void settle(SimQueue &q, uint32_t s, uint64_t now) {
+    SimDepSet &d = q.deps[s];
+    const uint64_t at = d.local_at > d.peer_at ? d.local_at : d.peer_at;
+    if (at <= now) {
+        q.held_ready |= d.members;
+        return;
+    }
+    d.release_at = at;
+    q.deps_armed |= 1u << s;
+}
+
+// A producer has finished at `at`: count it off every set waiting on it.
+void wake_held(SimQueue &q, uint64_t index, uint64_t at) {
     uint32_t &slot = q.held_waiters[index & (SIM_HELD_WAIT_SLOTS - 1)];
     uint32_t m = slot;
     slot = 0;
     while (m != 0) {
         const uint32_t s = static_cast<uint32_t>(__builtin_ctz(m));
         m &= m - 1;
-        if (--q.held[s].remaining == 0) {
-            q.held_ready |= 1u << s;
+        SimDepSet &d = q.deps[s];
+        if (--d.remaining == 0) {
+            d.local_at = at;
+            if (d.peer_open == 0) {
+                settle(q, s, at);
+            }
         }
     }
 }
@@ -512,11 +606,12 @@ void wake_held(SimQueue &q, uint64_t index) {
 // The advance walks the run of completions the prefix now absorbs, clearing each
 // as the head passes it, and moves the head by one more than the run -- the extra
 // step being the watermark's own position, which the window does not store.
-void mark_queue_done(SimQueue &q, uint64_t index) {
+void mark_queue_done(SimQueue &q, uint64_t index, uint64_t at) {
     if (index == UINT64_MAX || index < q.watermark) {
         return;
     }
-    wake_held(q, index);
+    ++q.finishes;
+    wake_held(q, index, at);
     if (index > q.watermark) {
         const uint64_t off = index - q.watermark - 1;
         if (off >= SIM_AHEAD_HORIZON) {
@@ -654,6 +749,7 @@ void commit(
     if (legible_at < q.next_event) {
         q.next_event = legible_at;
     }
+    publish(q, e.index[part], legible_at);
 }
 
 // Whether a package can seat a mix group: every one of its three cores must have
@@ -839,6 +935,7 @@ void place_stolen(SimQueue &q, uint32_t core_slot, uint64_t index, uint64_t dur,
     if (legible_at < q.next_event) {
         q.next_event = legible_at;
     }
+    publish(q, index, legible_at);
 }
 
 // Take the pipelined task off a core whose cancellation succeeded. The core keeps
@@ -992,6 +1089,12 @@ void promote_held(SimQueue &q, uint64_t at) {
             q.held_used &= ~(1u << s);
             --q.held_n;
             ++q.held_promoted;
+            SimDepSet &d = q.deps[h.ds];
+            d.members &= ~(1u << s);
+            if (d.members == 0) {
+                q.deps_used &= ~(1u << h.ds);
+                d = SimDepSet{};
+            }
         }
     }
 }
@@ -1032,7 +1135,7 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
         q.finish_at[c.index[0] & (SIM_FINISH_TS_SLOTS - 1)] = c.finish[0];
     }
 #endif
-    mark_queue_done(q, c.index[0]);
+    mark_queue_done(q, c.index[0], due_at);
     // The producers that have finished are now recorded, so anything held for
     // them can be placed -- before the core below is refreshed, so a core freed
     // by this same retirement can take it in the same step.
@@ -1067,7 +1170,61 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
 // something due inside the interval -- the task pipelined behind the one that
 // ended, or one placed on a core it freed -- and only then is it read again.
 // Placing lowers `next_event`, which is how such an end shows itself.
+// Place the entries of a set whose release was timed on a peer's completion.
+void fire_release(SimQueue &q, uint32_t s) {
+    SimDepSet &d = q.deps[s];
+    const uint64_t at = d.release_at;
+    d.release_at = UINT64_MAX;
+    q.deps_armed &= ~(1u << s);
+    q.held_ready |= d.members;
+    ++q.peer_timed;
+    promote_held(q, at);
+    dispatch_pending(q, at);
+}
+
+// Retire and release everything due by `upto` when releases are timed on a peer:
+// the two kinds of event are replayed together, earliest first, so a release lands
+// between the retirements around it exactly as the hardware would see it.
+void replay_with_releases(SimQueue &q, uint64_t upto) {
+    for (;;) {
+        uint32_t core = UINT32_MAX;
+        uint64_t core_at = UINT64_MAX;
+        for (uint32_t i = 0; i < q.core_count; ++i) {
+            if (q.evt_at[i] < core_at) {
+                core_at = q.evt_at[i];
+                core = i;
+            }
+        }
+        uint32_t set = UINT32_MAX;
+        uint64_t rel_at = UINT64_MAX;
+        for (uint32_t m = q.deps_armed; m != 0; m &= m - 1) {
+            const uint32_t t = static_cast<uint32_t>(__builtin_ctz(m));
+            if (q.deps[t].release_at < rel_at) {
+                rel_at = q.deps[t].release_at;
+                set = t;
+            }
+        }
+        if (core_at > upto && rel_at > upto) {
+            break;
+        }
+        if (rel_at < core_at) {
+            fire_release(q, set);
+            continue;
+        }
+        q.next_event = UINT64_MAX;
+        retire_core(q, core, core_at, upto);
+    }
+    refresh_next_event(q);
+}
+
 void retire_due(SimQueue &q, uint64_t upto) {
+    if (upto > q.replayed_to) {
+        q.replayed_to = upto;
+    }
+    if (q.deps_armed != 0) {
+        replay_with_releases(q, upto);
+        return;
+    }
     if (q.next_event > upto) {
         return;
     }
@@ -1078,6 +1235,10 @@ void retire_due(SimQueue &q, uint64_t upto) {
         const uint32_t core = due[k++];
         q.next_event = UINT64_MAX;
         retire_core(q, core, q.evt_at[core], upto);
+        if (q.deps_armed != 0) {
+            replay_with_releases(q, upto);
+            return;
+        }
         if (q.next_event <= upto || q.evt_at[core] <= upto) {
             n = collect_due(q, upto, due);
             k = 0;
@@ -1209,6 +1370,168 @@ void finish_push(SimQueue &q, uint32_t queue_idx, const Access &a) {
     ++q.push_calls;
 }
 
+// Read what queue `p.queue` has published for range `p`, from where the last read
+// stopped. Returns true once every position in it is known; `at` takes the latest
+// instant one of them becomes legible here. A slot holding a later position than
+// the one sought means the sought one finished long before, which needs no time.
+bool read_peer(uint32_t qi, SimPeerDep &p, uint64_t &at) {
+    const uint64_t ofs = g_ledger[qi].overrun_ticks;
+    while (p.next < p.end) {
+        SimPub &pub = g_pub[p.queue * SIM_PUB_SLOTS + (p.next & (SIM_PUB_SLOTS - 1))];
+        const uint64_t want = (g_pub_epoch << 40) | ((p.next + 1) & SIM_PUB_POS_MASK);
+        const uint64_t tag = pub.tag.load(std::memory_order_acquire);
+        if (tag == want) {
+            const uint64_t real = pub.real.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (pub.tag.load(std::memory_order_relaxed) == want) {
+                const uint64_t here = (real > ofs ? real - ofs : 0) + g_peer_link_ticks;
+                if (here > at) {
+                    at = here;
+                }
+            }
+        } else if ((tag >> 40) != g_pub_epoch || (tag & SIM_PUB_POS_MASK) < (want & SIM_PUB_POS_MASK)) {
+            return false;
+        }
+        ++p.next;
+    }
+    return true;
+}
+
+// Learn what peers have published for every set still waiting on one. A set
+// whose producers have then all finished is settled at the replay's edge: one
+// whose last producer became legible behind it is placed there, and counted late.
+void resolve_peers(SimQueue &q, uint32_t qi) {
+    if (q.deps_peer_open == 0) {
+        return;
+    }
+    bool ready = false;
+    for (uint32_t open = q.deps_peer_open; open != 0; open &= open - 1) {
+        const uint32_t s = static_cast<uint32_t>(__builtin_ctz(open));
+        SimDepSet &d = q.deps[s];
+        for (uint32_t i = 0; i < d.peer_n; ++i) {
+            SimPeerDep &p = d.peer[i];
+            if (p.next < p.end && read_peer(qi, p, d.peer_at)) {
+                --d.peer_open;
+                ++q.peer_resolved;
+            }
+        }
+        if (d.peer_open != 0) {
+            continue;
+        }
+        q.deps_peer_open &= ~(1u << s);
+        if (d.remaining != 0) {
+            continue;
+        }
+        const uint64_t at = d.local_at > d.peer_at ? d.local_at : d.peer_at;
+        if (at < q.replayed_to) {
+            ++q.peer_late;
+            q.peer_late_ticks += q.replayed_to - at;
+        }
+        settle(q, s, q.replayed_to);
+        ready = ready || (q.held_ready & d.members) != 0;
+    }
+    if (ready) {
+        promote_held(q, q.replayed_to);
+        dispatch_pending(q, q.replayed_to);
+    }
+}
+
+// Admit `n` entries that wait on one set of producers. Each takes a hold slot. A
+// range in this queue is waited for position by position; one in another queue is
+// read from what that queue publishes. Returns false, admitting nothing, when the
+// hold slots or comparators would not cover the request -- a manager sizes its
+// intake by the room the queue reports, so that is a fault rather than
+// back-pressure, and it is counted.
+bool admit_held(
+    SimQueue &q, uint32_t qi, const SimQueueEntryStore *es, uint32_t n, const SimDep *deps, uint32_t dep_n,
+    uint64_t arrive_at
+) {
+    if (n == 0 || dep_n > SIM_HELD_MAX_DEPS || q.held_n + n > SIM_HELD_CAP || q.deps_used == UINT32_MAX) {
+        ++q.held_refused;
+        return false;
+    }
+    const uint32_t s = static_cast<uint32_t>(__builtin_ctz(~q.deps_used));
+    q.deps_used |= 1u << s;
+    SimDepSet &d = q.deps[s];
+    d = SimDepSet{};
+    for (uint32_t i = 0; i < dep_n; ++i) {
+        const SimDep &dep = deps[i];
+        if (dep.queue == qi) {
+            // The manager named these from its own view, which lags the
+            // controller's: any may have finished while this call was in flight,
+            // and those are not waited for. A position named twice is waited for
+            // once.
+            for (uint64_t pos = dep.first; pos < dep.first + dep.count; ++pos) {
+                if (position_done(q, pos)) {
+                    continue;
+                }
+                uint32_t &w = q.held_waiters[pos & (SIM_HELD_WAIT_SLOTS - 1)];
+                if ((w & (1u << s)) == 0) {
+                    w |= 1u << s;
+                    ++d.remaining;
+                }
+            }
+        } else if (dep.queue < SIM_MAX_QUEUES && dep.count > 0 && d.peer_n < SIM_HELD_MAX_DEPS) {
+            SimPeerDep &p = d.peer[d.peer_n++];
+            p = SimPeerDep{dep.first, dep.first + dep.count, dep.queue};
+            if (read_peer(qi, p, d.peer_at)) {
+                ++q.peer_resolved;
+            } else {
+                ++d.peer_open;
+            }
+        }
+    }
+    if (d.peer_open != 0) {
+        q.deps_peer_open |= 1u << s;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t slot = static_cast<uint32_t>(__builtin_ctz(~q.held_used));
+        SimHeld &h = q.held[slot];
+        h.e = es[i];
+        // Legible to the controller once the posted store completes, the same
+        // arrival every submitted entry pays; nothing can be placed before that.
+        h.e.enqueued_at = arrive_at;
+        h.seq = q.held_seq++;
+        h.ds = s;
+        q.held_used |= 1u << slot;
+        d.members |= 1u << slot;
+        ++q.held_n;
+        ++q.held_admitted;
+    }
+    if (q.held_n > q.held_high) {
+        q.held_high = q.held_n;
+    }
+    if (d.remaining == 0 && d.peer_open == 0) {
+        // When the producers this queue named became legible here: its own from what
+        // it published, a peer's as resolved above. A set ready before its entries
+        // arrived was fed behind execution.
+        if (dep_n > 0 && g_pub_on) {
+            uint64_t ready = d.peer_at;
+            const uint64_t ofs = g_ledger[qi].overrun_ticks;
+            for (uint32_t i = 0; i < dep_n; ++i) {
+                if (deps[i].queue != qi) continue;
+                for (uint64_t pos = deps[i].first; pos < deps[i].first + deps[i].count; ++pos) {
+                    const SimPub &pub = g_pub[qi * SIM_PUB_SLOTS + (pos & (SIM_PUB_SLOTS - 1))];
+                    if (pub.tag.load(std::memory_order_relaxed) != ((g_pub_epoch << 40) | ((pos + 1) & SIM_PUB_POS_MASK))) {
+                        continue;
+                    }
+                    const uint64_t real = pub.real.load(std::memory_order_relaxed);
+                    const uint64_t here = real > ofs ? real - ofs : 0;
+                    if (here > ready) ready = here;
+                }
+            }
+            if (ready < arrive_at) {
+                ++q.admit_late;
+                q.admit_late_ticks += arrive_at - ready;
+            }
+        }
+        settle(q, s, arrive_at);
+    }
+    promote_held(q, arrive_at);
+    dispatch_pending(q, arrive_at);
+    return true;
+}
+
 }  // namespace
 
 namespace {
@@ -1272,6 +1595,7 @@ void take_bells(SimQueue &q, uint32_t queue_idx) {
             const uint64_t released = lands + g_link_ticks;
             const uint64_t from = c.bell_ready[k] > released ? c.bell_ready[k] : released;
             c.finish[k] = from + g_pickup_ticks + c.gated_dur[k];
+            publish(q, c.index[k], c.finish[k] + g_fin_ticks + g_link_ticks);
             c.bell_core[k] = SIM_NO_BELL;
             --c.gated_count;
             --q.belled_outstanding;
@@ -1318,6 +1642,9 @@ void configure(uint64_t reg_base, uint32_t num_cores) {
         g_bells = std::make_unique<SimBell[]>(num_cores);
         g_bell_count = num_cores;
     }
+    if (!g_pub) {
+        g_pub = std::make_unique<SimPub[]>(static_cast<size_t>(SIM_MAX_QUEUES) * SIM_PUB_SLOTS);
+    }
 }
 
 void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint64_t notice_ns) {
@@ -1335,6 +1662,7 @@ void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint6
     g_link_ticks = ns_to_ticks(SIM_GQ_CORE_LINK_NS);
     g_core_poll_ticks = ns_to_ticks(SIM_CORE_POLL_NS);
     g_arrive_ticks = ns_to_ticks(SIM_QUEUE_ARRIVAL_NS);
+    g_peer_link_ticks = ns_to_ticks(SIM_GQ_PEER_LINK_NS);
 }
 
 void set_queue_latencies_ns(uint64_t report_ns, uint64_t poll_ns) {
@@ -1360,6 +1688,9 @@ void set_compute_ns_table(
 }
 
 void init() {
+    // Every queue's positions start again from zero, so what an earlier run
+    // published names nothing in this one.
+    ++g_pub_epoch;
     for (uint32_t i = 0; i < SIM_MAX_QUEUES; ++i) {
         g_queues[i] = SimQueue{};
         // Distinct non-zero seed per queue; xorshift64 must never start at 0.
@@ -1468,58 +1799,168 @@ bool submit_grouped(
 ) {
     if (dep_n == 0) return submit(queue_idx, gq_index, func_id, parts, task_id, type, false);
     const Access a = begin_access(queue_idx, g_push_ticks);
-    const uint64_t deadline = a.release;
-    if (queue_idx >= SIM_MAX_QUEUES || type == SimTaskType::Empty || parts == 0) {
-        wait_until(deadline);
+    if (queue_idx >= SIM_MAX_QUEUES || type == SimTaskType::Empty || parts == 0 || dep_n > SIM_HELD_MAX_DEPS) {
+        if (queue_idx < SIM_MAX_QUEUES && dep_n > SIM_HELD_MAX_DEPS) ++g_queues[queue_idx].held_refused;
+        wait_until(a.release);
         return false;
     }
     SimQueue &q = g_queues[queue_idx];
-    if (dep_n > SIM_HELD_MAX_DEPS || q.held_n >= SIM_HELD_CAP) {
-        // Not back-pressure: the manager sizes its intake by `held_room`, so
-        // reaching here means that accounting is wrong. Reported, never absorbed --
-        // a silently dropped task waits forever and takes the run down with it.
-        ++q.held_refused;
-        wait_until(deadline);
+    SimQueueEntryStore e = {};
+    e.parts = parts > SIM_MIX_MAX_ENTRIES ? SIM_MIX_MAX_ENTRIES : parts;
+    for (uint32_t i = 0; i < e.parts; ++i) {
+        e.index[i] = gq_index[i];
+        e.func_id[i] = func_id[i];
+    }
+    e.task_id = task_id;
+    e.type = type;
+    SimDep deps[SIM_HELD_MAX_DEPS];
+    for (uint32_t i = 0; i < dep_n; ++i) {
+        deps[i] = SimDep{dep_index[i], 1, queue_idx};
+    }
+    // Not back-pressure when refused: the manager sizes its intake by
+    // `held_room`, so reaching here means that accounting is wrong. Reported,
+    // never absorbed -- a silently dropped task waits forever.
+    const bool ok = admit_held(q, queue_idx, &e, 1, deps, dep_n, a.at + g_arrive_ticks);
+    if (!ok) {
+        wait_until(a.release);
         return false;
     }
-    const uint32_t s = static_cast<uint32_t>(__builtin_ctz(~q.held_used));
-    SimHeld &h = q.held[s];
-    h.e = SimQueueEntryStore{};
-    h.e.parts = parts > SIM_MIX_MAX_ENTRIES ? SIM_MIX_MAX_ENTRIES : parts;
-    for (uint32_t i = 0; i < h.e.parts; ++i) {
-        h.e.index[i] = gq_index[i];
-        h.e.func_id[i] = func_id[i];
-    }
-    h.e.task_id = task_id;
-    h.e.type = type;
-    h.e.gated = false;
-    // Legible to the controller once the posted store completes, the same arrival
-    // every submitted entry pays; nothing can be placed before that.
-    h.e.enqueued_at = a.at + g_arrive_ticks;
-    h.seq = q.held_seq++;
-    // The manager named these from its own view, which lags the controller's: any
-    // of them may have retired while this call was in flight, and those are not
-    // waited for. A producer named twice is waited for once.
-    h.remaining = 0;
-    for (uint32_t i = 0; i < dep_n; ++i) {
-        if (position_done(q, dep_index[i])) continue;
-        uint32_t &w = q.held_waiters[dep_index[i] & (SIM_HELD_WAIT_SLOTS - 1)];
-        if ((w & (1u << s)) == 0) {
-            w |= 1u << s;
-            ++h.remaining;
-        }
-    }
-    q.held_used |= 1u << s;
-    if (h.remaining == 0) {
-        q.held_ready |= 1u << s;
-    }
-    ++q.held_n;
-    if (q.held_n > q.held_high) q.held_high = q.held_n;
-    ++q.held_admitted;
-    promote_held(q, h.e.enqueued_at);
-    dispatch_pending(q, h.e.enqueued_at);
     finish_push(q, queue_idx, a);
     return true;
+}
+
+bool submit_held(
+    uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, const SimTaskType *type, uint32_t n,
+    int32_t task_id, const SimDep *deps, uint32_t dep_n
+) {
+    const Access a = begin_access(queue_idx, g_push_ticks);
+    if (queue_idx >= SIM_MAX_QUEUES || n == 0 || n > SIM_HELD_CAP) {
+        wait_until(a.release);
+        return false;
+    }
+    SimQueue &q = g_queues[queue_idx];
+    // A manager that reads its queue only when there is something to report can
+    // submit while finishes are due and unreplayed; the controller sees them
+    // before it places what arrives, so bring the replay up to now first.
+    resolve_peers(q, queue_idx);
+    retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
+    SimQueueEntryStore es[SIM_HELD_CAP];
+    for (uint32_t i = 0; i < n; ++i) {
+        es[i] = SimQueueEntryStore{};
+        es[i].parts = 1;
+        es[i].index[0] = gq_index[i];
+        es[i].func_id[0] = func_id[i];
+        es[i].task_id = task_id;
+        es[i].type = type[i];
+    }
+    if (!admit_held(q, queue_idx, es, n, deps, dep_n, a.at + g_arrive_ticks)) {
+        wait_until(a.release);
+        return false;
+    }
+    finish_push(q, queue_idx, a);
+    return true;
+}
+
+void set_peer_forwarding(bool on) { g_pub_on = on && g_pub != nullptr; }
+
+void status_consumed(uint32_t queue_idx) {
+    if (queue_idx >= SIM_MAX_QUEUES) return;
+    SimQueue &q = g_queues[queue_idx];
+    q.finishes_read = q.finishes;
+}
+
+int describe_held(uint32_t queue_idx, char *buf, uint32_t cap) {
+    if (queue_idx >= SIM_MAX_QUEUES || buf == nullptr || cap == 0) return 0;
+    const SimQueue &q = g_queues[queue_idx];
+    const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
+    int n = snprintf(
+        buf, cap,
+        "wm=%llu next_event=%lld replayed=%lld now=%llu held_n=%u ready=%#x used=%#x sets=%#x open=%#x armed=%#x "
+        "rings=%u/%u",
+        static_cast<unsigned long long>(q.watermark),
+        q.next_event == UINT64_MAX ? -1LL : static_cast<long long>(q.next_event) - static_cast<long long>(now),
+        static_cast<long long>(q.replayed_to) - static_cast<long long>(now), static_cast<unsigned long long>(now),
+        q.held_n, q.held_ready, q.held_used, q.deps_used, q.deps_peer_open, q.deps_armed,
+        q.push[ring_of(SimTaskType::Cube)] - q.pop[ring_of(SimTaskType::Cube)],
+        q.push[ring_of(SimTaskType::Vector)] - q.pop[ring_of(SimTaskType::Vector)]
+    );
+    for (uint32_t m = q.deps_used; m != 0 && n > 0 && static_cast<uint32_t>(n) < cap; m &= m - 1) {
+        const uint32_t s = static_cast<uint32_t>(__builtin_ctz(m));
+        const SimDepSet &d = q.deps[s];
+        n += snprintf(
+            buf + n, cap - static_cast<uint32_t>(n), " | set%u mem=%#x rem=%u open=%u/%u rel=%lld local=%lld peer=%lld",
+            s, d.members, d.remaining, d.peer_open, d.peer_n,
+            d.release_at == UINT64_MAX ? -1LL : static_cast<long long>(d.release_at) - static_cast<long long>(now),
+            static_cast<long long>(d.local_at) - static_cast<long long>(now),
+            static_cast<long long>(d.peer_at) - static_cast<long long>(now)
+        );
+        for (uint32_t i = 0; i < d.peer_n && n > 0 && static_cast<uint32_t>(n) < cap; ++i) {
+            const SimPeerDep &p = d.peer[i];
+            const SimPub &pub = g_pub[p.queue * SIM_PUB_SLOTS + (p.next & (SIM_PUB_SLOTS - 1))];
+            const uint64_t tag = pub.tag.load(std::memory_order_relaxed);
+            n += snprintf(
+                buf + n, cap - static_cast<uint32_t>(n), " q%u[%llu,%llu) slot=%lld/e%llu", p.queue,
+                static_cast<unsigned long long>(p.next), static_cast<unsigned long long>(p.end),
+                static_cast<long long>(tag & SIM_PUB_POS_MASK) - 1, static_cast<unsigned long long>(tag >> 40)
+            );
+        }
+    }
+    for (uint32_t i = 0; i < q.core_count && n > 0 && static_cast<uint32_t>(n) < cap; ++i) {
+        const SimCore &c = q.cores[i];
+        if (c.outstanding == 0) continue;
+        n += snprintf(
+            buf + n, cap - static_cast<uint32_t>(n), " | core%u out=%u idx0=%llu fin0=%lld evt=%lld", i, c.outstanding,
+            static_cast<unsigned long long>(c.index[0]),
+            c.finish[0] == SIM_GATED ? -2LL : static_cast<long long>(c.finish[0]) - static_cast<long long>(now),
+            q.evt_at[i] == UINT64_MAX ? -1LL : static_cast<long long>(q.evt_at[i]) - static_cast<long long>(now)
+        );
+    }
+    return n;
+}
+
+bool poll_may_report(uint32_t queue_idx) {
+    if (queue_idx >= SIM_MAX_QUEUES) return true;
+    const SimQueue &q = g_queues[queue_idx];
+    if (q.belled_outstanding != 0 || q.finishes != q.finishes_read) return true;
+    const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
+    const uint64_t legible = now > g_report_ticks ? now - g_report_ticks : 0;
+    if (q.next_event <= legible) return true;
+    for (uint32_t m = q.deps_armed; m != 0; m &= m - 1) {
+        if (q.deps[__builtin_ctz(m)].release_at <= legible) return true;
+    }
+    for (uint32_t open = q.deps_peer_open; open != 0; open &= open - 1) {
+        const SimDepSet &d = q.deps[__builtin_ctz(open)];
+        for (uint32_t i = 0; i < d.peer_n; ++i) {
+            const SimPeerDep &p = d.peer[i];
+            if (p.next >= p.end) continue;
+            const SimPub &pub = g_pub[p.queue * SIM_PUB_SLOTS + (p.next & (SIM_PUB_SLOTS - 1))];
+            const uint64_t tag = pub.tag.load(std::memory_order_relaxed);
+            if ((tag >> 40) == g_pub_epoch && (tag & SIM_PUB_POS_MASK) >= ((p.next + 1) & SIM_PUB_POS_MASK)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void queue_admit_lateness(uint32_t queue_idx, uint64_t *late, uint64_t *late_ns) {
+    const SimQueue &q = g_queues[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
+    const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
+    *late = q.admit_late;
+    *late_ns = freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(q.admit_late_ticks) * 1'000'000'000ULL / freq) : 0;
+}
+
+void queue_peer_stats(
+    uint32_t queue_idx, uint64_t *published, uint64_t *resolved, uint64_t *timed, uint64_t *late, uint64_t *late_ns
+) {
+    const SimQueue &q = g_queues[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
+    const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
+    *published = q.peer_published;
+    *resolved = q.peer_resolved;
+    *timed = q.peer_timed;
+    *late = q.peer_late;
+    *late_ns =
+        freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(q.peer_late_ticks) * 1'000'000'000ULL / freq) : 0;
 }
 
 void func_hist(uint64_t *out, uint32_t n) {
@@ -1629,6 +2070,7 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
     }
     SimQueue &q = g_queues[queue_idx];
     take_bells(q, queue_idx);
+    resolve_peers(q, queue_idx);
     // What the manager can see lags what has happened by the report path: a core
     // finishing, its controller telling the queue, and the queue writing the
     // register. Reading as of `report` before the access completes is that
@@ -1704,6 +2146,7 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             // already there and its startup has overlapped.
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
+            publish(q, c.index[k], c.finish[k] + g_fin_ticks + g_link_ticks);
             --q.cohort_staged;
             --c.gated_count;
             released = true;

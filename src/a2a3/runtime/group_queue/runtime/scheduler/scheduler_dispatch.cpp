@@ -1303,6 +1303,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (gq_group::active() && feed_open_groups(thread_idx)) {
             made_progress = true;
         }
+        if (silo_active_ && feed_silos(thread_idx)) {
+            made_progress = true;
+        }
 #if SIMPLER_DFX
         CYCLE_COUNT_START();
         chip_swimlane.sched_loop_count++;
@@ -1319,10 +1322,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         iter_shared_sampled = false;
 #endif
         int32_t task_count = 0;
-        // A grouped entry is placed by the controller and holds no core here, so
-        // the core tracker cannot say whether this thread still has work out.
-        // Positions handed out but not retired can.
-        const bool gq_outstanding = gq_group::active() && gq_index_[thread_idx].outstanding() > 0;
+        // An entry a group or a silo fed is placed by the controller and holds no
+        // core here, so the core tracker cannot say whether this thread still has
+        // work out. Positions handed out but not retired can.
+        const bool gq_outstanding = (gq_group::active() || silo_active_) && gq_index_[thread_idx].outstanding() > 0;
         if (!tracker.has_any_running_cores() && !gq_outstanding) {
             LoopAction action = check_exit_conditions(thread_idx, header, runtime, task_count);
             if (action == LoopAction::BREAK_LOOP) break;
@@ -1335,7 +1338,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 1: Check running cores for completion
         int32_t completed_this_turn = 0;
 
-        bool try_completed = tracker.has_any_running_cores() || gq_outstanding;
+        // A silo's positions are read only when the controller has something to
+        // report: its events carry their own instants, so a read that would return
+        // nothing new is one the manager can skip without changing what it learns.
+        bool try_completed = tracker.has_any_running_cores() ||
+                             (gq_outstanding && (!silo_active_ || asimgq::poll_may_report(thread_idx)));
         if (try_completed) {
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress

@@ -93,6 +93,10 @@ bound by how fast the manager hands tasks over, which none of these changes touc
 - The rank asymmetry silicon shows is lost here as in aSim: both ranks run the
   same tasks, because the model computes no dispatch predicate.
 - qwen has not been run: no expanded `deps.json` of it is on disk.
+- The hops above are below the simulator's own: a hop inside a controller there is
+  1.02 us -- most of it the core's entry poll and startup, which every arm pays --
+  and 1.33 us across one with a 310 ns link. At those hops the ideal fabric is
+  -12.5 %. [silos.md](silos.md) measures the design built on this.
 
 ## Reproducing it
 

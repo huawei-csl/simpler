@@ -1848,6 +1848,7 @@ static TaskOutputTensors submit_task_common(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = aiv1_kernel_id;
@@ -1912,6 +1913,7 @@ static TaskOutputTensors submit_task_common(
             sm_tasks.get_slot_state_by_task_id(fanin_row[i]).ed_flags |= ED_FLAG_TRACKED;
         }
     }
+    task.silo = orch->stamp_silo(fanin_row, payload.fanin_count, *prepared.slot_state);
 
     ORCH_STEP_LAP(g_orch_fanin_ns);
     ORCH_PHASE_END(HostPhaseKind::OrchSubmitTask, task_id.raw);
@@ -2126,6 +2128,7 @@ bool graph_submit_outer(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.silo = TASK_SILO_NONE;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
     task.packed_buffer_base = allocation.packed_base;
     task.packed_buffer_end = allocation.packed_end;
@@ -2909,6 +2912,39 @@ void OrchestratorState::end_group() {
     open_group_first = end;
 }
 
+void OrchestratorState::declare_silos() {
+    if (is_fatal()) return;
+    silos_declared = true;
+}
+
+// The silo a task is fed to. A task that cannot be fed ahead of its producers
+// keeps the ordinary path: a dispatch predicate is read when the task is ready,
+// and a sync-start cohort needs every core at once. A supertask wide enough to
+// fill more than one silo is split across all of them; anything narrower follows
+// its latest stamped producer, so a chain stays where its data is, and takes the
+// next hint in turn when it has none.
+uint8_t OrchestratorState::stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot) {
+    if (!silos_declared || slot.task_kind != TaskKind::KERNEL || slot.task_attrs.has_predicate() ||
+        slot.task_attrs.requires_sync_start() || slot.active_mask.to_shape() == ResourceShape::DUMMY) {
+        return TASK_SILO_NONE;
+    }
+    ++silo_task_count;
+    if (slot.logical_block_num >= TASK_SILO_SPREAD_MIN_BLOCKS) return TASK_SILO_SPREAD;
+    int32_t latest = -1;
+    uint8_t inherited = TASK_SILO_NONE;
+    for (int32_t i = 0; i < fanin_count; i++) {
+        const uint8_t s = sm_header->tasks.get_task_by_task_id(fanin[i]).silo;
+        if (s >= TASK_SILO_FIRST && fanin[i] > latest) {
+            latest = fanin[i];
+            inherited = s;
+        }
+    }
+    if (inherited != TASK_SILO_NONE) return inherited;
+    const uint8_t hint = static_cast<uint8_t>(TASK_SILO_FIRST + next_silo_hint % TASK_SILO_HINTS);
+    ++next_silo_hint;
+    return hint;
+}
+
 // Decide the declaration set as a whole. Every group here holds only edges that
 // enter it from outside, so no controller has anything to resolve and the grouping
 // is cost without benefit -- it is dropped, and the graph runs exactly as an
@@ -3130,6 +3166,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;

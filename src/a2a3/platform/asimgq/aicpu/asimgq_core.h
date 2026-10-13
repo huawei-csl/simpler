@@ -202,8 +202,9 @@ bool submit(
 // Task slots in one controller. A slot is occupied from submit until the manager
 // learns the task finished, so this bounds what one GC can hold at all.
 constexpr uint32_t SIM_HELD_CAP = 32;
-// Dependency comparators per task slot. A task with more unmet producers than
-// this cannot be expressed to the controller, so the manager holds it back.
+// Dependency comparators per task slot, each naming one producer's range of
+// positions. A task with more unmet producers than this cannot be expressed to the
+// controller, so the manager holds it back.
 constexpr uint32_t SIM_HELD_MAX_DEPS = 4;
 
 // Hand the controller a task whose producers are members of the same group. The
@@ -218,6 +219,66 @@ constexpr uint32_t SIM_HELD_MAX_DEPS = 4;
 bool submit_grouped(
     uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, uint32_t parts, int32_t task_id,
     SimTaskType type, const uint64_t *dep_index, uint32_t dep_n
+);
+
+// A producer a held entry waits on: the `count` consecutive positions from `first`,
+// in queue `queue`'s own numbering. A producer's tasks take consecutive positions,
+// so one range names all of them.
+struct SimDep {
+    uint64_t first;
+    uint32_t count;
+    uint32_t queue;
+};
+
+// How long a completion one GroupQueue records takes to become legible to another.
+// Each queue forwards what it records to its peers, which keep a copy; the trip is
+// a store across the die between two controllers, anchored where the
+// AICPU-to-queue store is.
+constexpr uint64_t SIM_GQ_PEER_LINK_NS = 310;
+
+// Whether this run's queues forward their completions to each other. A run that
+// feeds silos needs it; any other leaves it off, so no queue spends simulator work
+// publishing what no peer reads. Set before any queue is accessed.
+void set_peer_forwarding(bool on);
+
+// Hand the controller `n` single-part entries that wait on the same producers,
+// which may sit in any queue. Each entry takes one hold slot, and is placed once
+// every named position has finished -- and, for a position in another queue, once
+// that finish has crossed the link. Returns false, admitting nothing, when the hold
+// slots or comparators would not cover the request.
+bool submit_held(
+    uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, const SimTaskType *type, uint32_t n,
+    int32_t task_id, const SimDep *deps, uint32_t dep_n
+);
+
+// Whether a status read of this queue now could report anything the last one did
+// not, or let the controller act on anything it has not seen: a finish that has
+// become legible, a timed release that is due, a peer position a held entry waits
+// on that has since been published, or a pre-stage. Reads nothing a manager could
+// not learn by polling and charges nothing; a manager that skips a read this calls
+// idle loses nothing, since every event carries its own instant and is replayed at
+// the next read.
+bool poll_may_report(uint32_t queue_idx);
+
+// The manager has retired everything the status read it just made reported. Only
+// a read whose result is retired from counts: poll_may_report() compares against
+// this, and a read made for another purpose leaves finishes unretired.
+void status_consumed(uint32_t queue_idx);
+
+// For the stall diagnostics: the queue's replay state and every dependency set
+// it holds -- what each waits on here and in its peers. Returns the length written.
+int describe_held(uint32_t queue_idx, char *buf, uint32_t cap);
+
+// Admissions whose named producers had all become legible to this queue before the
+// entries arrived, and by how long in all.
+void queue_admit_lateness(uint32_t queue_idx, uint64_t *late, uint64_t *late_ns);
+
+// What crossed between queues for this one: positions it published for its peers,
+// ranges in other queues its held entries resolved, releases timed on a peer's
+// completion, and how many it learned only after its own replay had passed them --
+// placed late, by `late_ns` in all.
+void queue_peer_stats(
+    uint32_t queue_idx, uint64_t *published, uint64_t *resolved, uint64_t *timed, uint64_t *late, uint64_t *late_ns
 );
 
 // Hand the controller an early-dispatch pre-stage: a task staged before its

@@ -104,6 +104,15 @@ struct OrchestratorState {
     // ungrouped. Only the outermost pair opens and closes a group.
     int32_t group_depth{0};
 
+    // === SILOS (Private) ===
+    // Whether the graph declared silos, and the stamping state that follows from
+    // it. A supertask wide enough is split across every silo; any other task runs
+    // in the silo of its latest producer that has one, or takes the next hint in
+    // turn when none does -- see stamp_silo().
+    bool silos_declared{false};
+    uint32_t next_silo_hint{0};
+    int32_t silo_task_count{0};
+
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -182,6 +191,12 @@ struct OrchestratorState {
     void end_scope();
     void begin_group();
     void end_group();
+
+    // Feed every task submitted from here on to a silo. A runtime without silos
+    // ignores the stamps.
+    void declare_silos();
+    uint8_t stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot);
+    int32_t silo_tasks() const { return silo_task_count; }
 
     // Called once orchestration is over, when the whole declaration set is known.
     void finish_groups();

@@ -285,6 +285,46 @@ private:
     // to pick between a core's two deferred-completion slabs.
     int32_t feed_seq_[PLATFORM_MAX_AICPU_THREADS] = {};
 
+    // Hand this thread's silo its next pieces of the graph, in task order. Returns
+    // true if anything was submitted.
+    bool feed_silos(int32_t thread_idx);
+
+    // Where a silo's feed has reached. A silo takes every stamped task in task
+    // order -- its block range of a spread one, the whole of one stamped to it --
+    // and names the pieces of each producer still running, so its controller holds
+    // the task until they finish wherever they ran. Task order is what makes the
+    // naming possible: a consumer can name only a piece some silo has already fed.
+    struct SiloFeed {
+        int32_t cursor = 0;
+        // The task the feed last stopped at and the epochs it saw then, so a wait
+        // is counted once and re-asked only when something it depends on moved.
+        int32_t stalled_at = -1;
+        uint64_t stalled_completions = ~0ULL;
+        uint64_t stalled_pieces = ~0ULL;
+        uint32_t stalled_room = 0;
+        int32_t stalled_skips = 0;
+        static constexpr int32_t kStaleLimit = 256;
+        uint64_t pieces = 0;
+        uint64_t entries = 0;
+        uint64_t named = 0;             // producer pieces named to the controller
+        uint64_t wait_unfed = 0;        // a producer's piece no silo had fed yet
+        uint64_t wait_ordinary = 0;     // a producer on the ordinary path, still running
+        uint64_t wait_comparators = 0;  // more producer pieces running than comparators
+        uint64_t wait_room = 0;         // no position window or hold slots for the piece
+        // Producers already retired when their consumer's piece was fed, and pieces
+        // every one of whose producers had: work the feed reached behind execution.
+        uint64_t producers_retired = 0;
+        uint64_t pieces_behind = 0;
+        // How long the feed stood stopped, by what first stopped it, in counter
+        // ticks: unfed, ordinary, comparators, room.
+        uint64_t stalled_since = 0;
+        int32_t stalled_reason = -1;
+        uint64_t stall_ticks[4] = {};
+    };
+    SiloFeed silo_feed_[PLATFORM_MAX_AICPU_THREADS];
+    // Whether this run feeds silos: the graph stamped at least one task.
+    bool silo_active_ = false;
+
     // Split every shape's ready-queue slot region into one disjoint span per
     // Scheduler thread. Runs once per run, before any push.
     void partition_ready_queues_by_owner();
@@ -429,19 +469,32 @@ private:
         if (!from_group) note_task_position(h.local_id, idx);
         // A pre-stage waits on its doorbell, not on named producers: those are what
         // the doorbell is rung for.
+        // Under silos the queue's cores also run what the silos fed, which no core
+        // tracker counts, so an ordinary dispatch can find its ring full. Admitted
+        // as a held entry it waits in the hold array instead, which the position
+        // window this dispatch already took a place in bounds.
+        asimgq::SimDep held_deps[asimgq::SIM_HELD_MAX_DEPS];
+        for (int i = 0; i < dep_n; ++i) {
+            held_deps[i] = asimgq::SimDep{deps[i], 1, static_cast<uint32_t>(thread_idx)};
+        }
+        const asimgq::SimTaskType ring = queue_ring_for(h);
         const bool accepted =
             h.cohort ? asimgq::submit(
-                           static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
-                           queue_ring_for(h), /*gated=*/true
+                           static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id), ring,
+                           /*gated=*/true
                        ) :
             h.gated ? asimgq::submit_belled(
-                          static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
-                          queue_ring_for(h), asimgq::core_index_for_addr(h.reg_addr), h.reg_task_id
+                          static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id), ring,
+                          asimgq::core_index_for_addr(h.reg_addr), h.reg_task_id
                       ) :
-                      asimgq::submit_grouped(
-                          static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
-                          queue_ring_for(h), deps, static_cast<uint32_t>(dep_n)
-                      );
+            silo_active_ ? asimgq::submit_held(
+                               static_cast<uint32_t>(thread_idx), &idx, &fid, &ring, 1,
+                               static_cast<int32_t>(h.reg_task_id), held_deps, static_cast<uint32_t>(dep_n)
+                           ) :
+                           asimgq::submit_grouped(
+                               static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id),
+                               ring, deps, static_cast<uint32_t>(dep_n)
+                           );
         if (!accepted) {
             // Callers size their dispatch by the room the queue reported, which
             // only grows between the read and the submit, so this cannot fire.

@@ -104,4 +104,9 @@ struct RuntimeOps {
     // ignore the declaration entirely.
     void (*group_begin)(RuntimeContext *rt);
     void (*group_end)(RuntimeContext *rt);
+
+    // Feed every task submitted from here on to a silo: a controller of its own
+    // that waits for the task's producers wherever they were fed. A runtime
+    // without silos is free to ignore the declaration.
+    void (*declare_silos)(RuntimeContext *rt);
 };

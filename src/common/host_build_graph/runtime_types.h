@@ -252,6 +252,22 @@ struct TaskPayload;        // Forward declaration (defined below)
 // its producers are held by one controller.
 constexpr int32_t NO_TASK_GROUP = -1;
 
+// Which silo a task is fed to, as the graph declares it. A silo is one controller
+// and the cores it serves; a task fed to one waits there for its producers, which
+// may be fed to any silo. Zero, the value an unstamped descriptor carries, leaves
+// the task to the ordinary path.
+constexpr uint8_t TASK_SILO_NONE = 0;
+// The task's blocks are split by block range across every silo, one piece each.
+constexpr uint8_t TASK_SILO_SPREAD = 1;
+// Every other value names a silo: `value - TASK_SILO_FIRST`, taken modulo the
+// silos the run has. The stamp is a hint because the host does not know how many
+// silos the device will run; a span divisible by every small count keeps hints
+// handed out in turn spread evenly over any of them.
+constexpr uint8_t TASK_SILO_FIRST = 2;
+constexpr uint32_t TASK_SILO_HINTS = 240;
+// The fewest blocks a task needs to be split across silos rather than fed whole.
+constexpr int32_t TASK_SILO_SPREAD_MIN_BLOCKS = 4;
+
 /**
  * Task descriptor structure (shared memory)
  *
@@ -287,9 +303,12 @@ struct alignas(64) TaskDescriptor {
     int32_t group_first;
     int32_t group_extent;
 
+    // The silo the task is fed to: one of the TASK_SILO_* values.
+    uint8_t silo;
+
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[12];
+    uint8_t reserved[11];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();

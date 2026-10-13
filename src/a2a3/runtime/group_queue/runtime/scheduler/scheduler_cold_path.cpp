@@ -213,6 +213,42 @@ void SchedulerContext::log_stall_diagnostics(
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
 
+    if (silo_active_ && sched_->task_view.tasks != nullptr) {
+        const SiloFeed &sf = silo_feed_[thread_idx];
+        SharedMemoryTaskHeader &stasks = *sched_->task_view.tasks;
+        const int32_t head = sf.cursor;
+        int32_t lo = 0, hi = 0, nb = 0, kind = -1;
+        uint32_t stamp = 0, fanin = 0, feeds = 0, done = 0;
+        if (head < task_count) {
+            const ChipTaskSlotState &hs = stasks.get_slot_state_by_task_id(head);
+            stamp = hs.to_descriptor().silo;
+            nb = hs.logical_block_num;
+            kind = static_cast<int32_t>(hs.task_kind);
+            fanin = static_cast<uint32_t>(hs.to_payload().fanin_count);
+            feeds = silo_feeds(hs) ? 1 : 0;
+            done = stasks.is_completed(head) ? 1 : 0;
+            silo_piece(hs.to_descriptor().silo, nb, thread_idx, active_sched_threads_, lo, hi);
+        }
+        uint64_t admitted = 0, promoted = 0, refused = 0, published = 0, resolved = 0, timed = 0, late = 0, late_ns = 0;
+        uint32_t held_high = 0;
+        asimgq::queue_group_stats(static_cast<uint32_t>(thread_idx), &admitted, &promoted, &refused, &held_high);
+        asimgq::queue_peer_stats(static_cast<uint32_t>(thread_idx), &published, &resolved, &timed, &late, &late_ns);
+        LOG_INFO(
+            "[STALL thread=%d] SILO cursor=%d stalled_at=%d pieces=%" PRIu64 " wait_unfed=%" PRIu64
+            " wait_ordinary=%" PRIu64 " wait_comparators=%" PRIu64 " wait_room=%" PRIu64 " room=%u push=%" PRIu64
+            " wm=%" PRIu64 " head: stamp=%u blocks=%d kind=%d fanin=%u feeds=%u done=%u"
+            " piece=[%d,%d) admitted=%" PRIu64 " promoted=%" PRIu64 " refused=%" PRIu64 " published=%" PRIu64
+            " resolved=%" PRIu64 " timed=%" PRIu64,
+            thread_idx, sf.cursor, sf.stalled_at, sf.pieces, sf.wait_unfed, sf.wait_ordinary, sf.wait_comparators,
+            sf.wait_room, gq_index_[thread_idx].room(), gq_index_[thread_idx].push_index(),
+            gq_index_[thread_idx].watermark(), stamp, nb, kind, fanin, feeds, done, lo, hi, admitted, promoted, refused,
+            published, resolved, timed
+        );
+        char held_buf[1536];
+        asimgq::describe_held(static_cast<uint32_t>(thread_idx), held_buf, sizeof(held_buf));
+        LOG_INFO("[STALL thread=%d] HELD %s", thread_idx, held_buf);
+    }
+
     // T0 owns the task-table scan; printing it from other threads would
     // produce identical TASK lines once per scheduler thread.
     if (thread_idx == 0) {
@@ -653,6 +689,148 @@ void SchedulerContext::seed_ready_groups() {
     );
 }
 
+// Hand this thread's silo its next pieces, in task order: for each stamped task,
+// the block range this silo runs, named against the pieces of every producer that
+// has not finished. The controller holds the piece until those positions finish,
+// in its own queue or -- by what the other queues publish -- in theirs, so no
+// AICPU stands between a producer finishing and its consumer starting.
+//
+// The feed stops at the first task it cannot hand over yet: a producer piece no
+// silo has fed, a producer left on the ordinary path that has not finished, more
+// producer pieces running than the comparators hold, or no room for the piece.
+// Every producer precedes its consumer in task order, so the lowest task any silo
+// is stopped at has every producer piece fed already -- the feeds cannot wait on
+// each other in a cycle.
+bool SchedulerContext::feed_silos(int32_t thread_idx) {
+    if (!silo_active_ || sched_->task_view.tasks == nullptr) return false;
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    SiloFeed &f = silo_feed_[thread_idx];
+    GqIndexSpace &space = gq_index_[thread_idx];
+    const int32_t submitted = total_tasks_;
+    const int32_t silos = active_sched_threads_;
+    bool progress = false;
+    while (f.cursor < submitted) {
+        const int32_t id = f.cursor;
+        ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
+        if (tasks.is_completed(id) || !silo_feeds(slot)) {
+            ++f.cursor;
+            continue;
+        }
+        const TaskDescriptor &desc = slot.to_descriptor();
+        int32_t lo = 0, hi = 0;
+        silo_piece(desc.silo, slot.logical_block_num, thread_idx, silos, lo, hi);
+        if (lo >= hi) {
+            ++f.cursor;
+            continue;
+        }
+        // A stop is re-examined only once something it waits on can have moved.
+        const uint64_t completions = g_completion_epoch.load(std::memory_order_acquire);
+        const uint64_t pieces = g_piece_epoch.load(std::memory_order_acquire);
+        const bool fresh_stop = f.stalled_at != id;
+        // The bound on skips is a backstop against a completion that moves no epoch.
+        if (!fresh_stop && f.stalled_completions == completions && f.stalled_pieces == pieces &&
+            f.stalled_room >= space.room() && ++f.stalled_skips < SiloFeed::kStaleLimit) {
+            return progress;
+        }
+        auto stop = [&](uint64_t &counter) {
+            if (fresh_stop) {
+                ++counter;
+                if (f.stalled_reason >= 0) f.stall_ticks[f.stalled_reason] += asimgq::now_ticks() - f.stalled_since;
+                f.stalled_since = asimgq::now_ticks();
+                f.stalled_reason = &counter == &f.wait_unfed       ? 0 :
+                                   &counter == &f.wait_ordinary    ? 1 :
+                                   &counter == &f.wait_comparators ? 2 :
+                                                                     3;
+            }
+            f.stalled_at = id;
+            f.stalled_completions = completions;
+            f.stalled_pieces = pieces;
+            f.stalled_room = space.room();
+            f.stalled_skips = 0;
+            return progress;
+        };
+        const int32_t subs = active_subtask_count(slot);
+        const uint32_t n = static_cast<uint32_t>((hi - lo) * subs);
+        if (n > space.room()) return stop(f.wait_room);
+        asimgq::SimDep deps[asimgq::SIM_HELD_MAX_DEPS];
+        uint32_t dep_n = 0;
+        uint32_t retired = 0;
+        const TaskPayload &payload = slot.to_payload();
+        const int32_t *fanin = payload.fanin_data();
+        for (int32_t k = 0; k < payload.fanin_count; ++k) {
+            const int32_t prod = fanin[k];
+            if (tasks.is_completed(prod)) {
+                ++retired;
+                continue;
+            }
+            const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(prod);
+            if (!silo_feeds(ps)) return stop(f.wait_ordinary);
+            const int32_t psubs = active_subtask_count(ps);
+            for (int32_t s = 0; s < silos; ++s) {
+                int32_t plo = 0, phi = 0;
+                silo_piece(ps.to_descriptor().silo, ps.logical_block_num, s, silos, plo, phi);
+                if (plo >= phi) continue;
+                const uint64_t first = piece_position(s, prod);
+                if (first == kNoPosition) return stop(f.wait_unfed);
+                if (dep_n == asimgq::SIM_HELD_MAX_DEPS) return stop(f.wait_comparators);
+                deps[dep_n++] =
+                    asimgq::SimDep{first, static_cast<uint32_t>((phi - plo) * psubs), static_cast<uint32_t>(s)};
+            }
+        }
+        // One entry per (block, subtask), on consecutive positions, so a consumer
+        // names the whole piece with one range.
+        uint64_t idx[asimgq::SIM_HELD_CAP];
+        int32_t fid[asimgq::SIM_HELD_CAP];
+        asimgq::SimTaskType type[asimgq::SIM_HELD_CAP];
+        uint32_t m = 0;
+        const int32_t book_core = core_trackers_[thread_idx].get_core_id_by_offset(0);
+        for (int32_t b = lo; b < hi; ++b) {
+            for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
+                const SubtaskSlot subslot = static_cast<SubtaskSlot>(sub);
+                if (!slot.active_mask.subtask_active(subslot)) continue;
+                // capacity_token is -1: the controller places this entry itself, so
+                // it takes nothing from the thread's core budget.
+                idx[m] = space.assign(
+                    GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, subslot, book_core, -1, false, false}
+                );
+                fid[m] = desc.kernel_id[sub];
+                type[m] = (subslot == SubtaskSlot::AIC) ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
+                ++m;
+            }
+        }
+        // Account before the entries reach the queue (see account_published_blocks).
+        sched_->account_published_blocks(slot, hi - lo);
+        if (!asimgq::submit_held(
+                static_cast<uint32_t>(thread_idx), idx, fid, type, m, static_cast<int32_t>(desc.task_id.raw), deps,
+                dep_n
+            )) {
+            // The piece was sized against the position window, which bounds the hold
+            // slots too, so a refusal means that accounting is wrong.
+            for (uint32_t j = m; j-- > 0;) {
+                space.unreserve(idx[j]);
+            }
+            LOG_ERROR(
+                "Thread %d: silo refused a piece of task %d (%u entries, %u producers)", thread_idx, id, m, dep_n
+            );
+            return stop(f.wait_room);
+        }
+        note_piece_position(thread_idx, id, idx[0]);
+        f.producers_retired += retired;
+        if (payload.fanin_count > 0 && retired == static_cast<uint32_t>(payload.fanin_count)) ++f.pieces_behind;
+        f.named += dep_n;
+        f.entries += m;
+        ++f.pieces;
+        if (f.stalled_reason >= 0 && f.stalled_at == id) {
+            f.stall_ticks[f.stalled_reason] += asimgq::now_ticks() - f.stalled_since;
+            f.stalled_reason = -1;
+        }
+        f.stalled_at = -1;
+        ++f.cursor;
+        progress = true;
+    }
+    return progress;
+}
+
 // Everything the GroupQueue carries that is scoped to one run. Positions and
 // group claims both name state a run resets -- every queue's watermark goes back
 // to zero -- so one carried over from an earlier round would wait on a prefix
@@ -669,6 +847,12 @@ void SchedulerContext::gq_prepare_run() {
     }
     ++g_position_epoch;  // every position recorded by an earlier run is now stale
     gq_group::reset_group_owners();
+    silo_active_ = sched_->task_view.tasks != nullptr && sched_->task_view.tasks->silo_tasks > 0;
+    if (silo_active_) size_piece_positions(total_tasks_);
+    asimgq::set_peer_forwarding(silo_active_);
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
+        silo_feed_[i] = SiloFeed{};
+    }
     cohort_.task_id.store(0, std::memory_order_relaxed);
     cohort_.state.store(SyncStartCohort::kIdle, std::memory_order_relaxed);
     cohort_.target.store(0, std::memory_order_relaxed);
@@ -1025,6 +1209,24 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             held_high, steals_tried, steals_won, steal_gain_us, cohort_stamped_[thread_idx], cohort_blocks_[thread_idx],
             cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q), bells, bells_waiting
         );
+        if (silo_active_) {
+            const SiloFeed &sf = silo_feed_[thread_idx];
+            uint64_t published = 0, resolved = 0, timed = 0, late = 0, late_ns = 0, adm_late = 0, adm_late_ns = 0;
+            asimgq::queue_peer_stats(q, &published, &resolved, &timed, &late, &late_ns);
+            asimgq::queue_admit_lateness(q, &adm_late, &adm_late_ns);
+            LOG_INFO(
+                "[GQ_SILO thread=%d] pieces=%" PRIu64 " entries=%" PRIu64 " named=%" PRIu64 " wait_unfed=%" PRIu64
+                " wait_ordinary=%" PRIu64 " wait_comparators=%" PRIu64 " wait_room=%" PRIu64 " peer_resolved=%" PRIu64
+                " peer_timed=%" PRIu64 " peer_late=%" PRIu64 " peer_late_us=%.1f cursor=%d producers_retired=%" PRIu64
+                " pieces_behind=%" PRIu64 " admit_late=%" PRIu64 " admit_late_us=%.1f stall_unfed_us=%.1f"
+                " stall_ordinary_us=%.1f stall_comparators_us=%.1f stall_room_us=%.1f",
+                thread_idx, sf.pieces, sf.entries, sf.named, sf.wait_unfed, sf.wait_ordinary, sf.wait_comparators,
+                sf.wait_room, resolved, timed, late, static_cast<double>(late_ns) / 1000.0, sf.cursor,
+                sf.producers_retired, sf.pieces_behind, adm_late, static_cast<double>(adm_late_ns) / 1000.0,
+                cycles_to_us(sf.stall_ticks[0]), cycles_to_us(sf.stall_ticks[1]), cycles_to_us(sf.stall_ticks[2]),
+                cycles_to_us(sf.stall_ticks[3])
+            );
+        }
         if (bells_waiting > 0) {
             char bell_buf[768];
             asimgq::describe_waiting_bells(q, bell_buf, sizeof(bell_buf));
@@ -1651,6 +1853,11 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         // every consumer that names it. The same is true of a task with no logical
         // block, which never reaches a core.
         if (gq_group::active() && gq_group::group_of(id) != gq_group::NO_GROUP && group_queue_delivers(slot)) {
+            continue;
+        }
+        // A silo feeds this task in task order whatever its producers' state, so it
+        // must not also reach a ready queue.
+        if (silo_active_ && silo_feeds(slot)) {
             continue;
         }
         int32_t state = sched_->classify_fanin_state(&slot);

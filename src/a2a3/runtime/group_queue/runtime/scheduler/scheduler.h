@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include <vector>
 #include "common/platform_config.h"  // PLATFORM_MAX_AICPU_THREADS, sizing the per-owner ready rows
 #include "scheduler/task_grouping.h"
 
@@ -545,6 +546,69 @@ inline uint64_t task_position(int32_t local_id) {
     const uint64_t v = g_task_position[local_id];
     if ((v >> 40) != g_position_epoch || (v & kPositionMask) == 0) return kNoPosition;
     return (v & kPositionMask) - 1;
+}
+
+// Where each silo put its piece of each task: the first of the piece's
+// consecutive positions in that silo's queue, by silo and local id. Written by the
+// silo that fed the piece, read by any silo whose consumer names it. Tagged with
+// the run like g_task_position, so a run bumps the epoch instead of clearing it.
+// Sized to the run's task count the first time a run needs it.
+inline std::vector<uint64_t> g_piece_position;
+inline int32_t g_piece_stride = 0;
+// Bumped whenever a piece is recorded. A silo whose next task names a piece no
+// silo has fed yet re-asks only when this or g_completion_epoch moved.
+inline std::atomic<uint64_t> g_piece_epoch{0};
+
+inline void size_piece_positions(int32_t tasks) {
+    if (tasks <= g_piece_stride) return;
+    g_piece_stride = tasks;
+    g_piece_position.assign(static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS) * static_cast<size_t>(tasks), 0);
+}
+
+inline void note_piece_position(int32_t silo, int32_t local_id, uint64_t first) {
+    if (local_id < 0 || local_id >= g_piece_stride) return;
+    const size_t i = static_cast<size_t>(silo) * static_cast<size_t>(g_piece_stride) + static_cast<size_t>(local_id);
+    __atomic_store_n(&g_piece_position[i], (g_position_epoch << 40) | ((first + 1) & kPositionMask), __ATOMIC_RELEASE);
+    g_piece_epoch.fetch_add(1, std::memory_order_release);
+}
+
+inline uint64_t piece_position(int32_t silo, int32_t local_id) {
+    if (local_id < 0 || local_id >= g_piece_stride) return kNoPosition;
+    const size_t i = static_cast<size_t>(silo) * static_cast<size_t>(g_piece_stride) + static_cast<size_t>(local_id);
+    const uint64_t v = __atomic_load_n(&g_piece_position[i], __ATOMIC_ACQUIRE);
+    if ((v >> 40) != g_position_epoch || (v & kPositionMask) == 0) return kNoPosition;
+    return (v & kPositionMask) - 1;
+}
+
+// Whether a task is fed to a silo. Only one the graph stamped, and only one that
+// reaches a core without a decision made at its dispatch point: a predicate is
+// read when the task is ready, and a sync-start cohort needs every core at once.
+inline bool silo_feeds(const ChipTaskSlotState &slot) {
+    return slot.to_descriptor().silo != TASK_SILO_NONE && slot.task_kind == TaskKind::KERNEL &&
+           slot.logical_block_num > 0 && slot.active_mask.to_shape() != ResourceShape::DUMMY &&
+           !slot.task_attrs.has_predicate() && !slot.task_attrs.requires_sync_start();
+}
+
+// The logical blocks [lo, hi) of a task that silo `silo` of `silos` runs. A spread
+// task is cut into one contiguous block range per silo; any other runs whole in the
+// silo its stamp names.
+inline void silo_piece(uint8_t stamp, int32_t blocks, int32_t silo, int32_t silos, int32_t &lo, int32_t &hi) {
+    if (stamp == TASK_SILO_SPREAD) {
+        lo = static_cast<int32_t>((static_cast<int64_t>(blocks) * silo) / silos);
+        hi = static_cast<int32_t>((static_cast<int64_t>(blocks) * (silo + 1)) / silos);
+        return;
+    }
+    const int32_t owner = static_cast<int32_t>((stamp - TASK_SILO_FIRST) % static_cast<uint32_t>(silos));
+    lo = 0;
+    hi = (silo == owner) ? blocks : 0;
+}
+
+inline int32_t active_subtask_count(const ChipTaskSlotState &slot) {
+    int32_t n = 0;
+    for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
+        if (slot.active_mask.subtask_active(static_cast<SubtaskSlot>(sub))) ++n;
+    }
+    return n;
 }
 
 struct SchedulerLayout {

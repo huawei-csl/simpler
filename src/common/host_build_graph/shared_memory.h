@@ -99,6 +99,10 @@ struct alignas(64) SharedMemoryTaskHeader {
     // claimed, and the bytes past task_states[total_tasks - 1] are not states.
     int32_t total_tasks;
 
+    // How many of those tasks the graph stamped with a silo. Written beside
+    // total_tasks and read-only from then on; a run with none feeds no silo.
+    int32_t silo_tasks;
+
     // The byte holds a ChipTaskState and only ever advances:
     //   PENDING -> PUBLISHED -> COMPLETED
     // Both transitions are plain stores; monotonicity is by construction, not
@@ -143,6 +147,7 @@ static_assert(offsetof(SharedMemoryTaskHeader, task_storage) == 0, "SharedMemory
 // The device reads this one out of the H2D'd header, so it is pinned separately from the
 // segment pointers above, which are host-side only.
 static_assert(offsetof(SharedMemoryTaskHeader, total_tasks) == 16, "SharedMemoryTaskHeader total_tasks layout drift");
+static_assert(offsetof(SharedMemoryTaskHeader, silo_tasks) == 20, "SharedMemoryTaskHeader silo_tasks layout drift");
 
 /**
  * Shared memory header structure

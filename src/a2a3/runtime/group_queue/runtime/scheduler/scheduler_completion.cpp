@@ -355,6 +355,7 @@ void SchedulerContext::check_running_cores_for_completion(
             space.note_early(idx);
             retire(idx);
         }
+        asimgq::status_consumed(static_cast<uint32_t>(thread_idx));
     }
     return;
 #endif

@@ -102,6 +102,10 @@ time, so one queue's six would have to be busy for the whole round.
 
 [../controller-oracle.md](../controller-oracle.md) prices what a controller
 that resolved this case's edges itself could win, and which changes it would take.
+[../silos.md](../silos.md) builds the cheapest of them -- groups that see each
+other's completions, with every supertask of four or more blocks split across them
+-- and measures M2 at **-2.1 %** against M0 (window -3.7 %), and -5.6 % with eight
+comparators per task instead of four.
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
 split each into per-queue pieces declared in separate groups, so the four threads

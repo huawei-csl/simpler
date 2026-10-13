@@ -798,7 +798,9 @@ Four properties are load-bearing:
   stamp or close the next one.
 
 Completion is unchanged: a cohort block retires through its own manager's
-watermark like any other, so nothing crosses queues except the rendezvous.
+watermark like any other, so nothing crosses queues except the rendezvous -- and,
+in a run that feeds silos, the completions each queue forwards to the others
+([silos.md](silos.md)).
 
 Measured on qwen (40 cohorts a round, 48 rounds per arm, two interleaved
 sessions), the release is level with the AICPU drain: -0.4 % and -0.1 % of
