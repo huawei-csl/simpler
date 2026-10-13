@@ -68,9 +68,9 @@ rounds, first two dropped (n=12):
 | arm | device_wall | window | vs M0 |
 | --- | ----------- | ------ | ----- |
 | silicon | 31.72 ms | 29.70 ms | |
-| M0 | 32.29 ms | 30.86 ms | |
-| M2 | 33.59 ms | 31.56 ms | +4.0 % (window +2.3 %) |
-| **M2, silos** | **31.63 ms** | **29.72 ms** | **-2.1 % (window -3.7 %)** |
+| M0 | 32.29 ms | 30.93 ms | |
+| M2 | 33.59 ms | 31.75 ms | +4.0 % (window +2.7 %) |
+| **M2, silos** | **31.63 ms** | **29.96 ms** | **-2.1 % (window -3.1 %)** |
 
 Every arm completes every task, and the core time issued agrees to 0.4 % (348.7,
 348.0 and 347.5 ms a round). M2's and the silos' overrun ledgers are of a size, 15.3
@@ -101,9 +101,9 @@ finish. With eight comparators per task, a single session of six rounds:
 
 | arm | device_wall | window | vs M0 |
 | --- | ----------- | ------ | ----- |
-| M2, silos, 8 comparators | 30.49 ms | 28.42 ms | -5.6 % (window -7.9 %) |
+| M2, silos, 8 comparators | 30.49 ms | 28.83 ms | -5.6 % (window -6.8 %) |
 
-which is within a point of the oracle's -8.8 %. The comparator stops all but
+two points short of the oracle's -8.8 %. The comparator stops all but
 vanish and the window becomes the stop that remains; the predicated stops vanish in
 that run too.
 

@@ -32,8 +32,8 @@ the mean of three draws.
 | check | oracle | aSim |
 | ----- | ------ | ---- |
 | paged_attention Case1, hand-over at 6 tasks/us | 11.04 ms | M2 11.50 ms |
-| deepseek_v4, whole chip, every hop 3.7 us (silicon's median hop gap) | 30.66 ms | M0 window 30.93 ms |
-| deepseek_v4, four controllers, wide tasks confined, every hop 3.7 us | 55.62 ms | one-group probe: M2 window 57.38 ms |
+| deepseek_v4, whole chip, every hop 3.7 us (silicon's median hop gap) | 30.66 ms | M0 window 30.98 ms |
+| deepseek_v4, four controllers, wide tasks confined, every hop 3.7 us | 55.62 ms | one-group probe: M2 window 57.88 ms |
 | core time a round, deepseek_v4 | 348.1 ms | 348.7 ms |
 
 paged_attention calibrates the hand-over rate: it is entirely submission-bound,

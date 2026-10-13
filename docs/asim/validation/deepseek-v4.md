@@ -11,11 +11,13 @@ Three arms interleaved in one lock, two independent sessions:
 
 | session | silicon | M0 | M2 | M2 vs M0 | window |
 | ------- | ------- | -- | -- | -------- | ------ |
-| 2026-10-09, n=12 | 36.187 ms | 36.638 ms | 38.384 ms | **+4.8 %** | +3.4 % |
-| 2026-10-12, n=18 | 35.740 ms | 36.710 ms | 37.911 ms | **+3.3 %** | +2.7 % |
+| 2026-10-09, n=12 | 36.187 ms | 36.638 ms | 38.384 ms | **+4.8 %** | +3.5 % |
+| 2026-10-12, n=18 | 35.740 ms | 36.710 ms | 37.911 ms | **+3.3 %** | +2.9 % |
 
-Compute issued agrees between the arms to 0.5 %, every round completes every
-task, and every duration comes from the calibration. M0 reads +1.2 % and +2.7 %
+The window is the scheduler's on each thread less that thread's own ledger, the
+latest of the four -- the removal `device_wall` makes. Compute issued agrees
+between the arms to 0.5 %, every round completes every task, and every duration
+comes from the calibration. M0 reads +1.2 % and +2.7 %
 against silicon.
 
 **The case is critical-path bound.** A round carries ~227 ms of cube and ~122 ms
@@ -57,9 +59,9 @@ early dispatch on as the case ships it:
 | arm | device_wall | window | vs silicon |
 | --- | ----------- | ------ | ---------- |
 | silicon | 32.75 ms | 29.68 ms | |
-| M0 | 32.27 ms | 30.93 ms | -1.5 % |
-| M2 | 33.80 ms | 31.88 ms | +3.2 % |
-| **M2 vs M0** | **+4.7 %** | window +3.1 % | |
+| M0 | 32.27 ms | 30.98 ms | -1.5 % |
+| M2 | 33.80 ms | 32.11 ms | +3.2 % |
+| **M2 vs M0** | **+4.7 %** | window +3.7 % | |
 
 **Expanding the graph does not turn the result.** M2 loses by about what it lost
 on the Graph form, and for the same reason: the controller resolves no edge, so
@@ -89,7 +91,7 @@ moves work between threads, by being claimed.
 
 On this case that pins the critical chain, and every wide task on it, to one
 thread's 18 cores. **One 3-task group resolving 4 edges -- a probe that changes
-nothing else -- takes M2 to 59.8 ms, +85 % against M0** (n=6, window +86 %).
+nothing else -- takes M2 to 59.8 ms, +85 % against M0** (n=6, window +87 %).
 
 The silicon critical path says why no grouping can earn that back. On the
 expanded form's rank 0 it is 1,670 tasks: 18.7 ms of compute kernels, 3.5 ms of
@@ -104,7 +106,7 @@ time, so one queue's six would have to be busy for the whole round.
 that resolved this case's edges itself could win, and which changes it would take.
 [../silos.md](../silos.md) builds the cheapest of them -- groups that see each
 other's completions, with every supertask of four or more blocks split across them
--- and measures M2 at **-2.1 %** against M0 (window -3.7 %), and -5.6 % with eight
+-- and measures M2 at **-2.1 %** against M0 (window -3.1 %), and -5.6 % with eight
 comparators per task instead of four.
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
