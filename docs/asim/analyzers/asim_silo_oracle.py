@@ -30,6 +30,10 @@ PART > 0 replaces the feed with partitions: the graph is cut into chunks of PART
 tasks in task order, every task of a chunk is resident in its silo from the chunk's
 launch, and a chunk launches LAUNCH_US after the chunk RESIDENT places before it
 has finished -- one at a time with RESIDENT=1, the next while the last runs with 2.
+LAUNCH_ON=cut launches the next chunk once every task of the last one that a later
+chunk depends on has finished, rather than every task. CUT=narrow moves each chunk
+boundary within a quarter chunk of where it would fall to the point fewest
+dependencies cross.
 
   usage: asim_silo_oracle.py <deps.json> <swimlane.json> <calib>
 Env: W (default 32), ORDER, H_IN (0.45), H_N (0.8), PRED (0), SPLIT_MIN (4), EDGE,
@@ -63,6 +67,8 @@ ENTER_US = float(ENV.get("ENTER_US", "0"))
 PART = int(ENV.get("PART", "0"))
 LAUNCH_US = float(ENV.get("LAUNCH_US", "1"))
 RESIDENT = int(ENV.get("RESIDENT", "1"))
+LAUNCH_ON = ENV.get("LAUNCH_ON", "all")
+CUT = ENV.get("CUT", "even")
 SEEDS = int(ENV.get("SEEDS", "3"))
 
 deps = json.load(open(sys.argv[1]))
@@ -139,16 +145,38 @@ for n in real_nodes:
         named_by[d].append(n)
 
 
+# Where each chunk starts in task order. An even cut falls every PART tasks; a narrow
+# one moves within a quarter chunk to where the fewest producer-to-consumer edges
+# cross it.
+starts = []
+if PART > 0:
+    crossing = [0] * (len(ids) + 1)
+    for c_node in real_nodes:
+        for d in named[c_node]:
+            lo, hi = order[d[1]], order[c_node[1]]
+            if lo < hi:
+                crossing[lo + 1] += 1
+                crossing[hi + 1] -= 1
+    for i in range(1, len(crossing)):
+        crossing[i] += crossing[i - 1]
+    for k in range(0, len(ids), PART):
+        if CUT == "narrow" and k > 0:
+            span = range(max(1, k - PART // 4), min(len(ids), k + PART // 4))
+            k = min(span, key=lambda i: (crossing[i], abs(i - k)))
+        if not starts or k > starts[-1]:
+            starts.append(k)
 # Chunks are numbered over those holding a task that reaches a core: one made only
 # of tasks a predicate retires has nothing to launch.
-chunk_of = {}
+chunk_at = {}
 if PART > 0:
-    for c, k in enumerate(sorted({order[n[1]] // PART for n in real_nodes})):
-        chunk_of[k] = c
+    raw = {n: max(i for i, st in enumerate(starts) if st <= order[n[1]]) for n in real_nodes}
+    for c, k in enumerate(sorted(set(raw.values()))):
+        chunk_at[k] = c
+    chunk_at = {n: chunk_at[raw[n]] for n in real_nodes}
 
 
 def part_of(n):
-    return chunk_of[order[n[1]] // PART] if PART > 0 else 0
+    return chunk_at[n] if PART > 0 else 0
 
 
 def shape(k):
@@ -219,7 +247,17 @@ class Run:
         for n in real_nodes:
             self.members[part_of(n)].append(n)
         self.part_left = {k: len(v) for k, v in self.members.items()}
+        # What a later chunk waits on in each chunk: its tasks some later chunk names.
+        self.cut_left = defaultdict(int)
+        self.outgoing = set()
+        for n in real_nodes:
+            for d in named[n]:
+                if part_of(d) < part_of(n) and d not in self.outgoing:
+                    self.outgoing.add(d)
+                    self.cut_left[part_of(d)] += 1
         self.launched = {}
+        self.resident = [0] * N_Q
+        self.peak = 0
 
     def push(self, t, kind, x):
         heapq.heappush(self.ev, (t, kind, next(self.seq), x))
@@ -288,14 +326,25 @@ class Run:
             return
         self.launched[k] = t
         for n in self.members[k]:
+            self.resident[gof(n)] += blocks(n)
+            self.peak = max(self.peak, self.resident[gof(n)])
             self.entered[n] = t + ENTER_US
             if n in self.relmet:
                 self.push(max(self.relmet[n], self.entered[n]), self.REL, n)
+        # A chunk nothing later depends on lets the next one go at once.
+        if LAUNCH_ON == "cut" and self.cut_left[k] == 0:
+            self.push(t + LAUNCH_US, self.LAUNCH, k + 1)
 
     def finished(self, x, t):
         k = part_of(x)
+        self.resident[gof(x)] -= blocks(x)
         self.part_left[k] -= 1
-        if self.part_left[k] == 0:
+        if LAUNCH_ON == "cut":
+            if x in self.outgoing:
+                self.cut_left[k] -= 1
+                if self.cut_left[k] == 0 and k in self.launched:
+                    self.push(t + LAUNCH_US, self.LAUNCH, k + 1)
+        elif self.part_left[k] == 0:
             nxt = k + RESIDENT
             at = max(t + LAUNCH_US, self.launched.get(nxt - 1, 0.0))
             self.push(at, self.LAUNCH, nxt)
@@ -331,10 +380,11 @@ class Run:
             elif PART == 0:
                 self.pos[gof(x)] -= blocks(x)
                 self.try_enter(gof(x), t)
-        return max(self.done.values())
+        return max(self.done.values()), self.peak
 
 
-spans = [Run(seed).run() for seed in range(SEEDS)]
+draws = [Run(seed).run() for seed in range(SEEDS)]
+spans = [d[0] for d in draws]
 cross = sum(1 for n in real_nodes for d in named[n] if gof(d) != gof(n))
 if PART > 0:
     # A producer in the same chunk is one range of chunk-wide positions however many
@@ -346,7 +396,7 @@ if PART > 0:
     print(
         f"chunks={len({part_of(n) for n in real_nodes})} producers per task: max {max(per_piece)}, "
         f"over 4 {sum(1 for x in per_piece if x > 4)} of {len(per_piece)}; "
-        f"tasks resident per silo per chunk: max {max(slots.values())}"
+        f"tasks resident per silo per chunk: max {max(slots.values())}, at once: max {max(d[1] for d in draws)}"
     )
 print(
     f"{sum(spans) / len(spans) / 1e3:.3f} ms  W={W:g} ORDER={ORDER} H_IN={H_IN} H_N={H_N} PRED={PRED} "

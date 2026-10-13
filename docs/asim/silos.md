@@ -117,21 +117,32 @@ latency each move the result by 0.1 % or less.
 A variant of the design launches a *partition* -- a chunk of the graph in task
 order -- at once: every task of it is resident in its silo from the launch, and
 positions are numbered across the partition, so a spread producer is one range
-whatever silos ran it and costs one comparator. The oracle prices it with
-`PART`, `RESIDENT` and `LAUNCH_US`, at the simulator's hops with a 200 ns exchange
-(`H_IN=1.02 H_N=1.22`), predicates free, against 30.66 ms today:
+whatever silos ran it and costs one comparator. The oracle prices it with `PART`,
+`RESIDENT`, `CUT` and `LAUNCH_US` (3.7 us here), at the simulator's hops with a
+200 ns exchange (`H_IN=1.02 H_N=1.22`), predicates free, against 30.66 ms today.
+The last column is the most tasks one silo holds at once:
 
-| partitions | makespan | vs today |
-| ---------- | -------- | -------- |
-| the whole graph | 27.24 ms | -11.2 % |
-| one layer each, one at a time | 28.74 ms | -6.3 % |
-| one layer each, two in flight | 27.25 ms | -11.1 % |
-| about a quarter layer each, four in flight | 27.22 ms | -11.2 % |
+| partitions | in flight | makespan | vs today | resident |
+| ---------- | --------- | -------- | -------- | -------- |
+| the whole graph | 1 | 27.24 ms | -11.2 % | all |
+| one layer each, cut evenly | 1 | 28.74 ms | -6.3 % | 174 |
+| one layer each, cut at narrow points | 1 | 27.39 ms | -10.7 % | 271 |
+| half a layer each, cut at narrow points | 1 | 27.76 ms | -9.4 % | 142 |
+| half a layer each, cut evenly | 2 | 27.27 ms | -11.1 % | 168 |
 
-A partition that waits for the one before it to finish drains the fabric at every
-boundary; two in flight hide it whatever the size. Residency is the price: a layer
-puts up to 184 tasks on one silo, a quarter layer 112. Inside a partition a task
-names at most eight producer supertasks, and 1-3 % of tasks name more than four.
+**A partition that waits for the one before it pays for whatever the cut splits.**
+The next partition cannot start until every task of the last has finished, so work
+that would have overlapped the boundary becomes a bubble -- about 30 us a boundary
+at an even cut, almost all of the drop to -6.3 %; the launch itself is 0.2 ms of
+it. Moving each boundary to where the fewest dependencies cross (`CUT=narrow`,
+within a quarter chunk) leaves little to overlap, and one partition at a time comes
+within half a point of two in flight. Two in flight gets there with smaller
+partitions and less residency, at the price of numbering across two partitions.
+Launching the next partition once the tasks it depends on have finished, rather
+than all of them (`LAUNCH_ON=cut`), changes nothing: those are the last to finish.
+
+Inside a partition a task names at most eight producer supertasks, and 1-3 % of
+tasks name more than four.
 
 ## Limits
 
