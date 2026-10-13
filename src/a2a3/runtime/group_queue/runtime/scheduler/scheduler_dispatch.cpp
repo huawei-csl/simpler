@@ -1303,7 +1303,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (gq_group::active() && feed_open_groups(thread_idx)) {
             made_progress = true;
         }
-        if (silo_active_ && feed_silos(thread_idx)) {
+        if (silo_active_ && !part_active_ && feed_silos(thread_idx)) {
+            made_progress = true;
+        }
+        if (part_active_ && launch_partitions(thread_idx)) {
             made_progress = true;
         }
 #if SIMPLER_DFX

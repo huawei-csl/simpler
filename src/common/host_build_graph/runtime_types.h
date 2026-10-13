@@ -303,12 +303,19 @@ struct alignas(64) TaskDescriptor {
     int32_t group_first;
     int32_t group_extent;
 
+    // The partition the task belongs to, when the graph declares partitions: a run
+    // of consecutive tasks launched into the silos at once. On a partition's first
+    // task, `part_tasks` is how many of its tasks complete on the device -- the
+    // count that says the partition has finished.
+    uint16_t part;
+    uint16_t part_tasks;
+
     // The silo the task is fed to: one of the TASK_SILO_* values.
     uint8_t silo;
 
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[11];
+    uint8_t reserved[7];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();

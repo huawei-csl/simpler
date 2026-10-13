@@ -1848,6 +1848,8 @@ static TaskOutputTensors submit_task_common(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.part = 0;
+    task.part_tasks = 0;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
@@ -2128,6 +2130,8 @@ bool graph_submit_outer(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.part = 0;
+    task.part_tasks = 0;
     task.silo = TASK_SILO_NONE;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
     task.packed_buffer_base = allocation.packed_base;
@@ -2917,6 +2921,65 @@ void OrchestratorState::declare_silos() {
     silos_declared = true;
 }
 
+void OrchestratorState::declare_partitions(int32_t target_tasks) {
+    if (is_fatal() || target_tasks <= 0) return;
+    silos_declared = true;
+    partition_target = target_tasks;
+}
+
+// Cut the graph into partitions of about `partition_target` tasks. Each boundary
+// moves, within a quarter partition of where it would fall, to the point the fewest
+// dependencies cross: a partition launches only once the one before it has
+// finished, so whatever a boundary splits that could have overlapped it waits.
+void OrchestratorState::finish_partitions() {
+    partition_count = 0;
+    const int32_t total = task_allocator.active_count();
+    if (partition_target <= 0 || total <= 0) return;
+    // crossing[i]: dependencies from a task before i to one at or after it.
+    std::vector<int32_t> crossing(static_cast<size_t>(total) + 2, 0);
+    for (int32_t c = 0; c < total; ++c) {
+        const TaskPayload &p = sm_header->tasks.get_slot_state_by_task_id(c).to_payload();
+        const int32_t *fanin = p.fanin_data();
+        for (int32_t k = 0; k < p.fanin_count; ++k) {
+            if (fanin[k] >= 0 && fanin[k] < c) {
+                ++crossing[static_cast<size_t>(fanin[k]) + 1];
+                --crossing[static_cast<size_t>(c) + 1];
+            }
+        }
+    }
+    for (size_t i = 1; i < crossing.size(); ++i) {
+        crossing[i] += crossing[i - 1];
+    }
+    const auto dist = [](int32_t x, int32_t k) {
+        return x > k ? x - k : k - x;
+    };
+    std::vector<int32_t> starts{0};
+    for (int32_t k = partition_target; k < total; k += partition_target) {
+        const int32_t lo = std::max(starts.back() + 1, k - partition_target / 4);
+        const int32_t hi = std::min(total - 1, k + partition_target / 4);
+        if (lo > hi) continue;
+        int32_t best = lo;
+        for (int32_t i = lo; i <= hi; ++i) {
+            if (crossing[i] < crossing[best] || (crossing[i] == crossing[best] && dist(i, k) < dist(best, k))) {
+                best = i;
+            }
+        }
+        starts.push_back(best);
+    }
+    starts.push_back(total);
+    for (size_t part = 0; part + 1 < starts.size(); ++part) {
+        int32_t on_device = 0;
+        for (int32_t id = starts[part]; id < starts[part + 1]; ++id) {
+            TaskDescriptor &t = sm_header->tasks.get_task_by_task_id(id);
+            t.part = static_cast<uint16_t>(part);
+            t.part_tasks = 0;
+            if (!sm_header->tasks.is_completed(id)) ++on_device;
+        }
+        sm_header->tasks.get_task_by_task_id(starts[part]).part_tasks = static_cast<uint16_t>(on_device);
+    }
+    partition_count = static_cast<int32_t>(starts.size()) - 1;
+}
+
 // The silo a task is fed to. A task that cannot be fed ahead of its producers
 // keeps the ordinary path: a dispatch predicate is read when the task is ready,
 // and a sync-start cohort needs every core at once. A supertask wide enough to
@@ -3166,6 +3229,8 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.part = 0;
+    task.part_tasks = 0;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;

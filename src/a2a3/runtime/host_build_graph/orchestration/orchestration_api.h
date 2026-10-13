@@ -309,6 +309,23 @@ static inline void rt_declare_silos() {
     rt->ops->declare_silos(rt);
 }
 
+/**
+ * Feed the silos one partition at a time.
+ *
+ * Once the graph is complete it is cut into partitions of about `target_tasks`
+ * consecutive tasks, each boundary placed where the fewest dependencies cross. A
+ * partition is launched into the silos whole -- every task resident in its silo,
+ * waiting on its producers there -- and only once the partition before it has
+ * finished. Implies rt_declare_silos(); a runtime without silos ignores it.
+ */
+static inline void rt_declare_partitions(int32_t target_tasks) {
+    RuntimeContext *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->declare_partitions == nullptr) {
+        return;
+    }
+    rt->ops->declare_partitions(rt, target_tasks);
+}
+
 static inline void rt_orchestration_done() {
     rt_graph_commit();
     rt_submit_phase_state() = RtSubmitPhaseState{};

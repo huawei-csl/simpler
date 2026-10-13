@@ -109,4 +109,9 @@ struct RuntimeOps {
     // that waits for the task's producers wherever they were fed. A runtime
     // without silos is free to ignore the declaration.
     void (*declare_silos)(RuntimeContext *rt);
+
+    // Feed the silos one partition at a time: once the graph is complete, cut it
+    // into runs of about `target_tasks` tasks where the fewest dependencies cross,
+    // and launch each into the silos only once the one before it has finished.
+    void (*declare_partitions)(RuntimeContext *rt, int32_t target_tasks);
 };

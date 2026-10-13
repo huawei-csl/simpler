@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <vector>
 #include "common/platform_config.h"  // PLATFORM_MAX_AICPU_THREADS, sizing the per-owner ready rows
 #include "scheduler/task_grouping.h"
@@ -603,6 +604,23 @@ inline void silo_piece(uint8_t stamp, int32_t blocks, int32_t silo, int32_t silo
     hi = (silo == owner) ? blocks : 0;
 }
 
+// Partition mode: how many of each partition's tasks have completed on the device.
+// A partition is launched once the one before it has finished, which is when this
+// reaches the count its first task carries.
+inline bool g_part_active = false;
+inline std::unique_ptr<std::atomic<int32_t>[]> g_part_done;
+inline int32_t g_part_capacity = 0;
+
+inline void reset_part_done(int32_t partitions) {
+    if (partitions > g_part_capacity) {
+        g_part_done = std::make_unique<std::atomic<int32_t>[]>(static_cast<size_t>(partitions));
+        g_part_capacity = partitions;
+    }
+    for (int32_t i = 0; i < partitions; ++i) {
+        g_part_done[i].store(0, std::memory_order_relaxed);
+    }
+}
+
 inline int32_t active_subtask_count(const ChipTaskSlotState &slot) {
     int32_t n = 0;
     for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
@@ -978,6 +996,9 @@ struct SchedulerState {
 
         tasks.store_completed(task_id);
         g_completion_epoch.fetch_add(1, std::memory_order_acq_rel);
+        if (g_part_active) {
+            g_part_done[slot_state.to_descriptor().part].fetch_add(1, std::memory_order_acq_rel);
+        }
         // COMPLETED >= PUBLISHED, so a tracked producer that never published
         // (DUMMY, predicate-retired) still releases its publish-list waiters
         // here. Idempotent after a publish-time seal.

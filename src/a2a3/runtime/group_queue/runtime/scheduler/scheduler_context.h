@@ -325,6 +325,72 @@ private:
     // Whether this run feeds silos: the graph stamped at least one task.
     bool silo_active_ = false;
 
+    // Launch this thread's piece of the next partition once the one in flight has
+    // finished, and feed the tasks of the one in flight it held back once their
+    // producers allow.
+    // Returns true if anything was submitted.
+    bool launch_partitions(int32_t thread_idx);
+
+    // One silo's share of some tasks, ready to post: the tasks it can name to the
+    // controller, with their producer sets and entries -- positions are taken when it
+    // is posted -- and the tasks it holds back. A task is held back when it names a
+    // producer left on the ordinary path, which has no piece to wait on, or more
+    // producer supertasks than the comparators hold; it is fed once that clears.
+    struct PartBatch {
+        std::vector<int32_t> ids;
+        std::vector<int32_t> blocks;  // per posted task, its block count here
+        std::vector<int32_t> held;
+        std::vector<asimgq::SimPartEntry> entries;
+        std::vector<SubtaskSlot> subslots;
+        std::vector<asimgq::SimPartSet> sets;
+        std::vector<asimgq::SimPartDep> deps;
+        uint64_t held_ordinary = 0;
+        uint64_t held_comparators = 0;
+    };
+    // Build `b` for the tasks in `ids`. A producer in a partition before `floor` is
+    // taken as finished: it will have by the time the batch is posted, since a
+    // partition launches only once the one before it has.
+    void build_batch(int32_t thread_idx, const int32_t *ids, int32_t n, int32_t floor, PartBatch &b);
+    // Take positions for `b`'s entries and hand them to the controller. Returns false,
+    // posting nothing, when the position window cannot take them.
+    bool post_batch(int32_t thread_idx, PartBatch &b);
+
+    // Where a thread's partition launches stand. A partition goes in whole: every task
+    // of it this silo runs is resident in its controller from the launch, waiting on
+    // its producers there. The next one is built while the one in flight runs, so a
+    // launch only takes positions and posts.
+    struct PartLaunch {
+        int32_t launched = -1;   // partition in flight
+        int32_t next_first = 0;  // first task of the one after it
+        int32_t expect = 0;      // tasks of the one in flight that complete on the device
+        PartBatch next;
+        int32_t next_part = -1;  // the partition `next` holds, or -1
+        int32_t next_end = 0;
+        int32_t next_expect = 0;
+        PartBatch retry;
+        std::vector<int32_t> held_back;
+        std::vector<int32_t> ids;
+        uint64_t held_epoch = ~0ULL;
+        uint64_t launches = 0;
+        uint64_t launched_entries = 0;
+        uint64_t held_ordinary = 0;
+        uint64_t held_comparators = 0;
+        uint64_t held_fed = 0;
+        uint64_t wait_room = 0;
+        // Real time from this silo having nothing left to do in the partition in
+        // flight to launching the next, summed.
+        uint64_t barrier_ticks = 0;
+        uint64_t barrier_seen = 0;
+        // Real time spent building batches, and posting them; of the posting, the
+        // part spent in the queue's submit, and the part of that on its ledger.
+        uint64_t build_ticks = 0;
+        uint64_t post_ticks = 0;
+        uint64_t submit_ticks = 0;
+        uint64_t submit_ledger_ticks = 0;
+    };
+    PartLaunch part_launch_[PLATFORM_MAX_AICPU_THREADS];
+    bool part_active_ = false;
+
     // Split every shape's ready-queue slot region into one disjoint span per
     // Scheduler thread. Runs once per run, before any push.
     void partition_ready_queues_by_owner();

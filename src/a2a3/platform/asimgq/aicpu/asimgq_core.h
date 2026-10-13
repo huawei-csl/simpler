@@ -251,6 +251,55 @@ bool submit_held(
     int32_t task_id, const SimDep *deps, uint32_t dep_n
 );
 
+// How long a completion one GroupQueue records takes to reach the others when the
+// controllers exchange their watermark and look-ahead state, as the partition design
+// specifies the exchange.
+constexpr uint64_t SIM_GQ_EXCHANGE_NS = 200;
+
+// A producer a partition task waits on, named by supertask: the runtime's task id
+// and the queues that run a piece of it. One comparator, however many queues --
+// numbered across the partition, a supertask's pieces are one range.
+struct SimPartDep {
+    int32_t task;
+    uint32_t queues;  // bit q: queue q runs a piece of it
+};
+
+// One entry of a launched partition, a single-part task on this queue, and the set
+// of producers it waits on: deps[set.first .. set.first + set.n).
+struct SimPartEntry {
+    uint64_t index;  // this queue's position, which its manager retires
+    int32_t func_id;
+    int32_t task_id;  // the supertask it is a piece of
+    SimTaskType type;
+    uint32_t set;
+};
+struct SimPartSet {
+    uint32_t first;
+    uint32_t n;
+};
+
+// Switch this run's queues to partition mode, or out of it. In it, each queue keeps
+// a resident store for launched partitions and exchanges piece completions with the
+// others. Call before any queue is accessed in the run.
+void set_partition_mode(bool on);
+
+// Launch entries of a partition into this queue. Each is resident from now on and
+// held until every producer its set names has finished in every queue that runs a
+// piece of it: here at once, elsewhere SIM_GQ_EXCHANGE_NS after that queue records
+// it. Every entry of one supertask's piece on this queue arrives in one call. Returns
+// false, admitting nothing, when the store cannot take them.
+bool submit_partition(
+    uint32_t queue_idx, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets, uint32_t set_n,
+    const SimPartDep *deps, uint32_t dep_n
+);
+
+// The partition store's use over the run: the most entries resident at once, piece
+// completions learned from the other queues, releases timed on a completion, and
+// how many were learned only after this queue's replay had passed them.
+void queue_part_stats(
+    uint32_t queue_idx, uint64_t *resident_peak, uint64_t *events_in, uint64_t *timed, uint64_t *late, uint64_t *late_ns
+);
+
 // Whether a status read of this queue now could report anything the last one did
 // not, or let the controller act on anything it has not seen: a finish that has
 // become legible, a timed release that is due, a peer position a held entry waits
@@ -454,6 +503,9 @@ struct SimQueueEntryStore {
     // placed, it is placed as an ordinary entry.
     uint32_t bell_core = SIM_NO_BELL;
     uint32_t bell_token = 0;
+    // The supertask this entry is a piece of, for an entry of a launched partition;
+    // -1 otherwise. The queue counts a piece finished when every entry of it has.
+    int32_t piece_task = -1;
 };
 
 // Work that did not fit inside the latency a poll models, summed, and how many

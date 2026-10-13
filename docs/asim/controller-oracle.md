@@ -96,7 +96,8 @@ bound by how fast the manager hands tasks over, which none of these changes touc
 - The hops above are below the simulator's own: a hop inside a controller there is
   1.02 us -- most of it the core's entry poll and startup, which every arm pays --
   and 1.33 us across one with a 310 ns link. At those hops the ideal fabric is
-  -12.5 %. [silos.md](silos.md) measures the design built on this.
+  -12.5 %. [silos.md](silos.md) and [partitions.md](partitions.md) measure the designs
+  built on this.
 
 ## Reproducing it
 

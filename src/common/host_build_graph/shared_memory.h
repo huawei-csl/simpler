@@ -103,6 +103,9 @@ struct alignas(64) SharedMemoryTaskHeader {
     // total_tasks and read-only from then on; a run with none feeds no silo.
     int32_t silo_tasks;
 
+    // How many partitions the graph was cut into; zero when it declared none.
+    int32_t partitions;
+
     // The byte holds a ChipTaskState and only ever advances:
     //   PENDING -> PUBLISHED -> COMPLETED
     // Both transitions are plain stores; monotonicity is by construction, not
@@ -148,6 +151,7 @@ static_assert(offsetof(SharedMemoryTaskHeader, task_storage) == 0, "SharedMemory
 // segment pointers above, which are host-side only.
 static_assert(offsetof(SharedMemoryTaskHeader, total_tasks) == 16, "SharedMemoryTaskHeader total_tasks layout drift");
 static_assert(offsetof(SharedMemoryTaskHeader, silo_tasks) == 20, "SharedMemoryTaskHeader silo_tasks layout drift");
+static_assert(offsetof(SharedMemoryTaskHeader, partitions) == 24, "SharedMemoryTaskHeader partitions layout drift");
 
 /**
  * Shared memory header structure

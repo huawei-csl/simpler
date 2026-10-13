@@ -121,3 +121,50 @@ TEST_F(HbgSiloStampTest, ConsumerOfOnlySpreadProducersTakesTheNextHint) {
     EXPECT_EQ(silo_of(wide), TASK_SILO_SPREAD);
     EXPECT_EQ(silo_of(tail), TASK_SILO_FIRST + 1);
 }
+
+// Partitions: cut once the graph is complete, each boundary moved within a quarter
+// partition to where the fewest dependencies cross, every task stamped with its
+// partition and each partition's first task with how many of its tasks complete on
+// the device.
+TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
+    orch.declare_partitions(4);
+    // Two chains of four, the second fed by the last task of the first: every cut
+    // near 4 crosses one dependency, so the boundary stays at 4.
+    TaskId prev = submit(1);
+    for (int i = 0; i < 3; ++i)
+        prev = submit(1, &prev, 1);
+    TaskId c = submit(1, &prev, 1);
+    for (int i = 0; i < 3; ++i)
+        c = submit(1, &c, 1);
+    orch.finish_partitions();
+    EXPECT_EQ(orch.partitions(), 2);
+    auto &tasks = sm_handle->header->tasks;
+    for (int32_t id = 0; id < 4; ++id)
+        EXPECT_EQ(tasks.get_task_by_task_id(id).part, 0);
+    for (int32_t id = 4; id < 8; ++id)
+        EXPECT_EQ(tasks.get_task_by_task_id(id).part, 1);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_tasks, 4);
+    EXPECT_EQ(tasks.get_task_by_task_id(4).part_tasks, 4);
+}
+
+TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
+    orch.declare_partitions(4);
+    // Tasks 1 and 2 both feed task 4, so cuts at 3 and 4 cross three and two
+    // dependencies; after task 4 only its edge to task 5 crosses.
+    const TaskId t0 = submit(1);
+    const TaskId t1 = submit(1, &t0, 1);
+    const TaskId t2 = submit(1, &t1, 1);
+    submit(1, &t1, 1);
+    const TaskId into4[] = {t1, t2};
+    const TaskId t4 = submit(1, into4, 2);
+    const TaskId t5 = submit(1, &t4, 1);
+    const TaskId t6 = submit(1, &t5, 1);
+    submit(1, &t6, 1);
+    orch.finish_partitions();
+    auto &tasks = sm_handle->header->tasks;
+    EXPECT_EQ(orch.partitions(), 2);
+    EXPECT_EQ(tasks.get_task_by_task_id(4).part, 0);
+    EXPECT_EQ(tasks.get_task_by_task_id(5).part, 1);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_tasks, 5);
+    EXPECT_EQ(tasks.get_task_by_task_id(5).part_tasks, 3);
+}

@@ -11,7 +11,9 @@
 #include "aicpu/asimgq_core.h"
 #include "aicpu/platform_aicpu_affinity.h"
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cstdio>
 #include <memory>
 #include <vector>
@@ -36,6 +38,7 @@ uint64_t g_mix_push_ticks = 0;     // controller's per-entry push of a mix group
 uint64_t g_mix_arrival_ticks = 0;  // controller -> core, per mix entry
 uint64_t g_cancel_ticks = 0;       // controller -> core, one way, for a cancellation
 uint64_t g_peer_link_ticks = 0;    // a queue's completion -> legible to another queue
+uint64_t g_exchange_ticks = 0;     // the same, by the partition design's exchange
 
 std::vector<uint64_t> g_func_compute_ticks;        // index = func_id, value = mean compute ticks
 std::vector<uint64_t> g_func_compute_sigma_ticks;  // index = func_id, value = compute stddev ticks
@@ -504,6 +507,238 @@ void publish(SimQueue &q, uint64_t index, uint64_t legible_at) {
     ++q.peer_published;
 }
 
+// ---------------------------------------------------------------------------
+// Partition mode. A launched partition's entries are resident in their queue and
+// wait on producer supertasks. A queue counts its own piece of a supertask finished
+// once every entry of it has, and tells the other queues over an exchange ring; a
+// producer is done for a waiting set once every queue running a piece of it has
+// said so. Everything here is owned by the queue's own thread except the rings,
+// which are single-producer, single-consumer.
+// ---------------------------------------------------------------------------
+constexpr uint32_t SIM_PART_NONE = UINT32_MAX;
+// Task ids the store keys by. One partition is in flight at a time, so the keys
+// span far more tasks than any partition holds.
+constexpr uint32_t SIM_PART_KEYS = 4096;
+constexpr uint32_t SIM_PART_SLOTS = 2048;
+constexpr uint32_t SIM_PART_SETS = 2048;
+constexpr uint32_t SIM_PART_WAITERS = 8192;
+constexpr uint32_t SIM_PART_RING = 1024;
+
+struct SimPartKey {
+    uint64_t epoch = 0;
+    int32_t task = -1;
+    uint32_t known = 0;    // queues whose piece of this supertask has finished
+    uint64_t done_at = 0;  // the latest of them, as legible here
+    uint32_t waiters = SIM_PART_NONE;
+    uint32_t piece_size = 0;  // this queue's piece: entries, and how many are placed
+    uint32_t piece_placed = 0;
+    uint64_t piece_at = 0;
+};
+struct SimPartWaiter {
+    uint32_t set;
+    uint32_t dep;
+    uint32_t next;
+};
+struct SimPartSetState {
+    SimPartDep deps[SIM_HELD_MAX_DEPS];
+    bool dep_done[SIM_HELD_MAX_DEPS];
+    uint32_t dep_n = 0;
+    uint32_t open = 0;
+    uint64_t ready_at = 0;
+    uint32_t members = SIM_PART_NONE;
+    uint32_t member_n = 0;
+};
+struct SimPartSlot {
+    SimQueueEntryStore e;
+    uint32_t set = SIM_PART_NONE;
+    uint32_t next = SIM_PART_NONE;
+};
+struct SimPartEvent {
+    int32_t task;
+    uint32_t src;
+    uint64_t real;
+};
+struct SimPartRing {
+    std::atomic<uint32_t> head{0};
+    std::atomic<uint32_t> tail{0};
+    SimPartEvent ev[SIM_PART_RING];
+};
+
+struct SimPartState {
+    bool on = false;
+    std::vector<SimPartKey> keys;
+    std::vector<SimPartWaiter> waiters;
+    uint32_t waiter_free = SIM_PART_NONE;
+    uint32_t waiter_bump = 0;
+    std::vector<SimPartSetState> sets;
+    uint32_t set_free = SIM_PART_NONE;
+    uint32_t set_bump = 0;
+    std::vector<uint32_t> set_next_free;
+    std::vector<SimPartSlot> slots;
+    uint32_t slot_free = SIM_PART_NONE;
+    uint32_t slot_bump = 0;
+    // Entries whose producers have all finished, waiting for room in their ring.
+    std::vector<uint32_t> ready[2];
+    uint32_t ready_head[2] = {0, 0};
+    uint32_t ready_tail[2] = {0, 0};
+    // Sets whose release is timed on a completion, earliest first.
+    std::vector<std::pair<uint64_t, uint32_t>> releases;
+    uint32_t waiter_live = 0;
+    uint32_t set_live = 0;
+    uint64_t resident = 0;
+    uint64_t resident_peak = 0;
+    uint64_t events_in = 0;
+    uint64_t timed = 0;
+    uint64_t late = 0;
+    uint64_t late_ticks = 0;
+};
+SimPartState g_part[SIM_MAX_QUEUES];
+std::unique_ptr<SimPartRing[]> g_part_rings;  // [src * SIM_MAX_QUEUES + dst]
+uint64_t g_part_epoch = 0;
+bool g_part_on = false;
+
+SimPartKey &part_key(SimPartState &p, int32_t task) {
+    SimPartKey &k = p.keys[static_cast<uint32_t>(task) & (SIM_PART_KEYS - 1)];
+    if (k.epoch != g_part_epoch || k.task != task) {
+        k = SimPartKey{};
+        k.epoch = g_part_epoch;
+        k.task = task;
+    }
+    return k;
+}
+
+uint32_t part_alloc_waiter(SimPartState &p) {
+    if (p.waiter_free != SIM_PART_NONE) {
+        const uint32_t i = p.waiter_free;
+        p.waiter_free = p.waiters[i].next;
+        return i;
+    }
+    return p.waiter_bump < SIM_PART_WAITERS ? p.waiter_bump++ : SIM_PART_NONE;
+}
+
+uint32_t part_alloc_slot(SimPartState &p) {
+    if (p.slot_free != SIM_PART_NONE) {
+        const uint32_t i = p.slot_free;
+        p.slot_free = p.slots[i].next;
+        return i;
+    }
+    return p.slot_bump < SIM_PART_SLOTS ? p.slot_bump++ : SIM_PART_NONE;
+}
+
+uint32_t part_alloc_set(SimPartState &p) {
+    if (p.set_free != SIM_PART_NONE) {
+        const uint32_t i = p.set_free;
+        p.set_free = p.set_next_free[i];
+        return i;
+    }
+    return p.set_bump < SIM_PART_SETS ? p.set_bump++ : SIM_PART_NONE;
+}
+
+void part_ready_push(SimPartState &p, uint32_t slot) {
+    const uint32_t r = p.slots[slot].e.type == SimTaskType::Cube ? 0 : 1;
+    p.ready[r][p.ready_tail[r]++ & (SIM_PART_SLOTS - 1)] = slot;
+}
+
+// A set whose producers have all finished: its entries are placeable at `ready_at`,
+// at once if the replay has reached it, else on a release timed for it. One learned
+// after the replay has passed it is placed where the replay stands, counted late.
+void part_settle(SimQueue &q, SimPartState &p, uint32_t set) {
+    SimPartSetState &s = p.sets[set];
+    if (s.ready_at > q.replayed_to) {
+        p.releases.emplace_back(s.ready_at, set);
+        std::push_heap(p.releases.begin(), p.releases.end(), std::greater<>());
+        return;
+    }
+    if (s.ready_at < q.replayed_to) {
+        ++p.late;
+        p.late_ticks += q.replayed_to - s.ready_at;
+    }
+    for (uint32_t m = s.members; m != SIM_PART_NONE; m = p.slots[m].next) {
+        part_ready_push(p, m);
+    }
+}
+
+// Queue `src` has finished its piece of `k.task`, legible here at `at`.
+void part_known(SimQueue &q, SimPartState &p, SimPartKey &k, uint32_t src, uint64_t at) {
+    k.known |= 1U << src;
+    if (at > k.done_at) k.done_at = at;
+    uint32_t *link = &k.waiters;
+    while (*link != SIM_PART_NONE) {
+        SimPartWaiter &w = p.waiters[*link];
+        SimPartSetState &s = p.sets[w.set];
+        const SimPartDep &d = s.deps[w.dep];
+        if ((k.known & d.queues) != d.queues) {
+            link = &w.next;
+            continue;
+        }
+        s.dep_done[w.dep] = true;
+        if (k.done_at > s.ready_at) s.ready_at = k.done_at;
+        const uint32_t set = w.set;
+        const uint32_t freed = *link;
+        *link = w.next;
+        p.waiters[freed].next = p.waiter_free;
+        p.waiter_free = freed;
+        --p.waiter_live;
+        if (--s.open == 0) part_settle(q, p, set);
+    }
+}
+
+// One of this queue's partition entries has been placed, ending at `legible_at`.
+// The piece it belongs to finishes once all its entries have been placed; then this
+// queue knows it at once and the others after the exchange.
+void part_placed(SimQueue &q, int32_t task, uint64_t legible_at) {
+    const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
+    SimPartState &p = g_part[qi];
+    SimPartKey &k = part_key(p, task);
+    ++k.piece_placed;
+    if (legible_at > k.piece_at) k.piece_at = legible_at;
+    if (k.piece_placed != k.piece_size) return;
+    part_known(q, p, k, qi, k.piece_at);
+    const uint64_t real = k.piece_at + g_ledger[qi].overrun_ticks;
+    for (uint32_t dst = 0; dst < SIM_MAX_QUEUES; ++dst) {
+        if (dst == qi || !g_part[dst].on) continue;
+        SimPartRing &r = g_part_rings[qi * SIM_MAX_QUEUES + dst];
+        const uint32_t head = r.head.load(std::memory_order_relaxed);
+        while (head - r.tail.load(std::memory_order_acquire) >= SIM_PART_RING) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+        r.ev[head & (SIM_PART_RING - 1)] = SimPartEvent{task, qi, real};
+        r.head.store(head + 1, std::memory_order_release);
+    }
+}
+
+// Take the piece completions the other queues have sent this one.
+void part_drain(SimQueue &q, uint32_t qi) {
+    SimPartState &p = g_part[qi];
+    if (!p.on) return;
+    const uint64_t ofs = g_ledger[qi].overrun_ticks;
+    for (uint32_t src = 0; src < SIM_MAX_QUEUES; ++src) {
+        if (src == qi || !g_part[src].on) continue;
+        SimPartRing &r = g_part_rings[src * SIM_MAX_QUEUES + qi];
+        uint32_t tail = r.tail.load(std::memory_order_relaxed);
+        const uint32_t head = r.head.load(std::memory_order_acquire);
+        while (tail != head) {
+            const SimPartEvent ev = r.ev[tail & (SIM_PART_RING - 1)];
+            ++tail;
+            ++p.events_in;
+            const uint64_t here = (ev.real > ofs ? ev.real - ofs : 0) + g_exchange_ticks;
+            part_known(q, p, part_key(p, ev.task), ev.src, here);
+        }
+        r.tail.store(tail, std::memory_order_release);
+    }
+}
+
+bool part_inbox_pending(uint32_t qi) {
+    for (uint32_t src = 0; src < SIM_MAX_QUEUES; ++src) {
+        if (src == qi || !g_part[src].on) continue;
+        const SimPartRing &r = g_part_rings[src * SIM_MAX_QUEUES + qi];
+        if (r.tail.load(std::memory_order_relaxed) != r.head.load(std::memory_order_acquire)) return true;
+    }
+    return false;
+}
+
 // Which queue this is. A controller needs its own index to tag the work it places,
 // so a completion can be published to the queue that owns the position.
 // xorshift64: 3 shifts + 3 xors, cheap enough to hide inside a modeled latency.
@@ -738,7 +973,7 @@ void commit(
         c.pipe_dur = dur;
         c.pipe_task_id = e.task_id;
         // A mix part cannot move: its halves share one package's local memory.
-        c.pipe_stealable = (e.type != SimTaskType::Mix);
+        c.pipe_stealable = (e.type != SimTaskType::Mix) && e.piece_task < 0;
     }
     c.finish[c.outstanding] = fin;
     c.index[c.outstanding] = e.index[part];
@@ -750,6 +985,9 @@ void commit(
         q.next_event = legible_at;
     }
     publish(q, e.index[part], legible_at);
+    if (e.piece_task >= 0) {
+        part_placed(q, e.piece_task, legible_at);
+    }
 }
 
 // Whether a package can seat a mix group: every one of its three cores must have
@@ -1099,6 +1337,50 @@ void promote_held(SimQueue &q, uint64_t at) {
     }
 }
 
+// Move partition entries whose producers have finished into their rings, in the
+// order they became ready, while each ring has room. A slot whose entry moved is
+// free again, and so is its set once every member has.
+void promote_part(SimQueue &q, uint64_t at) {
+    const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
+    SimPartState &p = g_part[qi];
+    if (!p.on) return;
+    for (uint32_t r = 0; r < 2; ++r) {
+        while (p.ready_head[r] != p.ready_tail[r]) {
+            const uint32_t slot = p.ready[r][p.ready_head[r] & (SIM_PART_SLOTS - 1)];
+            SimPartSlot &sl = p.slots[slot];
+            if (!enqueue_entry(q, sl.e, at > sl.e.enqueued_at ? at : sl.e.enqueued_at)) break;
+            ++p.ready_head[r];
+            SimPartSetState &s = p.sets[sl.set];
+            if (--s.member_n == 0) {
+                p.set_next_free[sl.set] = p.set_free;
+                p.set_free = sl.set;
+                --p.set_live;
+            }
+            sl.next = p.slot_free;
+            p.slot_free = slot;
+            --p.resident;
+        }
+    }
+}
+
+// Release a set timed on a completion: its entries are placeable now.
+void fire_part_release(SimQueue &q, SimPartState &p) {
+    std::pop_heap(p.releases.begin(), p.releases.end(), std::greater<>());
+    const auto [at, set] = p.releases.back();
+    p.releases.pop_back();
+    ++p.timed;
+    for (uint32_t m = p.sets[set].members; m != SIM_PART_NONE; m = p.slots[m].next) {
+        part_ready_push(p, m);
+    }
+    promote_part(q, at);
+    dispatch_pending(q, at);
+}
+
+uint64_t part_next_release(uint32_t qi) {
+    const SimPartState &p = g_part[qi];
+    return (p.on && !p.releases.empty()) ? p.releases.front().first : UINT64_MAX;
+}
+
 // The cores whose oldest end is legible by `upto`, in the order they retire: by
 // time, and by core among equal times -- the order repeatedly taking the minimum
 // would visit them in. Returns how many.
@@ -1140,6 +1422,7 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
     // them can be placed -- before the core below is refreshed, so a core freed
     // by this same retirement can take it in the same step.
     promote_held(q, due_at);
+    promote_part(q, due_at);
     // Every per-slot field moves with the slot: a held task pipelined behind the
     // one retiring becomes the core's first, and keeps what it was placed with.
     c.finish[0] = c.finish[1];
@@ -1204,8 +1487,14 @@ void replay_with_releases(SimQueue &q, uint64_t upto) {
                 set = t;
             }
         }
-        if (core_at > upto && rel_at > upto) {
+        const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
+        const uint64_t part_at = part_next_release(qi);
+        if (core_at > upto && rel_at > upto && part_at > upto) {
             break;
+        }
+        if (part_at < core_at && part_at <= rel_at) {
+            fire_part_release(q, g_part[qi]);
+            continue;
         }
         if (rel_at < core_at) {
             fire_release(q, set);
@@ -1221,7 +1510,8 @@ void retire_due(SimQueue &q, uint64_t upto) {
     if (upto > q.replayed_to) {
         q.replayed_to = upto;
     }
-    if (q.deps_armed != 0) {
+    const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
+    if (q.deps_armed != 0 || part_next_release(qi) <= upto) {
         replay_with_releases(q, upto);
         return;
     }
@@ -1235,7 +1525,7 @@ void retire_due(SimQueue &q, uint64_t upto) {
         const uint32_t core = due[k++];
         q.next_event = UINT64_MAX;
         retire_core(q, core, q.evt_at[core], upto);
-        if (q.deps_armed != 0) {
+        if (q.deps_armed != 0 || part_next_release(qi) <= upto) {
             replay_with_releases(q, upto);
             return;
         }
@@ -1512,7 +1802,8 @@ bool admit_held(
                 if (deps[i].queue != qi) continue;
                 for (uint64_t pos = deps[i].first; pos < deps[i].first + deps[i].count; ++pos) {
                     const SimPub &pub = g_pub[qi * SIM_PUB_SLOTS + (pos & (SIM_PUB_SLOTS - 1))];
-                    if (pub.tag.load(std::memory_order_relaxed) != ((g_pub_epoch << 40) | ((pos + 1) & SIM_PUB_POS_MASK))) {
+                    if (pub.tag.load(std::memory_order_relaxed) !=
+                        ((g_pub_epoch << 40) | ((pos + 1) & SIM_PUB_POS_MASK))) {
                         continue;
                     }
                     const uint64_t real = pub.real.load(std::memory_order_relaxed);
@@ -1663,6 +1954,7 @@ void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint6
     g_core_poll_ticks = ns_to_ticks(SIM_CORE_POLL_NS);
     g_arrive_ticks = ns_to_ticks(SIM_QUEUE_ARRIVAL_NS);
     g_peer_link_ticks = ns_to_ticks(SIM_GQ_PEER_LINK_NS);
+    g_exchange_ticks = ns_to_ticks(SIM_GQ_EXCHANGE_NS);
 }
 
 void set_queue_latencies_ns(uint64_t report_ns, uint64_t poll_ns) {
@@ -1863,6 +2155,136 @@ bool submit_held(
 
 void set_peer_forwarding(bool on) { g_pub_on = on && g_pub != nullptr; }
 
+void set_partition_mode(bool on) {
+    g_part_on = on;
+    ++g_part_epoch;
+    if (on && !g_part_rings) {
+        g_part_rings = std::make_unique<SimPartRing[]>(static_cast<size_t>(SIM_MAX_QUEUES) * SIM_MAX_QUEUES);
+    }
+    for (uint32_t qi = 0; qi < SIM_MAX_QUEUES; ++qi) {
+        SimPartState &p = g_part[qi];
+        p.on = on && g_queues[qi].core_count > 0;
+        if (!p.on) continue;
+        if (p.keys.empty()) {
+            p.keys.resize(SIM_PART_KEYS);
+            p.waiters.resize(SIM_PART_WAITERS);
+            p.sets.resize(SIM_PART_SETS);
+            p.set_next_free.resize(SIM_PART_SETS);
+            p.slots.resize(SIM_PART_SLOTS);
+            p.ready[0].resize(SIM_PART_SLOTS);
+            p.ready[1].resize(SIM_PART_SLOTS);
+            p.releases.reserve(SIM_PART_SETS);
+        }
+        p.waiter_free = p.set_free = p.slot_free = SIM_PART_NONE;
+        p.waiter_bump = p.set_bump = p.slot_bump = 0;
+        p.ready_head[0] = p.ready_head[1] = p.ready_tail[0] = p.ready_tail[1] = 0;
+        p.releases.clear();
+        p.waiter_live = p.set_live = 0;
+        p.resident = p.resident_peak = p.events_in = p.timed = p.late = p.late_ticks = 0;
+    }
+    if (on) {
+        for (size_t i = 0; i < static_cast<size_t>(SIM_MAX_QUEUES) * SIM_MAX_QUEUES; ++i) {
+            g_part_rings[i].head.store(0, std::memory_order_relaxed);
+            g_part_rings[i].tail.store(0, std::memory_order_relaxed);
+        }
+    }
+}
+
+bool submit_partition(
+    uint32_t queue_idx, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets, uint32_t set_n,
+    const SimPartDep *deps, uint32_t dep_n
+) {
+    // The manager posts one descriptor per entry; the queue sees them arrive together.
+    const Access a = begin_access(queue_idx, g_push_ticks * (n > 0 ? n : 1));
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on || n == 0) {
+        wait_until(a.release);
+        return false;
+    }
+    SimQueue &q = g_queues[queue_idx];
+    SimPartState &p = g_part[queue_idx];
+    part_drain(q, queue_idx);
+    retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
+    const uint64_t arrive_at = a.at + g_arrive_ticks;
+    // A store that cannot take the whole launch admits none of it.
+    bool fits = set_n <= SIM_PART_SETS - p.set_live && n <= SIM_PART_SLOTS - p.resident &&
+                dep_n <= SIM_PART_WAITERS - p.waiter_live;
+    for (uint32_t i = 0; fits && i < set_n; ++i) {
+        fits = sets[i].n <= SIM_HELD_MAX_DEPS;
+    }
+    if (!fits) {
+        ++q.held_refused;
+        wait_until(a.release);
+        return false;
+    }
+    std::vector<uint32_t> set_ids(set_n);
+    for (uint32_t i = 0; i < set_n; ++i) {
+        set_ids[i] = part_alloc_set(p);
+        ++p.set_live;
+        SimPartSetState &s = p.sets[set_ids[i]];
+        s = SimPartSetState{};
+        s.ready_at = arrive_at;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        ++part_key(p, entries[i].task_id).piece_size;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t slot = part_alloc_slot(p);
+        SimPartSlot &sl = p.slots[slot];
+        sl.e = SimQueueEntryStore{};
+        sl.e.parts = 1;
+        sl.e.index[0] = entries[i].index;
+        sl.e.func_id[0] = entries[i].func_id;
+        sl.e.task_id = entries[i].task_id;
+        sl.e.type = entries[i].type;
+        sl.e.piece_task = entries[i].task_id;
+        sl.e.enqueued_at = arrive_at;
+        sl.set = set_ids[entries[i].set];
+        SimPartSetState &s = p.sets[sl.set];
+        sl.next = s.members;
+        s.members = slot;
+        ++s.member_n;
+        ++p.resident;
+    }
+    if (p.resident > p.resident_peak) p.resident_peak = p.resident;
+    for (uint32_t i = 0; i < set_n; ++i) {
+        SimPartSetState &s = p.sets[set_ids[i]];
+        for (uint32_t j = 0; j < sets[i].n && sets[i].first + j < dep_n; ++j) {
+            const SimPartDep &d = deps[sets[i].first + j];
+            const uint32_t di = s.dep_n++;
+            s.deps[di] = d;
+            s.dep_done[di] = false;
+            SimPartKey &k = part_key(p, d.task);
+            if ((k.known & d.queues) == d.queues) {
+                s.dep_done[di] = true;
+                if (k.done_at > s.ready_at) s.ready_at = k.done_at;
+                continue;
+            }
+            const uint32_t w = part_alloc_waiter(p);
+            ++p.waiter_live;
+            p.waiters[w] = SimPartWaiter{set_ids[i], di, k.waiters};
+            k.waiters = w;
+            ++s.open;
+        }
+        if (s.open == 0) part_settle(q, p, set_ids[i]);
+    }
+    promote_part(q, arrive_at);
+    dispatch_pending(q, arrive_at);
+    finish_push(q, queue_idx, a);
+    return true;
+}
+
+void queue_part_stats(
+    uint32_t queue_idx, uint64_t *resident_peak, uint64_t *events_in, uint64_t *timed, uint64_t *late, uint64_t *late_ns
+) {
+    const SimPartState &p = g_part[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
+    const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
+    *resident_peak = p.resident_peak;
+    *events_in = p.events_in;
+    *timed = p.timed;
+    *late = p.late;
+    *late_ns = freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(p.late_ticks) * 1'000'000'000ULL / freq) : 0;
+}
+
 void status_consumed(uint32_t queue_idx) {
     if (queue_idx >= SIM_MAX_QUEUES) return;
     SimQueue &q = g_queues[queue_idx];
@@ -1925,6 +2347,7 @@ bool poll_may_report(uint32_t queue_idx) {
     const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
     const uint64_t legible = now > g_report_ticks ? now - g_report_ticks : 0;
     if (q.next_event <= legible) return true;
+    if (g_part[queue_idx].on && (part_next_release(queue_idx) <= legible || part_inbox_pending(queue_idx))) return true;
     for (uint32_t m = q.deps_armed; m != 0; m &= m - 1) {
         if (q.deps[__builtin_ctz(m)].release_at <= legible) return true;
     }
@@ -1947,7 +2370,8 @@ void queue_admit_lateness(uint32_t queue_idx, uint64_t *late, uint64_t *late_ns)
     const SimQueue &q = g_queues[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
     const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
     *late = q.admit_late;
-    *late_ns = freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(q.admit_late_ticks) * 1'000'000'000ULL / freq) : 0;
+    *late_ns =
+        freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(q.admit_late_ticks) * 1'000'000'000ULL / freq) : 0;
 }
 
 void queue_peer_stats(
@@ -2071,6 +2495,11 @@ SimQueueStatus read_queue_status(uint32_t queue_idx) {
     SimQueue &q = g_queues[queue_idx];
     take_bells(q, queue_idx);
     resolve_peers(q, queue_idx);
+    if (g_part[queue_idx].on) {
+        part_drain(q, queue_idx);
+        promote_part(q, q.replayed_to);
+        dispatch_pending(q, q.replayed_to);
+    }
     // What the manager can see lags what has happened by the report path: a core
     // finishing, its controller telling the queue, and the queue writing the
     // register. Reading as of `report` before the access completes is that

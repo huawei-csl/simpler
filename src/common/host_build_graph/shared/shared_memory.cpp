@@ -139,6 +139,7 @@ void SharedMemoryHandle::init_header() {
     // orchestration, so the real value is not known here yet.
     header->tasks.total_tasks = 0;
     header->tasks.silo_tasks = 0;
+    header->tasks.partitions = 0;
 
     // Error reporting
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);

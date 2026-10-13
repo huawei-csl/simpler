@@ -827,6 +827,7 @@ int32_t run_host_orchestration(
     // is one the segments are actually pitched to.
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.total_tasks = total_tasks;
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.silo_tasks = orchestrator.silo_tasks();
+    reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.partitions = orchestrator.partitions();
 
     // The device reads no task slot past total_tasks, so only that prefix of each
     // segment has to travel. In the mirror the orchestrator wrote, the four

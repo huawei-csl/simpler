@@ -86,6 +86,9 @@ void rt_scope_end(RuntimeContext *rt) { rt->orchestrator->end_scope(); }
 static void group_begin_impl(RuntimeContext *rt) { rt->orchestrator->begin_group(); }
 static void group_end_impl(RuntimeContext *rt) { rt->orchestrator->end_group(); }
 static void declare_silos_impl(RuntimeContext *rt) { rt->orchestrator->declare_silos(); }
+static void declare_partitions_impl(RuntimeContext *rt, int32_t target_tasks) {
+    rt->orchestrator->declare_partitions(target_tasks);
+}
 
 void rt_orchestration_done(RuntimeContext *rt) {
     // Host orchestration calls this runtime entry directly rather than the
@@ -96,6 +99,7 @@ void rt_orchestration_done(RuntimeContext *rt) {
     // The declaration set is complete only now, and whether it is worth honouring
     // is a property of the set rather than of any one group.
     rt->orchestrator->finish_groups();
+    rt->orchestrator->finish_partitions();
     rt->orchestrator->mark_done();
     // The orchestrator itself never crosses to the device, so the count of tasks
     // it completed inline is published into the header that does.
@@ -246,6 +250,7 @@ static const RuntimeOps s_runtime_ops = {
     .group_begin = group_begin_impl,
     .group_end = group_end_impl,
     .declare_silos = declare_silos_impl,
+    .declare_partitions = declare_partitions_impl,
 };
 
 // =============================================================================

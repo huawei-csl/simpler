@@ -113,6 +113,11 @@ struct OrchestratorState {
     uint32_t next_silo_hint{0};
     int32_t silo_task_count{0};
 
+    // The partition size the graph asked for, in tasks, and how many partitions
+    // the cut produced. Zero target: no partitions.
+    int32_t partition_target{0};
+    int32_t partition_count{0};
+
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
@@ -197,6 +202,13 @@ struct OrchestratorState {
     void declare_silos();
     uint8_t stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot);
     int32_t silo_tasks() const { return silo_task_count; }
+
+    // Feed the silos one partition at a time: cut the graph, once it is complete,
+    // into runs of about `target_tasks` tasks where the fewest dependencies cross.
+    // Implies silos.
+    void declare_partitions(int32_t target_tasks);
+    void finish_partitions();
+    int32_t partitions() const { return partition_count; }
 
     // Called once orchestration is over, when the whole declaration set is known.
     void finish_groups();
