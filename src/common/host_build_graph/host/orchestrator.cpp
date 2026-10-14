@@ -1724,6 +1724,31 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
     return true;
 }
 
+// The last task to write the element a dispatch predicate reads, by local id, or -1
+// when the tensormap does not track that element. Looked up before the predicated
+// task's own dependencies are resolved, which may retire a covered entry.
+static int32_t predicate_writer(OrchestratorState *orch, const CoreTaskPredicate &predicate) {
+    if (predicate.op == PredicateOp::NONE || orch->in_manual_scope()) return -1;
+    const simpler::hbg::Tensor &operand = *predicate.operand.tensor;
+    if (operand.manual_dep) return -1;
+    uint32_t shapes[MAX_TENSOR_DIMS];
+    uint32_t offsets[MAX_TENSOR_DIMS];
+    for (uint32_t dim = 0; dim < operand.ndims; ++dim) {
+        shapes[dim] = 1;
+        offsets[dim] = dim < predicate.operand.ndims ? predicate.operand.indices[dim] : 0;
+    }
+    const simpler::hbg::Tensor element = operand.view(shapes, offsets);
+    int32_t writer =
+        operand.owner_task_id.is_valid() && operand.owner_task_id.is_global() ? operand.owner_task_id.local_id() : -1;
+    orch->tensor_map.lookup(element, [&](ChipTensorMapEntry &entry, OverlapStatus) -> bool {
+        if (entry.producer_task_id.is_valid() && entry.producer_task_id.is_global()) {
+            writer = std::max(writer, entry.producer_task_id.local_id());
+        }
+        return true;
+    });
+    return writer;
+}
+
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
@@ -1738,6 +1763,7 @@ static TaskOutputTensors submit_task_common(
     TaskOutputTensors result;
     DispatchPredicate resolved_predicate{};
     if (!resolve_dispatch_predicate(orch, args.predicate(), &resolved_predicate)) return result;
+    const int32_t pred_writer = predicate_writer(orch, args.predicate());
     OutputLayout layout = calculate_output_layout(args);
     PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
@@ -1848,8 +1874,10 @@ static TaskOutputTensors submit_task_common(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.predicate_writer = pred_writer;
     task.part = 0;
-    task.part_tasks = 0;
+    task.part_size = 0;
+    task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = aiv0_kernel_id;
@@ -2130,8 +2158,10 @@ bool graph_submit_outer(
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.predicate_writer = -1;
     task.part = 0;
-    task.part_tasks = 0;
+    task.part_size = 0;
+    task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
     task.packed_buffer_base = allocation.packed_base;
@@ -2929,16 +2959,24 @@ void OrchestratorState::declare_partitions(int32_t target_tasks) {
 
 // Cut the graph into partitions of about `partition_target` tasks. Each boundary
 // moves, within a quarter partition of where it would fall, to the point the fewest
-// dependencies cross: a partition launches only once the one before it has
-// finished, so whatever a boundary splits that could have overlapped it waits.
+// dependencies cross: the controllers finish a partition before they start the
+// next, so whatever a boundary splits that could have overlapped it waits.
+//
+// Then number each partition for the controllers. Every task a silo runs takes one
+// index per block and active subtask, consecutive, and the tasks are ordered by
+// dependency level within the partition: what finishes early takes the low
+// indices, so the watermark keeps up with the work and a look-ahead of a few hundred
+// covers the rest. A dependency-only task takes no index; its level passes through
+// to its consumers, which name its producers instead.
 void OrchestratorState::finish_partitions() {
     partition_count = 0;
     const int32_t total = task_allocator.active_count();
     if (partition_target <= 0 || total <= 0) return;
+    SharedMemoryTaskHeader &tasks = sm_header->tasks;
     // crossing[i]: dependencies from a task before i to one at or after it.
     std::vector<int32_t> crossing(static_cast<size_t>(total) + 2, 0);
     for (int32_t c = 0; c < total; ++c) {
-        const TaskPayload &p = sm_header->tasks.get_slot_state_by_task_id(c).to_payload();
+        const TaskPayload &p = tasks.get_slot_state_by_task_id(c).to_payload();
         const int32_t *fanin = p.fanin_data();
         for (int32_t k = 0; k < p.fanin_count; ++k) {
             if (fanin[k] >= 0 && fanin[k] < c) {
@@ -2967,32 +3005,81 @@ void OrchestratorState::finish_partitions() {
         starts.push_back(best);
     }
     starts.push_back(total);
-    for (size_t part = 0; part + 1 < starts.size(); ++part) {
-        int32_t on_device = 0;
-        for (int32_t id = starts[part]; id < starts[part + 1]; ++id) {
-            TaskDescriptor &t = sm_header->tasks.get_task_by_task_id(id);
-            t.part = static_cast<uint16_t>(part);
-            t.part_tasks = 0;
-            if (!sm_header->tasks.is_completed(id)) ++on_device;
+    const auto indices_of = [&](int32_t id) {
+        const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
+        if (tasks.get_task_by_task_id(id).silo == TASK_SILO_NONE || tasks.is_completed(id) ||
+            slot.logical_block_num <= 0) {
+            return 0;
         }
-        sm_header->tasks.get_task_by_task_id(starts[part]).part_tasks = static_cast<uint16_t>(on_device);
+        int32_t subs = 0;
+        for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
+            if (slot.active_mask.subtask_active(static_cast<SubtaskSlot>(sub))) ++subs;
+        }
+        return static_cast<int32_t>(slot.logical_block_num) * subs;
+    };
+    std::vector<int32_t> level(static_cast<size_t>(total), 0);
+    std::vector<int32_t> order;
+    for (size_t part = 0; part + 1 < starts.size(); ++part) {
+        const int32_t first = starts[part];
+        const int32_t end = starts[part + 1];
+        order.clear();
+        for (int32_t id = first; id < end; ++id) {
+            const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
+            const int32_t *fanin = p.fanin_data();
+            int32_t lv = 0;
+            for (int32_t k = 0; k < p.fanin_count; ++k) {
+                const int32_t prod = fanin[k];
+                if (prod < first || prod >= id) continue;
+                lv = std::max(lv, level[static_cast<size_t>(prod)] + (indices_of(prod) > 0 ? 1 : 0));
+            }
+            level[static_cast<size_t>(id)] = lv;
+            TaskDescriptor &t = tasks.get_task_by_task_id(id);
+            t.part = static_cast<uint16_t>(part);
+            t.part_size = 0;
+            t.part_index = TASK_PART_INDEX_NONE;
+            if (indices_of(id) > 0) order.push_back(id);
+        }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            return level[static_cast<size_t>(a)] < level[static_cast<size_t>(b)];
+        });
+        int32_t next = 0;
+        for (const int32_t id : order) {
+            if (next + indices_of(id) > TASK_PART_MAX_INDICES) {
+                LOG_ERROR(
+                    "Partition %zu spans more than %d indices; running the graph without partitions", part,
+                    TASK_PART_MAX_INDICES
+                );
+                for (int32_t t = 0; t < total; ++t) {
+                    tasks.get_task_by_task_id(t).part_index = TASK_PART_INDEX_NONE;
+                }
+                return;
+            }
+            tasks.get_task_by_task_id(id).part_index = static_cast<uint16_t>(next);
+            next += indices_of(id);
+        }
+        tasks.get_task_by_task_id(first).part_size = static_cast<uint16_t>(next);
     }
     partition_count = static_cast<int32_t>(starts.size()) - 1;
 }
 
 // The silo a task is fed to. A task that cannot be fed ahead of its producers
-// keeps the ordinary path: a dispatch predicate is read when the task is ready,
-// and a sync-start cohort needs every core at once. A supertask wide enough to
-// fill more than one silo is split across all of them; anything narrower follows
-// its latest stamped producer, so a chain stays where its data is, and takes the
-// next hint in turn when it has none.
+// keeps the ordinary path: a sync-start cohort needs every core at once, and
+// without partitions a dispatch predicate is read when the task is ready. Within
+// partitions a predicated task is fed like any other; its controller asks the
+// manager for the answer once the task is ready. A supertask wide enough to fill
+// more than one silo is split across all of them; anything narrower follows its
+// latest stamped producer, so a chain stays where its data is, and takes the next
+// hint in turn when it has none.
 uint8_t OrchestratorState::stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot) {
-    if (!silos_declared || slot.task_kind != TaskKind::KERNEL || slot.task_attrs.has_predicate() ||
+    const bool partitioned = partition_target > 0;
+    if (!silos_declared || slot.task_kind != TaskKind::KERNEL || (slot.task_attrs.has_predicate() && !partitioned) ||
         slot.task_attrs.requires_sync_start() || slot.active_mask.to_shape() == ResourceShape::DUMMY) {
         return TASK_SILO_NONE;
     }
     ++silo_task_count;
-    if (slot.logical_block_num >= TASK_SILO_SPREAD_MIN_BLOCKS) return TASK_SILO_SPREAD;
+    if (slot.logical_block_num >= (partitioned ? TASK_PART_SPREAD_MIN_BLOCKS : TASK_SILO_SPREAD_MIN_BLOCKS)) {
+        return TASK_SILO_SPREAD;
+    }
     int32_t latest = -1;
     uint8_t inherited = TASK_SILO_NONE;
     for (int32_t i = 0; i < fanin_count; i++) {
@@ -3229,8 +3316,10 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     task.group = orch->open_group;
     task.group_first = orch->open_group_first;
     task.group_extent = 0;
+    task.predicate_writer = -1;
     task.part = 0;
-    task.part_tasks = 0;
+    task.part_size = 0;
+    task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;

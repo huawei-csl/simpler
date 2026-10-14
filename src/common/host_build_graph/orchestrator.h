@@ -203,9 +203,9 @@ struct OrchestratorState {
     uint8_t stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot);
     int32_t silo_tasks() const { return silo_task_count; }
 
-    // Feed the silos one partition at a time: cut the graph, once it is complete,
-    // into runs of about `target_tasks` tasks where the fewest dependencies cross.
-    // Implies silos.
+    // Run the silos one partition at a time: cut the graph, once it is complete,
+    // into runs of about `target_tasks` tasks where the fewest dependencies cross,
+    // and number each partition's tasks for the controllers. Implies silos.
     void declare_partitions(int32_t target_tasks);
     void finish_partitions();
     int32_t partitions() const { return partition_count; }

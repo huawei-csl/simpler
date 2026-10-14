@@ -267,6 +267,14 @@ constexpr uint8_t TASK_SILO_FIRST = 2;
 constexpr uint32_t TASK_SILO_HINTS = 240;
 // The fewest blocks a task needs to be split across silos rather than fed whole.
 constexpr int32_t TASK_SILO_SPREAD_MIN_BLOCKS = 4;
+// The same, when the graph declares partitions.
+constexpr int32_t TASK_PART_SPREAD_MIN_BLOCKS = 8;
+// A partition-local index is what the controllers' watermark and look-ahead count
+// in: one per block and active subtask of every task the silos run. A task that
+// takes none -- dependency-only, or one the controllers cannot run -- carries this.
+constexpr uint16_t TASK_PART_INDEX_NONE = 0xFFFF;
+// The most indices one partition may span: an index is 11 bits.
+constexpr int32_t TASK_PART_MAX_INDICES = 2048;
 
 /**
  * Task descriptor structure (shared memory)
@@ -303,19 +311,27 @@ struct alignas(64) TaskDescriptor {
     int32_t group_first;
     int32_t group_extent;
 
+    // The task that last wrote the element this task's dispatch predicate reads, by
+    // local id, or -1 when it has no predicate or the writer is not tracked. The
+    // predicate's value is final once that task has finished, which can be well
+    // before this task is ready.
+    int32_t predicate_writer;
+
     // The partition the task belongs to, when the graph declares partitions: a run
-    // of consecutive tasks launched into the silos at once. On a partition's first
-    // task, `part_tasks` is how many of its tasks complete on the device -- the
-    // count that says the partition has finished.
+    // of consecutive tasks the controllers finish before they start the next.
+    // `part_index` is the first partition-local index of the task's own tasks, which
+    // are consecutive, block by block, or TASK_PART_INDEX_NONE when it takes none. On
+    // a partition's first task, `part_size` is how many indices the partition spans.
     uint16_t part;
-    uint16_t part_tasks;
+    uint16_t part_size;
+    uint16_t part_index;
 
     // The silo the task is fed to: one of the TASK_SILO_* values.
     uint8_t silo;
 
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[7];
+    uint8_t reserved[1];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();

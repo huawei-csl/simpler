@@ -351,6 +351,10 @@ struct alignas(64) SimQueue {
     // How far this queue's events have been replayed. A peer completion learned only
     // after the replay passed it is placed here, late, rather than in the past.
     uint64_t replayed_to = 0;
+    // Where the replay stands: the instant of the event it is replaying, else the end
+    // of the last interval it replayed. A partition release due inside the interval
+    // is timed, not late.
+    uint64_t replay_at = 0;
     // Finishes recorded, and how many the manager had retired from at its last
     // status_consumed(): a replay a submit ran, or a read made only to size a
     // dispatch, records finishes the manager has not yet retired.
@@ -508,21 +512,33 @@ void publish(SimQueue &q, uint64_t index, uint64_t legible_at) {
 }
 
 // ---------------------------------------------------------------------------
-// Partition mode. A launched partition's entries are resident in their queue and
-// wait on producer supertasks. A queue counts its own piece of a supertask finished
-// once every entry of it has, and tells the other queues over an exchange ring; a
-// producer is done for a waiting set once every queue running a piece of it has
-// said so. Everything here is owned by the queue's own thread except the rings,
-// which are single-producer, single-consumer.
+// Partition mode. A queue holds the entries of its current partition and of the
+// next, each waiting on three conditions: the queue reaching its partition, its
+// producer supertasks finishing, and the partition's watermark reaching its set's
+// threshold. A queue learns each index of a partition finished -- its own at once,
+// the others' from their broadcasts -- and its watermark is the run of finished
+// indices from zero, with the instant it passed each one. The queue moves to the
+// next partition once its watermark covers the current one whole. Everything here
+// is owned by the queue's own thread except the exchange rings, which are
+// single-producer, single-consumer.
 // ---------------------------------------------------------------------------
 constexpr uint32_t SIM_PART_NONE = UINT32_MAX;
-// Task ids the store keys by. One partition is in flight at a time, so the keys
-// span far more tasks than any partition holds.
+// Task ids the store keys by. At most two partitions are resident, so the keys
+// span far more tasks than they hold.
 constexpr uint32_t SIM_PART_KEYS = 4096;
-constexpr uint32_t SIM_PART_SLOTS = 2048;
+constexpr uint32_t SIM_PART_SLOTS = SIM_PART_STORE;
 constexpr uint32_t SIM_PART_SETS = 2048;
 constexpr uint32_t SIM_PART_WAITERS = 8192;
 constexpr uint32_t SIM_PART_RING = 1024;
+// Watermark contexts a queue keeps, by partition number modulo this: its current
+// partition, the next, and one a peer may already be broadcasting.
+constexpr uint32_t SIM_PART_WMS = 4;
+// The conditions a set waits on, by kind: its arrival, a producer finished in this
+// queue or in another, the watermark's threshold, and its queue reaching the
+// partition.
+enum SimPartCause : uint8_t { PART_ARRIVE = 0, PART_OWN = 1, PART_PEER = 2, PART_THRESHOLD = 3, PART_SWITCH = 4 };
+constexpr uint8_t PART_ANSWER_RUN = 1;
+constexpr uint8_t PART_ANSWER_SKIP = 2;
 
 struct SimPartKey {
     uint64_t epoch = 0;
@@ -530,9 +546,13 @@ struct SimPartKey {
     uint32_t known = 0;    // queues whose piece of this supertask has finished
     uint64_t done_at = 0;  // the latest of them, as legible here
     uint32_t waiters = SIM_PART_NONE;
-    uint32_t piece_size = 0;  // this queue's piece: entries, and how many are placed
+    uint32_t piece_size = 0;  // this queue's piece: entries, and how many are done
     uint32_t piece_placed = 0;
     uint64_t piece_at = 0;
+    int32_t piece_part = -1;  // and the indices it spans
+    uint32_t piece_lo = 0;
+    uint32_t piece_hi = 0;
+    uint32_t piece_set = SIM_PART_NONE;  // and the set its entries wait in
 };
 struct SimPartWaiter {
     uint32_t set;
@@ -544,7 +564,17 @@ struct SimPartSetState {
     bool dep_done[SIM_HELD_MAX_DEPS];
     uint32_t dep_n = 0;
     uint32_t open = 0;
-    uint64_t ready_at = 0;
+    uint64_t ready_at = 0;      // the latest condition met, so far
+    uint64_t other_at = 0;      // the same, leaving out the watermark threshold
+    uint64_t threshold_at = 0;  // when the watermark reached the threshold
+    int32_t part = 0;
+    uint32_t threshold = 0;
+    bool lookahead = false;  // the threshold is the look-ahead's, not a producer's
+    bool decision = false;
+    int32_t task = -1;
+    uint8_t last = 0;        // the kind of condition met last, a SimPartCause
+    uint8_t answer = 0;      // a predicated piece's answer, given before it was ready
+    uint64_t answer_at = 0;  // and when it lands here
     uint32_t members = SIM_PART_NONE;
     uint32_t member_n = 0;
 };
@@ -553,15 +583,31 @@ struct SimPartSlot {
     uint32_t set = SIM_PART_NONE;
     uint32_t next = SIM_PART_NONE;
 };
+// A finished piece, broadcast: the supertask, its sender, the real instant it goes
+// out, and the indices it covers.
 struct SimPartEvent {
     int32_t task;
     uint32_t src;
     uint64_t real;
+    int32_t part;
+    uint32_t lo;
+    uint32_t hi;
 };
 struct SimPartRing {
     std::atomic<uint32_t> head{0};
     std::atomic<uint32_t> tail{0};
     SimPartEvent ev[SIM_PART_RING];
+};
+// One partition's watermark as this queue knows it.
+struct SimPartWm {
+    int32_t part = -1;
+    uint32_t size = 0;
+    bool sized = false;
+    uint32_t wm = 0;                                     // indices known finished, from zero
+    uint64_t wm_at = 0;                                  // when the watermark passed the last of them
+    std::vector<uint64_t> known;                         // per index: when it became known here, or UINT64_MAX
+    std::vector<uint64_t> passed;                        // per index below wm: when the watermark passed it
+    std::vector<std::pair<uint32_t, uint32_t>> waiting;  // (threshold, set), soonest first
 };
 
 struct SimPartState {
@@ -577,12 +623,22 @@ struct SimPartState {
     std::vector<SimPartSlot> slots;
     uint32_t slot_free = SIM_PART_NONE;
     uint32_t slot_bump = 0;
-    // Entries whose producers have all finished, waiting for room in their ring.
+    // Entries whose conditions are all met, waiting for room in their ring.
     std::vector<uint32_t> ready[2];
     uint32_t ready_head[2] = {0, 0};
     uint32_t ready_tail[2] = {0, 0};
     // Sets whose release is timed on a completion, earliest first.
     std::vector<std::pair<uint64_t, uint32_t>> releases;
+    SimPartWm wms[SIM_PART_WMS];
+    int32_t cur_part = 0;
+    uint64_t switch_at = 0;  // when this queue reached cur_part
+    // Sets waiting for this queue to reach their partition, by partition number.
+    std::vector<uint32_t> gated[SIM_PART_WMS];
+    // Predicated pieces found ready, waiting for the manager: (when, set), oldest
+    // first; and the ones it has taken but not yet answered.
+    std::vector<std::pair<uint64_t, uint32_t>> decisions;
+    uint32_t decision_head = 0;
+    std::vector<std::pair<uint64_t, uint32_t>> asked;
     uint32_t waiter_live = 0;
     uint32_t set_live = 0;
     uint64_t resident = 0;
@@ -591,11 +647,26 @@ struct SimPartState {
     uint64_t timed = 0;
     uint64_t late = 0;
     uint64_t late_ticks = 0;
+    uint64_t late_by[5] = {0, 0, 0, 0, 0};
+    uint64_t wm_waits = 0;
+    uint64_t wm_wait_ticks = 0;
+    uint64_t la_waits = 0;
+    uint64_t la_wait_ticks = 0;
+    uint64_t decided = 0;
+    uint64_t skips = 0;
+    uint64_t decision_ticks = 0;
+    uint64_t answered_ahead = 0;
+    uint64_t answer_waits = 0;
+    uint64_t answer_wait_ticks = 0;
+    uint64_t switches = 0;
+    uint64_t behind = 0;
+    uint64_t behind_ticks = 0;
 };
 SimPartState g_part[SIM_MAX_QUEUES];
 std::unique_ptr<SimPartRing[]> g_part_rings;  // [src * SIM_MAX_QUEUES + dst]
 uint64_t g_part_epoch = 0;
 bool g_part_on = false;
+uint64_t g_broadcast_ticks = 1;
 
 SimPartKey &part_key(SimPartState &p, int32_t task) {
     SimPartKey &k = p.keys[static_cast<uint32_t>(task) & (SIM_PART_KEYS - 1)];
@@ -605,6 +676,22 @@ SimPartKey &part_key(SimPartState &p, int32_t task) {
         k.task = task;
     }
     return k;
+}
+
+// The watermark context of partition `part`, taken over from the partition four
+// before it, which every queue has long finished.
+SimPartWm &part_wm(SimPartState &p, int32_t part) {
+    SimPartWm &w = p.wms[static_cast<uint32_t>(part) & (SIM_PART_WMS - 1)];
+    if (w.part != part) {
+        w.part = part;
+        w.size = 0;
+        w.sized = false;
+        w.wm = 0;
+        w.wm_at = 0;
+        std::fill(w.known.begin(), w.known.end(), UINT64_MAX);
+        w.waiting.clear();
+    }
+    return w;
 }
 
 uint32_t part_alloc_waiter(SimPartState &p) {
@@ -634,28 +721,147 @@ uint32_t part_alloc_set(SimPartState &p) {
     return p.set_bump < SIM_PART_SETS ? p.set_bump++ : SIM_PART_NONE;
 }
 
+void part_free_set(SimPartState &p, uint32_t set) {
+    p.sets[set].task = -1;
+    p.set_next_free[set] = p.set_free;
+    p.set_free = set;
+    --p.set_live;
+}
+
 void part_ready_push(SimPartState &p, uint32_t slot) {
     const uint32_t r = p.slots[slot].e.type == SimTaskType::Cube ? 0 : 1;
     p.ready[r][p.ready_tail[r]++ & (SIM_PART_SLOTS - 1)] = slot;
 }
 
-// A set whose producers have all finished: its entries are placeable at `ready_at`,
-// at once if the replay has reached it, else on a release timed for it. One learned
-// after the replay has passed it is placed where the replay stands, counted late.
-void part_settle(SimQueue &q, SimPartState &p, uint32_t set) {
+void part_entry_done(SimQueue &q, const SimQueueEntryStore &e, uint64_t at);
+void mark_queue_done(SimQueue &q, uint64_t index, uint64_t at);
+
+// A skipped piece: each of its entries finishes at `at` without a core, as its
+// manager will read.
+void part_skip(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
+    ++p.skips;
+    uint32_t m = p.sets[set].members;
+    while (m != SIM_PART_NONE) {
+        SimPartSlot &sl = p.slots[m];
+        const uint32_t next = sl.next;
+        const SimQueueEntryStore e = sl.e;
+        sl.next = p.slot_free;
+        p.slot_free = m;
+        --p.resident;
+        mark_queue_done(q, e.index[0], at);
+        part_entry_done(q, e, at);
+        m = next;
+    }
+    part_free_set(p, set);
+}
+
+// A set whose conditions are all met, at `at`: its entries go to their rings. A
+// predicated piece goes to the manager for an answer first, unless the answer came
+// before it was ready.
+void part_release(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
     SimPartSetState &s = p.sets[set];
-    if (s.ready_at > q.replayed_to) {
-        p.releases.emplace_back(s.ready_at, set);
+    // An answer sent before the piece was ready but still on its way: the piece goes
+    // when it lands.
+    if (s.decision && s.answer != 0 && s.answer_at > at) {
+        ++p.answer_waits;
+        p.answer_wait_ticks += s.answer_at - at;
+        s.ready_at = s.answer_at;
+        p.releases.emplace_back(s.answer_at, set);
         std::push_heap(p.releases.begin(), p.releases.end(), std::greater<>());
         return;
     }
-    if (s.ready_at < q.replayed_to) {
-        ++p.late;
-        p.late_ticks += q.replayed_to - s.ready_at;
+    if (s.threshold_at > s.other_at) {
+        ++(s.lookahead ? p.la_waits : p.wm_waits);
+        (s.lookahead ? p.la_wait_ticks : p.wm_wait_ticks) += s.threshold_at - s.other_at;
+    }
+    if (s.decision && s.answer == PART_ANSWER_SKIP) {
+        part_skip(q, p, set, at);
+        return;
+    }
+    if (s.decision && s.answer != PART_ANSWER_RUN) {
+        p.decisions.emplace_back(at, set);
+        return;
     }
     for (uint32_t m = s.members; m != SIM_PART_NONE; m = p.slots[m].next) {
         part_ready_push(p, m);
     }
+}
+
+// A set whose conditions are all met: released at `ready_at`, at once if the replay
+// has reached it, else on a release timed for it. One learned after the replay has
+// passed it is released where the replay stands, counted late.
+void part_settle(SimQueue &q, SimPartState &p, uint32_t set) {
+    SimPartSetState &s = p.sets[set];
+    if (s.ready_at > q.replay_at) {
+        p.releases.emplace_back(s.ready_at, set);
+        std::push_heap(p.releases.begin(), p.releases.end(), std::greater<>());
+        return;
+    }
+    if (s.ready_at < q.replay_at) {
+        ++p.late;
+        ++p.late_by[s.last];
+        p.late_ticks += q.replay_at - s.ready_at;
+    }
+    part_release(q, p, set, q.replay_at);
+}
+
+// One of a set's conditions is met, at `at`.
+void part_condition(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at, SimPartCause cause) {
+    SimPartSetState &s = p.sets[set];
+    if (at > s.ready_at) s.ready_at = at;
+    if (cause == PART_THRESHOLD) {
+        s.threshold_at = at;
+    } else if (at > s.other_at) {
+        s.other_at = at;
+    }
+    s.last = cause;
+    if (--s.open == 0) part_settle(q, p, set);
+}
+
+// This queue has reached the next partition once its watermark covers the current
+// one whole: the sets waiting for it are free to go from then, and a partition
+// already covered by then is passed too.
+void part_try_switch(SimQueue &q, SimPartState &p) {
+    for (;;) {
+        SimPartWm &w = part_wm(p, p.cur_part);
+        if (!w.sized || w.wm < w.size) return;
+        if (w.size > 0 && w.passed[w.size - 1] > p.switch_at) p.switch_at = w.passed[w.size - 1];
+        ++p.cur_part;
+        ++p.switches;
+        std::vector<uint32_t> &g = p.gated[static_cast<uint32_t>(p.cur_part) & (SIM_PART_WMS - 1)];
+        std::vector<uint32_t> open;
+        open.swap(g);
+        for (const uint32_t set : open) {
+            if (p.sets[set].part == p.cur_part) {
+                part_condition(q, p, set, p.switch_at, PART_SWITCH);
+            } else {
+                g.push_back(set);
+            }
+        }
+    }
+}
+
+// Indices [lo, hi) of partition `part` are known finished here from `at`. The
+// watermark takes in what that completes, and each threshold it reaches is met at
+// the instant the watermark passed it.
+void part_learn(SimQueue &q, SimPartState &p, int32_t part, uint32_t lo, uint32_t hi, uint64_t at) {
+    if (part < p.cur_part) return;
+    SimPartWm &w = part_wm(p, part);
+    for (uint32_t i = lo; i < hi && i < SIM_PART_INDICES; ++i) {
+        if (w.known[i] == UINT64_MAX || at < w.known[i]) w.known[i] = at;
+    }
+    while (w.wm < SIM_PART_INDICES && w.known[w.wm] != UINT64_MAX) {
+        if (w.known[w.wm] > w.wm_at) w.wm_at = w.known[w.wm];
+        w.passed[w.wm] = w.wm_at;
+        ++w.wm;
+    }
+    while (!w.waiting.empty() && w.waiting.front().first <= w.wm) {
+        std::pop_heap(w.waiting.begin(), w.waiting.end(), std::greater<>());
+        const auto [threshold, set] = w.waiting.back();
+        w.waiting.pop_back();
+        part_condition(q, p, set, w.passed[threshold - 1], PART_THRESHOLD);
+    }
+    if (part == p.cur_part) part_try_switch(q, p);
 }
 
 // Queue `src` has finished its piece of `k.task`, legible here at `at`.
@@ -672,29 +878,32 @@ void part_known(SimQueue &q, SimPartState &p, SimPartKey &k, uint32_t src, uint6
             continue;
         }
         s.dep_done[w.dep] = true;
-        if (k.done_at > s.ready_at) s.ready_at = k.done_at;
         const uint32_t set = w.set;
         const uint32_t freed = *link;
         *link = w.next;
         p.waiters[freed].next = p.waiter_free;
         p.waiter_free = freed;
         --p.waiter_live;
-        if (--s.open == 0) part_settle(q, p, set);
+        part_condition(q, p, set, k.done_at, src == static_cast<uint32_t>(&q - &g_queues[0]) ? PART_OWN : PART_PEER);
     }
 }
 
-// One of this queue's partition entries has been placed, ending at `legible_at`.
-// The piece it belongs to finishes once all its entries have been placed; then this
-// queue knows it at once and the others after the exchange.
-void part_placed(SimQueue &q, int32_t task, uint64_t legible_at) {
+// One of this queue's partition entries is done, legible at `at` -- run on a core,
+// or skipped by its manager. Its index is known here at once. The piece it belongs
+// to finishes once all its entries are done; then this queue knows it at once, and
+// broadcasts it in the first slot from then, which the others learn
+// SIM_GQ_EXCHANGE_NS later.
+void part_entry_done(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
     SimPartState &p = g_part[qi];
-    SimPartKey &k = part_key(p, task);
+    part_learn(q, p, e.piece_part, e.piece_index, e.piece_index + 1, at);
+    SimPartKey &k = part_key(p, e.piece_task);
     ++k.piece_placed;
-    if (legible_at > k.piece_at) k.piece_at = legible_at;
+    if (at > k.piece_at) k.piece_at = at;
     if (k.piece_placed != k.piece_size) return;
     part_known(q, p, k, qi, k.piece_at);
-    const uint64_t real = k.piece_at + g_ledger[qi].overrun_ticks;
+    const uint64_t slot_at = (k.piece_at + g_broadcast_ticks - 1) / g_broadcast_ticks * g_broadcast_ticks;
+    const uint64_t real = slot_at + g_ledger[qi].overrun_ticks;
     for (uint32_t dst = 0; dst < SIM_MAX_QUEUES; ++dst) {
         if (dst == qi || !g_part[dst].on) continue;
         SimPartRing &r = g_part_rings[qi * SIM_MAX_QUEUES + dst];
@@ -704,12 +913,12 @@ void part_placed(SimQueue &q, int32_t task, uint64_t legible_at) {
             __asm__ volatile("yield");
 #endif
         }
-        r.ev[head & (SIM_PART_RING - 1)] = SimPartEvent{task, qi, real};
+        r.ev[head & (SIM_PART_RING - 1)] = SimPartEvent{e.piece_task, qi, real, k.piece_part, k.piece_lo, k.piece_hi};
         r.head.store(head + 1, std::memory_order_release);
     }
 }
 
-// Take the piece completions the other queues have sent this one.
+// Take the pieces the other queues have broadcast to this one.
 void part_drain(SimQueue &q, uint32_t qi) {
     SimPartState &p = g_part[qi];
     if (!p.on) return;
@@ -724,6 +933,7 @@ void part_drain(SimQueue &q, uint32_t qi) {
             ++tail;
             ++p.events_in;
             const uint64_t here = (ev.real > ofs ? ev.real - ofs : 0) + g_exchange_ticks;
+            part_learn(q, p, ev.part, ev.lo, ev.hi, here);
             part_known(q, p, part_key(p, ev.task), ev.src, here);
         }
         r.tail.store(tail, std::memory_order_release);
@@ -986,7 +1196,7 @@ void commit(
     }
     publish(q, e.index[part], legible_at);
     if (e.piece_task >= 0) {
-        part_placed(q, e.piece_task, legible_at);
+        part_entry_done(q, e, legible_at);
     }
 }
 
@@ -1337,9 +1547,9 @@ void promote_held(SimQueue &q, uint64_t at) {
     }
 }
 
-// Move partition entries whose producers have finished into their rings, in the
-// order they became ready, while each ring has room. A slot whose entry moved is
-// free again, and so is its set once every member has.
+// Move partition entries whose conditions are met into their rings, in the order
+// they became ready, while each ring has room. A slot whose entry moved is free
+// again, and so is its set once every member has.
 void promote_part(SimQueue &q, uint64_t at) {
     const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
     SimPartState &p = g_part[qi];
@@ -1351,11 +1561,7 @@ void promote_part(SimQueue &q, uint64_t at) {
             if (!enqueue_entry(q, sl.e, at > sl.e.enqueued_at ? at : sl.e.enqueued_at)) break;
             ++p.ready_head[r];
             SimPartSetState &s = p.sets[sl.set];
-            if (--s.member_n == 0) {
-                p.set_next_free[sl.set] = p.set_free;
-                p.set_free = sl.set;
-                --p.set_live;
-            }
+            if (--s.member_n == 0) part_free_set(p, sl.set);
             sl.next = p.slot_free;
             p.slot_free = slot;
             --p.resident;
@@ -1369,9 +1575,7 @@ void fire_part_release(SimQueue &q, SimPartState &p) {
     const auto [at, set] = p.releases.back();
     p.releases.pop_back();
     ++p.timed;
-    for (uint32_t m = p.sets[set].members; m != SIM_PART_NONE; m = p.slots[m].next) {
-        part_ready_push(p, m);
-    }
+    part_release(q, p, set, at);
     promote_part(q, at);
     dispatch_pending(q, at);
 }
@@ -1493,23 +1697,33 @@ void replay_with_releases(SimQueue &q, uint64_t upto) {
             break;
         }
         if (part_at < core_at && part_at <= rel_at) {
+            q.replay_at = part_at;
             fire_part_release(q, g_part[qi]);
             continue;
         }
         if (rel_at < core_at) {
+            q.replay_at = rel_at;
             fire_release(q, set);
             continue;
         }
         q.next_event = UINT64_MAX;
+        q.replay_at = core_at;
         retire_core(q, core, core_at, upto);
     }
     refresh_next_event(q);
 }
 
+void replay_due(SimQueue &q, uint64_t upto);
+
 void retire_due(SimQueue &q, uint64_t upto) {
     if (upto > q.replayed_to) {
         q.replayed_to = upto;
     }
+    replay_due(q, upto);
+    q.replay_at = q.replayed_to;
+}
+
+void replay_due(SimQueue &q, uint64_t upto) {
     const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
     if (q.deps_armed != 0 || part_next_release(qi) <= upto) {
         replay_with_releases(q, upto);
@@ -1524,6 +1738,7 @@ void retire_due(SimQueue &q, uint64_t upto) {
     while (k < n) {
         const uint32_t core = due[k++];
         q.next_event = UINT64_MAX;
+        q.replay_at = q.evt_at[core];
         retire_core(q, core, q.evt_at[core], upto);
         if (q.deps_armed != 0 || part_next_release(qi) <= upto) {
             replay_with_releases(q, upto);
@@ -1955,6 +2170,7 @@ void set_latencies_ns(uint64_t push_ns, uint64_t read_ns, uint64_t ack_ns, uint6
     g_arrive_ticks = ns_to_ticks(SIM_QUEUE_ARRIVAL_NS);
     g_peer_link_ticks = ns_to_ticks(SIM_GQ_PEER_LINK_NS);
     g_exchange_ticks = ns_to_ticks(SIM_GQ_EXCHANGE_NS);
+    g_broadcast_ticks = ns_to_ticks(SIM_GQ_BROADCAST_NS) > 0 ? ns_to_ticks(SIM_GQ_BROADCAST_NS) : 1;
 }
 
 void set_queue_latencies_ns(uint64_t report_ns, uint64_t poll_ns) {
@@ -2174,13 +2390,33 @@ void set_partition_mode(bool on) {
             p.ready[0].resize(SIM_PART_SLOTS);
             p.ready[1].resize(SIM_PART_SLOTS);
             p.releases.reserve(SIM_PART_SETS);
+            for (SimPartWm &w : p.wms) {
+                w.known.resize(SIM_PART_INDICES);
+                w.passed.resize(SIM_PART_INDICES);
+                w.waiting.reserve(SIM_PART_SETS);
+            }
         }
         p.waiter_free = p.set_free = p.slot_free = SIM_PART_NONE;
         p.waiter_bump = p.set_bump = p.slot_bump = 0;
         p.ready_head[0] = p.ready_head[1] = p.ready_tail[0] = p.ready_tail[1] = 0;
         p.releases.clear();
+        for (SimPartWm &w : p.wms) {
+            w.part = -1;
+        }
+        part_wm(p, 0);
+        p.cur_part = 0;
+        p.switch_at = 0;
+        for (std::vector<uint32_t> &g : p.gated) {
+            g.clear();
+        }
+        p.decisions.clear();
+        p.decision_head = 0;
+        p.asked.clear();
         p.waiter_live = p.set_live = 0;
         p.resident = p.resident_peak = p.events_in = p.timed = p.late = p.late_ticks = 0;
+        std::fill(std::begin(p.late_by), std::end(p.late_by), 0);
+        p.wm_waits = p.wm_wait_ticks = p.la_waits = p.la_wait_ticks = 0;
+        p.decided = p.skips = p.decision_ticks = p.answered_ahead = p.switches = p.behind = p.behind_ticks = 0;
     }
     if (on) {
         for (size_t i = 0; i < static_cast<size_t>(SIM_MAX_QUEUES) * SIM_MAX_QUEUES; ++i) {
@@ -2191,12 +2427,12 @@ void set_partition_mode(bool on) {
 }
 
 bool submit_partition(
-    uint32_t queue_idx, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets, uint32_t set_n,
-    const SimPartDep *deps, uint32_t dep_n
+    uint32_t queue_idx, int32_t part, uint32_t size, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets,
+    uint32_t set_n, const SimPartDep *deps, uint32_t dep_n
 ) {
     // The manager posts one descriptor per entry; the queue sees them arrive together.
     const Access a = begin_access(queue_idx, g_push_ticks * (n > 0 ? n : 1));
-    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on || n == 0) {
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
         wait_until(a.release);
         return false;
     }
@@ -2205,27 +2441,56 @@ bool submit_partition(
     part_drain(q, queue_idx);
     retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
     const uint64_t arrive_at = a.at + g_arrive_ticks;
-    // A store that cannot take the whole launch admits none of it.
-    bool fits = set_n <= SIM_PART_SETS - p.set_live && n <= SIM_PART_SLOTS - p.resident &&
-                dep_n <= SIM_PART_WAITERS - p.waiter_live;
+    // A store that cannot take the whole call admits none of it.
+    bool fits = part >= p.cur_part && set_n <= SIM_PART_SETS - p.set_live && n <= SIM_PART_SLOTS - p.resident &&
+                dep_n <= SIM_PART_WAITERS - p.waiter_live && size <= SIM_PART_INDICES;
     for (uint32_t i = 0; fits && i < set_n; ++i) {
-        fits = sets[i].n <= SIM_HELD_MAX_DEPS;
+        fits = sets[i].n <= SIM_HELD_MAX_DEPS && sets[i].threshold <= size;
+    }
+    for (uint32_t i = 0; fits && i < n; ++i) {
+        fits = entries[i].pindex < size;
     }
     if (!fits) {
         ++q.held_refused;
         wait_until(a.release);
         return false;
     }
+    SimPartWm &w = part_wm(p, part);
+    w.size = size;
+    w.sized = true;
     std::vector<uint32_t> set_ids(set_n);
+    // A set of the partition this queue has reached waits for the instant it did,
+    // which a watermark known ahead of time can put later than its arrival.
+    const uint64_t floor_at = (part == p.cur_part && p.switch_at > arrive_at) ? p.switch_at : arrive_at;
     for (uint32_t i = 0; i < set_n; ++i) {
         set_ids[i] = part_alloc_set(p);
         ++p.set_live;
-        SimPartSetState &s = p.sets[set_ids[i]];
-        s = SimPartSetState{};
-        s.ready_at = arrive_at;
+        SimPartSetState &st = p.sets[set_ids[i]];
+        st = SimPartSetState{};
+        st.ready_at = st.other_at = floor_at;
+        st.part = part;
+        st.threshold = sets[i].threshold;
+        st.decision = sets[i].decision;
+    }
+    // The look-ahead bounds a set by its last entry: the watermark must be within
+    // SIM_PART_LOOKAHEAD of it.
+    for (uint32_t i = 0; i < n; ++i) {
+        SimPartSetState &st = p.sets[set_ids[entries[i].set]];
+        if (entries[i].pindex + 1 > SIM_PART_LOOKAHEAD && entries[i].pindex + 1 - SIM_PART_LOOKAHEAD > st.threshold) {
+            st.threshold = entries[i].pindex + 1 - SIM_PART_LOOKAHEAD;
+            st.lookahead = true;
+        }
     }
     for (uint32_t i = 0; i < n; ++i) {
-        ++part_key(p, entries[i].task_id).piece_size;
+        SimPartKey &k = part_key(p, entries[i].task_id);
+        if (k.piece_size == 0) {
+            k.piece_part = part;
+            k.piece_lo = entries[i].pindex;
+            k.piece_hi = entries[i].pindex + 1;
+        }
+        if (entries[i].pindex < k.piece_lo) k.piece_lo = entries[i].pindex;
+        if (entries[i].pindex + 1 > k.piece_hi) k.piece_hi = entries[i].pindex + 1;
+        ++k.piece_size;
     }
     for (uint32_t i = 0; i < n; ++i) {
         const uint32_t slot = part_alloc_slot(p);
@@ -2237,52 +2502,197 @@ bool submit_partition(
         sl.e.task_id = entries[i].task_id;
         sl.e.type = entries[i].type;
         sl.e.piece_task = entries[i].task_id;
+        sl.e.piece_part = part;
+        sl.e.piece_index = entries[i].pindex;
         sl.e.enqueued_at = arrive_at;
         sl.set = set_ids[entries[i].set];
-        SimPartSetState &s = p.sets[sl.set];
-        sl.next = s.members;
-        s.members = slot;
-        ++s.member_n;
+        SimPartSetState &st = p.sets[sl.set];
+        st.task = entries[i].task_id;
+        part_key(p, entries[i].task_id).piece_set = sl.set;
+        if (part > 0 && part == p.cur_part) {
+            ++p.behind;
+            p.behind_ticks += arrive_at > p.switch_at ? arrive_at - p.switch_at : 0;
+        }
+        sl.next = st.members;
+        st.members = slot;
+        ++st.member_n;
         ++p.resident;
     }
     if (p.resident > p.resident_peak) p.resident_peak = p.resident;
+    // Every condition a set waits on is counted before any is met, so none settles
+    // it early.
     for (uint32_t i = 0; i < set_n; ++i) {
-        SimPartSetState &s = p.sets[set_ids[i]];
+        SimPartSetState &st = p.sets[set_ids[i]];
+        st.open = 1 + (part > p.cur_part ? 1 : 0) + (st.threshold > 0 ? 1 : 0);
         for (uint32_t j = 0; j < sets[i].n && sets[i].first + j < dep_n; ++j) {
             const SimPartDep &d = deps[sets[i].first + j];
-            const uint32_t di = s.dep_n++;
-            s.deps[di] = d;
-            s.dep_done[di] = false;
+            const uint32_t di = st.dep_n++;
+            st.deps[di] = d;
+            st.dep_done[di] = false;
             SimPartKey &k = part_key(p, d.task);
             if ((k.known & d.queues) == d.queues) {
-                s.dep_done[di] = true;
-                if (k.done_at > s.ready_at) s.ready_at = k.done_at;
+                st.dep_done[di] = true;
+                if (k.done_at > st.ready_at) st.ready_at = k.done_at;
+                if (k.done_at > st.other_at) st.other_at = k.done_at;
                 continue;
             }
-            const uint32_t w = part_alloc_waiter(p);
+            const uint32_t wi = part_alloc_waiter(p);
             ++p.waiter_live;
-            p.waiters[w] = SimPartWaiter{set_ids[i], di, k.waiters};
-            k.waiters = w;
-            ++s.open;
+            p.waiters[wi] = SimPartWaiter{set_ids[i], di, k.waiters};
+            k.waiters = wi;
+            ++st.open;
         }
-        if (s.open == 0) part_settle(q, p, set_ids[i]);
     }
+    for (uint32_t i = 0; i < set_n; ++i) {
+        const uint32_t set = set_ids[i];
+        SimPartSetState &st = p.sets[set];
+        if (part > p.cur_part) p.gated[static_cast<uint32_t>(part) & (SIM_PART_WMS - 1)].push_back(set);
+        if (st.threshold > 0) {
+            if (w.wm >= st.threshold) {
+                part_condition(q, p, set, w.passed[st.threshold - 1], PART_THRESHOLD);
+            } else {
+                w.waiting.emplace_back(st.threshold, set);
+                std::push_heap(w.waiting.begin(), w.waiting.end(), std::greater<>());
+            }
+        }
+        part_condition(q, p, set, floor_at, PART_ARRIVE);
+    }
+    part_try_switch(q, p);
     promote_part(q, arrive_at);
     dispatch_pending(q, arrive_at);
     finish_push(q, queue_idx, a);
     return true;
 }
 
-void queue_part_stats(
-    uint32_t queue_idx, uint64_t *resident_peak, uint64_t *events_in, uint64_t *timed, uint64_t *late, uint64_t *late_ns
-) {
+int32_t queue_partition(uint32_t queue_idx) {
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) return 0;
+    const SimPartState &p = g_part[queue_idx];
+    const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
+    return (p.cur_part > 0 && p.switch_at > now) ? p.cur_part - 1 : p.cur_part;
+}
+
+uint32_t part_store_room(uint32_t queue_idx) {
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) return 0;
+    return SIM_PART_SLOTS - static_cast<uint32_t>(g_part[queue_idx].resident);
+}
+
+// A parked piece becomes legible to the manager as a finish does: through the
+// queue's report path.
+bool decision_waiting(uint32_t queue_idx) {
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) return false;
+    const SimPartState &p = g_part[queue_idx];
+    if (p.decision_head >= p.decisions.size()) return false;
+    const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
+    return p.decisions[p.decision_head].first + g_report_ticks <= now;
+}
+
+int32_t take_decision(uint32_t queue_idx) {
+    const Access a = begin_access(queue_idx, g_queue_poll_ticks);
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
+        wait_until(a.release);
+        return -1;
+    }
+    SimQueue &q = g_queues[queue_idx];
+    SimPartState &p = g_part[queue_idx];
+    int32_t task = -1;
+    if (p.decision_head < p.decisions.size() && p.decisions[p.decision_head].first + g_report_ticks <= a.at) {
+        const auto [at, set] = p.decisions[p.decision_head++];
+        task = p.sets[set].task;
+        p.asked.emplace_back(at, set);
+        if (p.decision_head == p.decisions.size()) {
+            p.decisions.clear();
+            p.decision_head = 0;
+        }
+    }
+    finish_poll(q, queue_idx, a);
+    return task;
+}
+
+void answer_decision(uint32_t queue_idx, int32_t task_id, bool run) {
+    const Access a = begin_access(queue_idx, g_push_ticks);
+    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
+        wait_until(a.release);
+        return;
+    }
+    SimQueue &q = g_queues[queue_idx];
+    SimPartState &p = g_part[queue_idx];
+    part_drain(q, queue_idx);
+    retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
+    const uint64_t at = a.at + g_arrive_ticks;
+    // A piece taken from the decision queue, or one still waiting there, is acted on
+    // now; one that is not ready yet keeps the answer for when it is.
+    uint32_t set = SIM_PART_NONE;
+    uint64_t parked = 0;
+    for (size_t i = 0; i < p.asked.size(); ++i) {
+        if (p.sets[p.asked[i].second].task != task_id) continue;
+        parked = p.asked[i].first;
+        set = p.asked[i].second;
+        p.asked.erase(p.asked.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+    }
+    if (set == SIM_PART_NONE) {
+        const uint32_t own = part_key(p, task_id).piece_set;
+        if (own != SIM_PART_NONE && p.sets[own].task == task_id && p.sets[own].decision && p.sets[own].answer == 0 &&
+            p.sets[own].member_n > 0) {
+            for (size_t i = p.decision_head; i < p.decisions.size(); ++i) {
+                if (p.decisions[i].second != own) continue;
+                parked = p.decisions[i].first;
+                set = own;
+                p.decisions.erase(p.decisions.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+            if (set == SIM_PART_NONE) {
+                p.sets[own].answer = run ? PART_ANSWER_RUN : PART_ANSWER_SKIP;
+                p.sets[own].answer_at = at;
+                ++p.answered_ahead;
+            }
+        }
+    }
+    if (set != SIM_PART_NONE) {
+        ++p.decided;
+        p.decision_ticks += at > parked ? at - parked : 0;
+        if (run) {
+            SimPartSetState &st = p.sets[set];
+            for (uint32_t m = st.members; m != SIM_PART_NONE; m = p.slots[m].next) {
+                p.slots[m].e.enqueued_at = at;
+                part_ready_push(p, m);
+            }
+        } else {
+            part_skip(q, p, set, at);
+        }
+    }
+    promote_part(q, at);
+    dispatch_pending(q, at);
+    finish_push(q, queue_idx, a);
+}
+
+void queue_part_stats(uint32_t queue_idx, SimPartStats *out) {
     const SimPartState &p = g_part[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
     const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
-    *resident_peak = p.resident_peak;
-    *events_in = p.events_in;
-    *timed = p.timed;
-    *late = p.late;
-    *late_ns = freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(p.late_ticks) * 1'000'000'000ULL / freq) : 0;
+    const auto ns = [freq](uint64_t ticks) {
+        return freq != 0 ? static_cast<uint64_t>(static_cast<__uint128_t>(ticks) * 1'000'000'000ULL / freq) : 0;
+    };
+    out->resident_peak = p.resident_peak;
+    out->events_in = p.events_in;
+    out->timed = p.timed;
+    out->late = p.late;
+    out->late_ns = ns(p.late_ticks);
+    for (uint32_t i = 0; i < 5; ++i) {
+        out->late_by[i] = p.late_by[i];
+    }
+    out->wm_waits = p.wm_waits;
+    out->wm_wait_ns = ns(p.wm_wait_ticks);
+    out->la_waits = p.la_waits;
+    out->la_wait_ns = ns(p.la_wait_ticks);
+    out->decisions = p.decided;
+    out->skips = p.skips;
+    out->decision_ns = ns(p.decision_ticks);
+    out->answered_ahead = p.answered_ahead;
+    out->answer_waits = p.answer_waits;
+    out->answer_wait_ns = ns(p.answer_wait_ticks);
+    out->switches = p.switches;
+    out->behind = p.behind;
+    out->behind_ns = ns(p.behind_ticks);
 }
 
 void status_consumed(uint32_t queue_idx) {
@@ -2347,7 +2757,10 @@ bool poll_may_report(uint32_t queue_idx) {
     const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
     const uint64_t legible = now > g_report_ticks ? now - g_report_ticks : 0;
     if (q.next_event <= legible) return true;
-    if (g_part[queue_idx].on && (part_next_release(queue_idx) <= legible || part_inbox_pending(queue_idx))) return true;
+    if (g_part[queue_idx].on &&
+        (part_next_release(queue_idx) <= legible || part_inbox_pending(queue_idx) || decision_waiting(queue_idx))) {
+        return true;
+    }
     for (uint32_t m = q.deps_armed; m != 0; m &= m - 1) {
         if (q.deps[__builtin_ctz(m)].release_at <= legible) return true;
     }

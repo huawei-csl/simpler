@@ -310,13 +310,15 @@ static inline void rt_declare_silos() {
 }
 
 /**
- * Feed the silos one partition at a time.
+ * Run the graph on the silos one partition at a time.
  *
  * Once the graph is complete it is cut into partitions of about `target_tasks`
- * consecutive tasks, each boundary placed where the fewest dependencies cross. A
- * partition is launched into the silos whole -- every task resident in its silo,
- * waiting on its producers there -- and only once the partition before it has
- * finished. Implies rt_declare_silos(); a runtime without silos ignores it.
+ * consecutive tasks, each boundary placed where the fewest dependencies cross,
+ * and each partition's tasks are numbered by dependency level. Every silo's
+ * controller holds its share of a partition, resolves the partition's edges with
+ * the others by exchanging their watermarks, and moves to the next partition once
+ * the current one has finished whole. Implies rt_declare_silos(); a runtime
+ * without silos ignores it.
  */
 static inline void rt_declare_partitions(int32_t target_tasks) {
     RuntimeContext *rt = current_runtime();

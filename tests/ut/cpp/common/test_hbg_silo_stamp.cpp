@@ -15,6 +15,9 @@
  *   TASK_SILO_SPREAD  at least TASK_SILO_SPREAD_MIN_BLOCKS blocks: one piece per silo
  *   a hint            anything narrower: its latest stamped producer's, else the
  *                     next one in turn
+ *
+ * and, with them, the partition-local indices and the writer of the element a
+ * dispatch predicate reads.
  */
 
 #include <gtest/gtest.h>
@@ -124,8 +127,8 @@ TEST_F(HbgSiloStampTest, ConsumerOfOnlySpreadProducersTakesTheNextHint) {
 
 // Partitions: cut once the graph is complete, each boundary moved within a quarter
 // partition to where the fewest dependencies cross, every task stamped with its
-// partition and each partition's first task with how many of its tasks complete on
-// the device.
+// partition and each partition's first task with how many indices it spans -- one
+// per block and active subtask of every task the silos run.
 TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
     orch.declare_partitions(4);
     // Two chains of four, the second fed by the last task of the first: every cut
@@ -143,8 +146,8 @@ TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
         EXPECT_EQ(tasks.get_task_by_task_id(id).part, 0);
     for (int32_t id = 4; id < 8; ++id)
         EXPECT_EQ(tasks.get_task_by_task_id(id).part, 1);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_tasks, 4);
-    EXPECT_EQ(tasks.get_task_by_task_id(4).part_tasks, 4);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 4);
+    EXPECT_EQ(tasks.get_task_by_task_id(4).part_size, 4);
 }
 
 TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
@@ -165,6 +168,101 @@ TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
     EXPECT_EQ(orch.partitions(), 2);
     EXPECT_EQ(tasks.get_task_by_task_id(4).part, 0);
     EXPECT_EQ(tasks.get_task_by_task_id(5).part, 1);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_tasks, 5);
-    EXPECT_EQ(tasks.get_task_by_task_id(5).part_tasks, 3);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 5);
+    EXPECT_EQ(tasks.get_task_by_task_id(5).part_size, 3);
+}
+
+// Within a partition, indices follow dependency level, not submission order: a
+// root submitted late still precedes a consumer submitted early, and a task's
+// blocks take consecutive indices.
+TEST_F(HbgSiloStampTest, PartitionIndicesFollowDependencyLevel) {
+    orch.declare_partitions(100);
+    const TaskId a = submit(1);
+    const TaskId b = submit(1, &a, 1);
+    const TaskId c = submit(1);
+    const TaskId d = submit(2, &b, 1);
+    orch.finish_partitions();
+    auto &tasks = sm_handle->header->tasks;
+    EXPECT_EQ(orch.partitions(), 1);
+    EXPECT_EQ(tasks.get_task_by_task_id(a.local_id()).part_index, 0);
+    EXPECT_EQ(tasks.get_task_by_task_id(c.local_id()).part_index, 1);
+    EXPECT_EQ(tasks.get_task_by_task_id(b.local_id()).part_index, 2);
+    EXPECT_EQ(tasks.get_task_by_task_id(d.local_id()).part_index, 3);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 5);
+}
+
+// A dependency-only task takes no index, and its consumer sits one level past the
+// dummy's producers rather than two.
+TEST_F(HbgSiloStampTest, DummyTakesNoIndexAndPassesItsLevelThrough) {
+    orch.declare_partitions(100);
+    const TaskId a = submit(1);
+    CoreTaskArgs args;
+    args.set_dependencies(&a, 1);
+    const TaskId dummy = orch.submit_dummy_task(args).task_id();
+    ASSERT_TRUE(dummy.is_valid());
+    const TaskId b = submit(1, &dummy, 1);
+    const TaskId c = submit(1, &a, 1);
+    const TaskId root = submit(1);
+    orch.finish_partitions();
+    auto &tasks = sm_handle->header->tasks;
+    EXPECT_EQ(tasks.get_task_by_task_id(dummy.local_id()).part_index, TASK_PART_INDEX_NONE);
+    EXPECT_EQ(tasks.get_task_by_task_id(a.local_id()).part_index, 0);
+    EXPECT_EQ(tasks.get_task_by_task_id(root.local_id()).part_index, 1);
+    EXPECT_EQ(tasks.get_task_by_task_id(b.local_id()).part_index, 2);
+    EXPECT_EQ(tasks.get_task_by_task_id(c.local_id()).part_index, 3);
+    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 4);
+}
+
+// With partitions, a supertask is split across the silos from
+// TASK_PART_SPREAD_MIN_BLOCKS blocks; a narrower one runs whole in one silo.
+TEST_F(HbgSiloStampTest, PartitionsSpreadFromTheirOwnThreshold) {
+    orch.declare_partitions(100);
+    const TaskId narrow = submit(TASK_PART_SPREAD_MIN_BLOCKS - 1);
+    const TaskId wide = submit(TASK_PART_SPREAD_MIN_BLOCKS);
+    EXPECT_GE(silo_of(narrow), TASK_SILO_FIRST);
+    EXPECT_EQ(silo_of(wide), TASK_SILO_SPREAD);
+}
+
+// The task a predicate's value waits on is the last one to write the element it
+// reads -- here the writer of the half holding it, not the later writer of the other
+// half, and not one of the predicated task's own producers.
+TEST_F(HbgSiloStampTest, PredicateNamesTheLastWriterOfItsElement) {
+    MixedKernels mixed{};
+    mixed.aiv0_kernel_id = 0;
+    uint32_t shape[] = {16};
+    CoreTaskArgs make;
+    create_infos.emplace_back(shape, 1, DataType::INT32);
+    make.add_output(create_infos.back());
+    TaskOutputTensors made = orch.submit_task(mixed, make);
+    const simpler::hbg::Tensor &count = made.get_ref(0);
+
+    uint32_t half[] = {8};
+    uint32_t lo_at[] = {0};
+    uint32_t hi_at[] = {8};
+    const simpler::hbg::Tensor lo = count.view(half, lo_at);
+    const simpler::hbg::Tensor hi = count.view(half, hi_at);
+    CoreTaskArgs write_lo;
+    write_lo.add_inout(lo);
+    const TaskId lo_writer = orch.submit_task(mixed, write_lo).task_id();
+    CoreTaskArgs write_hi;
+    write_hi.add_inout(hi);
+    orch.submit_task(mixed, write_hi);
+
+    CoreTaskPredicate pred;
+    pred.operand.tensor = &count;
+    pred.operand.ndims = 1;
+    pred.operand.indices[0] = 3;
+    pred.op = PredicateOp::GT;
+    pred.target = 0;
+    CoreTaskArgs gated;
+    create_infos.emplace_back(shape, 1, DataType::FLOAT32);
+    gated.add_output(create_infos.back());
+    gated.set_predicate(pred);
+    const TaskId p = orch.submit_task(mixed, gated).task_id();
+    ASSERT_TRUE(p.is_valid());
+    const TaskId plain = submit(1);
+
+    SharedMemoryTaskHeader &tasks = sm_handle->header->tasks;
+    EXPECT_EQ(tasks.get_task_by_task_id(p.local_id()).predicate_writer, lo_writer.local_id());
+    EXPECT_EQ(tasks.get_task_by_task_id(plain.local_id()).predicate_writer, -1);
 }

@@ -107,9 +107,10 @@ that resolved this case's edges itself could win, and which changes it would tak
 [../silos.md](../silos.md) builds the cheapest of them -- groups that see each
 other's completions, with every supertask of four or more blocks split across them
 -- and measures M2 at **-2.1 %** against M0 (window -3.1 %), and -5.6 % with eight
-comparators per task instead of four. [../partitions.md](../partitions.md) launches
-the graph a layer at a time into those silos instead, with four comparators naming
-producers by supertask, and measures **-5.8 %** (window -7.5 %).
+comparators per task instead of four. [../partitions.md](../partitions.md) runs the
+graph a layer at a time on those silos instead -- the controllers sharing each
+partition's watermark, and the managers answering predicates before their tasks are
+ready -- and measures **-6.2 %** (window -6.8 %).
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
 split each into per-queue pieces declared in separate groups, so the four threads

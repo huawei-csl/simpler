@@ -251,54 +251,120 @@ bool submit_held(
     int32_t task_id, const SimDep *deps, uint32_t dep_n
 );
 
-// How long a completion one GroupQueue records takes to reach the others when the
-// controllers exchange their watermark and look-ahead state, as the partition design
-// specifies the exchange.
-constexpr uint64_t SIM_GQ_EXCHANGE_NS = 200;
+// How long a completion one GroupQueue records takes to reach the others: the
+// controllers exchange their watermark and look-ahead state through device memory.
+constexpr uint64_t SIM_GQ_EXCHANGE_NS = 300;
+// A controller broadcasts its state when it changes, at most once per this period.
+// The model sends on a fixed grid of the period, in the first slot at or after the
+// completion: an isolated completion waits up to one period the hardware would not
+// charge it, and a burst goes out together.
+constexpr uint64_t SIM_GQ_BROADCAST_NS = 100;
+// Entries one controller's partition store holds: its current subpartition and as
+// much of the next as fits.
+constexpr uint32_t SIM_PART_STORE = 512;
+// Indices one partition may span: an index is 11 bits.
+constexpr uint32_t SIM_PART_INDICES = 2048;
+// A controller's look-ahead: the finished indices past its watermark it can hold.
+// An entry starts only once the watermark is within this many indices of it, so
+// its finish has a bit to land in.
+constexpr uint32_t SIM_PART_LOOKAHEAD = 512;
 
 // A producer a partition task waits on, named by supertask: the runtime's task id
 // and the queues that run a piece of it. One comparator, however many queues --
-// numbered across the partition, a supertask's pieces are one range.
+// numbered across the partition, a supertask's tasks are one range of indices.
 struct SimPartDep {
     int32_t task;
     uint32_t queues;  // bit q: queue q runs a piece of it
 };
 
-// One entry of a launched partition, a single-part task on this queue, and the set
-// of producers it waits on: deps[set.first .. set.first + set.n).
+// One entry of a partition, a single-part task on this queue, its partition-local
+// index, and the set of conditions it waits on.
 struct SimPartEntry {
     uint64_t index;  // this queue's position, which its manager retires
     int32_t func_id;
     int32_t task_id;  // the supertask it is a piece of
     SimTaskType type;
     uint32_t set;
+    uint32_t pindex;  // its index in the partition
 };
+// What a set of entries waits for: the producers deps[first .. first + n), and the
+// partition's watermark reaching `threshold` -- every index below it finished. A
+// set's entries are one supertask's piece. A predicated piece is placed only once
+// its manager answers that the predicate passed.
 struct SimPartSet {
     uint32_t first;
     uint32_t n;
+    uint32_t threshold;
+    bool decision;
 };
 
 // Switch this run's queues to partition mode, or out of it. In it, each queue keeps
-// a resident store for launched partitions and exchanges piece completions with the
-// others. Call before any queue is accessed in the run.
+// a store for the partitions it is given and exchanges completions with the others.
+// Call before any queue is accessed in the run.
 void set_partition_mode(bool on);
 
-// Launch entries of a partition into this queue. Each is resident from now on and
-// held until every producer its set names has finished in every queue that runs a
-// piece of it: here at once, elsewhere SIM_GQ_EXCHANGE_NS after that queue records
-// it. Every entry of one supertask's piece on this queue arrives in one call. Returns
-// false, admitting nothing, when the store cannot take them.
+// Give this queue entries of partition `part`, which spans `size` indices. Every
+// queue learns a partition's size from its own manager, with n == 0 when its share
+// is empty. An entry waits for its queue to reach its partition -- the watermark of
+// the one before covering all of it -- then for its set's producers and threshold:
+// a producer finished here is known at once, elsewhere SIM_GQ_EXCHANGE_NS after
+// that queue's next broadcast. Every entry of one supertask's piece on this queue
+// arrives in one call. Returns false, admitting nothing, when the store cannot
+// take them.
 bool submit_partition(
-    uint32_t queue_idx, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets, uint32_t set_n,
-    const SimPartDep *deps, uint32_t dep_n
+    uint32_t queue_idx, int32_t part, uint32_t size, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets,
+    uint32_t set_n, const SimPartDep *deps, uint32_t dep_n
 );
 
-// The partition store's use over the run: the most entries resident at once, piece
-// completions learned from the other queues, releases timed on a completion, and
-// how many were learned only after this queue's replay had passed them.
-void queue_part_stats(
-    uint32_t queue_idx, uint64_t *resident_peak, uint64_t *events_in, uint64_t *timed, uint64_t *late, uint64_t *late_ns
-);
+// The partition this queue is running now, and how many entries its store can
+// still take. Part of the status a manager reads anyway.
+int32_t queue_partition(uint32_t queue_idx);
+uint32_t part_store_room(uint32_t queue_idx);
+
+// Whether a predicated piece this queue found ready is waiting for its manager, as
+// the status read shows; and the oldest such piece, by the supertask it belongs
+// to, or -1 -- one read of the decision queue.
+bool decision_waiting(uint32_t queue_idx);
+int32_t take_decision(uint32_t queue_idx);
+// The manager's answer for a predicated piece: run places its entries; skip
+// finishes them without a core, as if they had run. A piece not yet ready keeps the
+// answer, and acts on it once it is ready and the answer has landed, without being
+// handed to the manager.
+void answer_decision(uint32_t queue_idx, int32_t task_id, bool run);
+
+// The partition store over the run: the most entries resident at once; completions
+// learned from the other queues; releases timed on one, and how many were learned
+// only after this queue's replay had passed them, by how much in all, and by the
+// kind of condition learned last -- arrival, a producer here or in another queue,
+// the threshold, the partition switch; sets that
+// waited on the watermark after their producers had finished, and for how long --
+// for a threshold, and for the look-ahead; predicated pieces handed to the manager,
+// how many it skipped, how long they waited for an answer, how many were answered
+// before they were ready, and how many of those then waited for the answer to land,
+// and for how long; partitions this queue moved past; and entries that arrived
+// after their queue had reached their partition, and how long after.
+struct SimPartStats {
+    uint64_t resident_peak;
+    uint64_t events_in;
+    uint64_t timed;
+    uint64_t late;
+    uint64_t late_ns;
+    uint64_t late_by[5];
+    uint64_t wm_waits;
+    uint64_t wm_wait_ns;
+    uint64_t la_waits;
+    uint64_t la_wait_ns;
+    uint64_t decisions;
+    uint64_t skips;
+    uint64_t decision_ns;
+    uint64_t answered_ahead;
+    uint64_t answer_waits;
+    uint64_t answer_wait_ns;
+    uint64_t switches;
+    uint64_t behind;
+    uint64_t behind_ns;
+};
+void queue_part_stats(uint32_t queue_idx, SimPartStats *out);
 
 // Whether a status read of this queue now could report anything the last one did
 // not, or let the controller act on anything it has not seen: a finish that has
@@ -503,9 +569,12 @@ struct SimQueueEntryStore {
     // placed, it is placed as an ordinary entry.
     uint32_t bell_core = SIM_NO_BELL;
     uint32_t bell_token = 0;
-    // The supertask this entry is a piece of, for an entry of a launched partition;
-    // -1 otherwise. The queue counts a piece finished when every entry of it has.
+    // The supertask this entry is a piece of, for an entry of a partition; -1
+    // otherwise. The queue counts a piece finished when every entry of it has. The
+    // entry's partition and its index there, which its finish marks known.
     int32_t piece_task = -1;
+    int32_t piece_part = -1;
+    uint32_t piece_index = 0;
 };
 
 // Work that did not fit inside the latency a poll models, summed, and how many

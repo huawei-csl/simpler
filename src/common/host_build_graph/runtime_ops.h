@@ -110,8 +110,9 @@ struct RuntimeOps {
     // without silos is free to ignore the declaration.
     void (*declare_silos)(RuntimeContext *rt);
 
-    // Feed the silos one partition at a time: once the graph is complete, cut it
-    // into runs of about `target_tasks` tasks where the fewest dependencies cross,
-    // and launch each into the silos only once the one before it has finished.
+    // Run the graph on the silos one partition at a time: once the graph is
+    // complete, cut it into runs of about `target_tasks` tasks where the fewest
+    // dependencies cross, number each by dependency level, and let the controllers
+    // move to the next only once the one before it has finished.
     void (*declare_partitions)(RuntimeContext *rt, int32_t target_tasks);
 };

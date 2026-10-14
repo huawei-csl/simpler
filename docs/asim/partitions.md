@@ -1,91 +1,145 @@
-# Partitions: launching the graph a chunk at a time
+# Partitions: the controllers run the graph a partition at a time
 
 [silos.md](silos.md) feeds each silo one supertask at a time, in task order, so
-whatever stops the head of a silo's feed stops everything behind it. This variant
-launches a *partition* -- a chunk of the graph in task order -- whole, and lets the
-controllers resolve every edge inside it themselves. The terms are silos.md's: a
-*task* is one function execution on one core, a *supertask* everything one
-submission launches.
+whatever stops the head of a silo's feed stops everything behind it. Here the graph
+is split into *partitions*, each partition into one *subpartition* per group, and
+each controller runs its subpartition from resident entries: every dependency inside
+the partition is resolved by the controllers between themselves, without the
+managers.
+
+The terms: a *task* is one function execution on one core, and a *supertask*
+everything one submission launches. A *partition* is a subgraph; the partitions are
+disjoint, cover the graph, and are numbered `0 .. P-1`. A *partition-local index*
+numbers the tasks of one partition and is used only to track their completion. A
+*group* is one AICPU, its controller and its cores -- what [silos.md](silos.md) calls
+a silo.
 
 ## The design
 
-- **The host cuts the graph.** `rt_declare_partitions(target)` as an
-  orchestration's first statement declares silos, as `rt_declare_silos()` does, and
-  asks for partitions of about `target` supertasks. Once the graph is built the
-  host moves each boundary, within a quarter partition of where it would fall, to
-  the point the fewest dependencies cross, and stamps every supertask with its
-  partition.
-- **A launch hands each controller its whole subpartition.** Every task of the
-  partition its silo runs -- its block range of a spread supertask, all of a
-  narrower one -- reaches the controller in one launch and is resident from then
-  on, waiting on its producers there. Nothing migrates between silos.
-- **Producers are named by supertask.** Positions are numbered across the
-  partition, so a supertask's pieces in every silo are one range, and a consumer
-  names each producer with one comparator, whatever silos run it. A producer in an
-  earlier partition has finished by the launch and is not named.
-- **Controllers exchange completions.** A controller sees its own piece of a
-  supertask finish at once, and the other three learn of it 200 ns later
-  (`SIM_GQ_EXCHANGE_NS`) -- the period at which the design has the controllers
-  exchange their watermark and look-ahead state. A producer is finished for a
-  consumer once every silo running a piece of it has reported.
-- **One partition in flight.** The next partition launches once every supertask of
-  the one in flight has finished, which the managers count as they retire tasks. Each
-  manager builds its share of the next launch while the current partition runs --
-  every producer in an earlier partition will have finished by the time it is
-  posted -- so a boundary only takes positions and posts.
-- **What stays with the manager.** A supertask with a dispatch predicate or a
-  sync-start cohort keeps the ordinary path, as with silos. One naming such a
-  producer, or more than four producer supertasks, cannot be resolved by its
-  controller alone: its manager holds it back from the launch and feeds it once its
-  producers allow.
+- **Partitions are declared up front.** `rt_declare_partitions(target)` as an
+  orchestration's first statement declares silos and asks for partitions of about
+  `target` supertasks. Once the graph is built the host -- standing in for the
+  compiler, which would do this ahead of time -- moves each boundary, within a
+  quarter partition of where it would fall, to the point the fewest dependencies
+  cross. Here a partition is one layer: 372 supertasks.
+- **Each partition is numbered by dependency level.** Every task of a partition
+  takes an index -- one per block and active subtask of its supertask, the blocks
+  consecutive -- in the order of its supertask's dependency level, so a task's
+  producers in the partition sit below it. A dependency-only task takes none, and
+  levels pass through it. An index is 11 bits: a partition spans at most 2,048.
+- **Subpartitions are fixed.** A supertask of 8 or more blocks is split across the
+  four groups, each taking a quarter of its block range; a narrower one runs whole
+  in the group of its latest producer, or the next group in turn. Group `g`'s share
+  of a partition is its subpartition, and reaches its controller through its own
+  manager.
+- **What a task waits on.** The tasks of one supertask's piece share one record:
+  up to four named producer supertasks -- each one index range, whichever groups
+  run it -- and a threshold of their own. The four named are the producers that end
+  last; the threshold is where the fifth-latest ends, and the partition's watermark
+  must reach it. So a task with any number of producers needs nothing from its
+  manager. A task also waits until the watermark is within the 512-index look-ahead
+  of it, so its finish has a bit to land in.
+- **The controllers share one watermark.** Each controller tracks the partition's
+  watermark -- every index below it finished -- and a 512-bit look-ahead past it,
+  from its own finishes and the others' broadcasts. It broadcasts its state, tagged
+  with the partition, when it changes, at most once per 100 ns, and the others have
+  it 300 ns later; a receiver merges by maximum and OR. A producer is done for a
+  consumer once its whole index range is known finished.
+- **A controller moves on by itself.** It reaches partition `k + 1` once its
+  watermark covers `k` whole; a broadcast tagged with a later partition means every
+  earlier one has finished. The next subpartition is resident by then and is gated
+  until the switch: the manager appends it, in index order, as the store frees.
+- **Predicates are answered ahead.** The manager evaluates each dispatch predicate
+  once the task writing its operand has finished, and the controller holds the
+  answer until the task is ready -- [below](#predicates-in-hardware).
+- **What stays with the manager.** A sync-start cohort keeps the ordinary path, as
+  with silos; deepseek_v4 has none. A supertask with a producer the controllers do
+  not run is held back and fed once that producer has finished.
 
-Against M2 this adds a store per controller that holds a subpartition -- 234 tasks
-at its peak here, against M2's 32 positions -- the exchange between the controllers,
-and comparators that match a producer range in partition numbering. The comparator
-count stays M2's four.
+Against M2 this adds, per controller: a store of 512 entries (~20 bytes each), where
+the largest subpartition here is 318 tasks; a threshold and a look-ahead check per
+record beside M2's four comparators, which match index ranges; a watermark and
+512-bit look-ahead per partition in flight, the current one and the next; the
+broadcast of the partition, the watermark and the 512 bits, ~70 bytes; and two bits
+per record for predicates, with a write port for the answers and a decision queue.
+
+## Predicates in hardware
+
+A dispatch predicate lets a task skip itself: deepseek_v4's routed-expert tasks run
+only when `recv_count[e] > 0`, the rows dispatched to expert `e`. That is six
+supertasks per expert, 192 a layer, and a task that skips still has to finish in
+order, because its consumers wait on it. Three parties share the work.
+
+- **The host names the writer.** At submit it records the last task to write the
+  element a predicate reads (`TaskDescriptor::predicate_writer`, from the tensormap
+  it already keeps). The predicate's value is final once that task has finished --
+  here `dispatch_meta`, one per layer, which finishes before the expert tasks' input
+  rows have arrived.
+- **The manager answers when the writer finishes.** It posts the piece marked as
+  predicated, waits for the writer's completion -- which it learns from the
+  completions the managers retire anyway -- reads the element, and writes run or
+  skip to its controller: one posted store naming the piece.
+- **The controller holds the answer.** Two bits per record, *pending* and *skip*. The
+  answer is one more condition: a predicated piece is ready once its producers,
+  threshold and look-ahead allow and its answer has landed. A skip then finishes the
+  piece's tasks at once, without a core, and the controller broadcasts them like any
+  finish; a run dispatches them. A piece that is otherwise ready while its answer is
+  still pending goes to the decision queue, which the manager polls and answers --
+  the path for a predicate whose writer the host cannot name, in a manual scope. On
+  deepseek_v4 it goes unused, and it could go altogether: a manager that waited for
+  all of such a task's producers instead of its writer would never need asking.
+
+A skip waits for the piece to be ready, not just for the answer: a skipped task
+finishing before its own producers would let its consumers start before them, out
+of order with any write after their reads. What the early answer saves is the round
+trip through the manager once the piece is ready.
+
+Two variants cost more hardware. A predicate table in the controller would take one
+answer per distinct predicate -- 32 a layer here, one per expert -- instead of one
+per piece, at the price of a table and a field per record. A controller that read
+the element itself would need a device-memory read port, a comparator and ~18 bytes
+of predicate per record, and would take the manager off the path; on deepseek_v4
+the early answer already does.
 
 ## How the simulator models it
 
-- **The store.** Each queue keeps its launched entries resident, keyed by the
-  supertask each is a piece of. Every entry of one piece shares one record of the
-  producers it waits on, as with silos; in hardware each slot carries its own
-  comparators. A ready entry is placed when its core type has room, and a launched
-  entry is never stolen by another core.
-- **The exchange.** A queue records its piece of a supertask finished once every
-  entry of it has, and posts that on a single-producer ring to each other queue,
-  stamped on the real clock. The receiver converts it to its own clock, adds the
-  exchange, and replays the release together with its own retirements, earliest
-  first. One learned only after its replay has passed it is placed where the replay
-  stands and counted late.
-- **The boundary is the managers'.** The count of finished tasks per partition is
-  kept by the scheduler threads, in software; the controllers know nothing of
-  partitions beyond the entries they hold.
+- **The store.** Each queue keeps its entries resident in records, a record's named
+  producers keyed by supertask. A producer is done for a record once every queue
+  that runs a piece of it has reported that piece, which a queue learns at the same
+  instant as the indices the piece covers. The look-ahead holds a record by its last
+  entry: its threshold rises to that entry's index less 512.
+- **The exchange.** A queue posts each piece it finishes to every other queue, in the
+  first slot of a 100 ns grid from the finish, on a single-producer ring stamped on
+  the real clock. The receiver converts the stamp to its own clock, adds the 300 ns,
+  and learns the piece's indices and its supertask together.
+- **Releases are replayed.** A queue's model advances when its manager touches it.
+  A release due inside the interval being replayed is timed at its own instant; one
+  learned only after the replay has passed it is placed where the replay stands and
+  counted late.
+- **The manager.** It builds its share of the next partition 16 supertasks per pass
+  of its dispatch loop while the current one runs, and posts the share a piece at a
+  time as the store frees -- the next partition's once its controller has reached
+  the one before. It answers a predicate as soon as it sees the writer completed:
+  each answer is one store to its queue, landing as a submit does.
 
-## deepseek_v4: partitions beat the feed, and the boundary is what remains
+## deepseek_v4: the partition boundary is gone, and so are the predicate stops
 
 **What the oracle expects.** [`analyzers/asim_silo_oracle.py`](analyzers/asim_silo_oracle.py)
-prices partitions with `PART`, `RESIDENT`, `CUT` and `LAUNCH_US` (3.7 us), at the
-simulator's hops with the 200 ns exchange (`H_IN=1.02 H_N=1.22`), against 30.66 ms
-today. With predicates free, and the most blocks one silo holds at once in the last
-column:
+at the simulator's hops, one layer a partition cut at narrow points, supertasks
+split from 8 blocks, and the switch costing a cross-group hop (`LAUNCH_US=1.32`),
+against 30.66 ms today. The predicate column is what the path through a predicated
+task costs above the controllers' own hops:
 
-| partitions | in flight | makespan | vs today | blocks resident |
-| ---------- | --------- | -------- | -------- | --------------- |
-| the whole graph | 1 | 27.24 ms | -11.2 % | all |
-| one layer each, cut evenly | 1 | 28.74 ms | -6.3 % | 174 |
-| one layer each, cut at narrow points | 1 | 27.39 ms | -10.7 % | 271 |
-| half a layer each, cut at narrow points | 1 | 27.76 ms | -9.4 % | 142 |
-| half a layer each, cut evenly | 2 | 27.27 ms | -11.1 % | 168 |
+| predicate path | makespan | vs today |
+| -------------- | -------- | -------- |
+| free: answered before the task is ready | 27.32 ms | -10.9 % |
+| 1 us | 27.50 ms | -10.3 % |
+| a manager hop, 2.68 us | 27.87 ms | -9.1 % |
 
-A partition that waits for the one before it pays for whatever the cut splits: work
-that would have overlapped the boundary becomes a bubble, about 30 us a boundary at
-an even cut. Moving each boundary to where the fewest dependencies cross leaves
-little to overlap, so one partition at a time comes within half a point of two in
-flight, and that is what is built here: 372 supertasks a partition -- one layer --
-cut at narrow points. With predicates left with the manager (`PRED=2.68`) and four
-comparators (`C=4`), as here, the oracle gives **27.94 ms, -8.9 %**. Launching the
-next partition once only the tasks it depends on have finished (`LAUNCH_ON=cut`)
-changes nothing: those are the last to finish.
+Four named producers are enough: 176 of 8,829 pieces have more, and the makespan is
+27.32 ms whether every producer is named or those pieces wait for a manager instead.
+The oracle gives a skipped task no index, so it cannot see the look-ahead; the
+simulator can.
 
 **Measured.** The expanded orchestration with `rt_declare_partitions(372)` as its
 first statement, interleaved with M0 per job, eight rounds a rep with the first two
@@ -96,67 +150,69 @@ scheduler's on each thread less that thread's own ledger, the latest of the four
 | --- | ------- | ----------- | ------ | ----- |
 | M2 | A, n=12 | 33.53 ms | 31.73 ms | +3.7 % (window +2.5 %) |
 | M2, silos | A, n=12 | 31.62 ms | 29.90 ms | -2.2 % (window -3.5 %) |
-| M2, partitions, each launch built at its boundary | B, n=6 | 31.26 ms | 29.51 ms | -3.0 % (window -4.5 %) |
-| **M2, partitions** | C, n=12 | **30.39 ms** | **28.58 ms** | **-5.8 % (window -7.5 %)** |
+| M2, partitions, decision queue, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
+| **M2, partitions** | E, n=12 | **30.32 ms** | **28.82 ms** | **-6.2 % (window -6.8 %)** |
 
-M0 reads 32.33, 32.23 and 32.27 ms in the three sessions (windows 30.97, 30.89 and
-30.90 ms). Every arm completes every task, the core time issued agrees to 0.3 %,
-and the two reps of session C agree to 0.1 %.
+M0 reads 32.33, 32.30 and 32.32 ms in sessions A, D and E (windows 30.97, 30.91 and
+30.93 ms). Every arm completes every task, the core time issued agrees to 0.2 %, and
+the two reps of session E agree to 0.3 %.
 
-**The feed's stops are gone.** Per silo per round, 43 launches carry 7,178 tasks,
-and nothing waits for room. 7,381 piece completions arrive from the other
-controllers and 2,405 releases are timed on one, 6 of them after the controller's
-replay had passed it, by 16.5 us in all. Named by supertask, only 43 supertasks have
-more producers running than four comparators hold; with the 169 that name a
-predicated producer, 212 are held back and fed later -- each holding only itself,
-where the feed stopped ~1,700 times a round and held everything behind each stop.
+**The predicates are off the critical path.** Every predicated piece -- 2,064 per
+controller per round -- had its answer before it was ready, and none waited for the
+answer to land: the decision queue went unused. With the decision queue alone
+(session D), each of the 2,064 predicated pieces per controller per round
+waited for its manager once it was ready, ~2.4 us on average, one at a time: chains
+of up to five skipped supertasks paid a round trip per link.
 
-**What remains is the manager's share of the boundary and of the predicated
-paths.** Building a silo's share of a launch takes 27 us -- 1.14 ms a round -- and
-posting it 7 us of model time: taking positions and accounting the blocks, with the
-queue's own submit modelled at 0.5 us and the rest of its cost on the ledger. Built
-at the boundary, both sit on the critical path 43 times a round; built while the
-partition before it runs, only the post does, and that is the step from -3.0 % to
--5.8 %.
+**512 bits, because skipped tasks take indices.** A partition spans ~1,120 indices,
+~450 of them tasks that skip; at 256 bits the look-ahead held a piece back 78 times
+a round, at 512 never. A skipped task needs its index all the same: the controllers
+count it finished like any other, so its consumers can wait for it in the
+controller.
 
-The oracle prices the rest. It charges a launch 3.7 us and the path through a
-predicated task one manager hop, 2.68 us, and each microsecond more costs ~42 us a
-round at the boundaries and ~210 us on the predicated paths. A 9 us boundary -- the
-retirement, the post and the placement after it -- gives 28.15 ms (-8.2 %). The
-measured -7.5 % also needs the predicated path about a microsecond dearer than the
-oracle's, as it is here: a supertask held back behind a predicated producer waits
-for its manager to see the producer finish, then to build and post it.
+**What remains** against the oracle's -10.9 % is not attributed. Two counters
+stand out, per controller and round: ~250 releases learned only after the queue's
+replay had passed them, ~440 us of lateness in all -- a simulator artifact, under
+[Limits](#limits) -- and 47 records that waited for the watermark to pass their
+threshold after their named producers had finished, ~330 us in all. Every next
+subpartition was resident before its controller switched to it.
+
+An earlier build of partitions -- a software barrier at each boundary, positions
+numbered per launch in task order, and predicated supertasks left with the managers
+-- measured -5.8 % (window -7.5 %) in session C. Its window reads lower against a
+slower `device_wall` because it spent 1.8 ms of each round outside the window, where
+this build spends 1.5 ms and M0 1.4 ms.
 
 ## Limits
 
-- **The exchange period and the store are design parameters.** 200 ns is the
-  design's figure, not a measurement, and the store's size is the model's: 2,048
-  resident entries and 4,096 supertask keys per controller, far more than a
-  partition here needs.
-- **One partition in flight, behind a software count.** The boundary is the
-  managers': they count retirements and post the next launch, so it costs a
-  retirement's latency plus the post.
-- **Predicated supertasks never join a partition**, and one that names a
-  predicated producer is held back. A predicate is read when its supertask is
-  ready, so the manager dispatches or retires each one, as with silos.
-- **The cut is the host's.** A boundary moves within a quarter partition to the
-  narrowest point; nothing checks that the graph has one there.
+- **The partitioning is the host's**, as a stand-in for the compiler: a boundary
+  moves within a quarter partition to the narrowest point, and nothing checks that
+  the graph has one there.
+- **The managers still evaluate every predicate.** That costs nothing here because
+  the writer finishes early; a predicate whose writer finishes just before its task
+  is ready still pays the manager's reaction.
+- **Releases learned late.** A queue's model replays only when its manager touches
+  it, so a peer's finish can reach it after the replay has passed the instant it
+  would have released something; that release is placed late. Here that is ~250
+  releases per controller per round, ~440 us of lateness in all. It counts against
+  M2 only, so the gains above are lower bounds.
+- **The exchange period and the store are design parameters**, not measurements.
 - **The managers run in real time against a device that stands still while the
-  simulator overruns**, about 25 ms a round here against M2's 17 ms. `device_wall`
-  removes it per thread, as on every arm.
-- **qwen and paged_attention have not been run with partitions.**
+  simulator overruns**; `device_wall` removes it per thread, as on every arm.
+- **qwen and paged_attention have not been run with partitions**, and neither has a
+  sync-start cohort: qwen's 40 a round keep the ordinary path.
 
 ## Reproducing it
 
 The partition arm is the expanded orchestration with `rt_declare_partitions(372)`
 as the entry's first statement; everything else is as in
 [validation/deepseek-v4.md](validation/deepseek-v4.md#reproducing-it).
-`[GQ_PART thread=N]` in the device log carries the launches, the held-back
-supertasks, the boundary time, the build and post time -- with the submit's share
-and how much of that is on the ledger -- the store's peak and the exchanged
-completions above.
+`[GQ_PART thread=N]` in the device log carries, per manager and round, the pieces
+posted, the predicates answered ahead and from the decision queue, the store's
+peak, the exchanged finishes, the releases timed and late, and the waits on the
+threshold, the look-ahead and late answers.
 
 ```bash
-H_IN=1.02 H_N=1.22 PRED=2.68 C=4 PART=372 RESIDENT=1 CUT=narrow LAUNCH_US=3.7 \
+H_IN=1.02 H_N=1.32 PRED=0 C=4 SPLIT_MIN=8 PART=372 RESIDENT=1 CUT=narrow LAUNCH_US=1.32 \
   python docs/asim/analyzers/asim_silo_oracle.py <deps.json> <chip_swimlane_records.json> <calib>
 ```

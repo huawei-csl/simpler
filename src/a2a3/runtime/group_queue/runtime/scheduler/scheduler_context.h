@@ -325,70 +325,82 @@ private:
     // Whether this run feeds silos: the graph stamped at least one task.
     bool silo_active_ = false;
 
-    // Launch this thread's piece of the next partition once the one in flight has
-    // finished, and feed the tasks of the one in flight it held back once their
-    // producers allow.
-    // Returns true if anything was submitted.
-    bool launch_partitions(int32_t thread_idx);
+    // Hand this thread's controller its share of each partition, a piece at a time
+    // as its store has room, and answer the predicated pieces the controller found
+    // ready. The controller moves from one partition to the next by itself.
+    // Returns true if anything was handed over or answered.
+    bool feed_partitions(int32_t thread_idx);
 
-    // One silo's share of some tasks, ready to post: the tasks it can name to the
-    // controller, with their producer sets and entries -- positions are taken when it
-    // is posted -- and the tasks it holds back. A task is held back when it names a
-    // producer left on the ordinary path, which has no piece to wait on, or more
-    // producer supertasks than the comparators hold; it is fed once that clears.
+    // One silo's share of a partition, built ahead of handing it over: per piece of a
+    // supertask it runs, the entries in index order, the producers it names and the
+    // threshold its partition's watermark must reach -- positions are taken when a
+    // piece is posted. A supertask is held back when it names a producer the
+    // controllers cannot see finish; it is posted once that producer has.
     struct PartBatch {
-        std::vector<int32_t> ids;
-        std::vector<int32_t> blocks;  // per posted task, its block count here
-        std::vector<int32_t> held;
+        int32_t part = -1;
+        uint32_t size = 0;                  // indices the partition spans
+        std::vector<int32_t> order;         // the supertasks to build, in index order
+        size_t built = 0;                   // how many of them are built
+        std::vector<int32_t> ids;           // per piece: its supertask
+        std::vector<int32_t> blocks;        // per piece: its block count here
+        std::vector<uint32_t> first_entry;  // per piece: its first entry; one more at the end
         std::vector<asimgq::SimPartEntry> entries;
         std::vector<SubtaskSlot> subslots;
-        std::vector<asimgq::SimPartSet> sets;
+        std::vector<asimgq::SimPartSet> sets;  // per piece
         std::vector<asimgq::SimPartDep> deps;
-        uint64_t held_ordinary = 0;
-        uint64_t held_comparators = 0;
+        std::vector<int32_t> held;
+        size_t posted = 0;       // pieces handed over
+        bool announced = false;  // the controller knows the partition's size
+        bool complete() const { return part >= 0 && built == order.size(); }
     };
-    // Build `b` for the tasks in `ids`. A producer in a partition before `floor` is
-    // taken as finished: it will have by the time the batch is posted, since a
-    // partition launches only once the one before it has.
-    void build_batch(int32_t thread_idx, const int32_t *ids, int32_t n, int32_t floor, PartBatch &b);
-    // Take positions for `b`'s entries and hand them to the controller. Returns false,
-    // posting nothing, when the position window cannot take them.
-    bool post_batch(int32_t thread_idx, PartBatch &b);
+    // Start `b` on partition `part`, whose supertasks are `ids`, and build up to
+    // `limit` more of them, in index order. A producer finished by now, or in an
+    // earlier partition, is not named: the controller reaches `part` only once the
+    // one before it has finished whole. Building a step at a time keeps the dispatch
+    // loop, and the controller it reads, moving while a partition is built.
+    void begin_batch(int32_t part, uint32_t size, const std::vector<int32_t> &ids, PartBatch &b);
+    void build_batch(int32_t thread_idx, PartBatch &b, size_t limit);
+    // Take positions for the next pieces of `b` that the store and the position
+    // window have room for, and hand them to the controller. Returns whether any
+    // went.
+    bool post_pieces(int32_t thread_idx, PartBatch &b);
 
-    // Where a thread's partition launches stand. A partition goes in whole: every task
-    // of it this silo runs is resident in its controller from the launch, waiting on
-    // its producers there. The next one is built while the one in flight runs, so a
-    // launch only takes positions and posts.
-    struct PartLaunch {
-        int32_t launched = -1;   // partition in flight
-        int32_t next_first = 0;  // first task of the one after it
-        int32_t expect = 0;      // tasks of the one in flight that complete on the device
+    // Where a thread's feed stands: the partition it is handing over, the next one,
+    // built while the one before runs, and the supertasks it holds back.
+    struct PartFeed {
+        PartBatch cur;
         PartBatch next;
-        int32_t next_part = -1;  // the partition `next` holds, or -1
-        int32_t next_end = 0;
-        int32_t next_expect = 0;
+        int32_t next_first = 0;       // first task id of the partition to build next
+        std::vector<uint32_t> sizes;  // per partition built so far: the indices it spans
         PartBatch retry;
         std::vector<int32_t> held_back;
         std::vector<int32_t> ids;
         uint64_t held_epoch = ~0ULL;
-        uint64_t launches = 0;
-        uint64_t launched_entries = 0;
+        uint64_t partitions = 0;
+        uint64_t pieces = 0;
+        uint64_t entries = 0;
         uint64_t held_ordinary = 0;
-        uint64_t held_comparators = 0;
         uint64_t held_fed = 0;
         uint64_t wait_room = 0;
-        // Real time from this silo having nothing left to do in the partition in
-        // flight to launching the next, summed.
-        uint64_t barrier_ticks = 0;
-        uint64_t barrier_seen = 0;
+        uint64_t wait_part = 0;
+        uint64_t decisions = 0;
+        uint64_t skipped = 0;
+        // Predicated pieces posted before their answer was known, as (task, the task
+        // that writes the predicate's operand): each is answered once that writer has
+        // finished, as of the completion count last checked; and how many were.
+        std::vector<std::pair<int32_t, int32_t>> pred_waits;
+        uint64_t pred_epoch = ~0ULL;
+        uint64_t answered_early = 0;
         // Real time spent building batches, and posting them; of the posting, the
-        // part spent in the queue's submit, and the part of that on its ledger.
+        // part spent in the queue's submit, and the part of that on its ledger; and
+        // answering predicates.
         uint64_t build_ticks = 0;
         uint64_t post_ticks = 0;
         uint64_t submit_ticks = 0;
         uint64_t submit_ledger_ticks = 0;
+        uint64_t decide_ticks = 0;
     };
-    PartLaunch part_launch_[PLATFORM_MAX_AICPU_THREADS];
+    PartFeed part_feed_[PLATFORM_MAX_AICPU_THREADS];
     bool part_active_ = false;
 
     // Split every shape's ready-queue slot region into one disjoint span per
