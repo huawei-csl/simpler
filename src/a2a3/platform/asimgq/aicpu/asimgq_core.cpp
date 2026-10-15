@@ -570,11 +570,13 @@ struct SimPartSetState {
     int32_t part = 0;
     uint32_t threshold = 0;
     bool lookahead = false;  // the threshold is the look-ahead's, not a producer's
-    bool decision = false;
+    bool predicated = false;
     int32_t task = -1;
     uint8_t last = 0;        // the kind of condition met last, a SimPartCause
-    uint8_t answer = 0;      // a predicated piece's answer, given before it was ready
+    uint8_t answer = 0;      // a predicated piece's answer, 0 until its manager gives it
     uint64_t answer_at = 0;  // and when it lands here
+    bool parked = false;     // ready without an answer, waiting for it since parked_at
+    uint64_t parked_at = 0;
     uint32_t members = SIM_PART_NONE;
     uint32_t member_n = 0;
 };
@@ -634,11 +636,6 @@ struct SimPartState {
     uint64_t switch_at = 0;  // when this queue reached cur_part
     // Sets waiting for this queue to reach their partition, by partition number.
     std::vector<uint32_t> gated[SIM_PART_WMS];
-    // Predicated pieces found ready, waiting for the manager: (when, set), oldest
-    // first; and the ones it has taken but not yet answered.
-    std::vector<std::pair<uint64_t, uint32_t>> decisions;
-    uint32_t decision_head = 0;
-    std::vector<std::pair<uint64_t, uint32_t>> asked;
     uint32_t waiter_live = 0;
     uint32_t set_live = 0;
     uint64_t resident = 0;
@@ -652,9 +649,7 @@ struct SimPartState {
     uint64_t wm_wait_ticks = 0;
     uint64_t la_waits = 0;
     uint64_t la_wait_ticks = 0;
-    uint64_t decided = 0;
     uint64_t skips = 0;
-    uint64_t decision_ticks = 0;
     uint64_t answered_ahead = 0;
     uint64_t answer_waits = 0;
     uint64_t answer_wait_ticks = 0;
@@ -756,13 +751,13 @@ void part_skip(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
 }
 
 // A set whose conditions are all met, at `at`: its entries go to their rings. A
-// predicated piece goes to the manager for an answer first, unless the answer came
-// before it was ready.
+// predicated piece goes once its answer has landed, or finishes if the answer is
+// skip; without an answer it waits here for answer_predicate().
 void part_release(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
     SimPartSetState &s = p.sets[set];
     // An answer sent before the piece was ready but still on its way: the piece goes
     // when it lands.
-    if (s.decision && s.answer != 0 && s.answer_at > at) {
+    if (s.predicated && s.answer != 0 && s.answer_at > at) {
         ++p.answer_waits;
         p.answer_wait_ticks += s.answer_at - at;
         s.ready_at = s.answer_at;
@@ -774,12 +769,13 @@ void part_release(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
         ++(s.lookahead ? p.la_waits : p.wm_waits);
         (s.lookahead ? p.la_wait_ticks : p.wm_wait_ticks) += s.threshold_at - s.other_at;
     }
-    if (s.decision && s.answer == PART_ANSWER_SKIP) {
-        part_skip(q, p, set, at);
+    if (s.predicated && s.answer == 0) {
+        s.parked = true;
+        s.parked_at = at;
         return;
     }
-    if (s.decision && s.answer != PART_ANSWER_RUN) {
-        p.decisions.emplace_back(at, set);
+    if (s.predicated && s.answer == PART_ANSWER_SKIP) {
+        part_skip(q, p, set, at);
         return;
     }
     for (uint32_t m = s.members; m != SIM_PART_NONE; m = p.slots[m].next) {
@@ -2409,14 +2405,12 @@ void set_partition_mode(bool on) {
         for (std::vector<uint32_t> &g : p.gated) {
             g.clear();
         }
-        p.decisions.clear();
-        p.decision_head = 0;
-        p.asked.clear();
         p.waiter_live = p.set_live = 0;
         p.resident = p.resident_peak = p.events_in = p.timed = p.late = p.late_ticks = 0;
         std::fill(std::begin(p.late_by), std::end(p.late_by), 0);
         p.wm_waits = p.wm_wait_ticks = p.la_waits = p.la_wait_ticks = 0;
-        p.decided = p.skips = p.decision_ticks = p.answered_ahead = p.switches = p.behind = p.behind_ticks = 0;
+        p.skips = p.answered_ahead = p.answer_waits = p.answer_wait_ticks = 0;
+        p.switches = p.behind = p.behind_ticks = 0;
     }
     if (on) {
         for (size_t i = 0; i < static_cast<size_t>(SIM_MAX_QUEUES) * SIM_MAX_QUEUES; ++i) {
@@ -2470,7 +2464,7 @@ bool submit_partition(
         st.ready_at = st.other_at = floor_at;
         st.part = part;
         st.threshold = sets[i].threshold;
-        st.decision = sets[i].decision;
+        st.predicated = sets[i].predicated;
     }
     // The look-ahead bounds a set by its last entry: the watermark must be within
     // SIM_PART_LOOKAHEAD of it.
@@ -2576,39 +2570,7 @@ uint32_t part_store_room(uint32_t queue_idx) {
     return SIM_PART_SLOTS - static_cast<uint32_t>(g_part[queue_idx].resident);
 }
 
-// A parked piece becomes legible to the manager as a finish does: through the
-// queue's report path.
-bool decision_waiting(uint32_t queue_idx) {
-    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) return false;
-    const SimPartState &p = g_part[queue_idx];
-    if (p.decision_head >= p.decisions.size()) return false;
-    const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
-    return p.decisions[p.decision_head].first + g_report_ticks <= now;
-}
-
-int32_t take_decision(uint32_t queue_idx) {
-    const Access a = begin_access(queue_idx, g_queue_poll_ticks);
-    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
-        wait_until(a.release);
-        return -1;
-    }
-    SimQueue &q = g_queues[queue_idx];
-    SimPartState &p = g_part[queue_idx];
-    int32_t task = -1;
-    if (p.decision_head < p.decisions.size() && p.decisions[p.decision_head].first + g_report_ticks <= a.at) {
-        const auto [at, set] = p.decisions[p.decision_head++];
-        task = p.sets[set].task;
-        p.asked.emplace_back(at, set);
-        if (p.decision_head == p.decisions.size()) {
-            p.decisions.clear();
-            p.decision_head = 0;
-        }
-    }
-    finish_poll(q, queue_idx, a);
-    return task;
-}
-
-void answer_decision(uint32_t queue_idx, int32_t task_id, bool run) {
+void answer_predicate(uint32_t queue_idx, int32_t task_id, bool run) {
     const Access a = begin_access(queue_idx, g_push_ticks);
     if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
         wait_until(a.release);
@@ -2619,46 +2581,26 @@ void answer_decision(uint32_t queue_idx, int32_t task_id, bool run) {
     part_drain(q, queue_idx);
     retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
     const uint64_t at = a.at + g_arrive_ticks;
-    // A piece taken from the decision queue, or one still waiting there, is acted on
-    // now; one that is not ready yet keeps the answer for when it is.
-    uint32_t set = SIM_PART_NONE;
-    uint64_t parked = 0;
-    for (size_t i = 0; i < p.asked.size(); ++i) {
-        if (p.sets[p.asked[i].second].task != task_id) continue;
-        parked = p.asked[i].first;
-        set = p.asked[i].second;
-        p.asked.erase(p.asked.begin() + static_cast<std::ptrdiff_t>(i));
-        break;
-    }
-    if (set == SIM_PART_NONE) {
-        const uint32_t own = part_key(p, task_id).piece_set;
-        if (own != SIM_PART_NONE && p.sets[own].task == task_id && p.sets[own].decision && p.sets[own].answer == 0 &&
-            p.sets[own].member_n > 0) {
-            for (size_t i = p.decision_head; i < p.decisions.size(); ++i) {
-                if (p.decisions[i].second != own) continue;
-                parked = p.decisions[i].first;
-                set = own;
-                p.decisions.erase(p.decisions.begin() + static_cast<std::ptrdiff_t>(i));
-                break;
-            }
-            if (set == SIM_PART_NONE) {
-                p.sets[own].answer = run ? PART_ANSWER_RUN : PART_ANSWER_SKIP;
-                p.sets[own].answer_at = at;
-                ++p.answered_ahead;
-            }
-        }
-    }
-    if (set != SIM_PART_NONE) {
-        ++p.decided;
-        p.decision_ticks += at > parked ? at - parked : 0;
-        if (run) {
-            SimPartSetState &st = p.sets[set];
-            for (uint32_t m = st.members; m != SIM_PART_NONE; m = p.slots[m].next) {
-                p.slots[m].e.enqueued_at = at;
-                part_ready_push(p, m);
-            }
+    const uint32_t set = part_key(p, task_id).piece_set;
+    if (set != SIM_PART_NONE && p.sets[set].task == task_id && p.sets[set].predicated && p.sets[set].answer == 0 &&
+        p.sets[set].member_n > 0) {
+        SimPartSetState &st = p.sets[set];
+        st.answer = run ? PART_ANSWER_RUN : PART_ANSWER_SKIP;
+        st.answer_at = at;
+        if (!st.parked) {
+            ++p.answered_ahead;
         } else {
-            part_skip(q, p, set, at);
+            // Ready first, the piece goes as the answer lands.
+            ++p.answer_waits;
+            p.answer_wait_ticks += at > st.parked_at ? at - st.parked_at : 0;
+            if (run) {
+                for (uint32_t m = st.members; m != SIM_PART_NONE; m = p.slots[m].next) {
+                    p.slots[m].e.enqueued_at = at;
+                    part_ready_push(p, m);
+                }
+            } else {
+                part_skip(q, p, set, at);
+            }
         }
     }
     promote_part(q, at);
@@ -2684,9 +2626,7 @@ void queue_part_stats(uint32_t queue_idx, SimPartStats *out) {
     out->wm_wait_ns = ns(p.wm_wait_ticks);
     out->la_waits = p.la_waits;
     out->la_wait_ns = ns(p.la_wait_ticks);
-    out->decisions = p.decided;
     out->skips = p.skips;
-    out->decision_ns = ns(p.decision_ticks);
     out->answered_ahead = p.answered_ahead;
     out->answer_waits = p.answer_waits;
     out->answer_wait_ns = ns(p.answer_wait_ticks);
@@ -2757,8 +2697,7 @@ bool poll_may_report(uint32_t queue_idx) {
     const uint64_t now = get_sys_cnt_aicpu() - g_ledger[queue_idx].overrun_ticks;
     const uint64_t legible = now > g_report_ticks ? now - g_report_ticks : 0;
     if (q.next_event <= legible) return true;
-    if (g_part[queue_idx].on &&
-        (part_next_release(queue_idx) <= legible || part_inbox_pending(queue_idx) || decision_waiting(queue_idx))) {
+    if (g_part[queue_idx].on && (part_next_release(queue_idx) <= legible || part_inbox_pending(queue_idx))) {
         return true;
     }
     for (uint32_t m = q.deps_armed; m != 0; m &= m - 1) {

@@ -383,14 +383,23 @@ private:
         uint64_t held_fed = 0;
         uint64_t wait_room = 0;
         uint64_t wait_part = 0;
-        uint64_t decisions = 0;
         uint64_t skipped = 0;
-        // Predicated pieces posted before their answer was known, as (task, the task
-        // that writes the predicate's operand): each is answered once that writer has
-        // finished, as of the completion count last checked; and how many were.
-        std::vector<std::pair<int32_t, int32_t>> pred_waits;
+        // A predicated piece posted and not yet answered: its task, and the task it
+        // waits on -- the writer of the predicate's operand when the host named one,
+        // else one unfinished producer of the task at a time, as a wake list does; -1
+        // once there is none left.
+        struct PredWait {
+            int32_t task;
+            int32_t wait_on;
+            bool named;
+        };
+        // The pieces waiting, as of the completion count last checked; how many were
+        // answered, and how many of those had no writer named.
+        std::vector<PredWait> pred_waits;
+        std::vector<int32_t> walk;
         uint64_t pred_epoch = ~0ULL;
-        uint64_t answered_early = 0;
+        uint64_t answered = 0;
+        uint64_t answered_unnamed = 0;
         // Real time spent building batches, and posting them; of the posting, the
         // part spent in the queue's submit, and the part of that on its ledger; and
         // answering predicates.

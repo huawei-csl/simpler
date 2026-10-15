@@ -845,6 +845,28 @@ bool SchedulerContext::feed_silos(int32_t thread_idx) {
     return progress;
 }
 
+// An unfinished producer of `task`, a dependency-only producer seen through to its
+// own producers -- the latest submitted, as the likeliest to finish last -- or -1
+// once every one has finished. `walk` is scratch.
+static int32_t unfinished_producer(SharedMemoryTaskHeader &tasks, int32_t task, std::vector<int32_t> &walk) {
+    const TaskPayload &payload = tasks.get_slot_state_by_task_id(task).to_payload();
+    walk.assign(payload.fanin_data(), payload.fanin_data() + payload.fanin_count);
+    int32_t latest = -1;
+    while (!walk.empty()) {
+        const int32_t prod = walk.back();
+        walk.pop_back();
+        if (tasks.is_completed(prod)) continue;
+        const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(prod);
+        if (ps.task_kind == TaskKind::DUMMY || ps.active_mask.to_shape() == ResourceShape::DUMMY) {
+            const TaskPayload &pp = ps.to_payload();
+            walk.insert(walk.end(), pp.fanin_data(), pp.fanin_data() + pp.fanin_count);
+        } else {
+            latest = std::max(latest, prod);
+        }
+    }
+    return latest;
+}
+
 void SchedulerContext::begin_batch(int32_t part, uint32_t size, const std::vector<int32_t> &ids, PartBatch &b) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     b.part = part;
@@ -1043,12 +1065,14 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
         ++pf.wait_room;
         return false;
     }
-    // A predicate whose operand's writer is known is answered once that writer has
-    // finished; the rest wait for the controller to ask.
+    // Each predicate waits here for its answer (feed_partitions).
     for (size_t j = first; j < end; ++j) {
         const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(b.ids[j]);
-        if (!slot.task_attrs.has_predicate() || slot.to_descriptor().predicate_writer < 0) continue;
-        pf.pred_waits.emplace_back(b.ids[j], slot.to_descriptor().predicate_writer);
+        if (!slot.task_attrs.has_predicate()) continue;
+        const int32_t writer = slot.to_descriptor().predicate_writer;
+        pf.pred_waits.push_back(
+            PartFeed::PredWait{b.ids[j], writer >= 0 ? writer : unfinished_producer(tasks, b.ids[j], pf.walk), writer >= 0}
+        );
         pf.pred_epoch = ~0ULL;
     }
     b.posted = end;
@@ -1065,8 +1089,9 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
 // before, so it is resident when the controller moves on. The controller tells the
 // partitions apart and moves from one to the next by itself; all the manager does
 // at a boundary is keep the store full. A predicated piece is answered as soon as
-// the task writing its operand has finished, and the controller holds the answer
-// until the piece is ready.
+// the task writing its operand has finished -- every producer of the task, when the
+// host could not name that one -- and the controller holds the answer until the
+// piece is ready.
 bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     // Supertasks built per pass of the dispatch loop: a few microseconds of work.
     constexpr size_t kBuildStep = 16;
@@ -1075,24 +1100,6 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     PartFeed &pf = part_feed_[thread_idx];
     const uint32_t q = static_cast<uint32_t>(thread_idx);
     bool progress = false;
-    // A predicated piece the controller found ready without an answer: its producers
-    // have finished, so the value the predicate reads is final.
-    while (asimgq::decision_waiting(q)) {
-        const uint64_t from = asimgq::now_ticks();
-        const int32_t task = asimgq::take_decision(q);
-        if (task < 0) break;
-        const bool run = tasks.get_slot_state_by_task_id(task).to_payload().predicate.pass();
-        asimgq::answer_decision(q, task, run);
-        ++pf.decisions;
-        if (!run) ++pf.skipped;
-        for (size_t i = 0; i < pf.pred_waits.size(); ++i) {
-            if (pf.pred_waits[i].first != task) continue;
-            pf.pred_waits.erase(pf.pred_waits.begin() + static_cast<std::ptrdiff_t>(i));
-            break;
-        }
-        pf.decide_ticks += asimgq::now_ticks() - from;
-        progress = true;
-    }
     if (!pf.held_back.empty()) {
         const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
         if (epoch != pf.held_epoch) {
@@ -1158,21 +1165,28 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     }
     // The value a predicate reads is final once its writer has finished, which can be
     // well before the controller finds the piece ready: the answer goes then, and the
-    // controller holds it for the piece.
+    // controller holds it for the piece. Without a named writer it is final once every
+    // producer of the task has finished -- when M0 would read it -- and the piece
+    // waits on them one at a time.
     if (!pf.pred_waits.empty()) {
         const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
         if (epoch != pf.pred_epoch) {
             pf.pred_epoch = epoch;
             const uint64_t from = asimgq::now_ticks();
             size_t kept = 0;
-            for (const auto &[task, writer] : pf.pred_waits) {
-                if (!tasks.is_completed(writer)) {
-                    pf.pred_waits[kept++] = {task, writer};
+            for (PartFeed::PredWait w : pf.pred_waits) {
+                if (w.wait_on >= 0 && !tasks.is_completed(w.wait_on)) {
+                    pf.pred_waits[kept++] = w;
                     continue;
                 }
-                const bool run = tasks.get_slot_state_by_task_id(task).to_payload().predicate.pass();
-                asimgq::answer_decision(q, task, run);
-                ++pf.answered_early;
+                if (!w.named && (w.wait_on = unfinished_producer(tasks, w.task, pf.walk)) >= 0) {
+                    pf.pred_waits[kept++] = w;
+                    continue;
+                }
+                const bool run = tasks.get_slot_state_by_task_id(w.task).to_payload().predicate.pass();
+                asimgq::answer_predicate(q, w.task, run);
+                ++pf.answered;
+                if (!w.named) ++pf.answered_unnamed;
                 if (!run) ++pf.skipped;
                 progress = true;
             }
@@ -1574,22 +1588,22 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             LOG_INFO(
                 "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64
                 " held_ordinary=%" PRIu64 " held_fed=%" PRIu64 " wait_room=%" PRIu64 " wait_part=%" PRIu64
-                " decisions=%" PRIu64 " answered_early=%" PRIu64 " skipped=%" PRIu64
+                " answered=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64
                 " build_us=%.1f post_us=%.1f submit_us=%.1f"
                 " submit_ledger_us=%.1f decide_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64
                 " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64 " late_peer=%" PRIu64
                 " late_threshold=%" PRIu64 " late_switch=%" PRIu64 " wm_waits=%" PRIu64
-                " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f decision_wait_us=%.1f answered_ahead=%" PRIu64
-                " answer_waits=%" PRIu64 " answer_wait_us=%.1f switches=%" PRIu64 " behind=%" PRIu64 " behind_us=%.1f",
+                " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f answered_ahead=%" PRIu64 " answer_waits=%" PRIu64
+                " answer_wait_us=%.1f switches=%" PRIu64 " behind=%" PRIu64 " behind_us=%.1f",
                 thread_idx, pf.partitions, pf.pieces, pf.entries, pf.held_ordinary, pf.held_fed, pf.wait_room,
-                pf.wait_part, pf.decisions, pf.answered_early, pf.skipped, cycles_to_us(pf.build_ticks),
+                pf.wait_part, pf.answered, pf.answered_unnamed, pf.skipped, cycles_to_us(pf.build_ticks),
                 cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks), cycles_to_us(pf.submit_ledger_ticks),
                 cycles_to_us(pf.decide_ticks), ps.resident_peak, ps.events_in, ps.timed, ps.late,
                 static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2], ps.late_by[3],
                 ps.late_by[4], ps.wm_waits, static_cast<double>(ps.wm_wait_ns) / 1000.0, ps.la_waits,
-                static_cast<double>(ps.la_wait_ns) / 1000.0, static_cast<double>(ps.decision_ns) / 1000.0,
-                ps.answered_ahead, ps.answer_waits, static_cast<double>(ps.answer_wait_ns) / 1000.0, ps.switches,
-                ps.behind, static_cast<double>(ps.behind_ns) / 1000.0
+                static_cast<double>(ps.la_wait_ns) / 1000.0, ps.answered_ahead, ps.answer_waits,
+                static_cast<double>(ps.answer_wait_ns) / 1000.0, ps.switches, ps.behind,
+                static_cast<double>(ps.behind_ns) / 1000.0
             );
         }
         if (silo_active_ && !part_active_) {

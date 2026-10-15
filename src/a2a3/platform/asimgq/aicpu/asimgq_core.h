@@ -289,13 +289,13 @@ struct SimPartEntry {
 };
 // What a set of entries waits for: the producers deps[first .. first + n), and the
 // partition's watermark reaching `threshold` -- every index below it finished. A
-// set's entries are one supertask's piece. A predicated piece is placed only once
-// its manager answers that the predicate passed.
+// set's entries are one supertask's piece. A predicated piece also waits for its
+// manager's answer.
 struct SimPartSet {
     uint32_t first;
     uint32_t n;
     uint32_t threshold;
-    bool decision;
+    bool predicated;
 };
 
 // Switch this run's queues to partition mode, or out of it. In it, each queue keeps
@@ -321,28 +321,22 @@ bool submit_partition(
 int32_t queue_partition(uint32_t queue_idx);
 uint32_t part_store_room(uint32_t queue_idx);
 
-// Whether a predicated piece this queue found ready is waiting for its manager, as
-// the status read shows; and the oldest such piece, by the supertask it belongs
-// to, or -1 -- one read of the decision queue.
-bool decision_waiting(uint32_t queue_idx);
-int32_t take_decision(uint32_t queue_idx);
-// The manager's answer for a predicated piece: run places its entries; skip
-// finishes them without a core, as if they had run. A piece not yet ready keeps the
-// answer, and acts on it once it is ready and the answer has landed, without being
-// handed to the manager.
-void answer_decision(uint32_t queue_idx, int32_t task_id, bool run);
+// The manager's answer for a predicated piece, named by its supertask: run places
+// its entries; skip finishes them without a core, as if they had run. The answer is
+// one more condition of the piece: it acts once the piece is otherwise ready and the
+// answer has landed, whichever comes last.
+void answer_predicate(uint32_t queue_idx, int32_t task_id, bool run);
 
 // The partition store over the run: the most entries resident at once; completions
 // learned from the other queues; releases timed on one, and how many were learned
 // only after this queue's replay had passed them, by how much in all, and by the
 // kind of condition learned last -- arrival, a producer here or in another queue,
-// the threshold, the partition switch; sets that
-// waited on the watermark after their producers had finished, and for how long --
-// for a threshold, and for the look-ahead; predicated pieces handed to the manager,
-// how many it skipped, how long they waited for an answer, how many were answered
-// before they were ready, and how many of those then waited for the answer to land,
-// and for how long; partitions this queue moved past; and entries that arrived
-// after their queue had reached their partition, and how long after.
+// the threshold, the partition switch; sets that waited on the watermark after
+// their producers had finished, and for how long -- for a threshold, and for the
+// look-ahead; predicated pieces skipped, answers given before their piece was
+// ready, and pieces ready before their answer landed and how long they waited for
+// it in all; partitions this queue moved past; and entries that arrived after their
+// queue had reached their partition, and how long after.
 struct SimPartStats {
     uint64_t resident_peak;
     uint64_t events_in;
@@ -354,9 +348,7 @@ struct SimPartStats {
     uint64_t wm_wait_ns;
     uint64_t la_waits;
     uint64_t la_wait_ns;
-    uint64_t decisions;
     uint64_t skips;
-    uint64_t decision_ns;
     uint64_t answered_ahead;
     uint64_t answer_waits;
     uint64_t answer_wait_ns;

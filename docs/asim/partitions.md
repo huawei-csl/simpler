@@ -61,7 +61,7 @@ the largest subpartition here is 318 tasks; a threshold and a look-ahead check p
 record beside M2's four comparators, which match index ranges; a watermark and
 512-bit look-ahead per partition in flight, the current one and the next; the
 broadcast of the partition, the watermark and the 512 bits, ~70 bytes; and two bits
-per record for predicates, with a write port for the answers and a decision queue.
+per record for predicates, with a write port for the answers.
 
 ## Predicates in hardware
 
@@ -78,16 +78,15 @@ order, because its consumers wait on it. Three parties share the work.
 - **The manager answers when the writer finishes.** It posts the piece marked as
   predicated, waits for the writer's completion -- which it learns from the
   completions the managers retire anyway -- reads the element, and writes run or
-  skip to its controller: one posted store naming the piece.
+  skip to its controller: one posted store naming the piece. When the host cannot
+  name the writer, in a manual scope, the manager waits for every producer of the
+  task instead: that is when M0 reads the predicate.
 - **The controller holds the answer.** Two bits per record, *pending* and *skip*. The
   answer is one more condition: a predicated piece is ready once its producers,
   threshold and look-ahead allow and its answer has landed. A skip then finishes the
   piece's tasks at once, without a core, and the controller broadcasts them like any
-  finish; a run dispatches them. A piece that is otherwise ready while its answer is
-  still pending goes to the decision queue, which the manager polls and answers --
-  the path for a predicate whose writer the host cannot name, in a manual scope. On
-  deepseek_v4 it goes unused, and it could go altogether: a manager that waited for
-  all of such a task's producers instead of its writer would never need asking.
+  finish; a run dispatches them. A piece that is otherwise ready before its answer
+  has landed waits for it: the controller never asks.
 
 A skip waits for the piece to be ready, not just for the answer: a skipped task
 finishing before its own producers would let its consumers start before them, out
@@ -119,8 +118,9 @@ the early answer already does.
 - **The manager.** It builds its share of the next partition 16 supertasks per pass
   of its dispatch loop while the current one runs, and posts the share a piece at a
   time as the store frees -- the next partition's once its controller has reached
-  the one before. It answers a predicate as soon as it sees the writer completed:
-  each answer is one store to its queue, landing as a submit does.
+  the one before. It answers a predicate as soon as it sees the writer completed,
+  or every producer of the task when the host named no writer: each answer is one
+  store to its queue, landing as a submit does.
 
 ## deepseek_v4: the partition boundary is gone, and so are the predicate stops
 
@@ -150,7 +150,7 @@ scheduler's on each thread less that thread's own ledger, the latest of the four
 | --- | ------- | ----------- | ------ | ----- |
 | M2 | A, n=12 | 33.53 ms | 31.73 ms | +3.7 % (window +2.5 %) |
 | M2, silos | A, n=12 | 31.62 ms | 29.90 ms | -2.2 % (window -3.5 %) |
-| M2, partitions, decision queue, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
+| M2, partitions, answers only when asked, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
 | **M2, partitions** | E, n=12 | **30.32 ms** | **28.82 ms** | **-6.2 % (window -6.8 %)** |
 
 M0 reads 32.33, 32.30 and 32.32 ms in sessions A, D and E (windows 30.97, 30.91 and
@@ -159,10 +159,15 @@ the two reps of session E agree to 0.3 %.
 
 **The predicates are off the critical path.** Every predicated piece -- 2,064 per
 controller per round -- had its answer before it was ready, and none waited for the
-answer to land: the decision queue went unused. With the decision queue alone
-(session D), each of the 2,064 predicated pieces per controller per round
-waited for its manager once it was ready, ~2.4 us on average, one at a time: chains
-of up to five skipped supertasks paid a round trip per link.
+answer to land. In session D the manager answered only when its controller asked,
+through a decision queue the controller posted ready pieces to: each of the 2,064
+predicated pieces per controller per round waited for its manager once it was
+ready, ~2.4 us on average, one at a time, and chains of up to five skipped
+supertasks paid a round trip per link. With no writer named, every predicate left
+to its task's producers, a piece waits ~7.3 us for its answer once it is ready: a
+manager sees a producer finished only once every manager running a piece of it has
+retired that piece, later than the controllers know it. That run measured 32.20 ms
+against 30.36 ms with the writers named, two rounds each.
 
 **512 bits, because skipped tasks take indices.** A partition spans ~1,120 indices,
 ~450 of them tasks that skip; at 256 bits the look-ahead held a piece back 78 times
@@ -190,7 +195,8 @@ this build spends 1.5 ms and M0 1.4 ms.
   the graph has one there.
 - **The managers still evaluate every predicate.** That costs nothing here because
   the writer finishes early; a predicate whose writer finishes just before its task
-  is ready still pays the manager's reaction.
+  is ready still pays the manager's reaction, and so does one whose writer the host
+  cannot name.
 - **Releases learned late.** A queue's model replays only when its manager touches
   it, so a peer's finish can reach it after the replay has passed the instant it
   would have released something; that release is placed late. Here that is ~250
@@ -208,9 +214,9 @@ The partition arm is the expanded orchestration with `rt_declare_partitions(372)
 as the entry's first statement; everything else is as in
 [validation/deepseek-v4.md](validation/deepseek-v4.md#reproducing-it).
 `[GQ_PART thread=N]` in the device log carries, per manager and round, the pieces
-posted, the predicates answered ahead and from the decision queue, the store's
-peak, the exchanged finishes, the releases timed and late, and the waits on the
-threshold, the look-ahead and late answers.
+posted, the predicates answered and how many of them had no writer named, the
+store's peak, the exchanged finishes, the releases timed and late, and the waits on
+the threshold, the look-ahead and the answers.
 
 ```bash
 H_IN=1.02 H_N=1.32 PRED=0 C=4 SPLIT_MIN=8 PART=372 RESIDENT=1 CUT=narrow LAUNCH_US=1.32 \
