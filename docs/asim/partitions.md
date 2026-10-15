@@ -222,10 +222,7 @@ this build spends 1.5 ms and M0 1.4 ms.
   the piece would be ready reaches its controller late, and so does one whose writer
   the host cannot name.
 - **Every predicate is false on aSim.** The cores compute nothing, so `recv_count`
-  stays zero and no routed expert runs: the numbers above are for that case. With
-  half the experts made to run -- a predicate target of -1 on even experts, on both
-  arms -- the partition designs measured about +21 % against M0 (n=6), not yet
-  explained.
+  stays zero and no routed expert runs: the numbers above are for that case.
 - **The managers learn of finishes late.** A manager's status covers its queue's
   prefix and 32 positions past it, and partition pieces are posted far ahead, so a
   finish further out is reported only when the prefix reaches it. A task on the
