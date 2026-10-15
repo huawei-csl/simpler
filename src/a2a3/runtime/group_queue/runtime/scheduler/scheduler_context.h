@@ -326,9 +326,9 @@ private:
     bool silo_active_ = false;
 
     // Hand this thread's controller its share of each partition, a piece at a time
-    // as its store has room, and answer the predicated pieces the controller found
-    // ready. The controller moves from one partition to the next by itself.
-    // Returns true if anything was handed over or answered.
+    // as its store has room, a predicated piece once it is decided. The controller
+    // moves from one partition to the next by itself. Returns true if anything was
+    // handed over.
     bool feed_partitions(int32_t thread_idx);
 
     // One silo's share of a partition, built ahead of handing it over: per piece of a
@@ -394,31 +394,19 @@ private:
         uint64_t held_fed = 0;
         uint64_t wait_room = 0;
         uint64_t wait_part = 0;
+        // Predicated pieces: held back until the value their predicate reads was
+        // final, each counted once; posted decided, how many of those had no writer
+        // named, and how many went empty.
+        uint64_t pred_held = 0;
+        uint64_t decided = 0;
+        uint64_t decided_unnamed = 0;
         uint64_t skipped = 0;
-        // A predicated piece posted and not yet answered: its task, and the task it
-        // waits on -- the writer of the predicate's operand when the host named one,
-        // else one unfinished producer of the task at a time, as a wake list does; -1
-        // once there is none left.
-        struct PredWait {
-            int32_t task;
-            int32_t wait_on;
-            bool named;
-        };
-        // The pieces waiting, as of the completion count last checked; how many were
-        // answered, and how many of those had no writer named.
-        std::vector<PredWait> pred_waits;
-        std::vector<int32_t> walk;
-        uint64_t pred_epoch = ~0ULL;
-        uint64_t answered = 0;
-        uint64_t answered_unnamed = 0;
         // Real time spent building batches, and posting them; of the posting, the
-        // part spent in the queue's submit, and the part of that on its ledger; and
-        // answering predicates.
+        // part spent in the queue's submit, and the part of that on its ledger.
         uint64_t build_ticks = 0;
         uint64_t post_ticks = 0;
         uint64_t submit_ticks = 0;
         uint64_t submit_ledger_ticks = 0;
-        uint64_t decide_ticks = 0;
     };
     PartFeed part_feed_[PLATFORM_MAX_AICPU_THREADS];
     bool part_active_ = false;

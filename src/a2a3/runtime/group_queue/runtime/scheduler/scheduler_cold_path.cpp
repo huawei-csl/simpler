@@ -907,6 +907,7 @@ void SchedulerContext::begin_batch(int32_t part, uint32_t size, const std::vecto
 
 void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limit) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    PartFeed &pf = part_feed_[thread_idx];
     const int32_t silos = active_sched_threads_;
     const int32_t part = b.part;
     const uint64_t from = asimgq::now_ticks();
@@ -925,6 +926,21 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
         int32_t lo = 0, hi = 0;
         silo_piece(desc.silo, slot.logical_block_num, thread_idx, silos, lo, hi);
         if (lo >= hi) continue;
+        // A predicated piece reaches the controller decided. It is held back until the
+        // value its predicate reads is final -- once the task writing it has finished,
+        // or with none named every producer -- then goes to run, or as an empty piece.
+        bool empty = false;
+        if (slot.task_attrs.has_predicate()) {
+            const int32_t writer = desc.predicate_writer;
+            const int32_t wait_on =
+                writer >= 0 ? (tasks.is_completed(writer) ? -1 : writer) : unfinished_producer(tasks, id, walk);
+            if (wait_on >= 0) {
+                b.held.push_back(HeldPiece{id, wait_on, static_cast<uint32_t>((hi - lo) * active_subtask_count(slot))});
+                if (&b != &pf.retry) ++pf.pred_held;
+                continue;
+            }
+            empty = !slot.to_payload().predicate.pass();
+        }
         // Every producer in this partition, named once whichever silos run it: a
         // supertask's indices are one range. A dependency-only producer is seen
         // through to its own producers; one the controllers do not run has no
@@ -988,7 +1004,7 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
             b.deps.push_back(asimgq::SimPartDep{named[k].task, queues});
         }
         const uint32_t threshold = named.size() > asimgq::SIM_HELD_MAX_DEPS ? named[asimgq::SIM_HELD_MAX_DEPS].end : 0;
-        b.sets.push_back(asimgq::SimPartSet{dep_first, dn, threshold, slot.task_attrs.has_predicate()});
+        b.sets.push_back(asimgq::SimPartSet{dep_first, dn, threshold, empty});
         const uint32_t set = static_cast<uint32_t>(b.sets.size() - 1);
         b.ids.push_back(id);
         b.blocks.push_back(hi - lo);
@@ -1011,7 +1027,7 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
         }
         b.first_entry.push_back(static_cast<uint32_t>(b.entries.size()));
     }
-    part_feed_[thread_idx].build_ticks += asimgq::now_ticks() - from;
+    pf.build_ticks += asimgq::now_ticks() - from;
 }
 
 bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
@@ -1078,15 +1094,12 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
         ++pf.wait_room;
         return false;
     }
-    // Each predicate waits here for its answer (feed_partitions).
     for (size_t j = first; j < end; ++j) {
         const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(b.ids[j]);
         if (!slot.task_attrs.has_predicate()) continue;
-        const int32_t writer = slot.to_descriptor().predicate_writer;
-        pf.pred_waits.push_back(
-            PartFeed::PredWait{b.ids[j], writer >= 0 ? writer : unfinished_producer(tasks, b.ids[j], pf.walk), writer >= 0}
-        );
-        pf.pred_epoch = ~0ULL;
+        ++pf.decided;
+        if (slot.to_descriptor().predicate_writer < 0) ++pf.decided_unnamed;
+        if (b.sets[j].empty) ++pf.skipped;
     }
     b.posted = end;
     b.announced = true;
@@ -1101,10 +1114,9 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
 // has room -- the next partition's as soon as the controller has reached the one
 // before, so it is resident when the controller moves on. The controller tells the
 // partitions apart and moves from one to the next by itself; all the manager does
-// at a boundary is keep the store full. A predicated piece is answered as soon as
-// the task writing its operand has finished -- every producer of the task, when the
-// host could not name that one -- and the controller holds the answer until the
-// piece is ready.
+// at a boundary is keep the store full. A predicated piece is held back until the
+// value its predicate reads is final, and then posted decided: to run, or as an
+// empty piece the controller finishes without a core.
 bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     // Supertasks built per pass of the dispatch loop: a few microseconds of work.
     constexpr size_t kBuildStep = 16;
@@ -1193,37 +1205,6 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     } else if (pf.next.part >= 0 && !pf.next.complete()) {
         build_batch(thread_idx, pf.next, kBuildStep);
         progress = true;
-    }
-    // The value a predicate reads is final once its writer has finished, which can be
-    // well before the controller finds the piece ready: the answer goes then, and the
-    // controller holds it for the piece. Without a named writer it is final once every
-    // producer of the task has finished -- when M0 would read it -- and the piece
-    // waits on them one at a time.
-    if (!pf.pred_waits.empty()) {
-        const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
-        if (epoch != pf.pred_epoch) {
-            pf.pred_epoch = epoch;
-            const uint64_t from = asimgq::now_ticks();
-            size_t kept = 0;
-            for (PartFeed::PredWait w : pf.pred_waits) {
-                if (w.wait_on >= 0 && !tasks.is_completed(w.wait_on)) {
-                    pf.pred_waits[kept++] = w;
-                    continue;
-                }
-                if (!w.named && (w.wait_on = unfinished_producer(tasks, w.task, pf.walk)) >= 0) {
-                    pf.pred_waits[kept++] = w;
-                    continue;
-                }
-                const bool run = tasks.get_slot_state_by_task_id(w.task).to_payload().predicate.pass();
-                asimgq::answer_predicate(q, w.task, run);
-                ++pf.answered;
-                if (!w.named) ++pf.answered_unnamed;
-                if (!run) ++pf.skipped;
-                progress = true;
-            }
-            pf.pred_waits.resize(kept);
-            pf.decide_ticks += asimgq::now_ticks() - from;
-        }
     }
     return progress;
 }
@@ -1619,21 +1600,20 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             LOG_INFO(
                 "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64
                 " held_ordinary=%" PRIu64 " held_fed=%" PRIu64 " wait_room=%" PRIu64 " wait_part=%" PRIu64
-                " answered=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64
+                " pred_held=%" PRIu64 " decided=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64
                 " build_us=%.1f post_us=%.1f submit_us=%.1f"
-                " submit_ledger_us=%.1f decide_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64
+                " submit_ledger_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64
                 " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64 " late_peer=%" PRIu64
                 " late_threshold=%" PRIu64 " late_switch=%" PRIu64 " wm_waits=%" PRIu64
-                " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f answered_ahead=%" PRIu64 " answer_waits=%" PRIu64
-                " answer_wait_us=%.1f switches=%" PRIu64 " behind=%" PRIu64 " behind_us=%.1f",
+                " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f skips=%" PRIu64 " switches=%" PRIu64
+                " behind=%" PRIu64 " behind_us=%.1f",
                 thread_idx, pf.partitions, pf.pieces, pf.entries, pf.held_ordinary, pf.held_fed, pf.wait_room,
-                pf.wait_part, pf.answered, pf.answered_unnamed, pf.skipped, cycles_to_us(pf.build_ticks),
+                pf.wait_part, pf.pred_held, pf.decided, pf.decided_unnamed, pf.skipped, cycles_to_us(pf.build_ticks),
                 cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks), cycles_to_us(pf.submit_ledger_ticks),
-                cycles_to_us(pf.decide_ticks), ps.resident_peak, ps.events_in, ps.timed, ps.late,
+                ps.resident_peak, ps.events_in, ps.timed, ps.late,
                 static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2], ps.late_by[3],
                 ps.late_by[4], ps.wm_waits, static_cast<double>(ps.wm_wait_ns) / 1000.0, ps.la_waits,
-                static_cast<double>(ps.la_wait_ns) / 1000.0, ps.answered_ahead, ps.answer_waits,
-                static_cast<double>(ps.answer_wait_ns) / 1000.0, ps.switches, ps.behind,
+                static_cast<double>(ps.la_wait_ns) / 1000.0, ps.skips, ps.switches, ps.behind,
                 static_cast<double>(ps.behind_ns) / 1000.0
             );
         }

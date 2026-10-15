@@ -289,13 +289,13 @@ struct SimPartEntry {
 };
 // What a set of entries waits for: the producers deps[first .. first + n), and the
 // partition's watermark reaching `threshold` -- every index below it finished. A
-// set's entries are one supertask's piece. A predicated piece also waits for its
-// manager's answer.
+// set's entries are one supertask's piece. An empty set's entries finish without
+// a core once its conditions are met, as if they had run.
 struct SimPartSet {
     uint32_t first;
     uint32_t n;
     uint32_t threshold;
-    bool predicated;
+    bool empty;
 };
 
 // Switch this run's queues to partition mode, or out of it. In it, each queue keeps
@@ -321,22 +321,14 @@ bool submit_partition(
 int32_t queue_partition(uint32_t queue_idx);
 uint32_t part_store_room(uint32_t queue_idx);
 
-// The manager's answer for a predicated piece, named by its supertask: run places
-// its entries; skip finishes them without a core, as if they had run. The answer is
-// one more condition of the piece: it acts once the piece is otherwise ready and the
-// answer has landed, whichever comes last.
-void answer_predicate(uint32_t queue_idx, int32_t task_id, bool run);
-
 // The partition store over the run: the most entries resident at once; completions
 // learned from the other queues; releases timed on one, and how many were learned
 // only after this queue's replay had passed them, by how much in all, and by the
 // kind of condition learned last -- arrival, a producer here or in another queue,
 // the threshold, the partition switch; sets that waited on the watermark after
 // their producers had finished, and for how long -- for a threshold, and for the
-// look-ahead; predicated pieces skipped, answers given before their piece was
-// ready, and pieces ready before their answer landed and how long they waited for
-// it in all; partitions this queue moved past; and entries that arrived after their
-// queue had reached their partition, and how long after.
+// look-ahead; empty pieces finished; partitions this queue moved past; and entries
+// that arrived after their queue had reached their partition, and how long after.
 struct SimPartStats {
     uint64_t resident_peak;
     uint64_t events_in;
@@ -349,9 +341,6 @@ struct SimPartStats {
     uint64_t la_waits;
     uint64_t la_wait_ns;
     uint64_t skips;
-    uint64_t answered_ahead;
-    uint64_t answer_waits;
-    uint64_t answer_wait_ns;
     uint64_t switches;
     uint64_t behind;
     uint64_t behind_ns;

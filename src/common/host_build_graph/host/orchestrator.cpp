@@ -3065,9 +3065,9 @@ void OrchestratorState::finish_partitions() {
 // The silo a task is fed to. A task that cannot be fed ahead of its producers
 // keeps the ordinary path: a sync-start cohort needs every core at once, and
 // without partitions a dispatch predicate is read when the task is ready. Within
-// partitions a predicated task is fed like any other; its manager answers the
-// predicate once the value is final, and the controller holds the answer until the
-// task is ready. A supertask wide enough to fill
+// partitions a predicated task is fed once the value its predicate reads is final,
+// already decided: to run, or as an empty task its controller finishes without a
+// core. A supertask wide enough to fill
 // more than one silo is split across all of them; anything narrower follows its
 // latest stamped producer, so a chain stays where its data is, and takes the next
 // hint in turn when it has none.

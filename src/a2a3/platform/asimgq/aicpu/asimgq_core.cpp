@@ -537,8 +537,6 @@ constexpr uint32_t SIM_PART_WMS = 4;
 // queue or in another, the watermark's threshold, and its queue reaching the
 // partition.
 enum SimPartCause : uint8_t { PART_ARRIVE = 0, PART_OWN = 1, PART_PEER = 2, PART_THRESHOLD = 3, PART_SWITCH = 4 };
-constexpr uint8_t PART_ANSWER_RUN = 1;
-constexpr uint8_t PART_ANSWER_SKIP = 2;
 
 struct SimPartKey {
     uint64_t epoch = 0;
@@ -570,13 +568,9 @@ struct SimPartSetState {
     int32_t part = 0;
     uint32_t threshold = 0;
     bool lookahead = false;  // the threshold is the look-ahead's, not a producer's
-    bool predicated = false;
+    bool empty = false;
     int32_t task = -1;
-    uint8_t last = 0;        // the kind of condition met last, a SimPartCause
-    uint8_t answer = 0;      // a predicated piece's answer, 0 until its manager gives it
-    uint64_t answer_at = 0;  // and when it lands here
-    bool parked = false;     // ready without an answer, waiting for it since parked_at
-    uint64_t parked_at = 0;
+    uint8_t last = 0;  // the kind of condition met last, a SimPartCause
     uint32_t members = SIM_PART_NONE;
     uint32_t member_n = 0;
 };
@@ -650,9 +644,6 @@ struct SimPartState {
     uint64_t la_waits = 0;
     uint64_t la_wait_ticks = 0;
     uint64_t skips = 0;
-    uint64_t answered_ahead = 0;
-    uint64_t answer_waits = 0;
-    uint64_t answer_wait_ticks = 0;
     uint64_t switches = 0;
     uint64_t behind = 0;
     uint64_t behind_ticks = 0;
@@ -731,7 +722,7 @@ void part_ready_push(SimPartState &p, uint32_t slot) {
 void part_entry_done(SimQueue &q, const SimQueueEntryStore &e, uint64_t at);
 void mark_queue_done(SimQueue &q, uint64_t index, uint64_t at);
 
-// A skipped piece: each of its entries finishes at `at` without a core, as its
+// An empty piece: each of its entries finishes at `at` without a core, as its
 // manager will read.
 void part_skip(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
     ++p.skips;
@@ -750,31 +741,15 @@ void part_skip(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
     part_free_set(p, set);
 }
 
-// A set whose conditions are all met, at `at`: its entries go to their rings. A
-// predicated piece goes once its answer has landed, or finishes if the answer is
-// skip; without an answer it waits here for answer_predicate().
+// A set whose conditions are all met, at `at`: its entries go to their rings, or
+// finish there if the set is empty.
 void part_release(SimQueue &q, SimPartState &p, uint32_t set, uint64_t at) {
     SimPartSetState &s = p.sets[set];
-    // An answer sent before the piece was ready but still on its way: the piece goes
-    // when it lands.
-    if (s.predicated && s.answer != 0 && s.answer_at > at) {
-        ++p.answer_waits;
-        p.answer_wait_ticks += s.answer_at - at;
-        s.ready_at = s.answer_at;
-        p.releases.emplace_back(s.answer_at, set);
-        std::push_heap(p.releases.begin(), p.releases.end(), std::greater<>());
-        return;
-    }
     if (s.threshold_at > s.other_at) {
         ++(s.lookahead ? p.la_waits : p.wm_waits);
         (s.lookahead ? p.la_wait_ticks : p.wm_wait_ticks) += s.threshold_at - s.other_at;
     }
-    if (s.predicated && s.answer == 0) {
-        s.parked = true;
-        s.parked_at = at;
-        return;
-    }
-    if (s.predicated && s.answer == PART_ANSWER_SKIP) {
+    if (s.empty) {
         part_skip(q, p, set, at);
         return;
     }
@@ -2409,7 +2384,7 @@ void set_partition_mode(bool on) {
         p.resident = p.resident_peak = p.events_in = p.timed = p.late = p.late_ticks = 0;
         std::fill(std::begin(p.late_by), std::end(p.late_by), 0);
         p.wm_waits = p.wm_wait_ticks = p.la_waits = p.la_wait_ticks = 0;
-        p.skips = p.answered_ahead = p.answer_waits = p.answer_wait_ticks = 0;
+        p.skips = 0;
         p.switches = p.behind = p.behind_ticks = 0;
     }
     if (on) {
@@ -2464,7 +2439,7 @@ bool submit_partition(
         st.ready_at = st.other_at = floor_at;
         st.part = part;
         st.threshold = sets[i].threshold;
-        st.predicated = sets[i].predicated;
+        st.empty = sets[i].empty;
     }
     // The look-ahead bounds a set by its last entry: the watermark must be within
     // SIM_PART_LOOKAHEAD of it.
@@ -2570,44 +2545,6 @@ uint32_t part_store_room(uint32_t queue_idx) {
     return SIM_PART_SLOTS - static_cast<uint32_t>(g_part[queue_idx].resident);
 }
 
-void answer_predicate(uint32_t queue_idx, int32_t task_id, bool run) {
-    const Access a = begin_access(queue_idx, g_push_ticks);
-    if (queue_idx >= SIM_MAX_QUEUES || !g_part[queue_idx].on) {
-        wait_until(a.release);
-        return;
-    }
-    SimQueue &q = g_queues[queue_idx];
-    SimPartState &p = g_part[queue_idx];
-    part_drain(q, queue_idx);
-    retire_due(q, a.at > g_report_ticks ? a.at - g_report_ticks : 0);
-    const uint64_t at = a.at + g_arrive_ticks;
-    const uint32_t set = part_key(p, task_id).piece_set;
-    if (set != SIM_PART_NONE && p.sets[set].task == task_id && p.sets[set].predicated && p.sets[set].answer == 0 &&
-        p.sets[set].member_n > 0) {
-        SimPartSetState &st = p.sets[set];
-        st.answer = run ? PART_ANSWER_RUN : PART_ANSWER_SKIP;
-        st.answer_at = at;
-        if (!st.parked) {
-            ++p.answered_ahead;
-        } else {
-            // Ready first, the piece goes as the answer lands.
-            ++p.answer_waits;
-            p.answer_wait_ticks += at > st.parked_at ? at - st.parked_at : 0;
-            if (run) {
-                for (uint32_t m = st.members; m != SIM_PART_NONE; m = p.slots[m].next) {
-                    p.slots[m].e.enqueued_at = at;
-                    part_ready_push(p, m);
-                }
-            } else {
-                part_skip(q, p, set, at);
-            }
-        }
-    }
-    promote_part(q, at);
-    dispatch_pending(q, at);
-    finish_push(q, queue_idx, a);
-}
-
 void queue_part_stats(uint32_t queue_idx, SimPartStats *out) {
     const SimPartState &p = g_part[queue_idx < SIM_MAX_QUEUES ? queue_idx : 0];
     const uint64_t freq = get_sys_cnt_aicpu_frequency_hz();
@@ -2627,9 +2564,6 @@ void queue_part_stats(uint32_t queue_idx, SimPartStats *out) {
     out->la_waits = p.la_waits;
     out->la_wait_ns = ns(p.la_wait_ticks);
     out->skips = p.skips;
-    out->answered_ahead = p.answered_ahead;
-    out->answer_waits = p.answer_waits;
-    out->answer_wait_ns = ns(p.answer_wait_ticks);
     out->switches = p.switches;
     out->behind = p.behind;
     out->behind_ns = ns(p.behind_ticks);
