@@ -224,7 +224,10 @@ void SchedulerContext::log_stall_diagnostics(
             pf.wait_part
         );
         for (size_t i = 0; i < pf.held_back.size() && i < 8; ++i) {
-            LOG_INFO("[STALL thread=%d] PART held_back task=%d", thread_idx, pf.held_back[i]);
+            LOG_INFO(
+                "[STALL thread=%d] PART held_back task=%d wait_on=%d entries=%u", thread_idx, pf.held_back[i].id,
+                pf.held_back[i].wait_on, pf.held_back[i].entries
+            );
         }
     }
     if (silo_active_ && !part_active_ && sched_->task_view.tasks != nullptr) {
@@ -929,6 +932,7 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
         named.clear();
         walk.clear();
         bool hold = false;
+        int32_t blocker = -1;
         const TaskPayload &payload = slot.to_payload();
         walk.assign(payload.fanin_data(), payload.fanin_data() + payload.fanin_count);
         while (!walk.empty() && !hold) {
@@ -947,10 +951,11 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
                 walk.insert(walk.end(), pp.fanin_data(), pp.fanin_data() + pp.fanin_count);
             } else {
                 hold = true;
+                blocker = prod;
             }
         }
         if (hold) {
-            b.held.push_back(id);
+            b.held.push_back(HeldPiece{id, blocker, static_cast<uint32_t>((hi - lo) * active_subtask_count(slot))});
             continue;
         }
         // The four producers ending last are named; the rest end at or below the
@@ -1015,7 +1020,15 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
     GqIndexSpace &space = gq_index_[thread_idx];
     const uint32_t q = static_cast<uint32_t>(thread_idx);
     const size_t first = b.posted;
-    const uint32_t room = std::min(asimgq::part_store_room(q), space.room());
+    // Room an earlier partition's held pieces need is not this batch's to take.
+    uint32_t reserved = 0;
+    if (&b != &pf.retry) {
+        for (const HeldPiece &h : pf.held_back) {
+            if (tasks.get_task_by_task_id(h.id).part < b.part) reserved += h.entries;
+        }
+    }
+    const uint32_t free = std::min(asimgq::part_store_room(q), space.room());
+    const uint32_t room = free > reserved ? free - reserved : 0;
     size_t end = first;
     while (end < b.ids.size() && b.first_entry[end + 1] - b.first_entry[first] <= room) {
         ++end;
@@ -1105,25 +1118,43 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
         if (epoch != pf.held_epoch) {
             pf.held_epoch = epoch;
             int32_t part = INT32_MAX;
-            for (const int32_t id : pf.held_back) {
-                part = std::min<int32_t>(part, tasks.get_task_by_task_id(id).part);
+            for (const HeldPiece &h : pf.held_back) {
+                part = std::min<int32_t>(part, tasks.get_task_by_task_id(h.id).part);
             }
-            pf.ids.clear();
-            std::vector<int32_t> later;
-            for (const int32_t id : pf.held_back) {
-                (tasks.get_task_by_task_id(id).part == part ? pf.ids : later).push_back(id);
+            // The lowest partition's held pieces are built again once one may go.
+            bool due = false;
+            for (const HeldPiece &h : pf.held_back) {
+                if (tasks.get_task_by_task_id(h.id).part == part && (h.wait_on < 0 || tasks.is_completed(h.wait_on))) {
+                    due = true;
+                    break;
+                }
             }
-            begin_batch(part, pf.sizes[static_cast<size_t>(part)], pf.ids, pf.retry);
-            build_batch(thread_idx, pf.retry, pf.retry.order.size());
-            pf.retry.announced = true;
-            if (!pf.retry.ids.empty() && post_pieces(thread_idx, pf.retry)) {
-                pf.held_fed += pf.retry.posted;
-                progress = true;
+            if (due) {
+                pf.ids.clear();
+                std::vector<HeldPiece> later;
+                for (const HeldPiece &h : pf.held_back) {
+                    if (tasks.get_task_by_task_id(h.id).part == part) {
+                        pf.ids.push_back(h.id);
+                    } else {
+                        later.push_back(h);
+                    }
+                }
+                begin_batch(part, pf.sizes[static_cast<size_t>(part)], pf.ids, pf.retry);
+                build_batch(thread_idx, pf.retry, pf.retry.order.size());
+                pf.retry.announced = true;
+                if (!pf.retry.ids.empty() && post_pieces(thread_idx, pf.retry)) {
+                    pf.held_fed += pf.retry.posted;
+                    progress = true;
+                }
+                // What is still held, and what found no room, is tried again.
+                pf.held_back.assign(pf.retry.held.begin(), pf.retry.held.end());
+                for (size_t j = pf.retry.posted; j < pf.retry.ids.size(); ++j) {
+                    pf.held_back.push_back(
+                        HeldPiece{pf.retry.ids[j], -1, pf.retry.first_entry[j + 1] - pf.retry.first_entry[j]}
+                    );
+                }
+                pf.held_back.insert(pf.held_back.end(), later.begin(), later.end());
             }
-            // What is still held, and what found no room, is tried again.
-            pf.held_back.assign(pf.retry.held.begin(), pf.retry.held.end());
-            pf.held_back.insert(pf.held_back.end(), pf.retry.ids.begin() + pf.retry.posted, pf.retry.ids.end());
-            pf.held_back.insert(pf.held_back.end(), later.begin(), later.end());
         }
     }
     // The next share goes to the controller once the current one is all posted.

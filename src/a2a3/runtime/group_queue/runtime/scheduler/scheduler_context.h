@@ -336,6 +336,14 @@ private:
     // threshold its partition's watermark must reach -- positions are taken when a
     // piece is posted. A supertask is held back when it names a producer the
     // controllers cannot see finish; it is posted once that producer has.
+    //
+    // A held supertask: the task whose finish may let it go, or -1 when any finish
+    // may, and the entries its piece takes in the store.
+    struct HeldPiece {
+        int32_t id;
+        int32_t wait_on;
+        uint32_t entries;
+    };
     struct PartBatch {
         int32_t part = -1;
         uint32_t size = 0;                  // indices the partition spans
@@ -348,7 +356,7 @@ private:
         std::vector<SubtaskSlot> subslots;
         std::vector<asimgq::SimPartSet> sets;  // per piece
         std::vector<asimgq::SimPartDep> deps;
-        std::vector<int32_t> held;
+        std::vector<HeldPiece> held;
         size_t posted = 0;       // pieces handed over
         bool announced = false;  // the controller knows the partition's size
         bool complete() const { return part >= 0 && built == order.size(); }
@@ -373,7 +381,10 @@ private:
         int32_t next_first = 0;       // first task id of the partition to build next
         std::vector<uint32_t> sizes;  // per partition built so far: the indices it spans
         PartBatch retry;
-        std::vector<int32_t> held_back;
+        // Every piece held back, whatever its partition. A later partition's pieces
+        // leave room in the store for an earlier one's, which its controller needs
+        // before it can move on.
+        std::vector<HeldPiece> held_back;
         std::vector<int32_t> ids;
         uint64_t held_epoch = ~0ULL;
         uint64_t partitions = 0;
