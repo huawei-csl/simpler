@@ -49,56 +49,62 @@ a silo.
   watermark covers `k` whole; a broadcast tagged with a later partition means every
   earlier one has finished. The next subpartition is resident by then and is gated
   until the switch: the manager appends it, in index order, as the store frees.
-- **Predicates are answered ahead.** The manager evaluates each dispatch predicate
-  once the task writing its operand has finished, and the controller holds the
-  answer until the task is ready -- [below](#predicates-in-hardware).
+- **Predicated pieces are posted decided.** Submitting to a controller is
+  committal: every entry it takes executes. The manager holds a predicated piece back
+  until the value its predicate reads is final, then posts it to run or as an empty
+  piece -- [below](#predicates-in-hardware).
 - **What stays with the manager.** A sync-start cohort keeps the ordinary path, as
   with silos; deepseek_v4 has none. A supertask with a producer the controllers do
-  not run is held back and fed once that producer has finished.
+  not run is held back and fed once that producer has finished. A later partition's
+  pieces leave room in the store for every piece held back from an earlier one, which
+  its controller needs before it can move on.
 
 Against M2 this adds, per controller: a store of 512 entries (~20 bytes each), where
 the largest subpartition here is 318 tasks; a threshold and a look-ahead check per
 record beside M2's four comparators, which match index ranges; a watermark and
 512-bit look-ahead per partition in flight, the current one and the next; the
-broadcast of the partition, the watermark and the 512 bits, ~70 bytes; and two bits
-per record for predicates, with a write port for the answers.
+broadcast of the partition, the watermark and the 512 bits, ~70 bytes; and one bit
+per record, *empty*, for a predicated piece that skips.
 
 ## Predicates in hardware
 
 A dispatch predicate lets a task skip itself: deepseek_v4's routed-expert tasks run
 only when `recv_count[e] > 0`, the rows dispatched to expert `e`. That is six
 supertasks per expert, 192 a layer, and a task that skips still has to finish in
-order, because its consumers wait on it. Three parties share the work.
+order, because its consumers wait on it. Submitting to a controller is committal --
+an entry it takes executes, and nothing is withdrawn or answered later -- so the
+decision is made before the piece is submitted. Three parties share the work.
 
 - **The host names the writer.** At submit it records the last task to write the
   element a predicate reads (`TaskDescriptor::predicate_writer`, from the tensormap
   it already keeps). The predicate's value is final once that task has finished --
   here `dispatch_meta`, one per layer, which finishes before the expert tasks' input
   rows have arrived.
-- **The manager answers when the writer finishes.** It posts the piece marked as
-  predicated, waits for the writer's completion -- which it learns from the
-  completions the managers retire anyway -- reads the element, and writes run or
-  skip to its controller: one posted store naming the piece. When the host cannot
-  name the writer, in a manual scope, the manager waits for every producer of the
-  task instead: that is when M0 reads the predicate.
-- **The controller holds the answer.** Two bits per record, *pending* and *skip*. The
-  answer is one more condition: a predicated piece is ready once its producers,
-  threshold and look-ahead allow and its answer has landed. A skip then finishes the
-  piece's tasks at once, without a core, and the controller broadcasts them like any
-  finish; a run dispatches them. A piece that is otherwise ready before its answer
-  has landed waits for it: the controller never asks.
+- **The manager decides, then posts.** It holds a predicated piece back until the
+  writer has finished -- which it learns from the completions the managers retire
+  anyway -- reads the element, and posts the piece decided: to run, or as an empty
+  piece. When the host cannot name the writer, in a manual scope, the manager waits
+  for every producer of the task instead: that is when M0 reads the predicate. The
+  piece's consumers are posted as usual and wait on its indices, which finish
+  either way.
+- **The controller finishes empty pieces.** One bit per record, *empty*. An empty
+  piece waits like any other -- for its producers, threshold, look-ahead and
+  partition -- and then finishes its tasks at once, without a core; the controller
+  broadcasts them like any finish.
 
-A skip waits for the piece to be ready, not just for the answer: a skipped task
-finishing before its own producers would let its consumers start before them, out
-of order with any write after their reads. What the early answer saves is the round
-trip through the manager once the piece is ready.
+An empty piece waits for its conditions rather than finishing on arrival: a skipped
+task finishing before its own producers would let its consumers start before them,
+out of order with any write after their reads. Because a held piece reaches the
+store after the pieces behind it, the manager keeps room for it: a later partition's
+pieces leave free the entries an earlier partition's held pieces will need, or the
+store could fill with pieces gated behind a switch that cannot come.
 
-Two variants cost more hardware. A predicate table in the controller would take one
-answer per distinct predicate -- 32 a layer here, one per expert -- instead of one
-per piece, at the price of a table and a field per record. A controller that read
-the element itself would need a device-memory read port, a comparator and ~18 bytes
-of predicate per record, and would take the manager off the path; on deepseek_v4
-the early answer already does.
+Two variants cost more hardware. Posting predicated pieces up front and answering
+them later -- built and measured below -- needs two bits per record, *pending* and
+*skip*, and a port for the answers. A controller that read the element itself would
+need a device-memory read port, a comparator and ~18 bytes of predicate per record,
+and would take the manager off the path; on deepseek_v4 the writer finishes early
+enough that the manager is not on it either.
 
 ## How the simulator models it
 
@@ -118,9 +124,9 @@ the early answer already does.
 - **The manager.** It builds its share of the next partition 16 supertasks per pass
   of its dispatch loop while the current one runs, and posts the share a piece at a
   time as the store frees -- the next partition's once its controller has reached
-  the one before. It answers a predicate as soon as it sees the writer completed,
-  or every producer of the task when the host named no writer: each answer is one
-  store to its queue, landing as a submit does.
+  the one before. It holds a predicated piece back until it sees the writer
+  completed, or every producer of the task when the host named no writer, and posts
+  it then, to run or empty, on the path held pieces take.
 
 ## deepseek_v4: the partition boundary is gone, and so are the predicate stops
 
@@ -132,7 +138,7 @@ task costs above the controllers' own hops:
 
 | predicate path | makespan | vs today |
 | -------------- | -------- | -------- |
-| free: answered before the task is ready | 27.32 ms | -10.9 % |
+| free: decided before the task is ready | 27.32 ms | -10.9 % |
 | 1 us | 27.50 ms | -10.3 % |
 | a manager hop, 2.68 us | 27.87 ms | -9.1 % |
 
@@ -150,24 +156,41 @@ scheduler's on each thread less that thread's own ledger, the latest of the four
 | --- | ------- | ----------- | ------ | ----- |
 | M2 | A, n=12 | 33.53 ms | 31.73 ms | +3.7 % (window +2.5 %) |
 | M2, silos | A, n=12 | 31.62 ms | 29.90 ms | -2.2 % (window -3.5 %) |
-| M2, partitions, answers only when asked, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
-| **M2, partitions** | E, n=12 | **30.32 ms** | **28.82 ms** | **-6.2 % (window -6.8 %)** |
+| M2, partitions, answered when asked, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
+| M2, partitions, answered ahead | E, n=12 | 30.32 ms | 28.82 ms | -6.2 % (window -6.8 %) |
+| M2, partitions, answered ahead | F, n=12 | 30.38 ms | 28.83 ms | -6.0 % (window -6.7 %) |
+| **M2, partitions, posted decided** | F, n=48 | **30.00 ms** | **28.46 ms** | **-7.2 % (window -8.0 %)** |
 
-M0 reads 32.33, 32.30 and 32.32 ms in sessions A, D and E (windows 30.97, 30.91 and
-30.93 ms). Every arm completes every task, the core time issued agrees to 0.2 %, and
-the two reps of session E agree to 0.3 %.
+M0 reads 32.33, 32.30, 32.32 and 32.32 ms in sessions A, D, E and F (windows 30.97,
+30.91, 30.93 and 30.93 ms). Every arm completes every task and the core time issued
+agrees to 0.2 %. Session F pairs each rep of the decided design with an M0 rep run
+beside it in the same job, the two in alternating order: over eight pairs the
+speedup is -7.16 % (sd 0.19 pp, 95 % interval -7.31 to -7.00 %, every pair between
+-7.45 and -6.87 %), and -8.00 % in the window (sd 0.13 pp).
 
-**The predicates are off the critical path.** Every predicated piece -- 2,064 per
-controller per round -- had its answer before it was ready, and none waited for the
-answer to land. In session D the manager answered only when its controller asked,
-through a decision queue the controller posted ready pieces to: each of the 2,064
-predicated pieces per controller per round waited for its manager once it was
-ready, ~2.4 us on average, one at a time, and chains of up to five skipped
-supertasks paid a round trip per link. With no writer named, every predicate left
-to its task's producers, a piece waits ~7.3 us for its answer once it is ready: a
-manager sees a producer finished only once every manager running a piece of it has
-retired that piece, later than the controllers know it. That run measured 32.20 ms
-against 30.36 ms with the writers named, two rounds each.
+**Deciding before posting costs nothing here and frees the store.** Every predicated
+piece -- 2,064 per controller per round -- was held until `dispatch_meta` had
+finished and then posted decided; with every predicate false on aSim, all went
+empty. Held back, they no longer sit in the store waiting for an answer: a manager
+waited for room 687 times a round, against 4,131 times when the same pieces were
+posted up front and answered, and the store peaked at 498 entries rather than all
+512. Their ~4,700 entries reach their controller after it has reached their
+partition, which the answered design never does.
+
+In session D the manager answered only when its controller asked, through a decision
+queue the controller posted ready pieces to: each of the 2,064 predicated pieces per
+controller per round waited for its manager once it was ready, ~2.4 us on average,
+one at a time, and chains of up to five skipped supertasks paid a round trip per
+link. Without a named writer, a predicate is final only once every producer of its
+task has finished as the managers see it: answered then, each piece waited ~7.3 us
+once it was ready, and the case measured 32.20 ms against 30.36 ms with the writers
+named, two rounds each -- a manager sees a producer finished only once every manager
+running a piece of it has retired that piece, later than the controllers know it.
+
+Leaving predicated tasks out of the partitions -- no index, the managers reading the
+predicate at dispatch and holding back the tasks that name one -- measured -4.2 %
+in session F and deadlocks once a predicated task runs:
+[investigations](../investigations/2026-10-gq-unnumbered-predicated-tasks.md).
 
 **512 bits, because skipped tasks take indices.** A partition spans ~1,120 indices,
 ~450 of them tasks that skip; at 256 bits the look-ahead held a piece back 78 times
@@ -176,11 +199,12 @@ count it finished like any other, so its consumers can wait for it in the
 controller.
 
 **What remains** against the oracle's -10.9 % is not attributed. Two counters
-stand out, per controller and round: ~250 releases learned only after the queue's
-replay had passed them, ~440 us of lateness in all -- a simulator artifact, under
-[Limits](#limits) -- and 47 records that waited for the watermark to pass their
-threshold after their named producers had finished, ~330 us in all. Every next
-subpartition was resident before its controller switched to it.
+stand out, per controller and round: ~290 releases learned only after the queue's
+replay had passed them, ~1.1 ms of lateness in all -- a simulator artifact, under
+[Limits](#limits) -- and 42 records that waited for the watermark to pass their
+threshold after their named producers had finished, ~280 us in all. Apart from the
+held predicated pieces, every next subpartition was resident before its controller
+switched to it.
 
 An earlier build of partitions -- a software barrier at each boundary, positions
 numbered per launch in task order, and predicated supertasks left with the managers
@@ -193,14 +217,23 @@ this build spends 1.5 ms and M0 1.4 ms.
 - **The partitioning is the host's**, as a stand-in for the compiler: a boundary
   moves within a quarter partition to the narrowest point, and nothing checks that
   the graph has one there.
-- **The managers still evaluate every predicate.** That costs nothing here because
-  the writer finishes early; a predicate whose writer finishes just before its task
-  is ready still pays the manager's reaction, and so does one whose writer the host
-  cannot name.
+- **The managers still decide every predicate.** That costs nothing here because
+  the writer finishes early; a predicated piece whose writer finishes just before
+  the piece would be ready reaches its controller late, and so does one whose writer
+  the host cannot name.
+- **Every predicate is false on aSim.** The cores compute nothing, so `recv_count`
+  stays zero and no routed expert runs: the numbers above are for that case. With
+  half the experts made to run -- a predicate target of -1 on even experts, on both
+  arms -- the partition designs measured about +21 % against M0 (n=6), not yet
+  explained.
+- **The managers learn of finishes late.** A manager's status covers its queue's
+  prefix and 32 positions past it, and partition pieces are posted far ahead, so a
+  finish further out is reported only when the prefix reaches it. A task on the
+  managers' ordinary path inside a partitioned graph can deadlock on it.
 - **Releases learned late.** A queue's model replays only when its manager touches
   it, so a peer's finish can reach it after the replay has passed the instant it
-  would have released something; that release is placed late. Here that is ~250
-  releases per controller per round, ~440 us of lateness in all. It counts against
+  would have released something; that release is placed late. Here that is ~290
+  releases per controller per round, ~1.1 ms of lateness in all. It counts against
   M2 only, so the gains above are lower bounds.
 - **The exchange period and the store are design parameters**, not measurements.
 - **The managers run in real time against a device that stands still while the
@@ -214,9 +247,9 @@ The partition arm is the expanded orchestration with `rt_declare_partitions(372)
 as the entry's first statement; everything else is as in
 [validation/deepseek-v4.md](validation/deepseek-v4.md#reproducing-it).
 `[GQ_PART thread=N]` in the device log carries, per manager and round, the pieces
-posted, the predicates answered and how many of them had no writer named, the
-store's peak, the exchanged finishes, the releases timed and late, and the waits on
-the threshold, the look-ahead and the answers.
+posted, the predicated pieces held and posted decided, how many of them had no
+writer named and how many went empty, the store's peak, the exchanged finishes, the
+releases timed and late, and the waits on the threshold and the look-ahead.
 
 ```bash
 H_IN=1.02 H_N=1.32 PRED=0 C=4 SPLIT_MIN=8 PART=372 RESIDENT=1 CUT=narrow LAUNCH_US=1.32 \

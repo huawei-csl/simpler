@@ -109,8 +109,8 @@ other's completions, with every supertask of four or more blocks split across th
 -- and measures M2 at **-2.1 %** against M0 (window -3.1 %), and -5.6 % with eight
 comparators per task instead of four. [../partitions.md](../partitions.md) runs the
 graph a layer at a time on those silos instead -- the controllers sharing each
-partition's watermark, and the managers answering predicates before their tasks are
-ready -- and measures **-6.2 %** (window -6.8 %).
+partition's watermark, and the managers posting a predicated piece once its predicate
+is decided -- and measures **-7.2 %** (window -8.0 %) over eight paired reps.
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
 split each into per-queue pieces declared in separate groups, so the four threads
