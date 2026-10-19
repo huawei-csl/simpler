@@ -381,10 +381,13 @@ private:
         int32_t next_first = 0;       // first task id of the partition to build next
         std::vector<uint32_t> sizes;  // per partition built so far: the indices it spans
         PartBatch retry;
+        PartBatch routed;          // one conditional task routed here, built whole
+        uint64_t cond_cursor = 0;  // this manager's next ticket on the shared ring
         // Every piece held back, whatever its partition. A later partition's pieces
         // leave room in the store for an earlier one's, which its controller needs
-        // before it can move on.
+        // before it can move on. Per partition, the entries held.
         std::vector<HeldPiece> held_back;
+        std::vector<int64_t> held_sum;
         std::vector<int32_t> ids;
         uint64_t held_epoch = ~0ULL;
         uint64_t partitions = 0;
@@ -401,6 +404,10 @@ private:
         uint64_t decided = 0;
         uint64_t decided_unnamed = 0;
         uint64_t skipped = 0;
+        // Conditional tasks this manager decided to run and put on the shared ring, and
+        // those it posted from there.
+        uint64_t routed_out = 0;
+        uint64_t routed_in = 0;
         // Real time spent building batches, and posting them; of the posting, the
         // part spent in the queue's submit, and the part of that on its ledger.
         uint64_t build_ticks = 0;
@@ -410,6 +417,27 @@ private:
     };
     PartFeed part_feed_[PLATFORM_MAX_AICPU_THREADS];
     bool part_active_ = false;
+
+    // Conditional work, spread evenly over the groups. A predicated task the
+    // controllers run whole is decided by the manager of the group the host gave it:
+    // skipped, it goes to that group as an empty piece; to run, it goes on a ring every
+    // manager shares, and the k-th task put there is posted by manager k % groups to
+    // its own controller, in the order put.
+    struct CondRoute {
+        int32_t task;
+        int32_t part;
+    };
+    static constexpr uint32_t kCondRing = 16384;
+    CondRoute cond_ring_[kCondRing];
+    std::atomic<uint64_t> cond_seq_[kCondRing];  // Vyukov slot sequence: t free, t + 1 written
+    std::atomic<uint64_t> cond_tail_{0};
+    bool cond_slots_set_ = false;  // every slot's sequence has been set once
+    void route_conditional(int32_t thread_idx, int32_t task, int32_t part);
+    // Recount a feed's held entries per partition, after its held list changed.
+    void tally_held(PartFeed &pf);
+    // Post the conditional tasks routed to this thread's group that its controller can
+    // take, in ticket order. Returns true if any went.
+    bool feed_routed(int32_t thread_idx);
 
     // Split every shape's ready-queue slot region into one disjoint span per
     // Scheduler thread. Runs once per run, before any push.

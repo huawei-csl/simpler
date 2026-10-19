@@ -259,9 +259,11 @@ constexpr uint64_t SIM_GQ_EXCHANGE_NS = 300;
 // completion: an isolated completion waits up to one period the hardware would not
 // charge it, and a burst goes out together.
 constexpr uint64_t SIM_GQ_BROADCAST_NS = 100;
-// Entries one controller's partition store holds: its current subpartition and as
-// much of the next as fits.
-constexpr uint32_t SIM_PART_STORE = 512;
+// Entries one controller's partition store holds: its current subpartition, the
+// conditional work routed to it, and as much of the next as fits. The managers keep
+// no room for conditional work still to be routed, so a store that cannot take two
+// partitions' worth of one group's entries can fill with gated pieces and stall.
+constexpr uint32_t SIM_PART_STORE = 1024;
 // Indices one partition may span: an index is 11 bits.
 constexpr uint32_t SIM_PART_INDICES = 2048;
 // A controller's look-ahead: the finished indices past its watermark it can hold.
@@ -272,9 +274,12 @@ constexpr uint32_t SIM_PART_LOOKAHEAD = 512;
 // A producer a partition task waits on, named by supertask: the runtime's task id
 // and the queues that run a piece of it. One comparator, however many queues --
 // numbered across the partition, a supertask's tasks are one range of indices.
+// SIM_PART_ANY_QUEUE names a producer placed when it is decided, whole in one queue
+// not known ahead: the first queue to report it covers its whole range.
+constexpr uint32_t SIM_PART_ANY_QUEUE = 1U << 31;
 struct SimPartDep {
     int32_t task;
-    uint32_t queues;  // bit q: queue q runs a piece of it
+    uint32_t queues;  // bit q: queue q runs a piece of it; or SIM_PART_ANY_QUEUE
 };
 
 // One entry of a partition, a single-part task on this queue, its partition-local

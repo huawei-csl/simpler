@@ -870,6 +870,12 @@ static int32_t unfinished_producer(SharedMemoryTaskHeader &tasks, int32_t task, 
     return latest;
 }
 
+// Whether a task is conditional work the managers spread over the groups: a
+// predicated task the controllers run whole rather than split.
+static bool routes(const ChipTaskSlotState &slot) {
+    return slot.task_attrs.has_predicate() && slot.to_descriptor().silo != TASK_SILO_SPREAD;
+}
+
 void SchedulerContext::begin_batch(int32_t part, uint32_t size, const std::vector<int32_t> &ids, PartBatch &b) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     b.part = part;
@@ -923,14 +929,18 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (tasks.is_completed(id) || !part_feeds(slot)) continue;
         const TaskDescriptor &desc = slot.to_descriptor();
-        int32_t lo = 0, hi = 0;
-        silo_piece(desc.silo, slot.logical_block_num, thread_idx, silos, lo, hi);
+        // A conditional task routed here runs whole in this group, already decided.
+        const bool routed_here = &b == &pf.routed;
+        int32_t lo = 0, hi = slot.logical_block_num;
+        if (!routed_here) silo_piece(desc.silo, slot.logical_block_num, thread_idx, silos, lo, hi);
         if (lo >= hi) continue;
         // A predicated piece reaches the controller decided. It is held back until the
         // value its predicate reads is final -- once the task writing it has finished,
         // or with none named every producer -- then goes to run, or as an empty piece.
+        // One the controllers run whole goes to the shared ring to run, for the group
+        // whose turn it is.
         bool empty = false;
-        if (slot.task_attrs.has_predicate()) {
+        if (slot.task_attrs.has_predicate() && !routed_here) {
             const int32_t writer = desc.predicate_writer;
             const int32_t wait_on =
                 writer >= 0 ? (tasks.is_completed(writer) ? -1 : writer) : unfinished_producer(tasks, id, walk);
@@ -940,6 +950,10 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
                 continue;
             }
             empty = !slot.to_payload().predicate.pass();
+            if (!empty && routes(slot)) {
+                route_conditional(thread_idx, id, part);
+                continue;
+            }
         }
         // Every producer in this partition, named once whichever silos run it: a
         // supertask's indices are one range. A dependency-only producer is seen
@@ -996,10 +1010,14 @@ void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limi
         for (uint32_t k = 0; k < dn; ++k) {
             const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(named[k].task);
             uint32_t queues = 0;
-            for (int32_t q = 0; q < silos; ++q) {
-                int32_t plo = 0, phi = 0;
-                silo_piece(ps.to_descriptor().silo, ps.logical_block_num, q, silos, plo, phi);
-                if (plo < phi) queues |= 1U << q;
+            if (routes(ps)) {
+                queues = asimgq::SIM_PART_ANY_QUEUE;
+            } else {
+                for (int32_t q = 0; q < silos; ++q) {
+                    int32_t plo = 0, phi = 0;
+                    silo_piece(ps.to_descriptor().silo, ps.logical_block_num, q, silos, plo, phi);
+                    if (plo < phi) queues |= 1U << q;
+                }
             }
             b.deps.push_back(asimgq::SimPartDep{named[k].task, queues});
         }
@@ -1036,11 +1054,14 @@ bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
     GqIndexSpace &space = gq_index_[thread_idx];
     const uint32_t q = static_cast<uint32_t>(thread_idx);
     const size_t first = b.posted;
-    // Room an earlier partition's held pieces need is not this batch's to take.
+    // Room an earlier partition's held pieces need is not this batch's to take; only a
+    // partition the controller has not finished can still be waiting. Conditional work
+    // still to be routed here has no room kept: that relies on asimgq::SIM_PART_STORE.
     uint32_t reserved = 0;
-    if (&b != &pf.retry) {
-        for (const HeldPiece &h : pf.held_back) {
-            if (tasks.get_task_by_task_id(h.id).part < b.part) reserved += h.entries;
+    if (&b != &pf.retry && &b != &pf.routed) {
+        for (int32_t k = std::max(0, asimgq::queue_partition(q));
+             k < b.part && static_cast<size_t>(k) < pf.held_sum.size(); ++k) {
+            reserved += static_cast<uint32_t>(pf.held_sum[k]);
         }
     }
     const uint32_t free = std::min(asimgq::part_store_room(q), space.room());
@@ -1124,7 +1145,7 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     PartFeed &pf = part_feed_[thread_idx];
     const uint32_t q = static_cast<uint32_t>(thread_idx);
-    bool progress = false;
+    bool progress = feed_routed(thread_idx);
     if (!pf.held_back.empty()) {
         const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
         if (epoch != pf.held_epoch) {
@@ -1166,6 +1187,7 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
                     );
                 }
                 pf.held_back.insert(pf.held_back.end(), later.begin(), later.end());
+                tally_held(pf);
             }
         }
     }
@@ -1175,6 +1197,7 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
         std::swap(pf.cur, pf.next);
         pf.next.part = -1;
         pf.held_back.insert(pf.held_back.end(), pf.cur.held.begin(), pf.cur.held.end());
+        tally_held(pf);
         pf.held_ordinary += pf.cur.held.size();
         ++pf.partitions;
     }
@@ -1198,12 +1221,65 @@ bool SchedulerContext::feed_partitions(int32_t thread_idx) {
         }
         const uint32_t size = tasks.get_task_by_task_id(pf.next_first).part_size;
         begin_batch(part, size, pf.ids, pf.next);
-        if (pf.sizes.size() <= static_cast<size_t>(part)) pf.sizes.resize(static_cast<size_t>(part) + 1, 0);
+        if (pf.sizes.size() <= static_cast<size_t>(part)) {
+            pf.sizes.resize(static_cast<size_t>(part) + 1, 0);
+            pf.held_sum.resize(static_cast<size_t>(part) + 1, 0);
+        }
         pf.sizes[static_cast<size_t>(part)] = size;
         pf.next_first = end;
         progress = true;
     } else if (pf.next.part >= 0 && !pf.next.complete()) {
         build_batch(thread_idx, pf.next, kBuildStep);
+        progress = true;
+    }
+    return progress;
+}
+
+void SchedulerContext::tally_held(PartFeed &pf) {
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    std::fill(pf.held_sum.begin(), pf.held_sum.end(), 0);
+    for (const HeldPiece &h : pf.held_back) {
+        const size_t k = tasks.get_task_by_task_id(h.id).part;
+        if (k < pf.held_sum.size()) pf.held_sum[k] += h.entries;
+    }
+}
+
+void SchedulerContext::route_conditional(int32_t thread_idx, int32_t task, int32_t part) {
+    const uint64_t t = cond_tail_.fetch_add(1, std::memory_order_relaxed);
+    std::atomic<uint64_t> &seq = cond_seq_[t % kCondRing];
+    // The slot's ticket of a lap ago is posted before this one is written.
+    while (seq.load(std::memory_order_acquire) != t) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+    cond_ring_[t % kCondRing] = CondRoute{task, part};
+    seq.store(t + 1, std::memory_order_release);
+    ++part_feed_[thread_idx].routed_out;
+}
+
+bool SchedulerContext::feed_routed(int32_t thread_idx) {
+    PartFeed &pf = part_feed_[thread_idx];
+    const uint32_t q = static_cast<uint32_t>(thread_idx);
+    bool progress = false;
+    for (;;) {
+        const uint64_t t = pf.cond_cursor;
+        std::atomic<uint64_t> &seq = cond_seq_[t % kCondRing];
+        if (seq.load(std::memory_order_acquire) != t + 1) break;
+        const CondRoute r = cond_ring_[t % kCondRing];
+        // A task of a partition the controller has not come within one of waits, and
+        // so does everything routed here after it.
+        if (r.part > asimgq::queue_partition(q) + 1 || static_cast<size_t>(r.part) >= pf.sizes.size()) break;
+        pf.ids.assign(1, r.task);
+        begin_batch(r.part, pf.sizes[static_cast<size_t>(r.part)], pf.ids, pf.routed);
+        build_batch(thread_idx, pf.routed, 1);
+        pf.routed.announced = true;
+        // One naming a producer the controllers do not run waits for it here.
+        if (!pf.routed.held.empty()) break;
+        if (!pf.routed.ids.empty() && !post_pieces(thread_idx, pf.routed)) break;
+        seq.store(t + kCondRing, std::memory_order_release);
+        pf.cond_cursor = t + static_cast<uint64_t>(active_sched_threads_);
+        ++pf.routed_in;
         progress = true;
     }
     return progress;
@@ -1236,6 +1312,18 @@ void SchedulerContext::gq_prepare_run() {
     for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
         silo_feed_[i] = SiloFeed{};
         part_feed_[i] = PartFeed{};
+        part_feed_[i].cond_cursor = static_cast<uint64_t>(i);
+    }
+    // The shared ring restarts at ticket 0: a slot is free for ticket t when its
+    // sequence reads t. Only the slots the last run used need setting again.
+    if (part_active_) {
+        const uint64_t used =
+            cond_slots_set_ ? std::min<uint64_t>(cond_tail_.load(std::memory_order_relaxed), kCondRing) : kCondRing;
+        for (uint64_t i = 0; i < used; ++i) {
+            cond_seq_[i].store(i, std::memory_order_relaxed);
+        }
+        cond_slots_set_ = true;
+        cond_tail_.store(0, std::memory_order_relaxed);
     }
     cohort_.task_id.store(0, std::memory_order_relaxed);
     cohort_.state.store(SyncStartCohort::kIdle, std::memory_order_relaxed);
@@ -1600,17 +1688,17 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             LOG_INFO(
                 "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64
                 " held_ordinary=%" PRIu64 " held_fed=%" PRIu64 " wait_room=%" PRIu64 " wait_part=%" PRIu64
-                " pred_held=%" PRIu64 " decided=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64
-                " build_us=%.1f post_us=%.1f submit_us=%.1f"
-                " submit_ledger_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64
-                " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64 " late_peer=%" PRIu64
+                " pred_held=%" PRIu64 " decided=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64 " routed_out=%" PRIu64
+                " routed_in=%" PRIu64 " build_us=%.1f post_us=%.1f submit_us=%.1f"
+                " submit_ledger_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64 " late=%" PRIu64
+                " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64 " late_peer=%" PRIu64
                 " late_threshold=%" PRIu64 " late_switch=%" PRIu64 " wm_waits=%" PRIu64
                 " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f skips=%" PRIu64 " switches=%" PRIu64
                 " behind=%" PRIu64 " behind_us=%.1f",
                 thread_idx, pf.partitions, pf.pieces, pf.entries, pf.held_ordinary, pf.held_fed, pf.wait_room,
-                pf.wait_part, pf.pred_held, pf.decided, pf.decided_unnamed, pf.skipped, cycles_to_us(pf.build_ticks),
-                cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks), cycles_to_us(pf.submit_ledger_ticks),
-                ps.resident_peak, ps.events_in, ps.timed, ps.late,
+                pf.wait_part, pf.pred_held, pf.decided, pf.decided_unnamed, pf.skipped, pf.routed_out, pf.routed_in,
+                cycles_to_us(pf.build_ticks), cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks),
+                cycles_to_us(pf.submit_ledger_ticks), ps.resident_peak, ps.events_in, ps.timed, ps.late,
                 static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2], ps.late_by[3],
                 ps.late_by[4], ps.wm_waits, static_cast<double>(ps.wm_wait_ns) / 1000.0, ps.la_waits,
                 static_cast<double>(ps.la_wait_ns) / 1000.0, ps.skips, ps.switches, ps.behind,

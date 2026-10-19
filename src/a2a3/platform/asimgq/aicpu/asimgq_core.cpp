@@ -835,6 +835,11 @@ void part_learn(SimQueue &q, SimPartState &p, int32_t part, uint32_t lo, uint32_
     if (part == p.cur_part) part_try_switch(q, p);
 }
 
+// Whether every queue a producer is named by has reported its piece.
+bool part_dep_met(uint32_t known, uint32_t queues) {
+    return (queues & SIM_PART_ANY_QUEUE) != 0 ? (known & ~SIM_PART_ANY_QUEUE) != 0 : (known & queues) == queues;
+}
+
 // Queue `src` has finished its piece of `k.task`, legible here at `at`.
 void part_known(SimQueue &q, SimPartState &p, SimPartKey &k, uint32_t src, uint64_t at) {
     k.known |= 1U << src;
@@ -844,7 +849,7 @@ void part_known(SimQueue &q, SimPartState &p, SimPartKey &k, uint32_t src, uint6
         SimPartWaiter &w = p.waiters[*link];
         SimPartSetState &s = p.sets[w.set];
         const SimPartDep &d = s.deps[w.dep];
-        if ((k.known & d.queues) != d.queues) {
+        if (!part_dep_met(k.known, d.queues)) {
             link = &w.next;
             continue;
         }
@@ -2499,7 +2504,7 @@ bool submit_partition(
             st.deps[di] = d;
             st.dep_done[di] = false;
             SimPartKey &k = part_key(p, d.task);
-            if ((k.known & d.queues) == d.queues) {
+            if (part_dep_met(k.known, d.queues)) {
                 st.dep_done[di] = true;
                 if (k.done_at > st.ready_at) st.ready_at = k.done_at;
                 if (k.done_at > st.other_at) st.other_at = k.done_at;

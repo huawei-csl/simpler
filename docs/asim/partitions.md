@@ -27,11 +27,13 @@ a silo.
   consecutive -- in the order of its supertask's dependency level, so a task's
   producers in the partition sit below it. A dependency-only task takes none, and
   levels pass through it. An index is 11 bits: a partition spans at most 2,048.
-- **Subpartitions are fixed.** A supertask of 8 or more blocks is split across the
-  four groups, each taking a quarter of its block range; a narrower one runs whole
-  in the group of its latest producer, or the next group in turn. Group `g`'s share
-  of a partition is its subpartition, and reaches its controller through its own
-  manager.
+- **Subpartitions are fixed, but for conditional work.** A supertask of 8 or more
+  blocks is split across the four groups, each taking a quarter of its block range;
+  a narrower one runs whole in the group of its latest producer, or the next group in
+  turn. Group `g`'s share of a partition is its subpartition, and reaches its
+  controller through its own manager. A narrower predicated supertask is placed when
+  it is decided: skipped, in the group the host gave it; to run, in whichever group's
+  turn it is -- [below](#conditional-work-is-placed-when-decided).
 - **What a task waits on.** The tasks of one supertask's piece share one record:
   up to four named producer supertasks -- each one index range, whichever groups
   run it -- and a threshold of their own. The four named are the producers that end
@@ -57,14 +59,18 @@ a silo.
   with silos; deepseek_v4 has none. A supertask with a producer the controllers do
   not run is held back and fed once that producer has finished. A later partition's
   pieces leave room in the store for every piece held back from an earlier one, which
-  its controller needs before it can move on.
+  its controller needs before it can move on. Nothing is kept for conditional work
+  still to come: the store's size leaves room for it, not a guarantee --
+  [Limits](#limits).
 
-Against M2 this adds, per controller: a store of 512 entries (~20 bytes each), where
-the largest subpartition here is 318 tasks; a threshold and a look-ahead check per
-record beside M2's four comparators, which match index ranges; a watermark and
-512-bit look-ahead per partition in flight, the current one and the next; the
-broadcast of the partition, the watermark and the 512 bits, ~70 bytes; and one bit
-per record, *empty*, for a predicated piece that skips.
+Against M2 this adds, per controller: a store of 1,024 entries (~20 bytes each),
+which deepseek_v4 fills to at most 512; a threshold and a look-ahead check per record
+beside M2's four comparators, which match index ranges, and one bit per named
+producer, *any queue*, for conditional work; a watermark and 512-bit look-ahead per
+partition in flight, the current one and the next; the broadcast of the partition,
+the watermark and the 512 bits, ~70 bytes; and one bit per record, *empty*, for a
+predicated piece that skips. The ring the managers share is software, in the
+AICPUs' memory.
 
 ## Predicates in hardware
 
@@ -106,13 +112,37 @@ need a device-memory read port, a comparator and ~18 bytes of predicate per reco
 and would take the manager off the path; on deepseek_v4 the writer finishes early
 enough that the manager is not on it either.
 
+### Conditional work is placed when decided
+
+A predicated supertask of fewer than 8 blocks -- each of deepseek_v4's expert
+supertasks -- runs whole in one group. Placed by the host, it lands where its chain
+falls, by the parity of the expert's number: with the even experts running, ~78 % of
+a layer's running expert work sat in one group and the partitions measured +22.8 %
+against M0 (n=6). Which tasks run is known only from the data, so the placement waits
+for the decision:
+
+- **Skipped, it stays.** The manager of the group the host gave it posts it there as
+  an empty piece, as above.
+- **To run, it goes on a ring every manager shares.** The k-th task put there is
+  posted by manager `k mod 4`, whole, to its own controller, the tickets of a manager
+  in the order put. A ticket for a partition beyond the one after its controller's
+  waits, and so do that manager's tickets behind it, until the controller switches.
+- **Its consumers name it in any queue.** One bit, *any queue*, on the named
+  producer: the first queue to report the supertask covers its whole index range.
+
+Nothing is kept in a store for such a task before it arrives. Keeping each group an
+even share of an earlier partition's undecided conditional work, besides its own held
+pieces, cost 1.8 pp with 512 entries (-5.2 % against M0 instead of -7.0 %); the store
+was doubled instead, to 1,024 entries.
+
 ## How the simulator models it
 
 - **The store.** Each queue keeps its entries resident in records, a record's named
   producers keyed by supertask. A producer is done for a record once every queue
   that runs a piece of it has reported that piece, which a queue learns at the same
-  instant as the indices the piece covers. The look-ahead holds a record by its last
-  entry: its threshold rises to that entry's index less 512.
+  instant as the indices the piece covers -- or, named in any queue, once one queue
+  has reported it. The look-ahead holds a record by its last entry: its threshold
+  rises to that entry's index less 512.
 - **The exchange.** A queue posts each piece it finishes to every other queue, in the
   first slot of a 100 ns grid from the finish, on a single-producer ring stamped on
   the real clock. The receiver converts the stamp to its own clock, adds the 300 ns,
@@ -126,7 +156,9 @@ enough that the manager is not on it either.
   time as the store frees -- the next partition's once its controller has reached
   the one before. It holds a predicated piece back until it sees the writer
   completed, or every producer of the task when the host named no writer, and posts
-  it then, to run or empty, on the path held pieces take.
+  it then, to run or empty, on the path held pieces take. Conditional work that runs
+  goes on a 16,384-slot multi-producer ring instead; each manager takes its own
+  tickets in order and posts each task as its store frees.
 
 ## deepseek_v4: the partition boundary is gone, and so are the predicate stops
 
@@ -159,14 +191,31 @@ scheduler's on each thread less that thread's own ledger, the latest of the four
 | M2, partitions, answered when asked, 256-bit look-ahead | D, n=12 | 31.27 ms | 29.73 ms | -3.2 % (window -3.8 %) |
 | M2, partitions, answered ahead | E, n=12 | 30.32 ms | 28.82 ms | -6.2 % (window -6.8 %) |
 | M2, partitions, answered ahead | F, n=12 | 30.38 ms | 28.83 ms | -6.0 % (window -6.7 %) |
-| **M2, partitions, posted decided** | F, n=48 | **30.00 ms** | **28.46 ms** | **-7.2 % (window -8.0 %)** |
+| M2, partitions, posted decided | F, n=48 | 30.00 ms | 28.46 ms | -7.2 % (window -8.0 %) |
+| M2, partitions, posted decided | K, n=12 | 30.02 ms | 28.47 ms | -7.1 % (window -8.0 %) |
+| **M2, partitions, conditional work placed when decided** | K, n=12 | **30.13 ms** | **28.52 ms** | **-6.8 % (window -7.8 %)** |
 
-M0 reads 32.33, 32.30, 32.32 and 32.32 ms in sessions A, D, E and F (windows 30.97,
-30.91, 30.93 and 30.93 ms). Every arm completes every task and the core time issued
-agrees to 0.2 %. Session F pairs each rep of the decided design with an M0 rep run
-beside it in the same job, the two in alternating order: over eight pairs the
-speedup is -7.16 % (sd 0.19 pp, 95 % interval -7.31 to -7.00 %, every pair between
--7.45 and -6.87 %), and -8.00 % in the window (sd 0.13 pp).
+M0 reads 32.33, 32.30, 32.32, 32.32 and 32.34 ms in sessions A, D, E, F and K
+(windows 30.97, 30.91, 30.93, 30.93 and 30.93 ms). Every arm completes every task and
+the core time issued agrees to 0.2 %. Session F pairs each rep of the decided design
+with an M0 rep run beside it in the same job, the two in alternating order: over
+eight pairs the speedup is -7.16 % (sd 0.19 pp, 95 % interval -7.31 to -7.00 %, every
+pair between -7.45 and -6.87 %), and -8.00 % in the window (sd 0.13 pp). Session K
+pairs two reps of each design that way: conditional work placed when decided
+measures -6.81 % (sd 0.29 pp; window -7.83 %) and the host's placement -7.11 % (sd
+0.11 pp), the first trailing in both pairs, by 0.2 and 0.4 pp -- a difference two
+reps do not resolve. As the case runs no task goes through the ring, every predicate
+being false. With 1,024 entries no manager waited for room and the store peaked at
+511; the host's placement, with 512, waited 823 times per manager per round and
+filled the store.
+
+**With half the experts running, placing conditional work when decided turns the
+loss into a win.** A predicate target of -1 on even experts, on both arms, makes 16
+of the 32 experts run. In session K, M0 reads 39.18 ms (window 37.80 ms) and
+conditional work placed when decided 36.87 ms (window 35.23 ms): -5.95 % over two
+paired reps (sd 0.12 pp; window -6.78 %), where the host's placement measured
++22.8 % (n=6). The core time issued agrees to 0.6 %. Each manager posted 1,032 tasks from
+the ring per round, the store peaked at 504 entries, and no manager waited for room.
 
 **Deciding before posting costs nothing here and frees the store.** Every predicated
 piece -- 2,064 per controller per round -- was held until `dispatch_meta` had
@@ -199,10 +248,10 @@ count it finished like any other, so its consumers can wait for it in the
 controller.
 
 **What remains** against the oracle's -10.9 % is not attributed. Two counters
-stand out, per controller and round: ~290 releases learned only after the queue's
-replay had passed them, ~1.1 ms of lateness in all -- a simulator artifact, under
-[Limits](#limits) -- and 42 records that waited for the watermark to pass their
-threshold after their named producers had finished, ~280 us in all. Apart from the
+stand out, per controller and round: ~270 releases learned only after the queue's
+replay had passed them, ~1.05 ms of lateness in all -- a simulator artifact, under
+[Limits](#limits) -- and ~40 records that waited for the watermark to pass their
+threshold after their named producers had finished, ~255 us in all. Apart from the
 held predicated pieces, every next subpartition was resident before its controller
 switched to it.
 
@@ -222,15 +271,24 @@ this build spends 1.5 ms and M0 1.4 ms.
   the piece would be ready reaches its controller late, and so does one whose writer
   the host cannot name.
 - **Every predicate is false on aSim.** The cores compute nothing, so `recv_count`
-  stays zero and no routed expert runs: the numbers above are for that case.
+  stays zero and no routed expert runs: the numbers above are for that case, except
+  those with half the experts made to run, by a predicate target of -1.
+- **Nothing is kept in the store for conditional work still to come.** A
+  conditional task that finds its store full waits for room; if the store is full of
+  the next partition's pieces, gated until a switch that needs that task, the run
+  stalls. The 1,024 entries leave room to spare here -- at most 512 used -- but not
+  by construction: two consecutive partitions can put up to 1,344 entries in one
+  group's store on deepseek_v4. A store of 2,048 entries, and a position window to
+  match, would rule it out; so would keeping room for the work, at the cost measured
+  [above](#conditional-work-is-placed-when-decided).
 - **The managers learn of finishes late.** A manager's status covers its queue's
   prefix and 32 positions past it, and partition pieces are posted far ahead, so a
   finish further out is reported only when the prefix reaches it. A task on the
   managers' ordinary path inside a partitioned graph can deadlock on it.
 - **Releases learned late.** A queue's model replays only when its manager touches
   it, so a peer's finish can reach it after the replay has passed the instant it
-  would have released something; that release is placed late. Here that is ~290
-  releases per controller per round, ~1.1 ms of lateness in all. It counts against
+  would have released something; that release is placed late. Here that is ~270
+  releases per controller per round, ~1.05 ms of lateness in all. It counts against
   M2 only, so the gains above are lower bounds.
 - **The exchange period and the store are design parameters**, not measurements.
 - **The managers run in real time against a device that stands still while the
@@ -246,7 +304,10 @@ as the entry's first statement; everything else is as in
 `[GQ_PART thread=N]` in the device log carries, per manager and round, the pieces
 posted, the predicated pieces held and posted decided, how many of them had no
 writer named and how many went empty, the store's peak, the exchanged finishes, the
-releases timed and late, and the waits on the threshold and the look-ahead.
+releases timed and late, the waits on the threshold and the look-ahead, and the
+conditional tasks put on the shared ring and posted from it (`routed_out`,
+`routed_in`). Half the experts run with `expert_rows_pred.target` set to -1 where
+`expert_rows_pred.operand.indices[0]` is even, in the orchestration of both arms.
 
 ```bash
 H_IN=1.02 H_N=1.32 PRED=0 C=4 SPLIT_MIN=8 PART=372 RESIDENT=1 CUT=narrow LAUNCH_US=1.32 \
