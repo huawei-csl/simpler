@@ -227,6 +227,21 @@ void SchedulerContext::log_stall_diagnostics(
             pf.filled, pf.route_cursor, asimgq::part_store_room(static_cast<uint32_t>(thread_idx)),
             gq_index_[thread_idx].room(), pf.wait_room, pf.wait_part, pf.wait_gate, pf.chain_wait_ext
         );
+        const int32_t ck = part_cohort_cur_.load(std::memory_order_relaxed);
+        if (ck < static_cast<int32_t>(part_cohorts_.size())) {
+            const PartCohort &c = part_cohorts_[static_cast<size_t>(ck)];
+            LOG_INFO(
+                "[STALL thread=%d] PART cohort=%d/%zu task=%d entries=%d share=%d seen=%d done=%d staged=[%d %d %d %d] "
+                "stamped=%d released=%d",
+                thread_idx, ck, part_cohorts_.size(), c.task, c.entries, c.share[thread_idx], pf.cohort_seen,
+                pf.cohort_done, part_cohort_staged_[0].load(std::memory_order_relaxed),
+                part_cohort_staged_[1].load(std::memory_order_relaxed),
+                part_cohort_staged_[2].load(std::memory_order_relaxed),
+                part_cohort_staged_[3].load(std::memory_order_relaxed),
+                part_cohort_at_.load(std::memory_order_relaxed) != 0 ? 1 : 0,
+                part_cohort_released_.load(std::memory_order_relaxed)
+            );
+        }
         for (size_t i = 0; i < pf.held.size() && i < 8; ++i) {
             const part_plan::Item &item = *part_plan::at<part_plan::Item>(plan_, pf.held[i].item);
             LOG_INFO(
@@ -944,7 +959,7 @@ void SchedulerContext::stage_item(PartFeed &pf, const part_plan::Item &item, boo
     pf.sets.push_back(
         asimgq::SimLocalSet{
             static_cast<uint32_t>(pf.ranges.size()), item.named, item.threshold, item.gid, empty,
-            (item.flags & part_plan::kFlagBarrier) != 0, (item.flags & part_plan::kFlagAnnounce) != 0
+            (item.flags & part_plan::kFlagAnnounce) != 0, (item.flags & part_plan::kFlagCohort) != 0
         }
     );
     for (uint32_t k = 0; k < item.named; ++k) {
@@ -1083,8 +1098,9 @@ void SchedulerContext::decide_chain(int32_t thread_idx, uint32_t chain, bool run
 }
 
 // Post the current partition's next items, in order, as far as there is room. A home
-// slot or predicated piece not yet decided, and a piece naming a producer the
-// controllers do not run, is held back and the items behind it go on.
+// slot or predicated piece not yet decided is held back and the items behind it go
+// on; a piece naming a producer the controllers do not run stops the posting until
+// that producer has finished.
 bool SchedulerContext::post_in_order(int32_t thread_idx) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     PartFeed &pf = part_feed_[thread_idx];
@@ -1094,6 +1110,7 @@ bool SchedulerContext::post_in_order(int32_t thread_idx) {
     const size_t held_before = pf.held.size();
     uint32_t staged = 0;
     bool progress = false;
+    bool outside = false;
     while (pf.cur_item < sp.items) {
         const uint32_t off = sp.item_offset + pf.cur_item * part_plan::words_of<part_plan::Item>();
         const part_plan::Item &item = *part_plan::at<part_plan::Item>(plan_, off);
@@ -1120,12 +1137,23 @@ bool SchedulerContext::post_in_order(int32_t thread_idx) {
             }
             empty = !runs;
         } else if ((item.flags & part_plan::kFlagHold) != 0 && !outside_producers_done(tasks, item.task, pf.walk)) {
-            pf.held.push_back(PartHeld{pf.cur, off, need});
-            pf.held_entries[static_cast<size_t>(pf.cur)] += need;
-            ++pf.held_count;
-            ++pf.cur_item;
-            progress = true;
-            continue;
+            // A producer the controllers do not run, which the managers dispatch on
+            // the ordinary path, takes its positions only once its own producers have
+            // finished. Nothing behind its consumer may take positions before it, or
+            // the prefix that reports the producer's finish would wait on work that
+            // waits on it.
+            ++pf.wait_outside;
+            outside = true;
+            if (pf.hold_since == 0) {
+                const uint32_t q = static_cast<uint32_t>(thread_idx);
+                pf.hold_since = asimgq::now_ticks() - asimgq::queue_self_overrun_ticks(q);
+            }
+            break;
+        } else if ((item.flags & part_plan::kFlagHold) != 0 && pf.hold_since != 0) {
+            const uint32_t q = static_cast<uint32_t>(thread_idx);
+            pf.hold_wait_ticks += asimgq::now_ticks() - asimgq::queue_self_overrun_ticks(q) - pf.hold_since;
+            ++pf.hold_waits;
+            pf.hold_since = 0;
         }
         if (staged + need > room) break;
         if (item.kind == part_plan::kSlot) ++pf.slots_skipped;
@@ -1146,7 +1174,7 @@ bool SchedulerContext::post_in_order(int32_t thread_idx) {
             pf.cur_item = first_item;
             return false;
         }
-    } else if (pf.cur_item < sp.items && !progress) {
+    } else if (pf.cur_item < sp.items && !progress && !outside) {
         ++pf.wait_room;
     }
     return progress;
@@ -1187,9 +1215,6 @@ bool SchedulerContext::feed_held(int32_t thread_idx) {
                 continue;
             }
             empty = !runs;
-        } else if (!outside_producers_done(tasks, item.task, pf.walk)) {
-            keep.push_back(h);
-            continue;
         }
         if (h.entries > room) {
             keep.push_back(h);
@@ -1386,6 +1411,39 @@ void SchedulerContext::gq_prepare_run() {
             part_active_ = false;
             plan_ = nullptr;
         }
+    }
+    // The plan's sync-start tasks, in the order the controllers are given their
+    // pieces. Every block of a piece holds one of its group's clusters until the
+    // release, so a piece wider than its group could never be released.
+    part_cohorts_.clear();
+    if (part_active_) {
+        const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+        bool fits = true;
+        for (uint32_t k = 0; k < h.cohorts && fits; ++k) {
+            const part_plan::Cohort &pc = *part_plan::at<part_plan::Cohort>(
+                plan_, h.cohort_offset + k * part_plan::words_of<part_plan::Cohort>()
+            );
+            PartCohort c{};
+            c.task = pc.task;
+            for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+                c.share[g] = static_cast<int32_t>(pc.blocks[g] * pc.subs);
+                c.entries += c.share[g];
+                if (static_cast<int32_t>(pc.blocks[g]) > core_trackers_[g].get_cluster_count()) fits = false;
+            }
+            part_cohorts_.push_back(c);
+        }
+        if (!fits) {
+            LOG_ERROR("A sync-start piece of the partition plan is wider than its group; feeding silos without it");
+            part_cohorts_.clear();
+            part_active_ = false;
+            plan_ = nullptr;
+        }
+    }
+    part_cohort_cur_.store(0, std::memory_order_relaxed);
+    part_cohort_at_.store(0, std::memory_order_relaxed);
+    part_cohort_released_.store(0, std::memory_order_relaxed);
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
+        part_cohort_staged_[i].store(0, std::memory_order_relaxed);
     }
     // A silo's share of a partition is resident whole, with the head of the next, so
     // its positions span both: the look-ahead horizon bounds the window rather than
@@ -1781,6 +1839,8 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
         uint32_t held_high = 0;
         asimgq::queue_group_stats(q, &admitted, &promoted, &refused, &held_high);
         uint64_t bells = 0, bells_waiting = 0;
+        uint64_t hold_cube = 0, hold_vector = 0;
+        asimgq::queue_cohort_hold(q, &hold_cube, &hold_vector);
         asimgq::doorbell_counts(q, &bells, &bells_waiting);
         LOG_INFO(
             "[GQ_WORK thread=%d] aic_busy_us=%.1f aiv_busy_us=%.1f positions=%" PRIu64 " poll_overrun_us=%" PRIu64
@@ -1788,12 +1848,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             " ahead_high=%u ahead_dropped=%" PRIu64 " held_admitted=%" PRIu64 " held_promoted=%" PRIu64
             " held_refused=%" PRIu64 " held_high=%u steals_tried=%" PRIu64 " steals_won=%" PRIu64
             " steal_gain_us=%" PRId64 " cohorts=%" PRIu64 " cohort_blocks=%" PRIu64 " cohort_assembly_us=%.1f"
-            " cohort_piped=%" PRIu64 " bells=%" PRIu64 " bells_waiting=%" PRIu64,
+            " cohort_piped=%" PRIu64 " cohort_hold_us=%.1f/%.1f bells=%" PRIu64 " bells_waiting=%" PRIu64,
             thread_idx, cycles_to_us(aic), cycles_to_us(aiv), gq_index_[thread_idx].push_index(), poll_over_us,
             push_over_us, work_calls, work_calls ? (uint64_t)(cycles_to_us(work_total) * 1000.0 / work_calls) : 0,
             (uint64_t)(cycles_to_us(work_max) * 1000.0), ahead_hw, ahead_dropped, admitted, promoted, refused,
             held_high, steals_tried, steals_won, steal_gain_us, cohort_stamped_[thread_idx], cohort_blocks_[thread_idx],
-            cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q), bells, bells_waiting
+            cycles_to_us(cohort_assembly_ticks_[thread_idx]), asimgq::queue_cohort_piped(q), cycles_to_us(hold_cube),
+            cycles_to_us(hold_vector), bells, bells_waiting
         );
         if (part_active_) {
             const PartFeed &pf = part_feed_[thread_idx];
@@ -1803,23 +1864,24 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
                 "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64 " map_entries=%" PRIu64
                 " slots_skipped=%" PRIu64 " slots_routed=%" PRIu64 " held=%" PRIu64 " held_fed=%" PRIu64
                 " wait_room=%" PRIu64 " wait_part=%" PRIu64 " wait_gate=%" PRIu64 " wait_install=%" PRIu64
-                " chains_decided=%" PRIu64 " chains_dealt=%" PRIu64 " chains_in=%" PRIu64 " chain_wait_ext=%" PRIu64
-                " fills=%" PRIu64 " post_us=%.1f submit_us=%.1f submit_ledger_us=%.1f store_peak=%" PRIu64
-                " map_peak=%" PRIu64 " sent=%" PRIu64 " events_in=%" PRIu64 " matched=%" PRIu64 " early=%" PRIu64
-                " bumped=%" PRIu64 " timed=%" PRIu64 " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64
-                " late_own=%" PRIu64 " late_peer=%" PRIu64 " late_threshold=%" PRIu64 " late_map=%" PRIu64
-                " thr_waits=%" PRIu64 " thr_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f bar_waits=%" PRIu64
-                " bar_wait_us=%.1f skips=%" PRIu64 " sim_fills=%" PRIu64 " switches=%" PRIu64 " stream=%" PRIu64
-                " range_conflicts=%" PRIu64,
+                " wait_outside=%" PRIu64 " chains_decided=%" PRIu64 " chains_dealt=%" PRIu64 " chains_in=%" PRIu64
+                " chain_wait_ext=%" PRIu64 " fills=%" PRIu64
+                " post_us=%.1f submit_us=%.1f submit_ledger_us=%.1f store_peak=%" PRIu64 " map_peak=%" PRIu64
+                " sent=%" PRIu64 " events_in=%" PRIu64 " matched=%" PRIu64 " early=%" PRIu64 " bumped=%" PRIu64
+                " timed=%" PRIu64 " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64
+                " late_peer=%" PRIu64 " late_threshold=%" PRIu64 " late_map=%" PRIu64 " thr_waits=%" PRIu64
+                " thr_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f"
+                " skips=%" PRIu64 " sim_fills=%" PRIu64 " switches=%" PRIu64 " stream=%" PRIu64
+                " range_conflicts=%" PRIu64 " hold_waits=%" PRIu64 " hold_wait_us=%.1f",
                 thread_idx, pf.partitions, pf.pieces, pf.entries_posted, pf.map_entries, pf.slots_skipped,
                 pf.slots_routed, pf.held_count, pf.held_fed, pf.wait_room, pf.wait_part, pf.wait_gate, pf.wait_install,
-                pf.chains_decided, pf.chains_dealt, pf.chains_in, pf.chain_wait_ext, pf.fills,
+                pf.wait_outside, pf.chains_decided, pf.chains_dealt, pf.chains_in, pf.chain_wait_ext, pf.fills,
                 cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks), cycles_to_us(pf.submit_ledger_ticks),
                 ps.resident_peak, ps.map_peak, ps.sent, ps.events_in, ps.matched, ps.early, ps.bumped, ps.timed,
                 ps.late, static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2],
                 ps.late_by[3], ps.late_by[4], ps.waits[0], static_cast<double>(ps.wait_ns[0]) / 1000.0, ps.waits[1],
-                static_cast<double>(ps.wait_ns[1]) / 1000.0, ps.waits[2], static_cast<double>(ps.wait_ns[2]) / 1000.0,
-                ps.skips, ps.fills, ps.switches, ps.stream_len, ps.range_conflicts
+                static_cast<double>(ps.wait_ns[1]) / 1000.0, ps.skips, ps.fills, ps.switches, ps.stream_len,
+                ps.range_conflicts, pf.hold_waits, cycles_to_us(pf.hold_wait_ticks)
             );
         }
         if (silo_active_ && !part_active_) {

@@ -334,8 +334,7 @@ private:
     bool feed_partitions(int32_t thread_idx);
 
     // An item of the plan held back: a home slot or a predicated piece waiting for its
-    // decision, or a piece naming a producer the controllers do not run. `entries` is
-    // what it takes in the store.
+    // decision. `entries` is what it takes in the store.
     struct PartHeld {
         int32_t part;
         uint32_t item;  // its offset in the plan
@@ -373,11 +372,13 @@ private:
         uint64_t held_count = 0;
         uint64_t held_fed = 0;
         // Passes that found no room, the partition too far ahead of the controller,
-        // some controller not yet mapping it, and its map not yet installed here.
+        // some controller not yet mapping it, its map not yet installed here, and an
+        // item waiting on a producer the controllers do not run.
         uint64_t wait_room = 0;
         uint64_t wait_part = 0;
         uint64_t wait_gate = 0;
         uint64_t wait_install = 0;
+        uint64_t wait_outside = 0;
         // Chains this manager decided and dealt, those it posted, passes a chain waited
         // for its producers outside it, and dynamic regions filled.
         uint64_t chains_decided = 0;
@@ -390,6 +391,17 @@ private:
         uint64_t post_ticks = 0;
         uint64_t submit_ticks = 0;
         uint64_t submit_ledger_ticks = 0;
+        // On the queue's clock: how long items naming a producer the controllers do
+        // not run waited for it, from the first pass that stopped at one to its
+        // posting.
+        uint64_t hold_since = 0;
+        uint64_t hold_waits = 0;
+        uint64_t hold_wait_ticks = 0;
+        // The plan's sync-start pieces: the last one whose share this manager
+        // released, and how many of the current one's entries its queue last
+        // reported placed.
+        int32_t cohort_done = -1;
+        int32_t cohort_seen = 0;
     };
     PartFeed part_feed_[PLATFORM_MAX_AICPU_THREADS];
     bool part_active_ = false;
@@ -427,6 +439,21 @@ private:
     std::atomic<uint64_t> route_seq_[part_plan::kGroups][kRouteRing];
     std::atomic<uint64_t> route_tail_[part_plan::kGroups];
     bool route_slots_set_ = false;  // every slot's sequence has been set once
+    // The plan's sync-start tasks, in the order every controller places them: each
+    // one's entries over all groups, and each group's share. The managers release
+    // them one at a time, in that order: the current one, how many entries each
+    // manager's queue last reported placed, the release stamp, and how many managers
+    // have released their share.
+    struct PartCohort {
+        int32_t task = -1;
+        int32_t entries = 0;
+        int32_t share[part_plan::kGroups] = {};
+    };
+    std::vector<PartCohort> part_cohorts_;
+    std::atomic<int32_t> part_cohort_cur_{0};
+    std::atomic<int32_t> part_cohort_staged_[MAX_AICPU_THREADS]{};
+    std::atomic<uint64_t> part_cohort_at_{0};
+    std::atomic<int32_t> part_cohort_released_{0};
 
     // Split every shape's ready-queue slot region into one disjoint span per
     // Scheduler thread. Runs once per run, before any push.
@@ -573,15 +600,21 @@ private:
         // A pre-stage waits on its doorbell, not on named producers: those are what
         // the doorbell is rung for.
         // Under silos the queue's cores also run what the silos fed, which no core
-        // tracker counts, so an ordinary dispatch can find its ring full. Admitted
-        // as a held entry it waits in the hold array instead, which the position
-        // window this dispatch already took a place in bounds.
+        // tracker counts, so an ordinary dispatch -- a cohort member too -- can find
+        // its ring full. Admitted as a held entry it waits in the hold array
+        // instead, which the position window this dispatch already took a place in
+        // bounds, and a cohort member keeps its gate there.
         asimgq::SimDep held_deps[asimgq::SIM_HELD_MAX_DEPS];
         for (int i = 0; i < dep_n; ++i) {
             held_deps[i] = asimgq::SimDep{deps[i], 1, static_cast<uint32_t>(thread_idx)};
         }
         const asimgq::SimTaskType ring = queue_ring_for(h);
         const bool accepted =
+            (h.cohort && silo_active_) ?
+                asimgq::submit_held(
+                    static_cast<uint32_t>(thread_idx), &idx, &fid, &ring, 1, static_cast<int32_t>(h.reg_task_id),
+                    held_deps, static_cast<uint32_t>(dep_n), /*gated=*/true
+                ) :
             h.cohort ? asimgq::submit(
                            static_cast<uint32_t>(thread_idx), &idx, &fid, 1, static_cast<int32_t>(h.reg_task_id), ring,
                            /*gated=*/true
@@ -760,6 +793,11 @@ private:
     // stamp, and close the cohort once every share has started. One load when no
     // cohort is assembling.
     void service_cohort(int32_t thread_idx);
+    // The same for the plan's sync-start pieces, which the controllers place
+    // themselves: publish this queue's placed count while the current one
+    // assembles, stamp its release once every share is placed, start this
+    // manager's share, and move to the next once every manager has.
+    void service_part_cohort(int32_t thread_idx);
 
     // A cohort is claimed and not yet stamped. Regular dispatch stands aside so the
     // cores the cohort needs come free as soon as the work already on them ends,

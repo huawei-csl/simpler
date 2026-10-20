@@ -26,14 +26,20 @@ broadcast to each other; it is recorded in
   `target` supertasks. Once the graph is built the host -- standing in for the
   compiler, which would do this ahead of time -- moves each boundary, within a
   quarter partition of where it would fall, to the point the fewest dependencies
-  cross, and builds the *partition plan* the managers pass to the controllers. Here
-  a partition is one layer: 372 supertasks.
+  cross, and builds the *partition plan* the managers pass to the controllers. On
+  deepseek_v4 and qwen a partition is one layer, 372 and 277 supertasks.
 - **Each group numbers its own share.** One local id stream per group runs across
   the partitions, each subpartition in dependency-level order: a piece of a
   supertask takes one id per block and active subtask, so its producers in the group
-  sit below it. A supertask of 8 or more blocks is split across the four groups, a
-  quarter of its blocks each; a narrower one runs whole in the group of its latest
-  producer, or the next group in turn.
+  sit below it. A supertask of 8 or more blocks, or one that must start all its
+  blocks together, is split across the four groups, a quarter of its blocks each. A
+  narrower one runs whole in one group. The host stamps it with its latest producer's
+  group, or the next in turn; the plan instead deals it, in each partition's level
+  order, to the group given the fewest blocks of its core types so far, unless the
+  stamp already spreads the work as well -- as few waves of a group's cores per level
+  and core type, and on a tie no more blocks in the busiest group. The stamp then
+  stays: it keeps a task with its producer, so fewer producers need a global id.
+  Conditional work keeps the stamp either way.
 - **A producer run elsewhere stands as one local id, its proxy.** It goes just below
   its first dependent in the group, so it holds the group's watermark no longer than
   it has to. Every producer with a proxy anywhere gets a global id from the plan, and
@@ -41,15 +47,17 @@ broadcast to each other; it is recorded in
   proxy waits for -- four for a supertask split across the groups, the group's own
   piece included. The proxies an entry with more than four producers needs go where
   each producer's level falls instead, since its threshold covers most of them and
-  stays low that way; one a later partition needs goes at the end of its producer's
+  stays low that way; one the next partition needs goes at the end of its producer's
   subpartition.
 - **What an entry waits on.** The entries of a supertask's piece share one record:
   up to four named producers -- each one local range, a piece here or a proxy -- and
   a threshold, where the fifth-latest ends, that the group's watermark must reach.
-  An entry with a producer in an earlier partition names none of them: its threshold
-  is the subpartition's first id, which the watermark reaches once the group has
-  finished every earlier share, proxies included. An entry also waits until its id is
-  within the 512-id look-ahead of the watermark, so its finish has a bit to land in.
+  A producer in the partition before is named like any other, by its piece here or
+  by its proxy at the end of its own subpartition. One further back is not named:
+  the entry is posted only once every group maps its partition, which a group does
+  once its watermark has passed the partition two before, so the producer has
+  finished. An entry also waits until its id is within the 512-id look-ahead of the
+  watermark, so its finish has a bit to land in.
 - **The ring.** Four 64-bit lanes, one per group, pass from each controller to the
   next every 5 ns cycle. When a piece's last entry finishes, its controller writes
   the piece's global id on its own lane in the first free cycle, one per cycle;
@@ -74,6 +82,37 @@ ids; one watermark and a 512-bit look-ahead; the ring's four lanes, of which a g
 id uses 14 bits on deepseek_v4; and the map, at most 323 entries there, each a global
 id, a local id and two small counts, compared against four lanes a cycle. Nothing is
 broadcast and nothing merged.
+
+## Sync-start tasks
+
+A sync-start task's blocks must all start together: each waits on the others, and a
+missing peer never arrives. qwen3-14B decode has one a layer, a 270 us mix kernel
+over all 24 clusters.
+
+- **Split across the groups as a cohort.** The plan splits it like any wide
+  supertask, a quarter of its blocks a group, and flags each piece as a cohort; one
+  nothing in its own partition waits on goes last in the partition's level order, so
+  no group's watermark waits on it below the partition's other work. Its consumers
+  name it through proxies, like any producer split across the groups, so they start
+  once its pieces' global ids have gone round the ring.
+- **Placed in order, ahead of other work.** A controller places only the entries of
+  its current cohort piece -- the oldest it has not released -- so two cohorts can
+  never each hold cores the other waits for. A current entry whose producers have
+  finished goes to the head of its ring, ahead of the work it drains the cores for;
+  the piece's vector entries go only once its cube entries are placed, so they do
+  not hold vector cores the work still draining from cube cores may need. Each entry
+  takes an idle core and holds it without starting.
+- **Released whole by the managers.** The managers release the plan's cohorts one at
+  a time, in plan order. Each reads how many of the current cohort's entries its
+  queue has placed and publishes the count; the manager that finds the sum complete
+  stamps the release; each starts its own share from the stamp, and the last to do so
+  moves every manager to the next cohort.
+
+Against the rest of the design this adds, per controller, the sequence of its cohort
+pieces and the rule that places only the current one's, a ring-head insertion, and
+the count of placed members its status already carried; and, between the managers
+in the AICPUs' memory, the current cohort, each manager's placed count, the release
+stamp and how many managers have released.
 
 ## Conditional work
 
@@ -121,6 +160,11 @@ deadlock -- the failure recorded in
 - **Mapped ids and unused ids land like sets.** A proxy waits for its announcements
   and the look-ahead, an unused id of a dynamic region for the look-ahead, and each
   is recorded at the instant it lands.
+- **Cohort pieces hold their cores.** A cohort entry is placed only on an idle
+  core, where it sits without a finish; the release starts each member at the stamp,
+  or once its core came free if later, and only then counts its finish toward its
+  piece, so the piece's global id goes round the ring once the members end. Each
+  queue counts the core time its members held: the drain before each cohort.
 - **Releases are replayed.** A queue's model advances when its manager touches it.
   A release due inside the interval being replayed is timed at its own instant; one
   learned only after the replay has passed it is placed where the replay stands and
@@ -129,102 +173,29 @@ deadlock -- the failure recorded in
   store and position window have room, leaving the room an earlier partition's held
   items need, and reads its queue's status whenever the controller may have moved,
   with or without positions out: a proxy landing moves the watermark that lets it
-  map and post the next partition.
+  map and post the next partition. While a cohort assembles it reads its queue's
+  placed count on every pass until its share is placed.
 
-## deepseek_v4: -8.2 % against M0, 1.4 % ahead of the shared watermark
+## Measured
 
-**What the oracle expects.** [`analyzers/asim_local_oracle.py`](analyzers/asim_local_oracle.py)
-models both designs in one machinery at the simulator's hops, one layer a partition,
-no entry starting before the hand-over has reached it.
-With the shared watermark's exchange -- 300 ns, after up to 100 ns for a broadcast
-slot -- it reads 27.49 ms over ten draws, and local ids 27.14 ms (-1.3 %, sd 0.1 pp).
-Almost all of it is the exchange: the shared watermark with a 15 ns exchange reads
-27.19 ms, and local ids with the old exchange 27.44 ms, so the local watermark alone
-is worth ~0.2 %. With half the experts running it puts the two level, 36.77 against
-36.72 ms, dealing each conditional task once the managers see its producers
-complete, 3.7 us after they finish.
-
-**Measured.** The expanded orchestration with `rt_declare_partitions(372)` as its
-first statement, against M0 and against the shared-watermark design at its checkpoint
-(`asim-route3-checkpoint-2026-10-19`), the three interleaved in every job, eight rounds
-a rep with the first two dropped, two reps (n=12 rounds an arm):
-
-| arm | as-is | vs M0 | half the experts running | vs M0 |
-| --- | ----- | ----- | ------------------------ | ----- |
-| M0 | 32.31 ms | | 39.20 ms | |
-| shared watermark | 30.10 ms | -6.82 % | 36.69 ms | -6.47 % |
-| **local ids** | **29.69 ms** | **-8.15 %** | **36.15 ms** | **-7.79 %** |
-
-Paired rep by rep against the shared watermark, local ids measure -1.42 % as-is
-(range -1.59 to -1.26 %; window -1.52 %) and -1.41 % with half the experts running
-(range -1.58 to -1.23 %), slightly more than the oracle's 1.3 points. Every arm
-completes every task, and the core time issued agrees to 0.2 % as-is and 0.6 % with
-experts running.
-
-| per controller and round | local ids, as-is | local ids, experts | shared, as-is | shared, experts |
-| ------------------------ | ---------------- | ------------------ | ------------- | --------------- |
-| store peak (most of any) | 420 (432) | 420 (432) | 497 (512) | 493 (509) |
-| map peak | 322 (323) | 322 (323) | | |
-| finishes learned from the others | 8,226 | 10,290 | 12,814 | 12,814 |
-| releases learned late, in all | 283, 0.81 ms | 153, 0.17 ms | 272, 1.01 ms | 64, 0.27 ms |
-| waits for producers past the fourth | 61, 0.42 ms | 43, 2.0 ms | 40, 0.24 ms | 43, 0.61 ms |
-
-Each controller announces 2,742 global ids a round as-is and 3,430 with experts
-running; pieces finishing in the same cycle queue for the lane, ~4,400 cycles of 5 ns
-a round as-is and ~2,100 with experts running. With half the experts running, every
-manager posts 172 chains a round, four in every partition, and finds a chain waiting
-for its producers outside it ~690 times. Producers past the fourth wait longer there
-because the combine's threshold, not the four producers it names, is what holds it
-for the chains still running. An entry with a producer in an earlier partition waits
-at the barrier ~26 times a round, 0.6 to 0.8 ms each: it was posted a partition
-ahead, and the barrier is its whole wait. No announcement reached a
-controller before its map, and no range was named inconsistently.
-
-## paged_attention: -44.8 % against M0, 9.8 % behind declared groups
-
-The GroupQueue's paged_attention orchestration with its group declarations removed
-and `rt_declare_partitions(1028)` as the entry's first statement -- four of its 256
-disjoint batch elements a partition -- against M0, and against the same orchestration
-declaring one group per batch element. Case1, the three interleaved, 14 rounds a rep
-with the first two dropped, four reps (n=48 rounds an arm):
-
-| arm | device_wall | vs M0 | window |
-| --- | ----------- | ----- | ------ |
-| M0 | 22.21 ms | | 18.96 ms |
-| M2, declared groups | 11.14 ms | -49.8 % | 8.94 ms |
-| M2, partitions | 12.26 ms | -44.8 % | 9.60 ms |
-
-Partitions trail the groups by 9.8 % (7.7 to 11.0 % a rep). The plan has 64
-partitions; a group's share spans 320 ids and maps 64 global ids. The host deals each
-block's first task to the next group in turn, so a batch element's update chain
-crosses groups at every block: 16,128 global ids a round, ~4,000 announced by each
-controller.
-
-**The oracle puts the two level.** With every release floored at its hand-over, it
-reads 11.08 ms for partitions dealt by block and for a batch element per group alike,
-and 13.08 ms for the shared watermark: the case is bound by the hand-over, at the 6
-tasks/us calibrated on the groups' arm.
-
-**What the partitions lose is the simulator's.** All of the ~674 releases per
-controller per round learned late are ranges completed from another group, 7.5 ms of
-lateness in all, and the partition model's status read costs the simulator 601 ns
-against 287 ns for the groups' (a ledger of 13.2 against 5.2 ms a thread a round).
-The core time issued is the same, 12.7 ms of cube and 10.1 ms of vector a thread.
-Keeping each batch element in one group would remove the edges that cross: not
-measured.
+[validation/partitions.md](validation/partitions.md) has each case: qwen3-14B decode
+2.1 % behind M0, at the design's own floor, deepseek_v4 9.8 % ahead, and
+paged_attention 45.6 % ahead. What the design needed to run qwen, and the parts of it
+dropped on the way, are in
+[investigations](../investigations/2026-10-gq-partitions-qwen.md).
 
 ## Limits
 
 - **The partitioning and the plan are the host's**, as a stand-in for the compiler:
   a boundary moves within a quarter partition to the narrowest point, and the plan
-  rides at the end of the fanin pool -- 1.9 MB on deepseek_v4, uploaded with every
+  rides at the end of the fanin pool -- 2.0 MB on deepseek_v4, uploaded with every
   bind, where a compiler would ship it once.
 - **Every predicate is false on aSim.** The cores compute nothing, so `recv_count`
   stays zero and no routed expert runs: the numbers above are for that case, except
   those with half the experts made to run, by a predicate target of -1.
 - **Not deadlock-free by construction.** An entry's id must come within the
   look-ahead before it starts: 2 of deepseek_v4's 172 subpartitions span more than
-  512 ids, up to 568. No room is kept in the store for chains still to be dealt. And
+  512 ids, up to 562. No room is kept in the store for chains still to be dealt. And
   the managers still decide every chain, through the writer's completion.
 - **The managers learn of finishes late.** A manager's status covers its queue's
   prefix and 32 positions past it, so a dealt chain waits for its producers outside
@@ -237,29 +208,48 @@ measured.
   measurements.
 - **The managers run in real time against a device that stands still while the
   simulator overruns**; `device_wall` removes it per thread, as on every arm.
-- **qwen has not been run with partitions**, and neither has a sync-start cohort:
-  qwen's 40 a round keep the ordinary path. paged_attention's partitioned
-  orchestration is not checked in.
+- **A cohort drains its cores.** Its members hold each cube core from the moment it
+  frees until the last one does -- 1.14 ms a cube core a round on qwen, against 1.0 ms
+  in the oracle -- and an entry already pipelined behind running work cannot be taken
+  back to shorten that: its finish is announced when it is placed.
+- **qwen's and paged_attention's partitioned orchestrations are not checked in.**
 
 ## Reproducing it
 
-The partition arm is the expanded orchestration with `rt_declare_partitions(372)`
-as the entry's first statement; everything else is as in
-[validation/deepseek-v4.md](validation/deepseek-v4.md#reproducing-it). The host log
-carries one `Partition plan:` line per bind: partitions, plan size, the widest and
-mean subpartition, the largest map, global ids and chains. `[GQ_PART thread=N]` in
+deepseek_v4's partition arm is its expanded orchestration with
+`rt_declare_partitions(372)` as the entry's first statement; everything else is as in
+[validation/deepseek-v4.md](validation/deepseek-v4.md#reproducing-it). qwen's is the
+`host_build_graph` copy of `decode_fwd_layers_expanded.cpp` with
+`rt_declare_partitions(277)` first, run as in
+[running.md](running.md#case-2--qwen3-14b-decode_fwd-40-layers) on `a2a3asimgq` with
+eight rounds and the golden skipped, against the same source unpartitioned on
+`a2a3asim` and `a2a3asimgq`. The host log carries one `Partition plan:` line per
+bind: partitions, plan size, whether the narrow tasks were dealt or kept the stamp
+and the level waves of each, the widest and mean subpartition, the largest map,
+global ids and chains. `[GQ_PART thread=N]` in
 the device log carries, per manager and round, the pieces and entries posted, the
 map entries installed, home slots posted empty and left to the map, items held and
 posted later, the passes that waited for room, for the controller, for another
 manager's map and for its own, chains decided, dealt, posted and waiting for their
 producers, regions filled; and from the queue the store's and the map's peaks, the
 announcements sent, received, matched, received early and sent a cycle late, the
-releases timed and late, the waits on the watermark for producers past the fourth,
-the look-ahead and the barrier, and the local ids the stream used. Half the experts
+releases timed and late, the waits on the watermark for producers past the fourth
+and for the look-ahead, the local ids the stream used, and how long items naming a
+producer the managers dispatch themselves waited for it. `[GQ_WORK thread=N]` adds
+`cohort_hold_us`, the cube and vector core time cohort members held their cores
+before their release. Half the experts
 run with `expert_rows_pred.target` set to -1 where
 `expert_rows_pred.operand.indices[0]` is even, in the orchestration of both arms.
 
+The oracle reads a swimlane only for which tasks ran; qwen has no predicates, so a
+JSON listing every kernel task as `{"aicore_tasks": [[0, task_id], ...]}`, built from
+its `deps.json`, stands in for one.
+
 ```bash
+# the design as it stands (add COHORT=sync PART=277 for qwen):
+SEEDS=10 PLACE=pick LOOK=512 \
+  python docs/asim/analyzers/asim_local_oracle.py <deps.json> <chip_swimlane_records.json> <calib>
+# before 2026-10-20 -- the stamp's placement, earlier partitions behind a barrier:
 SEEDS=10 PROXY_AT=producer BARRIER=local LOOK=512 \
   python docs/asim/analyzers/asim_local_oracle.py <deps.json> <chip_swimlane_records.json> <calib>
 # the shared-watermark design in the same machinery:

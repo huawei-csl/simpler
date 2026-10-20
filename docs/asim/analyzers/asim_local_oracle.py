@@ -28,13 +28,29 @@ SHARED=1 models the shared-watermark design in the same machinery: one partition
 numbering, every finish known in the other groups RING later, and each group entering
 a partition once the whole partition before has finished (with BARRIER=local).
 
+PLACE chooses the group a narrow supertask runs in: as the host stamps it (stamp: its
+latest stamped producer's, or the next in turn), or dealt, taken in each partition's
+level order to the group with the fewest blocks so far (count), the fewest blocks of
+its core types (shape), the least calibrated block time (load), or the earliest
+finish in a list schedule of the whole graph (list); pick is what the plan does --
+shape, conditional tasks left stamped, unless the stamp needs no more waves of a
+group's cores per level and core type. PLACE_COND=stamp leaves conditional tasks
+where the host stamped them; SPAN=1 prints the placement's level waves. COHORT=sync runs a mix
+supertask over every cluster -- a sync-start cohort -- off the groups' streams: handed
+over MGR_US after its last producer finishes, holding every cluster from then and
+starting once all are free, its consumers learning of it MGR_US after it ends;
+COHORT_AT=end holds it until the rest of its partition before it has finished, and
+HOLD=post holds every piece behind a subpartition's first consumer of a cohort until
+that cohort has ended. COHORT=spread runs it as any spread supertask.
+
   usage: asim_local_oracle.py <deps.json> <swimlane.json> <calib>
 Env: H_IN (1.02) RING (0.015) SPLIT_MIN (8) PART (372) NAMED (4) LOOK (inf) BARRIER
 (none|local) GATE (2) ENTER_US (1.32) RATE (6) SEEDS (3) PRED (0) EXPERTS (0) DYN (0)
 DYN_AT (level) DYN_MGR (0) MGR_US (3.7) SKIP_IDX (1) PROXY_AT (consumer) STATS (0)
-SHARED (0). The line reports the mean makespan, each seed's, the look-ahead each group
-used, and the waits on the watermark: for producers past NAMED, for the look-ahead,
-and for the barrier.
+SHARED (0) PLACE (stamp) PLACE_COND (place) SPAN (0) COHORT (spread) COHORT_AT (ready)
+HOLD (none). The line reports the mean makespan, each seed's, the look-ahead each group
+used, the waits on the watermark: for producers past NAMED, for the look-ahead, and
+for the barrier, and the core time a cohort's drain held each cube core.
 """
 
 import heapq
@@ -72,6 +88,10 @@ DYN_MGR = int(ENV.get("DYN_MGR", "0"))  # routed work posted once its producers 
 MGR_US = float(ENV.get("MGR_US", "3.7"))
 # producer: a proxy a later partition's dependent needs goes at the end of its producer's own subpartition
 PROXY_AT = ENV.get("PROXY_AT", "consumer")
+PLACE = ENV.get("PLACE", "stamp")  # stamp | count | shape | load | list | pick
+PLACE_COND = ENV.get("PLACE_COND", "place")  # stamp: conditional tasks keep the host's stamp
+HOLD = ENV.get("HOLD", "none")  # post: a subpartition is posted no further than its first cohort consumer
+COHORT_AT = ENV.get("COHORT_AT", "ready")  # end: a cohort starts no earlier than its partition's earlier tasks end
 INF = float("inf")
 
 deps = json.load(open(sys.argv[1]))
@@ -99,6 +119,18 @@ nb = {t: max(1, info[t][1]) for t in kern}
 real = {t for t in kern if t in ran}
 skipped = kern - real
 split = {t: nb[t] >= SPLIT_MIN for t in kern}
+# A sync-start supertask -- a mix task over every cluster -- runs as a spread one
+# (COHORT=spread), or as the runtime runs it (COHORT=sync): on the managers' path,
+# every cluster at once, handed over MGR_US after its last producer finishes, its
+# consumers posted MGR_US after it ends.
+COHORT = ENV.get("COHORT", "spread")
+cohort = {
+    t
+    for t in kern
+    if COHORT == "sync" and info[t][0][0] >= 0 and (info[t][0][1] >= 0 or info[t][0][2] >= 0) and nb[t] == N_CL
+}
+for t in cohort:
+    split[t] = False
 
 # --- partitions, as the host cuts them
 total = len(ids)
@@ -139,17 +171,23 @@ if EXPERTS != "0":
                 cond_runs.add(t)
 cond = skipped  # every conditional task; the ones in cond_runs run
 
-# --- placement, as the host stamps it
+# --- placement: as the host stamps it (PLACE=stamp), or chosen by the compiler --
+# each task to the group with the least work so far, counted in blocks (count) or in
+# calibrated block time (load), or to the group a list schedule of the whole graph
+# finishes it earliest in (list)
 silo, turn = {}, 0
 for t in ids:
     if t not in kern:
+        continue
+    if t in cohort:
+        silo[t] = "cohort"
         continue
     if split[t]:
         silo[t] = "spread"
         continue
     latest, inh = -1, None
     for p in preds[t]:
-        if p in silo and silo[p] != "spread" and order[p] > latest:
+        if p in silo and silo[p] not in ("spread", "cohort") and order[p] > latest:
             latest, inh = order[p], silo[p]
     silo[t] = inh if inh is not None else turn % N_Q
     if inh is None:
@@ -172,6 +210,8 @@ def home(t):
 
 def run_groups(t):
     """Groups holding a piece of t that runs on cores."""
+    if t in cohort:
+        return []
     if t in cond and t not in cond_runs:
         return []
     if split[t]:
@@ -191,6 +231,27 @@ for t in ids:
             continue
         lv = max(lv, level[p] + (1 if p in kern else 0))
     level[t] = lv
+
+
+def level_waves(where):
+    """Per level of every partition and per core type, the waves of a group's cores its
+    busiest group needs, summed; and per core type, the blocks of the busiest group over
+    the whole graph, summed: the plan's measures of how a placement spreads work."""
+    acc = defaultdict(lambda: [[0.0, 0.0] for _ in range(N_Q)])
+    whole = [[0.0, 0.0] for _ in range(N_Q)]
+    for t in kern:
+        if t in cohort:
+            continue
+        k = info[t][0]
+        kinds_ = [i for i, on in ((0, k[0] >= 0), (1, k[1] >= 0 or k[2] >= 0)) if on]
+        groups = [(g, piece_blocks(t, g)) for g in range(N_Q)] if split[t] else [(where[t], nb[t])]
+        for g, b in groups:
+            for i in kinds_:
+                acc[(part_of[t], level[t])][g][i] += b
+                whole[g][i] += b
+    cores = [N_CL / N_Q, 2 * N_CL / N_Q]
+    waves = sum(max(-(-acc[key][g][i] // cores[i]) for g in range(N_Q)) for key in acc for i in range(2))
+    return waves, sum(max(whole[g][i] for g in range(N_Q)) for i in range(2))
 
 
 _succs_k = {}
@@ -226,6 +287,95 @@ def producers(t):
         else:
             stack.extend(preds[p])
     return out
+
+
+def block_us(t):
+    return max(calib.get(k, 5.0) for k in info[t][0] if k >= 0)
+
+
+if PLACE in ("count", "load", "shape", "pick"):
+    # shape: blocks counted per core type, a mix block on both
+    work = [[0.0, 0.0] for _ in range(N_Q)]
+    stamped = dict(silo)
+
+    def kinds(t):
+        k = info[t][0]
+        return (
+            [i for i, on in ((0, k[0] >= 0), (1, k[1] >= 0 or k[2] >= 0)) if on] if PLACE in ("shape", "pick") else [0]
+        )
+
+    for t in sorted(kern, key=lambda t: (part_of[t], level[t], order[t])):
+        if t in cohort:
+            continue
+        w = block_us(t) if PLACE == "load" else 1.0
+        if split[t]:
+            for g in range(N_Q):
+                for i in kinds(t):
+                    work[g][i] += piece_blocks(t, g) * w
+            continue
+        if (PLACE_COND == "stamp" or PLACE == "pick") and t in cond:
+            continue
+        g = min(range(N_Q), key=lambda h: (sum(work[h][i] for i in kinds(t)), h))
+        silo[t] = g
+        for i in kinds(t):
+            work[g][i] += nb[t] * w
+    if PLACE == "pick" and level_waves(stamped) <= level_waves(silo):
+        # the stamp spreads the work as well, and keeps a task with its producer
+        silo.update(stamped)
+elif PLACE == "list":
+    # Cores of each group as the compiler models them: when each comes free.
+    free = {g: {"aic": [0.0] * (N_CL // N_Q), "aiv": [0.0] * (2 * N_CL // N_Q)} for g in range(N_Q)}
+    est = {}
+
+    def fit(g, t, ready, commit):
+        k = info[t][0]
+        sh = "mix" if k[0] >= 0 and (k[1] >= 0 or k[2] >= 0) else "aic" if k[0] >= 0 else "aiv"
+        pools = ["aic"] if sh == "aic" else ["aiv"] if sh == "aiv" else ["aic", "aiv"]
+        cores = {q: sorted(free[g][q]) for q in pools}
+        end = ready
+        d = block_us(t)
+        for _ in range(piece_blocks(t, g) if split[t] else nb[t]):
+            st = max([ready] + [cores[q][0] for q in pools])
+            for q in pools:
+                cores[q][0] = st + d
+                if q == "aiv" and sh == "mix":
+                    cores[q][1] = st + d
+                cores[q].sort()
+            end = max(end, st + d)
+        if commit:
+            for q in pools:
+                free[g][q] = cores[q]
+        return end
+
+    for t in ids:
+        if t not in kern:
+            continue
+        r_by_g = []
+        for g in range(N_Q):
+            r = 0.0
+            for P in producers(t):
+                f = est.get(P, 0.0)
+                same = split[P] or silo[P] == g
+                r = max(r, f + (MGR_US if P in cohort else 0.0 if same else RING))
+            r_by_g.append(r)
+        if t in cohort:
+            st = max([r_by_g[0] + MGR_US] + [x for g in range(N_Q) for q in free[g].values() for x in q])
+            est[t] = st + block_us(t)
+            for g in range(N_Q):
+                for q in free[g]:
+                    free[g][q] = [est[t]] * len(free[g][q])
+            continue
+        if split[t]:
+            est[t] = max(fit(g, t, r_by_g[g], True) for g in range(N_Q))
+            continue
+        g = min(range(N_Q), key=lambda h: (fit(h, t, r_by_g[h], False), h))
+        silo[t] = g
+        est[t] = fit(g, t, r_by_g[g], True)
+
+
+if ENV.get("SPAN"):
+    _waves, _busiest = level_waves(silo)
+    print(f"level waves, busiest blocks: {_waves:.0f}, {_busiest:.0f}")
 
 
 class Piece:
@@ -449,6 +599,19 @@ if SHARED:
                 c.deps.append(pc)
 else:
     mirrors = {}
+    cohort_mirror = {}
+    cohort_piece = {}
+    for t in cohort:
+        c = Piece(t, None, part_of[t], "cohort")
+        waits_on = set(producers(t))
+        if COHORT_AT == "end":
+            # held until the rest of its partition has finished, in every group
+            waits_on |= {u for u in kern if part_of[u] == part_of[t] and order[u] < order[t] and u not in cohort}
+        for P in waits_on:
+            for h in run_groups(P):
+                piece_of[(P, h)].deps.append(c)
+                c.named.append(piece_of[(P, h)])
+        cohort_piece[t] = c
     for (p, g), pcs in list(members.items()):
         for pc in pcs:
             if pc.kind == "proxy" or (pc.kind == "slot" and pc.task in cond_runs):
@@ -475,6 +638,15 @@ else:
                     c.deps.append(pc)
                 continue
             for P in producers(pc.task):
+                if P in cohort:
+                    if (P, g) not in cohort_mirror:
+                        m = Piece(P, g, p, "proxy")
+                        m.hi = -1
+                        m.expect = 1
+                        cohort_piece[P].announce.append((m, MGR_US))
+                        cohort_mirror[(P, g)] = m
+                    cands.append(cohort_mirror[(P, g)])
+                    continue
                 if BARRIER == "global" and part_of[P] != p:
                     continue
                 if PROXY_AT == "producer" and part_of[P] < p:
@@ -507,7 +679,22 @@ else:
         sl.expect = 1
         piece_of[(t, run_groups(t)[0])].announce.append((sl, RING if EXPERTS == "ring" else 0.0))
 
-MIRRORS = mirrors if not SHARED else {}
+if not SHARED and HOLD == "post":
+    # The managers post a subpartition in order and stop at the first piece naming a
+    # cohort until that cohort has finished, so nothing behind it is resident before.
+    for (p, g), pcs in members.items():
+        gate_m = None
+        for pc in pcs:
+            if pc.kind == "proxy":
+                continue
+            if gate_m is None:
+                gate_m = next((c for c in pc.named if c.kind == "proxy" and c.lo < 0 and c.task in cohort), None)
+                continue
+            if gate_m not in pc.named:
+                pc.named.append(gate_m)
+                gate_m.deps.append(pc)
+MIRRORS = {**mirrors, **{("c",) + k: v for k, v in cohort_mirror.items()}} if not SHARED else {}
+COHORTS = list(cohort_piece.values()) if not SHARED else []
 if STATS and not SHARED:
     per = defaultdict(lambda: defaultdict(int))
     for (p, g), pcs in members.items():
@@ -605,12 +792,19 @@ class Run:
         self.la_need = [0] * N_Q
         self.waits, self.wait_us = [0, 0, 0], [0.0, 0.0, 0.0]
         self.proxy_hold_us = [0.0] * N_Q
+        self.cohort_hold = 0.0
         self.cond_left = defaultdict(int)
         self.all = (
             [pc for pcs in members.values() for pc in pcs]
             + [m for m in proxy_of.values() if m.lo < 0]
             + list(MIRRORS.values())
         )
+        for c in COHORTS:
+            c.known = c.done = INF
+            c.rel = None
+            c.resident = True
+            c.conds_at = c.cond_at = 0.0
+            c.unmet = len(c.named)
         for pc in self.all:
             pc.known = pc.done = INF
             pc.rel = None
@@ -643,6 +837,21 @@ class Run:
 
     def try_release(self, pc, now):
         if pc.rel is not None or not pc.resident or pc.unmet > 0:
+            return
+        if pc.kind == "cohort":
+            # Handed over once the managers see its last producer finish; its members
+            # hold every cluster from then, and start together once all are free.
+            t0 = max(pc.conds_at + MGR_US, order[pc.task] / RATE)
+            st = max([t0] + self.cores.aic + self.cores.aiv)
+            self.cohort_hold += sum(st - max(t0, x) for x in self.cores.aic)
+            k = info[pc.task][0]
+            d_aic = self.cores.dur(k[0])
+            d_aiv = max(self.cores.dur(x) for x in k[1:] if x >= 0)
+            self.cores.aic = [st + d_aic] * N_CL
+            self.cores.aiv = [st + d_aiv] * (2 * N_CL)
+            pc.rel = st
+            pc.done = st + max(d_aic, d_aiv)
+            self.push(pc.done, self.FIN, pc)
             return
         need, why, at = self.wm_cond(pc)
         if at is None:
@@ -690,6 +899,9 @@ class Run:
 
     def finish(self, pc, t):
         self.makespan = max(self.makespan, t)
+        if pc.kind == "cohort":
+            self.notify(pc, t)
+            return
         self.mark(pc.g, pc.lo, pc.hi, t)
         if SHARED:
             for g in range(N_Q):
@@ -763,7 +975,7 @@ class Run:
                 for g in range(N_Q):
                     if (x, g) in dyn_ids:
                         self.mark(g, dyn_next[(x, g)], dyn_ids[(x, g)][1], t)
-        unfinished = sum(1 for pc in self.all if pc.kind != "proxy" and pc.done == INF)
+        unfinished = sum(1 for pc in self.all + COHORTS if pc.kind != "proxy" and pc.done == INF)
         return self.makespan, unfinished
 
 
@@ -781,5 +993,5 @@ print(
     f"SKIP_IDX={SKIP_IDX} "
     f"unfinished={unfinished} seeds={seeds} "
     f"la_need={r0.la_need} waits(thr,la,bar)={r0.waits} wait_us={[round(x) for x in r0.wait_us]} "
-    f"proxy_hold_us={[round(x) for x in r0.proxy_hold_us]}"
+    f"proxy_hold_us={[round(x) for x in r0.proxy_hold_us]} cohort_hold_us_per_aic={r0.cohort_hold / N_CL:.0f}"
 )

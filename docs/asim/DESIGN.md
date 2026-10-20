@@ -28,7 +28,8 @@ Living document — update on every design refinement and every measured result.
 | [in-graph-grouping.md](in-graph-grouping.md) | What it would take to let a Definition declare a group -- the five pieces, and the grain to try first |
 | [controller-oracle.md](controller-oracle.md) | What a controller that resolved deepseek_v4's edges itself could win, and which two changes it takes |
 | [silos.md](silos.md) | Groups that see each other's completions: the design, how the simulator models it, and what it wins on deepseek_v4 |
-| [partitions.md](partitions.md) | The controllers running the graph a partition at a time, each group numbering its share locally and announcing finished producers' global ids on a ring, conditional work dealt whole once decided: the design, its hardware, the model, and its deepseek_v4 win |
+| [partitions.md](partitions.md) | The controllers running the graph a partition at a time, each group numbering its share locally and announcing finished producers' global ids on a ring, sync-start tasks released whole by the managers, conditional work dealt whole once decided: the design, its hardware and the model |
+| [validation/partitions.md](validation/partitions.md) | Partitions measured on qwen, deepseek_v4 and paged_attention against M0 |
 | [validation/transport-ablation.md](validation/transport-ablation.md) | **Why the GroupQueue wins on paged_attention even against a zero-latency AICPU-to-AICore connection** -- the central argument, with the ablation behind it |
 | [validation/m2-scheduling-window.md](validation/m2-scheduling-window.md) | M2 against `scan_and_claim`, gated on the scheduling window (2026-09-04) |
 | [validation/m2-group-queue.md](validation/m2-group-queue.md) | M2 with the task-grouping contract, gated on `device_wall` (2026-09-14) |
@@ -198,7 +199,9 @@ Case1 (65 536 tasks, 4 threads):
    place the GroupQueue is most likely to show a benefit — or keeping the
    agreement in software. Software was chosen, which makes the M2 number on
    cohorts unchanged by construction. The barrier remains the interesting
-   unmeasured option.
+   unmeasured option. Within partitions the controllers place a cohort's pieces
+   and announce their finish themselves, and only the release stays with the
+   managers ([partitions.md](partitions.md#sync-start-tasks)).
 5. **aSim's own per-call cost is part of the M2 delta.** M0 and M2 are different
    programs, so simulator work that does not fit inside the latency it models
    lands in the result rather than cancelling. Three such leaks have been found

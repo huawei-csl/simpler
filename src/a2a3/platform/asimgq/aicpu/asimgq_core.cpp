@@ -127,6 +127,9 @@ struct SimCore {
     // When the pre-stage is on its core and spinning on its gate: after the link
     // and the core's poll on an idle core, at the running task's end behind one.
     uint64_t bell_ready[2] = {0, 0};
+    // A gated slot holding a partition entry keeps it: its piece counts the finish
+    // once the release fixes when it ends.
+    SimQueueEntryStore gated_e[2] = {};
     // How many of this core's slots hold a member that has not started. A core
     // holding one takes nothing further, and `ready_at` stays the real end of its
     // running work rather than being poisoned with a sentinel: the sentinel is a
@@ -374,7 +377,14 @@ struct alignas(64) SimQueue {
     // core -- a manager offers a cohort only cores it holds idle, so that count
     // says how often the two views of a core disagreed.
     uint32_t cohort_staged = 0;
+    uint32_t cohort_staged_cube = 0;  // of them, on cube cores
     uint64_t cohort_piped = 0;
+    // Core time members held their cores placed and not started, cube and vector.
+    uint64_t cohort_hold[2] = {0, 0};
+    // Cohort members in the hold array, per ring, not yet in their ring. While one
+    // waits no partition entry joins that ring: the cores of its type drain, as the
+    // managers' drain stops dispatch, and the member takes one once it is idle.
+    uint32_t gated_held[SIM_RING_COUNT] = {};
     // Early-dispatch pre-stages held here, placed or still in a ring, whose
     // doorbell has not been taken. Zero lets an access skip the doorbell check.
     uint32_t belled_outstanding = 0;
@@ -542,9 +552,8 @@ constexpr uint32_t SIM_PART_SUBS = 4096;
 // by this queue's own work or by work standing for another queue's -- the
 // watermark reaching its threshold, and every announcement a mapped id counts.
 enum SimPartCause : uint8_t { PART_ARRIVE = 0, PART_OWN = 1, PART_PEER = 2, PART_THRESHOLD = 3, PART_MAP = 4 };
-// What a threshold stands for: the producers past the fourth, the look-ahead, or the
-// subpartition before finishing.
-enum SimThreshold : uint8_t { THR_PRODUCERS = 0, THR_LOOKAHEAD = 1, THR_BARRIER = 2 };
+// What a threshold stands for: the producers past the fourth, or the look-ahead.
+enum SimThreshold : uint8_t { THR_PRODUCERS = 0, THR_LOOKAHEAD = 1 };
 // An entry set; one local id that stands for work done elsewhere, mapped from a
 // global id; or local ids marked finished because the work they were held for did
 // not come.
@@ -571,6 +580,9 @@ struct SimPartSetState {
     uint32_t map_slot = SIM_PART_NONE;
     uint32_t members = SIM_PART_NONE;
     uint32_t member_n = 0;
+    // A sync-start piece, and its place among this queue's.
+    bool gated = false;
+    uint64_t gated_seq = 0;
 };
 struct SimPartSlot {
     SimQueueEntryStore e;
@@ -654,6 +666,18 @@ struct SimPartState {
     std::vector<uint32_t> ready[2];
     uint32_t ready_head[2] = {0, 0};
     uint32_t ready_tail[2] = {0, 0};
+    // The same for sync-start pieces' entries, which go first; only the current
+    // piece's go at all -- the oldest this queue has not released -- so two cohorts
+    // can never each hold some of the cores the other waits for. The pieces given,
+    // and the one current.
+    std::vector<uint32_t> gready[2];
+    uint64_t gated_next = 0;
+    uint64_t gated_cur = 0;
+    // Per piece given, in order: its cube entries. A piece's vector entries go only
+    // once all of them are placed: the cube cores are the ones that take draining,
+    // and until they have, vector members would hold vector cores the work still
+    // running on cube cores may need.
+    std::vector<uint32_t> gated_cube;
     // Sets whose release is timed on a completion, earliest first.
     std::vector<std::pair<uint64_t, uint32_t>> releases;
     // The cycles this queue's lane carried its last announcements in.
@@ -674,8 +698,8 @@ struct SimPartState {
     uint64_t late = 0;
     uint64_t late_ticks = 0;
     uint64_t late_by[5] = {0, 0, 0, 0, 0};
-    uint64_t waits[3] = {0, 0, 0};
-    uint64_t wait_ticks[3] = {0, 0, 0};
+    uint64_t waits[2] = {0, 0};
+    uint64_t wait_ticks[2] = {0, 0};
     uint64_t skips = 0;
     uint64_t fills = 0;
     uint64_t switches = 0;
@@ -739,6 +763,10 @@ uint32_t part_alloc_piece(SimPartState &p) {
 
 void part_ready_push(SimPartState &p, uint32_t slot) {
     const uint32_t r = p.slots[slot].e.type == SimTaskType::Cube ? 0 : 1;
+    if (p.slots[slot].e.gated) {
+        p.gready[r].push_back(slot);
+        return;
+    }
     p.ready[r][p.ready_tail[r]++ & (SIM_PART_SLOTS - 1)] = slot;
 }
 
@@ -1285,6 +1313,7 @@ void commit(
         c.bell_core[c.outstanding] = e.bell_core;
         c.bell_token[c.outstanding] = e.bell_token;
         c.bell_ready[c.outstanding] = pipelined ? start : start + g_link_ticks + g_core_poll_ticks;
+        c.gated_e[c.outstanding] = e;
         // A held task cannot be stolen, and this slot's pipeline record describes
         // whatever sat here before it.
         if (pipelined) {
@@ -1295,6 +1324,7 @@ void commit(
         ++c.gated_count;
         if (e.gated) {
             ++q.cohort_staged;
+            if (e.type == SimTaskType::Cube) ++q.cohort_staged_cube;
             if (pipelined) {
                 ++q.cohort_piped;
             }
@@ -1461,7 +1491,9 @@ bool rings_hold_work(const SimQueue &q) {
 // one core, so a controller that always took the cheaper push would starve it.
 // Beyond that the rings are independent: a cube that cannot be placed does not
 // hold up queued vector work, which it did when all shapes shared one FIFO.
-void dispatch_pending(SimQueue &q, uint64_t at) {
+void promote_part(SimQueue &q, uint64_t at);
+
+void dispatch_rings(SimQueue &q, uint64_t at) {
     if (q.package_count == 0) {
         return;
     }
@@ -1485,6 +1517,18 @@ void dispatch_pending(SimQueue &q, uint64_t at) {
         if (!placed) {
             return;
         }
+    }
+}
+
+void dispatch_pending(SimQueue &q, uint64_t at) {
+    dispatch_rings(q, at);
+    // A cohort's vector members wait for its cube members, so a placement that
+    // completed those lets them go now.
+    const SimPartState &p = g_part[static_cast<uint32_t>(&q - &g_queues[0])];
+    if (p.on && !p.gready[1].empty() && p.gated_cur < p.gated_cube.size() &&
+        q.cohort_staged_cube >= p.gated_cube[p.gated_cur]) {
+        promote_part(q, at);
+        dispatch_rings(q, at);
     }
 }
 
@@ -1637,6 +1681,23 @@ bool enqueue_entry(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
     return true;
 }
 
+// The same at the head of the ring, so the entry is the next of its shape a core
+// takes: a cohort member, ahead of the work it drains the cores for. The ring's
+// depth bounds it rather than its share of the cores, since a member does not add
+// to the work the group has taken on: it waits for a core the work ahead of it
+// leaves idle.
+bool enqueue_entry_front(SimQueue &q, const SimQueueEntryStore &e, uint64_t at) {
+    const uint32_t r = ring_of(e.type);
+    if (q.push[r] - q.pop[r] >= SIM_QUEUE_DEPTH) {
+        return false;
+    }
+    --q.pop[r];
+    SimQueueEntryStore &dst = q.ring[r][q.pop[r] % SIM_QUEUE_DEPTH];
+    dst = e;
+    dst.enqueued_at = at;
+    return true;
+}
+
 // Whether a position this queue was given has finished. The watermark covers the
 // contiguous prefix and the look-ahead word carries the finishes above it, so the
 // two together are exact across the whole horizon.
@@ -1667,6 +1728,7 @@ void promote_held(SimQueue &q, uint64_t at) {
             q.held_used &= ~(1u << s);
             --q.held_n;
             ++q.held_promoted;
+            if (h.e.gated) --q.gated_held[ring_of(h.e.type)];
             SimDepSet &d = q.deps[h.ds];
             d.members &= ~(1u << s);
             if (d.members == 0) {
@@ -1684,17 +1746,42 @@ void promote_part(SimQueue &q, uint64_t at) {
     const uint32_t qi = static_cast<uint32_t>(&q - &g_queues[0]);
     SimPartState &p = g_part[qi];
     if (!p.on) return;
+    auto moved = [&](uint32_t slot) {
+        SimPartSlot &sl = p.slots[slot];
+        SimPartSetState &s = p.sets[sl.set];
+        if (--s.member_n == 0) part_free_set(p, sl.set);
+        sl.next = p.slot_free;
+        p.slot_free = slot;
+        --p.resident;
+    };
     for (uint32_t r = 0; r < 2; ++r) {
+        if (q.gated_held[ring_of(r == 0 ? SimTaskType::Cube : SimTaskType::Vector)] != 0) continue;
+        // The current cohort's entries first. While one of them waits for room no
+        // other entry joins the ring, so the cores of its type drain for it.
+        bool waiting = false;
+        std::vector<uint32_t> &g = p.gready[r];
+        const bool cube_placed =
+            p.gated_cur >= p.gated_cube.size() || q.cohort_staged_cube >= p.gated_cube[p.gated_cur];
+        for (size_t i = 0; i < g.size() && (r == 0 || cube_placed);) {
+            SimPartSlot &sl = p.slots[g[i]];
+            if (p.sets[sl.set].gated_seq != p.gated_cur) {
+                ++i;
+                continue;
+            }
+            if (!enqueue_entry_front(q, sl.e, at > sl.e.enqueued_at ? at : sl.e.enqueued_at)) {
+                waiting = true;
+                break;
+            }
+            moved(g[i]);
+            g.erase(g.begin() + static_cast<ptrdiff_t>(i));
+        }
+        if (waiting) continue;
         while (p.ready_head[r] != p.ready_tail[r]) {
             const uint32_t slot = p.ready[r][p.ready_head[r] & (SIM_PART_SLOTS - 1)];
             SimPartSlot &sl = p.slots[slot];
             if (!enqueue_entry(q, sl.e, at > sl.e.enqueued_at ? at : sl.e.enqueued_at)) break;
             ++p.ready_head[r];
-            SimPartSetState &s = p.sets[sl.set];
-            if (--s.member_n == 0) part_free_set(p, sl.set);
-            sl.next = p.slot_free;
-            p.slot_free = slot;
-            --p.resident;
+            moved(slot);
         }
     }
 }
@@ -1766,6 +1853,7 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
     c.bell_core[0] = c.bell_core[1];
     c.bell_token[0] = c.bell_token[1];
     c.bell_ready[0] = c.bell_ready[1];
+    if (c.outstanding > 1 && c.finish[1] == SIM_GATED) c.gated_e[0] = c.gated_e[1];
     c.bell_core[1] = SIM_NO_BELL;
     --c.outstanding;
     refresh_core(q, core);
@@ -2132,6 +2220,7 @@ bool admit_held(
         d.members |= 1u << slot;
         ++q.held_n;
         ++q.held_admitted;
+        if (h.e.gated) ++q.gated_held[ring_of(h.e.type)];
     }
     if (q.held_n > q.held_high) {
         q.held_high = q.held_n;
@@ -2468,7 +2557,7 @@ bool submit_grouped(
 
 bool submit_held(
     uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, const SimTaskType *type, uint32_t n,
-    int32_t task_id, const SimDep *deps, uint32_t dep_n
+    int32_t task_id, const SimDep *deps, uint32_t dep_n, bool gated
 ) {
     const Access a = begin_access(queue_idx, g_push_ticks);
     if (queue_idx >= SIM_MAX_QUEUES || n == 0 || n > SIM_HELD_CAP) {
@@ -2489,6 +2578,7 @@ bool submit_held(
         es[i].func_id[0] = func_id[i];
         es[i].task_id = task_id;
         es[i].type = type[i];
+        es[i].gated = gated;
     }
     if (!admit_held(q, queue_idx, es, n, deps, dep_n, a.at + g_arrive_ticks)) {
         wait_until(a.release);
@@ -2541,6 +2631,10 @@ void set_partition_mode(bool on) {
         p.waiter_free = p.set_free = p.slot_free = p.piece_free = SIM_PART_NONE;
         p.waiter_bump = p.set_bump = p.slot_bump = p.piece_bump = 0;
         p.ready_head[0] = p.ready_head[1] = p.ready_tail[0] = p.ready_tail[1] = 0;
+        p.gready[0].clear();
+        p.gready[1].clear();
+        p.gated_cube.clear();
+        p.gated_next = p.gated_cur = 0;
         p.releases.clear();
         std::fill(std::begin(p.sent_slots), std::end(p.sent_slots), UINT64_MAX);
         p.sent_head = 0;
@@ -2668,9 +2762,19 @@ bool submit_local(
         SimPartSetState &st = p.sets[set_ids[i]];
         st.ready_at = st.other_at = arrive_at;
         st.threshold = sets[i].threshold;
-        st.thr_kind = sets[i].barrier ? THR_BARRIER : THR_PRODUCERS;
+        st.thr_kind = THR_PRODUCERS;
         st.empty = sets[i].empty;
         st.open = 1;
+        st.gated = sets[i].gated;
+        if (st.gated) {
+            st.gated_seq = p.gated_next++;
+            uint32_t cube = 0;
+            for (uint32_t k = 0; k < n; ++k) {
+                if (entries[k].set == i && entries[k].type == SimTaskType::Cube) ++cube;
+            }
+            if (p.gated_cube.size() < p.gated_next) p.gated_cube.resize(p.gated_next, 0);
+            p.gated_cube[st.gated_seq] = cube;
+        }
         piece_ids[i] = part_alloc_piece(p);
         SimPartPiece &pc = p.pieces[piece_ids[i]];
         pc.gid = sets[i].gid;
@@ -2701,6 +2805,7 @@ bool submit_local(
         sl.e.piece_part = part;
         sl.e.piece_index = entries[i].local;
         sl.e.piece = piece_ids[entries[i].set];
+        sl.e.gated = sets[entries[i].set].gated;
         sl.e.enqueued_at = arrive_at;
         sl.set = set_ids[entries[i].set];
         SimPartSetState &st = p.sets[sl.set];
@@ -2790,7 +2895,7 @@ void queue_part_stats(uint32_t queue_idx, SimPartStats *out) {
     for (uint32_t i = 0; i < 5; ++i) {
         out->late_by[i] = p.late_by[i];
     }
-    for (uint32_t i = 0; i < 3; ++i) {
+    for (uint32_t i = 0; i < 2; ++i) {
         out->waits[i] = p.waits[i];
         out->wait_ns[i] = ns(p.wait_ticks[i]);
     }
@@ -3074,6 +3179,7 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
     // The caller's instant is on the real clock; the cohort starts on the queue's.
     const uint64_t ofs = g_ledger[queue_idx].overrun_ticks;
     const uint64_t at = at_real > ofs ? at_real - ofs : 0;
+    bool piece_released = false;
     for (uint32_t i = 0; i < q.core_count; ++i) {
         SimCore &c = q.cores[i];
         if (c.gated_count == 0) {
@@ -3088,13 +3194,20 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             // No earlier than the cohort begins, and no earlier than this core
             // finishes what it was already running.
             const uint64_t start = at > c.gated_floor[k] ? at : c.gated_floor[k];
+            q.cohort_hold[(i % 3) == 0 ? 0 : 1] += start - c.gated_floor[k];
             // Same rule as an ordinary placement: the first member reaches its core
             // over the link and then starts up; one sitting behind running work is
             // already there and its startup has overlapped.
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
             publish(q, c.index[k], c.finish[k] + g_fin_ticks + g_link_ticks);
+            if (c.gated_e[k].piece_task >= 0) {
+                part_entry_done(q, c.gated_e[k], c.finish[k] + g_fin_ticks + g_link_ticks);
+                c.gated_e[k].piece_task = -1;
+                piece_released = true;
+            }
             --q.cohort_staged;
+            if ((i % 3) == 0) --q.cohort_staged_cube;
             --c.gated_count;
             released = true;
         }
@@ -3106,6 +3219,13 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             c.ready_at = c.finish[c.outstanding - 1];
         }
         refresh_core(q, i);
+    }
+    if (piece_released) {
+        // Every member of the current sync-start piece was placed before the
+        // managers released it, so the next one is current now.
+        ++g_part[queue_idx].gated_cur;
+        promote_part(q, at);
+        dispatch_pending(q, at);
     }
     refresh_next_event(q);
     finish_push(q, queue_idx, a);
@@ -3128,6 +3248,11 @@ uint32_t read_cohort_staged(uint32_t queue_idx) {
 
 uint64_t queue_cohort_piped(uint32_t queue_idx) {
     return queue_idx < SIM_MAX_QUEUES ? g_queues[queue_idx].cohort_piped : 0;
+}
+
+void queue_cohort_hold(uint32_t queue_idx, uint64_t *cube_ticks, uint64_t *vector_ticks) {
+    *cube_ticks = queue_idx < SIM_MAX_QUEUES ? g_queues[queue_idx].cohort_hold[0] : 0;
+    *vector_ticks = queue_idx < SIM_MAX_QUEUES ? g_queues[queue_idx].cohort_hold[1] : 0;
 }
 
 uint64_t now_ticks() { return get_sys_cnt_aicpu(); }

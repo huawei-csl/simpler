@@ -245,10 +245,11 @@ void set_peer_forwarding(bool on);
 // which may sit in any queue. Each entry takes one hold slot, and is placed once
 // every named position has finished -- and, for a position in another queue, once
 // that finish has crossed the link. Returns false, admitting nothing, when the hold
-// slots or comparators would not cover the request.
+// slots or comparators would not cover the request. A `gated` entry is a cohort
+// member: once placed it holds its core without running until release_cohort().
 bool submit_held(
     uint32_t queue_idx, const uint64_t *gq_index, const int32_t *func_id, const SimTaskType *type, uint32_t n,
-    int32_t task_id, const SimDep *deps, uint32_t dep_n
+    int32_t task_id, const SimDep *deps, uint32_t dep_n, bool gated = false
 );
 
 // Partitions. Each controller numbers its share of every partition -- its
@@ -298,8 +299,11 @@ struct SimLocalSet {
     uint32_t threshold;
     uint32_t gid;
     bool empty;
-    bool barrier;   // the threshold is the end of the subpartition before
     bool announce;  // another queue maps `gid`
+    // A sync-start piece. Its entries go to their rings before any other partition
+    // entry, cohort by cohort in the order this queue was given them, and once
+    // placed hold their cores until release_cohort() starts them.
+    bool gated;
 };
 // A global id this queue maps to one of its local ids, and how many announcements of
 // it -- from every queue, its own included -- that id waits for.
@@ -345,7 +349,7 @@ uint32_t part_store_room(uint32_t queue_idx);
 // much in all, and by the kind of condition learned last -- arrival, a range finished
 // here or standing for another queue, the threshold, the map; sets that waited on the
 // watermark after their other conditions were met, and for how long -- for producers
-// past the fourth, for the look-ahead, and for the subpartition before; empty pieces
+// past the fourth, and for the look-ahead; empty pieces
 // finished, fills, partitions this queue moved past; the local ids its stream used,
 // and the ranges named inconsistently.
 struct SimPartStats {
@@ -360,8 +364,8 @@ struct SimPartStats {
     uint64_t late;
     uint64_t late_ns;
     uint64_t late_by[5];
-    uint64_t waits[3];
-    uint64_t wait_ns[3];
+    uint64_t waits[2];
+    uint64_t wait_ns[2];
     uint64_t skips;
     uint64_t fills;
     uint64_t switches;
@@ -521,6 +525,10 @@ uint32_t read_cohort_staged(uint32_t queue_idx);
 // Cohort members this queue had to place behind running work rather than on an
 // idle core, over the run.
 uint64_t queue_cohort_piped(uint32_t queue_idx);
+
+// Core time, in counter ticks, cohort members held their cores placed and not yet
+// started, over the run: on cube cores, and on vector cores.
+void queue_cohort_hold(uint32_t queue_idx, uint64_t *cube_ticks, uint64_t *vector_ticks);
 
 // The clock a manager reads to stamp a release.
 uint64_t now_ticks();

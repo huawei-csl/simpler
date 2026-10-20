@@ -64,12 +64,13 @@ protected:
     }
 
     // One AIV task of `blocks` blocks with an output tensor, depending on `deps`.
-    TaskId submit(int16_t blocks, const TaskId *deps = nullptr, uint32_t dep_count = 0) {
+    TaskId submit(int16_t blocks, const TaskId *deps = nullptr, uint32_t dep_count = 0, bool sync_start = false) {
         uint32_t shape[] = {16};
         CoreTaskArgs args;
         create_infos.emplace_back(shape, 1, DataType::FLOAT32);
         args.add_output(create_infos.back());
         args.launch_spec.set_block_num(blocks);
+        args.launch_spec.set_require_sync_start(sync_start);
         if (dep_count > 0) args.set_dependencies(deps, dep_count);
         MixedKernels mixed{};
         mixed.aiv0_kernel_id = 0;
@@ -100,6 +101,26 @@ protected:
             const auto *item =
                 part_plan::at<part_plan::Item>(plan(), sp.item_offset + i * part_plan::words_of<part_plan::Item>());
             if (item->task == id.local_id()) return item;
+        }
+        return nullptr;
+    }
+
+    // The group the plan runs a narrow task of partition `part` in.
+    uint32_t home_of(uint32_t part, TaskId id) const {
+        for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+            if (item_of(sub(part, g), id) != nullptr) return g;
+        }
+        ADD_FAILURE() << "task " << id.local_id() << " has no item in partition " << part;
+        return 0;
+    }
+
+    // The map entry of a subpartition at local id `local`, or nullptr.
+    const part_plan::MapEntry *map_at(const part_plan::SubPartition &sp, uint32_t local) const {
+        for (uint32_t i = 0; i < sp.map; ++i) {
+            const auto *m = part_plan::at<part_plan::MapEntry>(
+                plan(), sp.map_offset + i * part_plan::words_of<part_plan::MapEntry>()
+            );
+            if (m->local == local) return m;
         }
         return nullptr;
     }
@@ -177,33 +198,99 @@ TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
     EXPECT_EQ(h.partitions, 2U);
 }
 
-// A task with a producer in an earlier partition names none of it: its threshold is
-// its group's share of the partition starting, which the group's watermark reaches
-// once every earlier share has finished.
-TEST_F(HbgSiloStampTest, PlanHoldsAnEarlierPartitionsConsumerAtTheBoundary) {
+// A task whose producer is in the partition before names it as any other: by its
+// piece, when the producer runs in the same group, or by the id at the end of the
+// producer's own subpartition that stands for it there, mapped with that partition.
+TEST_F(HbgSiloStampTest, PlanNamesAProducerInThePartitionBefore) {
     orch.declare_partitions(4);
     std::vector<TaskId> chain{submit(1)};
     for (int i = 0; i < 7; ++i)
         chain.push_back(submit(1, &chain.back(), 1));
     orch.finish_partitions();
     ASSERT_EQ(orch.partitions(), 2);
-    const uint32_t g = group_of(chain[0]);
-    const part_plan::SubPartition &first = sub(0, g);
-    const part_plan::SubPartition &second = sub(1, g);
-    EXPECT_EQ(first.base, 0U);
-    EXPECT_EQ(first.span, 4U);
-    EXPECT_EQ(second.base, 4U);
-    const part_plan::Item *head = item_of(second, chain[4]);
+    const uint32_t g = home_of(1, chain[4]);
+    const part_plan::Item *head = item_of(sub(1, g), chain[4]);
     ASSERT_NE(head, nullptr);
-    EXPECT_EQ(head->named, 0U);
-    EXPECT_EQ(head->threshold, second.base);
-    EXPECT_NE(head->flags & part_plan::kFlagBarrier, 0U);
-    const part_plan::Item *next = item_of(second, chain[5]);
-    ASSERT_NE(next, nullptr);
-    ASSERT_EQ(next->named, 1U);
-    EXPECT_EQ(next->ranges[0].lo, head->local);
-    EXPECT_EQ(next->ranges[0].hi, head->local + 1);
-    EXPECT_EQ(next->flags & part_plan::kFlagBarrier, 0U);
+    ASSERT_EQ(head->named, 1U);
+    EXPECT_EQ(head->threshold, 0U);
+    const part_plan::SubPartition &before = sub(0, g);
+    EXPECT_GE(head->ranges[0].lo, before.base);
+    EXPECT_LE(head->ranges[0].hi, before.base + before.span);
+    if (home_of(0, chain[3]) == g) {
+        EXPECT_EQ(head->ranges[0].lo, item_of(before, chain[3])->local);
+    } else {
+        const part_plan::MapEntry *m = map_at(before, head->ranges[0].lo);
+        ASSERT_NE(m, nullptr);
+        EXPECT_EQ(m->expected, 1U);
+        const uint32_t h = home_of(0, chain[3]);
+        EXPECT_EQ(m->gid, item_of(sub(0, h), chain[3])->gid);
+        EXPECT_NE(item_of(sub(0, h), chain[3])->flags & part_plan::kFlagAnnounce, 0U);
+    }
+}
+
+// A producer two partitions back is left to the order partitions go out in: a
+// partition's items are posted only once every group's watermark has passed the
+// partition two before, so the producer has finished, and the record does not name
+// it.
+TEST_F(HbgSiloStampTest, PlanLeavesAProducerTwoPartitionsBackToThePartitionOrder) {
+    orch.declare_partitions(2);
+    std::vector<TaskId> chain{submit(1)};
+    for (int i = 0; i < 4; ++i)
+        chain.push_back(submit(1, &chain.back(), 1));
+    const TaskId both[] = {chain[0], chain[4]};
+    const TaskId last = submit(1, both, 2);
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 3);
+    auto &tasks = sm_handle->header->tasks;
+    ASSERT_EQ(tasks.get_task_by_task_id(chain[0].local_id()).part, 0);
+    ASSERT_EQ(tasks.get_task_by_task_id(last.local_id()).part, 2);
+    const part_plan::Item *item = item_of(sub(2, home_of(2, last)), last);
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->named, 1U);
+    EXPECT_EQ(item->threshold, 0U);
+}
+
+// Within partitions a sync-start task is split across every group, each piece
+// flagged as a cohort the managers release whole, and goes last in its partition
+// when nothing there waits on it.
+TEST_F(HbgSiloStampTest, PlanSplitsASyncStartTaskIntoCohortPiecesLastInItsPartition) {
+    orch.declare_partitions(100);
+    const TaskId root = submit(1);
+    const TaskId cohort = submit(8, &root, 1, /*sync_start=*/true);
+    const TaskId other = submit(1, &root, 1);
+    const TaskId after = submit(1, &other, 1);
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 1);
+    EXPECT_EQ(silo_of(cohort), TASK_SILO_SPREAD);
+    auto &tasks = sm_handle->header->tasks;
+    EXPECT_GT(
+        tasks.get_task_by_task_id(cohort.local_id()).part_index, tasks.get_task_by_task_id(after.local_id()).part_index
+    );
+    for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+        const part_plan::Item *piece = item_of(sub(0, g), cohort);
+        ASSERT_NE(piece, nullptr);
+        EXPECT_NE(piece->flags & part_plan::kFlagCohort, 0U);
+        EXPECT_EQ(piece->block_hi - piece->block_lo, 8U / part_plan::kGroups);
+    }
+}
+
+// The plan deals one level's narrow tasks over the groups, so every group runs its
+// share of the level.
+TEST_F(HbgSiloStampTest, PlanSpreadsALevelsNarrowTasksOverTheGroups) {
+    orch.declare_partitions(100);
+    const TaskId root = submit(1);
+    std::vector<TaskId> level;
+    for (uint32_t i = 0; i < 2 * part_plan::kGroups; ++i)
+        level.push_back(submit(1, &root, 1));
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 1);
+    std::vector<uint32_t> per_group(part_plan::kGroups, 0);
+    for (const TaskId t : level)
+        ++per_group[home_of(0, t)];
+    for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+        EXPECT_GE(per_group[g], 1U);
+        EXPECT_LE(per_group[g], 3U);
+    }
 }
 
 TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
@@ -273,7 +360,7 @@ TEST_F(HbgSiloStampTest, PlanProxiesAProducerRunElsewhere) {
     const TaskId narrow = submit(1, &wide, 1);
     orch.finish_partitions();
     ASSERT_EQ(orch.partitions(), 1);
-    const uint32_t home = group_of(narrow);
+    const uint32_t home = home_of(0, narrow);
     const part_plan::SubPartition &sp = sub(0, home);
     ASSERT_EQ(sp.map, 1U);
     const auto &m = *part_plan::at<part_plan::MapEntry>(plan(), sp.map_offset);

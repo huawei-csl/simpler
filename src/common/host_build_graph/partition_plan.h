@@ -25,6 +25,10 @@
 // only. A producer that has a proxy anywhere carries a global id, which its pieces
 // announce on the ring when they finish, and each group's map takes it to the proxy.
 //
+// A sync-start supertask is split across the groups like any wide one, its pieces
+// flagged as a cohort; the plan lists the cohorts in the order every controller is
+// given their pieces, which is the order the managers release them in.
+//
 // Conditional work -- a predicated supertask narrow enough to run whole in one group
 // -- goes as a chain: the conditional tasks of one partition that share a predicate
 // and depend on each other. A chain that is skipped finishes through its tasks' home
@@ -52,7 +56,8 @@ struct Header {
     uint32_t sub_offset;    // SubPartition[partitions][groups]
     uint32_t chain_offset;  // Chain[chains]
     uint32_t gids;          // global ids handed out: 1 .. gids
-    uint32_t reserved;
+    uint32_t cohorts;
+    uint32_t cohort_offset;  // Cohort[cohorts], in release order
 };
 
 // One group's share of one partition.
@@ -82,8 +87,10 @@ enum ItemKind : uint32_t {
 constexpr uint32_t kFlagPredicated = 1U << 0;  // a piece posted decided: to run, or empty
 constexpr uint32_t kFlagHold = 1U << 1;        // it names a producer the controllers do not run
 constexpr uint32_t kFlagDecides = 1U << 2;     // the slot whose decision deals its chain
-constexpr uint32_t kFlagBarrier = 1U << 3;     // its threshold is the subpartition's first id
 constexpr uint32_t kFlagAnnounce = 1U << 4;    // some other group maps its global id
+// A sync-start piece: its entries hold their cores, once placed, until the managers
+// release the whole task at once.
+constexpr uint32_t kFlagCohort = 1U << 5;
 
 struct Item {
     int32_t task;
@@ -124,6 +131,13 @@ struct ChainTask {
     uint32_t gid;
     uint32_t named;
     Range ranges[kNamed];
+};
+
+// A sync-start supertask: its active subtasks per block, and each group's blocks.
+struct Cohort {
+    int32_t task;
+    uint32_t subs;
+    uint32_t blocks[kGroups];
 };
 
 template <typename T>

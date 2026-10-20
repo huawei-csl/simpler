@@ -36,6 +36,7 @@ struct TaskInfo {
     bool cond = false;        // conditional work: predicated, and run whole in one group
     bool spread = false;      // split by block range across every group
     bool predicated = false;  // a spread task posted decided
+    bool cohort = false;      // a sync-start spread task, released whole
     bool hold = false;        // it names a producer the controllers do not run
     int32_t home = -1;        // the group of a narrow task, or a conditional task's home slot
     int32_t part = -1;
@@ -98,6 +99,8 @@ bool OrchestratorState::build_partition_plan(
     const int32_t total = starts.back();
     const uint32_t parts = static_cast<uint32_t>(starts.size() - 1);
     std::vector<TaskInfo> info(static_cast<size_t>(total));
+    uint64_t stamp_waves = 0, dealt_waves = 0;
+    bool deal = false;
     auto is_dummy = [&](int32_t id) {
         const ChipTaskSlotState &s = tasks.get_slot_state_by_task_id(id);
         return s.task_kind == TaskKind::DUMMY || s.active_mask.to_shape() == ResourceShape::DUMMY;
@@ -123,8 +126,120 @@ bool OrchestratorState::build_partition_plan(
             t.spread = desc.silo == TASK_SILO_SPREAD;
             t.predicated = slot.task_attrs.has_predicate() && t.spread;
             t.cond = slot.task_attrs.has_predicate() && !t.spread;
+            t.cohort = slot.task_attrs.requires_sync_start();
             if (!t.spread) {
                 t.home = static_cast<int32_t>(static_cast<uint32_t>(desc.silo - TASK_SILO_FIRST) % kGroups);
+            }
+        }
+    }
+    // Where narrow tasks run. Dealt, each goes to the group given the fewest blocks of
+    // its core types so far, taken in the order the plan numbers each partition -- by
+    // level -- so every level's work spreads over the groups. The plan deals them
+    // unless the host's stamp spreads the work as well: as few waves of a group's
+    // cores per level and core type, and, on a tie, no more blocks in the busiest
+    // group of each type. The stamp keeps a task with its latest producer, so fewer
+    // producers need a global id. Conditional work keeps the stamp either way, where
+    // its chain's slots sit.
+    {
+        const std::array<uint32_t, 2> cores{
+            std::max<uint32_t>(1, static_cast<uint32_t>(total_cluster_count) / kGroups),
+            std::max<uint32_t>(1, static_cast<uint32_t>(total_aiv_count) / kGroups)
+        };
+        auto shape_of = [&](int32_t id) {
+            const ActiveMask &mask = tasks.get_slot_state_by_task_id(id).active_mask;
+            return std::array<bool, 2>{
+                mask.subtask_active(SubtaskSlot::AIC),
+                mask.subtask_active(SubtaskSlot::AIV0) || mask.subtask_active(SubtaskSlot::AIV1)
+            };
+        };
+        std::vector<int32_t> dealt(static_cast<size_t>(total), -1);
+        std::array<std::array<uint64_t, 2>, kGroups> work{};
+        for (const int32_t id : order) {
+            const TaskInfo &t = info[static_cast<size_t>(id)];
+            if (!t.runs || t.cond) continue;
+            const std::array<bool, 2> type = shape_of(id);
+            auto load = [&](uint32_t g) {
+                return (type[0] ? work[g][0] : 0) + (type[1] ? work[g][1] : 0);
+            };
+            auto add = [&](uint32_t g, uint32_t blocks) {
+                for (uint32_t k = 0; k < 2; ++k) {
+                    if (type[k]) work[g][k] += blocks;
+                }
+            };
+            if (t.spread) {
+                for (uint32_t g = 0; g < kGroups; ++g) {
+                    uint32_t lo = 0, hi = 0;
+                    spread_blocks(t.blocks, g, lo, hi);
+                    add(g, hi - lo);
+                }
+                continue;
+            }
+            uint32_t best = 0;
+            for (uint32_t g = 1; g < kGroups; ++g) {
+                if (load(g) < load(best)) best = g;
+            }
+            dealt[static_cast<size_t>(id)] = static_cast<int32_t>(best);
+            add(best, static_cast<uint32_t>(t.blocks));
+        }
+        // Per level of every partition and per core type, the waves of a group's cores
+        // its busiest group needs, summed; and per core type, the blocks of the busiest
+        // group over the whole graph, summed.
+        auto spread_of = [&](bool use_dealt, uint64_t &busiest) {
+            uint64_t sum = 0;
+            std::array<std::array<uint64_t, 2>, kGroups> all{};
+            size_t i = 0;
+            while (i < order.size()) {
+                const TaskInfo &head = info[static_cast<size_t>(order[i])];
+                std::array<std::array<uint64_t, 2>, kGroups> lv{};
+                size_t j = i;
+                for (; j < order.size(); ++j) {
+                    const TaskInfo &t = info[static_cast<size_t>(order[j])];
+                    if (t.part != head.part || t.level != head.level) break;
+                    if (!t.runs) continue;
+                    const std::array<bool, 2> type = shape_of(order[j]);
+                    for (uint32_t g = 0; g < kGroups; ++g) {
+                        uint32_t lo = 0, hi = 0;
+                        if (t.spread) {
+                            spread_blocks(t.blocks, g, lo, hi);
+                        } else {
+                            const int32_t home = use_dealt && !t.cond ? dealt[static_cast<size_t>(order[j])] : t.home;
+                            hi = home == static_cast<int32_t>(g) ? static_cast<uint32_t>(t.blocks) : 0;
+                        }
+                        for (uint32_t k = 0; k < 2; ++k) {
+                            if (type[k]) {
+                                lv[g][k] += hi - lo;
+                                all[g][k] += hi - lo;
+                            }
+                        }
+                    }
+                }
+                for (uint32_t k = 0; k < 2; ++k) {
+                    uint64_t most = 0;
+                    for (uint32_t g = 0; g < kGroups; ++g) {
+                        most = std::max<uint64_t>(most, (lv[g][k] + cores[k] - 1) / cores[k]);
+                    }
+                    sum += most;
+                }
+                i = j;
+            }
+            busiest = 0;
+            for (uint32_t k = 0; k < 2; ++k) {
+                uint64_t most = 0;
+                for (uint32_t g = 0; g < kGroups; ++g) {
+                    most = std::max<uint64_t>(most, all[g][k]);
+                }
+                busiest += most;
+            }
+            return sum;
+        };
+        uint64_t stamp_busiest = 0, dealt_busiest = 0;
+        stamp_waves = spread_of(false, stamp_busiest);
+        dealt_waves = spread_of(true, dealt_busiest);
+        deal = dealt_waves < stamp_waves || (dealt_waves == stamp_waves && dealt_busiest < stamp_busiest);
+        if (deal) {
+            for (const int32_t id : order) {
+                if (dealt[static_cast<size_t>(id)] >= 0)
+                    info[static_cast<size_t>(id)].home = dealt[static_cast<size_t>(id)];
             }
         }
     }
@@ -241,8 +356,10 @@ bool OrchestratorState::build_partition_plan(
         if (t.cond) needs_gid[static_cast<size_t>(id)] = true;
         consumer_groups(t, [&](uint32_t g) {
             for (const int32_t prod : prods[static_cast<size_t>(id)]) {
-                if (needs_proxy(info[static_cast<size_t>(prod)], g)) needs_gid[static_cast<size_t>(prod)] = true;
-                if (info[static_cast<size_t>(prod)].part < t.part) info[static_cast<size_t>(prod)].end_proxy[g] = true;
+                TaskInfo &pt = info[static_cast<size_t>(prod)];
+                if (pt.part + 1 < t.part) continue;
+                if (needs_proxy(pt, g)) needs_gid[static_cast<size_t>(prod)] = true;
+                if (pt.part < t.part) pt.end_proxy[g] = true;
             }
         });
     }
@@ -257,7 +374,8 @@ bool OrchestratorState::build_partition_plan(
         if (!t.runs) continue;
         consumer_groups(t, [&](uint32_t g) {
             for (const int32_t prod : prods[static_cast<size_t>(id)]) {
-                if (needs_proxy(info[static_cast<size_t>(prod)], g)) remote_proxy[static_cast<size_t>(prod)] = true;
+                const TaskInfo &pt = info[static_cast<size_t>(prod)];
+                if (pt.part + 1 >= t.part && needs_proxy(pt, g)) remote_proxy[static_cast<size_t>(prod)] = true;
             }
         });
     }
@@ -352,7 +470,8 @@ bool OrchestratorState::build_partition_plan(
                 item.block_lo = t.cond ? 0 : lo;
                 item.block_hi = t.cond ? 0 : hi;
                 item.kind = t.cond ? part_plan::kSlot : part_plan::kPiece;
-                item.flags = (t.predicated ? part_plan::kFlagPredicated : 0) | (t.hold ? part_plan::kFlagHold : 0);
+                item.flags = (t.predicated ? part_plan::kFlagPredicated : 0) | (t.hold ? part_plan::kFlagHold : 0) |
+                             (t.cohort ? part_plan::kFlagCohort : 0);
                 // Every item with a global id retires its own map entry when it finishes;
                 // only one some other group maps takes a cycle of the ring.
                 item.gid = t.gid;
@@ -378,19 +497,18 @@ bool OrchestratorState::build_partition_plan(
             sp.span = cur - sp.base;
             next[g] = cur;
             // What each item waits on, in this group's ids: the four producers ending
-            // last, the threshold where the fifth ends, and -- for an item with a
-            // producer in an earlier partition, which it does not name -- the end of
-            // the group's share of every earlier partition.
+            // last and the threshold where the fifth ends. A producer in the partition
+            // before stands as its piece in this group or as the id at the end of its
+            // own subpartition here that stands for it. One further back has finished
+            // before the item is posted: the item goes out only once every group maps
+            // its partition, which a group does once its watermark has passed the
+            // partition two before.
             for (part_plan::Item &item : sp.items) {
                 const TaskInfo &t = info[static_cast<size_t>(item.task)];
                 std::vector<part_plan::Range> cands;
-                bool earlier = false;
                 for (const int32_t prod : prods[static_cast<size_t>(item.task)]) {
                     const TaskInfo &pt = info[static_cast<size_t>(prod)];
-                    if (pt.part < t.part) {
-                        earlier = true;
-                        continue;
-                    }
+                    if (pt.part + 1 < t.part) continue;
                     part_plan::Range r{};
                     if (needs_proxy(pt, g)) {
                         r = part_plan::Range{
@@ -412,18 +530,14 @@ bool OrchestratorState::build_partition_plan(
                     item.ranges[k] = cands[k];
                 }
                 item.threshold = cands.size() > kNamed ? cands[kNamed].hi : 0;
-                if (earlier && sp.base >= item.threshold) {
-                    item.threshold = sp.base;
-                    item.flags |= part_plan::kFlagBarrier;
-                }
             }
         }
     }
-    // Check that the plan enforces every edge: a producer in the same partition is
-    // named or below the threshold; one in an earlier partition is below the
-    // subpartition's first id, which the item's threshold reaches; a proxy is mapped in
-    // its producer's partition, counting every piece, and every piece announces; a
-    // chain task names its producers in the chain and lists the rest as external.
+    // Check that the plan enforces every edge: a producer in the same partition or the
+    // one before is named or below the threshold, and one further back is left to the
+    // order partitions are posted in; a proxy is mapped in its producer's partition,
+    // counting every piece, and every piece announces; a chain task names its
+    // producers in the chain and lists the rest as external.
     uint32_t unenforced = 0;
     for (uint32_t p = 0; p < parts; ++p) {
         for (uint32_t g = 0; g < kGroups; ++g) {
@@ -431,6 +545,7 @@ bool OrchestratorState::build_partition_plan(
             for (const part_plan::Item &item : sp.items) {
                 for (const int32_t prod : prods[static_cast<size_t>(item.task)]) {
                     const TaskInfo &pt = info[static_cast<size_t>(prod)];
+                    if (pt.part + 1 < static_cast<int32_t>(p)) continue;
                     part_plan::Range h{};
                     if (needs_proxy(pt, g)) {
                         if (pt.proxy[g] < 0) {
@@ -450,10 +565,6 @@ bool OrchestratorState::build_partition_plan(
                         h = part_plan::Range{
                             static_cast<uint32_t>(pt.local[g]), static_cast<uint32_t>(pt.local[g]) + pt.count[g]
                         };
-                    }
-                    if (pt.part < static_cast<int32_t>(p)) {
-                        if (item.threshold < sp.base || h.hi > sp.base) ++unenforced;
-                        continue;
                     }
                     bool named = false;
                     for (uint32_t k = 0; k < item.named; ++k) {
@@ -486,7 +597,24 @@ bool OrchestratorState::build_partition_plan(
         LOG_ERROR("Partition plan leaves %u dependencies unenforced; running the graph without partitions", unenforced);
         return false;
     }
-    // Serialize: header, subpartitions, items, maps, chains, chain tasks, externals.
+    // The cohorts, in the order every controller is given their pieces: by partition,
+    // then by the level order its stream follows.
+    std::vector<part_plan::Cohort> cohorts;
+    for (const int32_t id : order) {
+        const TaskInfo &t = info[static_cast<size_t>(id)];
+        if (!t.runs || !t.cohort) continue;
+        part_plan::Cohort c{};
+        c.task = id;
+        c.subs = static_cast<uint32_t>(t.subs);
+        for (uint32_t g = 0; g < kGroups; ++g) {
+            uint32_t lo = 0, hi = 0;
+            spread_blocks(t.blocks, g, lo, hi);
+            c.blocks[g] = hi - lo;
+        }
+        cohorts.push_back(c);
+    }
+    // Serialize: header, subpartitions, items, maps, chains, chain tasks, externals,
+    // cohorts.
     using part_plan::words_of;
     uint32_t n_items = 0, n_map = 0, n_chain_tasks = 0, n_ext = 0;
     for (const SubInfo &sp : subs) {
@@ -504,7 +632,8 @@ bool OrchestratorState::build_partition_plan(
     const uint32_t chain_offset = map_offset + n_map * words_of<part_plan::MapEntry>();
     const uint32_t ctask_offset = chain_offset + static_cast<uint32_t>(chains.size()) * words_of<part_plan::Chain>();
     const uint32_t ext_offset = ctask_offset + n_chain_tasks * words_of<part_plan::ChainTask>();
-    const uint32_t words = ext_offset + n_ext;
+    const uint32_t cohort_offset = ext_offset + n_ext;
+    const uint32_t words = cohort_offset + static_cast<uint32_t>(cohorts.size()) * words_of<part_plan::Cohort>();
     const uint64_t capacity = task_allocator.capacity() * static_cast<uint64_t>(CHIP_MAX_FANIN);
     const int32_t plan_at = CHIP_ALIGN_UP(fanin_pool_cursor, ARG_POOL_ALIGN / static_cast<int32_t>(sizeof(int32_t)));
     if (static_cast<uint64_t>(plan_at) + words > capacity) {
@@ -518,8 +647,10 @@ bool OrchestratorState::build_partition_plan(
     }
     uint32_t *plan = reinterpret_cast<uint32_t *>(fanin_pool + plan_at);
     std::memset(plan, 0, static_cast<size_t>(words) * sizeof(uint32_t));
-    part_plan::Header header{words,      kGroups,      parts, static_cast<uint32_t>(chains.size()),
-                             sub_offset, chain_offset, gids,  0};
+    part_plan::Header header{words,        kGroups,      parts, static_cast<uint32_t>(chains.size()),
+                             sub_offset,   chain_offset, gids,  static_cast<uint32_t>(cohorts.size()),
+                             cohort_offset};
+    std::memcpy(plan + cohort_offset, cohorts.data(), cohorts.size() * sizeof(part_plan::Cohort));
     std::memcpy(plan, &header, sizeof(header));
     uint32_t item_at = item_offset, map_at = map_offset;
     std::vector<uint32_t> chain_first_of(parts + 1, 0);
@@ -612,10 +743,12 @@ bool OrchestratorState::build_partition_plan(
     plan_first = plan_at;
     plan_words = words;
     LOG_INFO(
-        "Partition plan: %u partitions, %u groups, %u words; subpartition span max %u mean %.0f (%u over the %u-id "
-        "look-ahead); map max %u per subpartition; %u global ids; %u chains, %u chain edges from another chain",
-        parts, kGroups, words, span_max, static_cast<double>(span_sum) / static_cast<double>(subs.size()), span_over,
-        part_plan::kLookahead, map_max, gids, static_cast<uint32_t>(chains.size()), cross_chain
+        "Partition plan: %u partitions, %u groups, %u words; narrow tasks %s (level waves %" PRIu64 " dealt, %" PRIu64
+        " stamped); subpartition span max %u mean %.0f (%u over the %u-id look-ahead); map max %u per subpartition; "
+        "%u global ids; %u chains, %u chain edges from another chain",
+        parts, kGroups, words, deal ? "dealt" : "stamped", dealt_waves, stamp_waves, span_max,
+        static_cast<double>(span_sum) / static_cast<double>(subs.size()), span_over, part_plan::kLookahead, map_max,
+        gids, static_cast<uint32_t>(chains.size()), cross_chain
     );
     return true;
 }

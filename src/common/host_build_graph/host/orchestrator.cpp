@@ -3011,10 +3011,12 @@ void OrchestratorState::finish_partitions() {
     };
     std::vector<int32_t> level(static_cast<size_t>(total), 0);
     std::vector<int32_t> order;
+    std::vector<uint8_t> consumed(static_cast<size_t>(total), 0);
     for (size_t part = 0; part + 1 < starts.size(); ++part) {
         const int32_t first = starts[part];
         const int32_t end = starts[part + 1];
         const size_t from = order.size();
+        int32_t top = 0;
         for (int32_t id = first; id < end; ++id) {
             const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
             const int32_t *fanin = p.fanin_data();
@@ -3022,13 +3024,27 @@ void OrchestratorState::finish_partitions() {
             for (int32_t k = 0; k < p.fanin_count; ++k) {
                 const int32_t prod = fanin[k];
                 if (prod < first || prod >= id) continue;
+                consumed[static_cast<size_t>(prod)] = 1;
                 lv = std::max(lv, level[static_cast<size_t>(prod)] + (runs(prod) ? 1 : 0));
             }
             level[static_cast<size_t>(id)] = lv;
             TaskDescriptor &t = tasks.get_task_by_task_id(id);
             t.part = static_cast<uint16_t>(part);
             t.part_index = TASK_PART_INDEX_NONE;
-            if (runs(id)) order.push_back(id);
+            if (runs(id)) {
+                order.push_back(id);
+                top = std::max(top, lv);
+            }
+        }
+        // A sync-start task nothing in its own partition waits on goes last in it:
+        // its pieces hold their cores until it is released whole, so where they sit
+        // no group's watermark waits on them below the partition's other work.
+        for (size_t i = from; i < order.size(); ++i) {
+            const int32_t id = order[i];
+            if (!consumed[static_cast<size_t>(id)] &&
+                tasks.get_slot_state_by_task_id(id).task_attrs.requires_sync_start()) {
+                level[static_cast<size_t>(id)] = top + 1;
+            }
         }
         std::stable_sort(order.begin() + static_cast<ptrdiff_t>(from), order.end(), [&](int32_t a, int32_t b) {
             return level[static_cast<size_t>(a)] < level[static_cast<size_t>(b)];
@@ -3047,22 +3063,25 @@ void OrchestratorState::finish_partitions() {
 }
 
 // The silo a task is fed to. A task that cannot be fed ahead of its producers
-// keeps the ordinary path: a sync-start cohort needs every core at once, and
-// without partitions a dispatch predicate is read when the task is ready. Within
-// partitions a predicated task is fed once the value its predicate reads is final,
-// already decided: to run, or as an empty task its controller finishes without a
-// core. A supertask wide enough to fill
-// more than one silo is split across all of them; anything narrower follows its
-// latest stamped producer, so a chain stays where its data is, and takes the next
-// hint in turn when it has none.
+// keeps the ordinary path: without partitions a sync-start cohort needs every core
+// at once, and a dispatch predicate is read when the task is ready. Within
+// partitions a sync-start task is split across every group, whose controllers hold
+// its pieces on their cores until the managers release it whole, and a predicated
+// task is fed once the value its predicate reads is final, already decided: to
+// run, or as an empty task its controller finishes without a core. A supertask
+// wide enough to fill more than one silo is split across all of them; anything
+// narrower follows its latest stamped producer, so a chain stays where its data
+// is, and takes the next hint in turn when it has none.
 uint8_t OrchestratorState::stamp_silo(const int32_t *fanin, int32_t fanin_count, const ChipTaskSlotState &slot) {
     const bool partitioned = partition_target > 0;
     if (!silos_declared || slot.task_kind != TaskKind::KERNEL || (slot.task_attrs.has_predicate() && !partitioned) ||
-        slot.task_attrs.requires_sync_start() || slot.active_mask.to_shape() == ResourceShape::DUMMY) {
+        (slot.task_attrs.requires_sync_start() && !partitioned) ||
+        slot.active_mask.to_shape() == ResourceShape::DUMMY) {
         return TASK_SILO_NONE;
     }
     ++silo_task_count;
-    if (slot.logical_block_num >= (partitioned ? TASK_PART_SPREAD_MIN_BLOCKS : TASK_SILO_SPREAD_MIN_BLOCKS)) {
+    if (slot.task_attrs.requires_sync_start() ||
+        slot.logical_block_num >= (partitioned ? TASK_PART_SPREAD_MIN_BLOCKS : TASK_SILO_SPREAD_MIN_BLOCKS)) {
         return TASK_SILO_SPREAD;
     }
     int32_t latest = -1;

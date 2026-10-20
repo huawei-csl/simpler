@@ -537,6 +537,16 @@ void SchedulerContext::dispatch_shape(
                 if (available > room_blocks) {
                     available = room_blocks;
                 }
+                if (silo_active_) {
+                    // Under silos each member waits in a hold entry until its ring
+                    // has room, so the spare hold entries bound the claim as well.
+                    const int32_t hold_blocks =
+                        static_cast<int32_t>(asimgq::read_queue_status(static_cast<uint32_t>(thread_idx)).held_room) /
+                        per_block;
+                    if (available > hold_blocks) {
+                        available = hold_blocks;
+                    }
+                }
                 int32_t start = 0;
                 const int32_t claim =
                     slot_state->claim_block_range(slot_state->logical_block_num, available > 0 ? available : 0, start);
@@ -732,6 +742,42 @@ void SchedulerContext::run_staging_order(
 }
 
 #ifdef __SIMULATED_DEVICE__
+void SchedulerContext::service_part_cohort(int32_t thread_idx) {
+    const int32_t k = part_cohort_cur_.load(std::memory_order_acquire);
+    if (k >= static_cast<int32_t>(part_cohorts_.size())) return;
+    PartFeed &pf = part_feed_[thread_idx];
+    if (pf.cohort_done == k) return;
+    const PartCohort &c = part_cohorts_[static_cast<size_t>(k)];
+    const int32_t share = c.share[thread_idx];
+    const uint32_t q = static_cast<uint32_t>(thread_idx);
+    uint64_t at = part_cohort_at_.load(std::memory_order_acquire);
+    if (at == 0) {
+        if (share > 0 && pf.cohort_seen < share) {
+            pf.cohort_seen = static_cast<int32_t>(asimgq::read_cohort_staged(q));
+            part_cohort_staged_[thread_idx].store(pf.cohort_seen, std::memory_order_release);
+        }
+        int32_t total = 0;
+        for (int32_t t = 0; t < active_sched_threads_; ++t) {
+            total += part_cohort_staged_[t].load(std::memory_order_acquire);
+        }
+        if (total < c.entries) return;
+        uint64_t expected = 0;
+        const uint64_t now = asimgq::now_ticks();
+        at = part_cohort_at_.compare_exchange_strong(expected, now, std::memory_order_acq_rel) ? now : expected;
+    }
+    if (share > 0) asimgq::release_cohort(q, at);
+    pf.cohort_done = k;
+    pf.cohort_seen = 0;
+    part_cohort_staged_[thread_idx].store(0, std::memory_order_release);
+    // The last manager to release moves every manager to the next; until then the
+    // stamp stands, so a manager that has not released yet still finds it.
+    if (part_cohort_released_.fetch_add(1, std::memory_order_acq_rel) + 1 == active_sched_threads_) {
+        part_cohort_released_.store(0, std::memory_order_relaxed);
+        part_cohort_at_.store(0, std::memory_order_relaxed);
+        part_cohort_cur_.store(k + 1, std::memory_order_release);
+    }
+}
+
 void SchedulerContext::service_cohort(int32_t thread_idx) {
     const uint64_t tid = cohort_.task_id.load(std::memory_order_acquire);
     if (tid == 0 || cohort_.state.load(std::memory_order_acquire) != SyncStartCohort::kAssembling) {
@@ -1507,6 +1553,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #ifdef __SIMULATED_DEVICE__
         service_cohort(thread_idx);
+        if (part_active_) service_part_cohort(thread_idx);
 #endif
 
         // Phase 2 drain check
