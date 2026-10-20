@@ -134,7 +134,8 @@ deadlock -- the failure recorded in
 ## deepseek_v4: -8.2 % against M0, 1.4 % ahead of the shared watermark
 
 **What the oracle expects.** [`analyzers/asim_local_oracle.py`](analyzers/asim_local_oracle.py)
-models both designs in one machinery at the simulator's hops, one layer a partition.
+models both designs in one machinery at the simulator's hops, one layer a partition,
+no entry starting before the hand-over has reached it.
 With the shared watermark's exchange -- 300 ns, after up to 100 ns for a broadcast
 slot -- it reads 27.49 ms over ten draws, and local ids 27.14 ms (-1.3 %, sd 0.1 pp).
 Almost all of it is the exchange: the shared watermark with a 15 ns exchange reads
@@ -179,6 +180,39 @@ at the barrier ~26 times a round, 0.6 to 0.8 ms each: it was posted a partition
 ahead, and the barrier is its whole wait. No announcement reached a
 controller before its map, and no range was named inconsistently.
 
+## paged_attention: -44.8 % against M0, 9.8 % behind declared groups
+
+The GroupQueue's paged_attention orchestration with its group declarations removed
+and `rt_declare_partitions(1028)` as the entry's first statement -- four of its 256
+disjoint batch elements a partition -- against M0, and against the same orchestration
+declaring one group per batch element. Case1, the three interleaved, 14 rounds a rep
+with the first two dropped, four reps (n=48 rounds an arm):
+
+| arm | device_wall | vs M0 | window |
+| --- | ----------- | ----- | ------ |
+| M0 | 22.21 ms | | 18.96 ms |
+| M2, declared groups | 11.14 ms | -49.8 % | 8.94 ms |
+| M2, partitions | 12.26 ms | -44.8 % | 9.60 ms |
+
+Partitions trail the groups by 9.8 % (7.7 to 11.0 % a rep). The plan has 64
+partitions; a group's share spans 320 ids and maps 64 global ids. The host deals each
+block's first task to the next group in turn, so a batch element's update chain
+crosses groups at every block: 16,128 global ids a round, ~4,000 announced by each
+controller.
+
+**The oracle puts the two level.** With every release floored at its hand-over, it
+reads 11.08 ms for partitions dealt by block and for a batch element per group alike,
+and 13.08 ms for the shared watermark: the case is bound by the hand-over, at the 6
+tasks/us calibrated on the groups' arm.
+
+**What the partitions lose is the simulator's.** All of the ~674 releases per
+controller per round learned late are ranges completed from another group, 7.5 ms of
+lateness in all, and the partition model's status read costs the simulator 601 ns
+against 287 ns for the groups' (a ledger of 13.2 against 5.2 ms a thread a round).
+The core time issued is the same, 12.7 ms of cube and 10.1 ms of vector a thread.
+Keeping each batch element in one group would remove the edges that cross: not
+measured.
+
 ## Limits
 
 - **The partitioning and the plan are the host's**, as a stand-in for the compiler:
@@ -203,8 +237,9 @@ controller before its map, and no range was named inconsistently.
   measurements.
 - **The managers run in real time against a device that stands still while the
   simulator overruns**; `device_wall` removes it per thread, as on every arm.
-- **qwen and paged_attention have not been run with partitions**, and neither has a
-  sync-start cohort: qwen's 40 a round keep the ordinary path.
+- **qwen has not been run with partitions**, and neither has a sync-start cohort:
+  qwen's 40 a round keep the ordinary path. paged_attention's partitioned
+  orchestration is not checked in.
 
 ## Reproducing it
 

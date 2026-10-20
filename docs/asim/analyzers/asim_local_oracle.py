@@ -652,6 +652,8 @@ class Run:
             self.waits[why] += 1
             self.wait_us[why] += at - max(pc.conds_at, self.resident_at[(pc.p, pc.g)])
         t = max(at, pc.conds_at)
+        # No entry starts before it has been handed over.
+        t = max(t, order[pc.task] / RATE)
         pc.rel = max(t + (H_IN if pc.kind == "run" else PRED), self.resident_at[(pc.p, pc.g)])
         self.la_need[pc.g] = max(self.la_need[pc.g], pc.hi - self.wm[pc.g])
         if pc.kind == "run":
