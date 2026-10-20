@@ -108,12 +108,13 @@ that resolved this case's edges itself could win, and which changes it would tak
 other's completions, with every supertask of four or more blocks split across them
 -- and measures M2 at **-2.1 %** against M0 (window -3.1 %), and -5.6 % with eight
 comparators per task instead of four. [../partitions.md](../partitions.md) runs the
-graph a layer at a time on those silos instead -- the controllers sharing each
-partition's watermark, and the managers posting a predicated piece once its predicate
-is decided -- and measures **-7.2 %** (window -8.0 %) over eight paired reps; placing
-the narrow predicated supertasks only once decided, in whichever group's turn it is,
-measures -6.8 % over two, and -6.0 % against the host placement's +22.8 % with half
-the experts made to run.
+graph a layer at a time on those silos instead -- each group numbering its share of a
+layer itself, the controllers announcing on a ring the finished producers another
+group needs, and the managers dealing conditional work whole once decided -- and
+measures **-8.2 %** against M0 (window -9.0 %) over two paired reps, and -7.8 % with
+half the experts made to run. The design it replaced, the controllers sharing each
+partition's watermark, measures -6.8 % and -6.5 % in the same jobs
+([investigations](../../investigations/2026-10-gq-shared-watermark-partitions.md)).
 
 So the only grouping that could pay here keeps wide tasks off a single queue:
 split each into per-queue pieces declared in separate groups, so the four threads

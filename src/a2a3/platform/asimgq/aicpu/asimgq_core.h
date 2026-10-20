@@ -251,104 +251,122 @@ bool submit_held(
     int32_t task_id, const SimDep *deps, uint32_t dep_n
 );
 
-// How long a completion one GroupQueue records takes to reach the others: the
-// controllers exchange their watermark and look-ahead state through device memory.
-constexpr uint64_t SIM_GQ_EXCHANGE_NS = 300;
-// A controller broadcasts its state when it changes, at most once per this period.
-// The model sends on a fixed grid of the period, in the first slot at or after the
-// completion: an isolated completion waits up to one period the hardware would not
-// charge it, and a burst goes out together.
-constexpr uint64_t SIM_GQ_BROADCAST_NS = 100;
-// Entries one controller's partition store holds: its current subpartition, the
-// conditional work routed to it, and as much of the next as fits. The managers keep
-// no room for conditional work still to be routed, so a store that cannot take two
-// partitions' worth of one group's entries can fill with gated pieces and stall.
+// Partitions. Each controller numbers its share of every partition -- its
+// subpartition -- in one local id stream of its own that runs across the
+// partitions, keeps its own watermark over that stream and a look-ahead past it,
+// and learns of work another controller finishes only through the global ids the
+// controllers announce on the ring. Nothing else crosses between them.
+//
+// The ring has one lane per controller. Every cycle each controller writes the
+// global id of one piece it finished, or nothing, on its own lane and passes every
+// lane on to its neighbour, so a lane reaches the controller k places along in k
+// cycles; each controller compares every lane -- its own included -- against its
+// map in the cycle the lane reaches it.
+constexpr uint64_t SIM_GQ_RING_CYCLE_NS = 5;
+// Entries one controller's partition store holds.
 constexpr uint32_t SIM_PART_STORE = 1024;
-// Indices one partition may span: an index is 11 bits.
-constexpr uint32_t SIM_PART_INDICES = 2048;
-// A controller's look-ahead: the finished indices past its watermark it can hold.
-// An entry starts only once the watermark is within this many indices of it, so
-// its finish has a bit to land in.
+// A controller's look-ahead: the local ids past its watermark it can hold finished.
+// An entry starts, and a mapped id lands, only once the watermark is within this
+// many ids of it, so its finish has a bit to land in.
 constexpr uint32_t SIM_PART_LOOKAHEAD = 512;
 
-// A producer a partition task waits on, named by supertask: the runtime's task id
-// and the queues that run a piece of it. One comparator, however many queues --
-// numbered across the partition, a supertask's tasks are one range of indices.
-// SIM_PART_ANY_QUEUE names a producer placed when it is decided, whole in one queue
-// not known ahead: the first queue to report it covers its whole range.
-constexpr uint32_t SIM_PART_ANY_QUEUE = 1U << 31;
-struct SimPartDep {
-    int32_t task;
-    uint32_t queues;  // bit q: queue q runs a piece of it; or SIM_PART_ANY_QUEUE
-};
-
-// One entry of a partition, a single-part task on this queue, its partition-local
-// index, and the set of conditions it waits on.
-struct SimPartEntry {
-    uint64_t index;  // this queue's position, which its manager retires
+// One entry of a subpartition: a single-part task on this queue, the position its
+// manager retires, and the local id its finish marks.
+struct SimLocalEntry {
+    uint64_t index;
     int32_t func_id;
     int32_t task_id;  // the supertask it is a piece of
     SimTaskType type;
     uint32_t set;
-    uint32_t pindex;  // its index in the partition
+    uint32_t local;
 };
-// What a set of entries waits for: the producers deps[first .. first + n), and the
-// partition's watermark reaching `threshold` -- every index below it finished. A
-// set's entries are one supertask's piece. An empty set's entries finish without
-// a core once its conditions are met, as if they had run.
-struct SimPartSet {
+// A run of local ids a set waits on: a piece of its producer run here, or the one id
+// that stands for a producer run elsewhere.
+struct SimLocalRange {
+    uint32_t lo;
+    uint32_t hi;
+};
+// What a set's entries wait for: the ranges [first, first + n), and the watermark
+// reaching `threshold` -- every local id below it finished. A set's entries are one
+// supertask's piece. When the last of them finishes, the queue matches `gid` against
+// its own map, unless it is 0, and announces it on its lane if `announce`. An empty
+// set's entries finish without a core once its conditions are met, as if they had
+// run.
+struct SimLocalSet {
     uint32_t first;
     uint32_t n;
     uint32_t threshold;
+    uint32_t gid;
     bool empty;
+    bool barrier;   // the threshold is the end of the subpartition before
+    bool announce;  // another queue maps `gid`
+};
+// A global id this queue maps to one of its local ids, and how many announcements of
+// it -- from every queue, its own included -- that id waits for.
+struct SimMapEntry {
+    uint32_t gid;
+    uint32_t local;
+    uint32_t expected;
 };
 
-// Switch this run's queues to partition mode, or out of it. In it, each queue keeps
-// a store for the partitions it is given and exchanges completions with the others.
-// Call before any queue is accessed in the run.
+// Switch this run's queues to partition mode, or out of it. Call before any queue is
+// accessed in the run.
 void set_partition_mode(bool on);
 
-// Give this queue entries of partition `part`, which spans `size` indices. Every
-// queue learns a partition's size from its own manager, with n == 0 when its share
-// is empty. An entry waits for its queue to reach its partition -- the watermark of
-// the one before covering all of it -- then for its set's producers and threshold:
-// a producer finished here is known at once, elsewhere SIM_GQ_EXCHANGE_NS after
-// that queue's next broadcast. Every entry of one supertask's piece on this queue
-// arrives in one call. Returns false, admitting nothing, when the store cannot
-// take them.
-bool submit_partition(
-    uint32_t queue_idx, int32_t part, uint32_t size, const SimPartEntry *entries, uint32_t n, const SimPartSet *sets,
-    uint32_t set_n, const SimPartDep *deps, uint32_t dep_n
+// Install partition `part`'s subpartition on this queue: the local ids it spans,
+// [base, base + span), right after the one before, and its map. Partitions are
+// installed in order. Returns false, installing nothing, when the map has no room.
+bool install_subpartition(
+    uint32_t queue_idx, int32_t part, uint32_t base, uint32_t span, const SimMapEntry *map, uint32_t n
 );
 
-// The partition this queue is running now, and how many entries its store can
+// Give this queue entries of partition `part`, whose subpartition is installed. Every
+// entry of one piece arrives in one call. Returns false, admitting nothing, when the
+// store cannot take them.
+bool submit_local(
+    uint32_t queue_idx, int32_t part, const SimLocalEntry *entries, uint32_t n, const SimLocalSet *sets, uint32_t set_n,
+    const SimLocalRange *ranges, uint32_t range_n
+);
+
+// Mark local ids [lo, hi) finished: ids held for work that did not come. They land
+// once the look-ahead covers them.
+void fill_local(uint32_t queue_idx, uint32_t lo, uint32_t hi);
+
+// The partition this queue's watermark is in now, and how many entries its store can
 // still take. Part of the status a manager reads anyway.
 int32_t queue_partition(uint32_t queue_idx);
 uint32_t part_store_room(uint32_t queue_idx);
 
-// The partition store over the run: the most entries resident at once; completions
-// learned from the other queues; releases timed on one, and how many were learned
-// only after this queue's replay had passed them, by how much in all, and by the
-// kind of condition learned last -- arrival, a producer here or in another queue,
-// the threshold, the partition switch; sets that waited on the watermark after
-// their producers had finished, and for how long -- for a threshold, and for the
-// look-ahead; empty pieces finished; partitions this queue moved past; and entries
-// that arrived after their queue had reached their partition, and how long after.
+// The partition store over the run: the most entries resident at once and the most
+// global ids mapped at once; announcements sent, received from the other queues,
+// matched against the map, received for a partition this queue had not installed yet,
+// and sent a cycle late because the queue's lane was taken; releases timed on one,
+// and how many were learned only after this queue's replay had passed them, by how
+// much in all, and by the kind of condition learned last -- arrival, a range finished
+// here or standing for another queue, the threshold, the map; sets that waited on the
+// watermark after their other conditions were met, and for how long -- for producers
+// past the fourth, for the look-ahead, and for the subpartition before; empty pieces
+// finished, fills, partitions this queue moved past; the local ids its stream used,
+// and the ranges named inconsistently.
 struct SimPartStats {
     uint64_t resident_peak;
+    uint64_t map_peak;
+    uint64_t sent;
     uint64_t events_in;
+    uint64_t matched;
+    uint64_t early;
+    uint64_t bumped;
     uint64_t timed;
     uint64_t late;
     uint64_t late_ns;
     uint64_t late_by[5];
-    uint64_t wm_waits;
-    uint64_t wm_wait_ns;
-    uint64_t la_waits;
-    uint64_t la_wait_ns;
+    uint64_t waits[3];
+    uint64_t wait_ns[3];
     uint64_t skips;
+    uint64_t fills;
     uint64_t switches;
-    uint64_t behind;
-    uint64_t behind_ns;
+    uint64_t stream_len;
+    uint64_t range_conflicts;
 };
 void queue_part_stats(uint32_t queue_idx, SimPartStats *out);
 
@@ -557,10 +575,12 @@ struct SimQueueEntryStore {
     uint32_t bell_token = 0;
     // The supertask this entry is a piece of, for an entry of a partition; -1
     // otherwise. The queue counts a piece finished when every entry of it has. The
-    // entry's partition and its index there, which its finish marks known.
+    // entry's partition, the local id its finish marks known, and the piece it counts
+    // toward.
     int32_t piece_task = -1;
     int32_t piece_part = -1;
     uint32_t piece_index = 0;
+    uint32_t piece = UINT32_MAX;
 };
 
 // Work that did not fit inside the latency a poll models, summed, and how many

@@ -20,8 +20,8 @@ need no predicate hardware at all.
 takes no index -- `finish_partitions` passes levels through it -- and `part_feeds` is
 false for it. Nothing else changed: the managers' existing hold path covers the
 consumers. Measured on aSim beside M0, the design that posts predicated pieces up
-front and answers them, and the adopted design that posts them decided
-([partitions.md](../asim/partitions.md)): deepseek_v4 expanded on two dies,
+front and answers them, and the design then adopted, which posts them decided
+([shared watermark](2026-10-gq-shared-watermark-partitions.md)): deepseek_v4 expanded on two dies,
 `rt_declare_partitions(372)`, eight rounds a rep with the first two dropped.
 
 ## Result
@@ -58,5 +58,6 @@ out of a predicated task that runs, each link of a chain included.
 
 ## References
 
-- [docs/asim/partitions.md](../asim/partitions.md) -- the adopted design and its
-  measurement.
+- [2026-10-gq-shared-watermark-partitions.md](2026-10-gq-shared-watermark-partitions.md)
+  -- the design this was measured against, and its measurement.
+- [docs/asim/partitions.md](../asim/partitions.md) -- the design that replaced it.

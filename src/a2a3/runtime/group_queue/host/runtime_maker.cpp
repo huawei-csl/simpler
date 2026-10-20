@@ -828,6 +828,8 @@ int32_t run_host_orchestration(
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.total_tasks = total_tasks;
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.silo_tasks = orchestrator.silo_tasks();
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.partitions = orchestrator.partitions();
+    reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.plan_offset = 0;
+    reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.plan_words = 0;
 
     // The device reads no task slot past total_tasks, so only that prefix of each
     // segment has to travel. In the mirror the orchestrator wrote, the four
@@ -957,6 +959,15 @@ int32_t run_host_orchestration(
         static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
     );
     always_assert(compacted == image_bytes);
+    // The partition plan is part of the fanin pool's prefix, which the restack moved
+    // to the image's own pitch; only now is its offset in the image known.
+    if (orchestrator.partitions() > 0 && orchestrator.partition_plan_first() >= 0) {
+        SharedMemoryTaskHeader &image_tasks = reinterpret_cast<SharedMemoryHeader *>(upload_base + copied_bytes)->tasks;
+        const uint64_t plan_offset = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).fanin_pool +
+                                     static_cast<uint64_t>(orchestrator.partition_plan_first()) * sizeof(int32_t);
+        image_tasks.plan_offset = static_cast<uint32_t>(plan_offset);
+        image_tasks.plan_words = orchestrator.partition_plan_words();
+    }
 
     const BindPhaseMark h2d_phase = bind_phase_begin();
     if (api->copy_to_device(arena_dev + layout.off_copied_begin, upload_base, upload_bytes) != 0) {

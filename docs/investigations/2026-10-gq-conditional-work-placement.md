@@ -3,7 +3,7 @@
 **Date**: 2026-10-19
 **Verdict**: dropped -- conditional work goes through a shared ring with no room
 kept, and the store holds 1,024 entries
-([partitions.md](../asim/partitions.md#conditional-work-is-placed-when-decided))
+([the shared-watermark design](2026-10-gq-shared-watermark-partitions.md), since superseded)
 
 ## Question
 
@@ -69,5 +69,7 @@ the ring's reservation at 1,024 entries has not been measured -- or deal by quot
 
 ## References
 
-- [docs/asim/partitions.md](../asim/partitions.md) -- the adopted design and its
-  measurement.
+- [2026-10-gq-shared-watermark-partitions.md](2026-10-gq-shared-watermark-partitions.md)
+  -- the design this was measured on, and its measurement.
+- [docs/asim/partitions.md](../asim/partitions.md) -- the design that replaced it,
+  which deals conditional work in whole chains.

@@ -106,6 +106,12 @@ struct alignas(64) SharedMemoryTaskHeader {
     // How many partitions the graph was cut into; zero when it declared none.
     int32_t partitions;
 
+    // Where the partition plan sits, in bytes from this header, and its size in
+    // 32-bit words; both zero when there is none. It rides at the end of the fanin
+    // pool, so the image carries it with that pool's prefix.
+    uint32_t plan_offset;
+    uint32_t plan_words;
+
     // The byte holds a ChipTaskState and only ever advances:
     //   PENDING -> PUBLISHED -> COMPLETED
     // Both transitions are plain stores; monotonicity is by construction, not
@@ -152,6 +158,8 @@ static_assert(offsetof(SharedMemoryTaskHeader, task_storage) == 0, "SharedMemory
 static_assert(offsetof(SharedMemoryTaskHeader, total_tasks) == 16, "SharedMemoryTaskHeader total_tasks layout drift");
 static_assert(offsetof(SharedMemoryTaskHeader, silo_tasks) == 20, "SharedMemoryTaskHeader silo_tasks layout drift");
 static_assert(offsetof(SharedMemoryTaskHeader, partitions) == 24, "SharedMemoryTaskHeader partitions layout drift");
+static_assert(offsetof(SharedMemoryTaskHeader, plan_offset) == 28, "SharedMemoryTaskHeader plan_offset layout drift");
+static_assert(offsetof(SharedMemoryTaskHeader, plan_words) == 32, "SharedMemoryTaskHeader plan_words layout drift");
 
 /**
  * Shared memory header structure

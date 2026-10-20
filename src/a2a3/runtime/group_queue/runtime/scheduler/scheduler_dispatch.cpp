@@ -1344,8 +1344,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // A silo's positions are read only when the controller has something to
         // report: its events carry their own instants, so a read that would return
         // nothing new is one the manager can skip without changing what it learns.
+        // A partition's controller also moves without positions out: ids standing for
+        // other groups' work land from the ring, and its watermark is what lets this
+        // thread map and post the next partition.
         bool try_completed = tracker.has_any_running_cores() ||
-                             (gq_outstanding && (!silo_active_ || asimgq::poll_may_report(thread_idx)));
+                             (gq_outstanding && (!silo_active_ || asimgq::poll_may_report(thread_idx))) ||
+                             (part_active_ && !gq_outstanding && asimgq::poll_may_report(thread_idx));
         if (try_completed) {
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress

@@ -30,6 +30,7 @@
 #include <atomic>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include "host_build_graph/task_allocator.h"
 #include "graph_cache.h"
@@ -117,6 +118,10 @@ struct OrchestratorState {
     // the cut produced. Zero target: no partitions.
     int32_t partition_target{0};
     int32_t partition_count{0};
+    // The partition plan, at the end of the fanin pool: its first element, or -1
+    // when there is none, and its size in 32-bit words.
+    int32_t plan_first{-1};
+    uint32_t plan_words{0};
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
@@ -205,13 +210,24 @@ struct OrchestratorState {
 
     // Run the silos one partition at a time: cut the graph, once it is complete,
     // into runs of about `target_tasks` tasks where the fewest dependencies cross,
-    // and number each partition's tasks for the controllers. Implies silos.
+    // and build the partition plan the controllers run it from. Implies silos.
     void declare_partitions(int32_t target_tasks);
     void finish_partitions();
     int32_t partitions() const { return partition_count; }
+    int32_t partition_plan_first() const { return plan_first; }
+    uint32_t partition_plan_words() const { return plan_words; }
 
     // Called once orchestration is over, when the whole declaration set is known.
     void finish_groups();
+
+    // Build the partition plan for partitions starting at `starts` (the last entry is
+    // the task count), with every task's dependency level in its partition and each
+    // partition's tasks the controllers run, in level order. Writes it at the end of
+    // the fanin pool and returns true, or returns false when the graph cannot run
+    // from a plan. Defined in host/partition_plan.cpp.
+    bool build_partition_plan(
+        const std::vector<int32_t> &starts, const std::vector<int32_t> &level, const std::vector<int32_t> &order
+    );
 
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);

@@ -115,8 +115,8 @@ latency each move the result by 0.1 % or less.
 ## Running partitions instead of feeding
 
 [partitions.md](partitions.md) runs the graph a partition at a time instead: each
-controller holds its share of a partition resident and resolves the partition's
-dependencies with the others through one shared watermark, so neither the feed
+controller holds its share of a partition resident, numbered locally, and learns of
+the others' work from the global ids they announce on a ring, so neither the feed
 order nor a spread producer's pieces stop anything.
 
 ## Limits

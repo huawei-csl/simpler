@@ -12,6 +12,7 @@
 
 #ifdef __SIMULATED_DEVICE__
 #include "aicpu/asimgq_core.h"
+#include "host_build_graph/partition_plan.h"
 #include "scheduler/gq_index_space.h"
 #endif
 
@@ -325,119 +326,107 @@ private:
     // Whether this run feeds silos: the graph stamped at least one task.
     bool silo_active_ = false;
 
-    // Hand this thread's controller its share of each partition, a piece at a time
-    // as its store has room, a predicated piece once it is decided. The controller
-    // moves from one partition to the next by itself. Returns true if anything was
-    // handed over.
+    // Hand this thread's controller its share of each partition from the partition
+    // plan: the partition's map first, then its items in order as the store has room,
+    // a home slot or predicated piece once it is decided, and the chains dealt to this
+    // group once their producers outside them are complete. The controller moves from
+    // one partition to the next by itself. Returns true if anything was handed over.
     bool feed_partitions(int32_t thread_idx);
 
-    // One silo's share of a partition, built ahead of handing it over: per piece of a
-    // supertask it runs, the entries in index order, the producers it names and the
-    // threshold its partition's watermark must reach -- positions are taken when a
-    // piece is posted. A supertask is held back when it names a producer the
-    // controllers cannot see finish; it is posted once that producer has.
-    //
-    // A held supertask: the task whose finish may let it go, or -1 when any finish
-    // may, and the entries its piece takes in the store.
-    struct HeldPiece {
-        int32_t id;
-        int32_t wait_on;
+    // An item of the plan held back: a home slot or a predicated piece waiting for its
+    // decision, or a piece naming a producer the controllers do not run. `entries` is
+    // what it takes in the store.
+    struct PartHeld {
+        int32_t part;
+        uint32_t item;  // its offset in the plan
         uint32_t entries;
     };
-    struct PartBatch {
-        int32_t part = -1;
-        uint32_t size = 0;                  // indices the partition spans
-        std::vector<int32_t> order;         // the supertasks to build, in index order
-        size_t built = 0;                   // how many of them are built
-        std::vector<int32_t> ids;           // per piece: its supertask
-        std::vector<int32_t> blocks;        // per piece: its block count here
-        std::vector<uint32_t> first_entry;  // per piece: its first entry; one more at the end
-        std::vector<asimgq::SimPartEntry> entries;
-        std::vector<SubtaskSlot> subslots;
-        std::vector<asimgq::SimPartSet> sets;  // per piece
-        std::vector<asimgq::SimPartDep> deps;
-        std::vector<HeldPiece> held;
-        size_t posted = 0;       // pieces handed over
-        bool announced = false;  // the controller knows the partition's size
-        bool complete() const { return part >= 0 && built == order.size(); }
-    };
-    // Start `b` on partition `part`, whose supertasks are `ids`, and build up to
-    // `limit` more of them, in index order. A producer finished by now, or in an
-    // earlier partition, is not named: the controller reaches `part` only once the
-    // one before it has finished whole. Building a step at a time keeps the dispatch
-    // loop, and the controller it reads, moving while a partition is built.
-    void begin_batch(int32_t part, uint32_t size, const std::vector<int32_t> &ids, PartBatch &b);
-    void build_batch(int32_t thread_idx, PartBatch &b, size_t limit);
-    // Take positions for the next pieces of `b` that the store and the position
-    // window have room for, and hand them to the controller. Returns whether any
-    // went.
-    bool post_pieces(int32_t thread_idx, PartBatch &b);
-
-    // Where a thread's feed stands: the partition it is handing over, the next one,
-    // built while the one before runs, and the supertasks it holds back.
+    // Where a thread's feed stands, and one submit's worth of entries built before it
+    // goes.
     struct PartFeed {
-        PartBatch cur;
-        PartBatch next;
-        int32_t next_first = 0;       // first task id of the partition to build next
-        std::vector<uint32_t> sizes;  // per partition built so far: the indices it spans
-        PartBatch retry;
-        PartBatch routed;          // one conditional task routed here, built whole
-        uint64_t cond_cursor = 0;  // this manager's next ticket on the shared ring
-        // Every piece held back, whatever its partition. A later partition's pieces
-        // leave room in the store for an earlier one's, which its controller needs
-        // before it can move on. Per partition, the entries held.
-        std::vector<HeldPiece> held_back;
-        std::vector<int64_t> held_sum;
-        std::vector<int32_t> ids;
+        int32_t installed = 0;  // partitions whose map this controller has, from the first
+        int32_t cur = 0;        // the partition being posted in order
+        uint32_t cur_item = 0;  // its next item
+        int32_t filled = 0;     // partitions whose dynamic region is settled, from the first
+        std::vector<PartHeld> held;
+        std::vector<uint32_t> held_entries;  // per partition: the entries held back
         uint64_t held_epoch = ~0ULL;
+        uint64_t route_cursor = 0;           // this group's next chain on its route ring
+        std::vector<uint32_t> dyn_next;      // per partition: the next free id of this group's dynamic region
+        std::vector<int32_t> chains_posted;  // per partition: the chains dealt here and posted
+        std::vector<uint8_t> chain_seen;     // per chain: decided by this manager
+        std::vector<asimgq::SimLocalEntry> entries;
+        std::vector<asimgq::SimLocalSet> sets;
+        std::vector<asimgq::SimLocalRange> ranges;
+        std::vector<SubtaskSlot> subslots;  // per entry
+        std::vector<int32_t> set_task;      // per set
+        std::vector<int32_t> set_blocks;    // per set: blocks published
+        std::vector<int16_t> set_precount;  // per set: subtasks a home slot completes beyond its one entry
+        std::vector<int32_t> walk;
         uint64_t partitions = 0;
         uint64_t pieces = 0;
-        uint64_t entries = 0;
-        uint64_t held_ordinary = 0;
+        uint64_t entries_posted = 0;
+        uint64_t map_entries = 0;
+        // Home slots: posted as empty pieces, and left to the map because their chain ran.
+        uint64_t slots_skipped = 0;
+        uint64_t slots_routed = 0;
+        uint64_t held_count = 0;
         uint64_t held_fed = 0;
+        // Passes that found no room, the partition too far ahead of the controller,
+        // some controller not yet mapping it, and its map not yet installed here.
         uint64_t wait_room = 0;
         uint64_t wait_part = 0;
-        // Predicated pieces: held back until the value their predicate reads was
-        // final, each counted once; posted decided, how many of those had no writer
-        // named, and how many went empty.
-        uint64_t pred_held = 0;
-        uint64_t decided = 0;
-        uint64_t decided_unnamed = 0;
-        uint64_t skipped = 0;
-        // Conditional tasks this manager decided to run and put on the shared ring, and
-        // those it posted from there.
-        uint64_t routed_out = 0;
-        uint64_t routed_in = 0;
-        // Real time spent building batches, and posting them; of the posting, the
-        // part spent in the queue's submit, and the part of that on its ledger.
-        uint64_t build_ticks = 0;
+        uint64_t wait_gate = 0;
+        uint64_t wait_install = 0;
+        // Chains this manager decided and dealt, those it posted, passes a chain waited
+        // for its producers outside it, and dynamic regions filled.
+        uint64_t chains_decided = 0;
+        uint64_t chains_dealt = 0;
+        uint64_t chains_in = 0;
+        uint64_t chain_wait_ext = 0;
+        uint64_t fills = 0;
+        // Real time spent posting; of it, the part spent in the queue's submit, and the
+        // part of that on its ledger.
         uint64_t post_ticks = 0;
         uint64_t submit_ticks = 0;
         uint64_t submit_ledger_ticks = 0;
     };
     PartFeed part_feed_[PLATFORM_MAX_AICPU_THREADS];
     bool part_active_ = false;
+    const uint32_t *plan_ = nullptr;
+    // The plan's subpartition of `part` for group `g`.
+    const part_plan::SubPartition &plan_sub(int32_t part, int32_t g) const;
+    // Entries the store and the position window can take for partition `part`,
+    // leaving what an earlier partition's held items will need.
+    uint32_t part_room(int32_t thread_idx, int32_t part) const;
+    // Stage an item to go, to run or as an empty piece.
+    void stage_item(PartFeed &pf, const part_plan::Item &item, bool empty);
+    // Take positions for what is staged and hand it to the controller.
+    bool submit_staged(int32_t thread_idx, int32_t part);
+    // Deal a decided chain, once: to run, to the group whose turn it is in its
+    // partition.
+    void decide_chain(int32_t thread_idx, uint32_t chain, bool runs);
+    bool post_in_order(int32_t thread_idx);
+    bool feed_held(int32_t thread_idx);
+    bool feed_chains(int32_t thread_idx);
+    bool feed_fills(int32_t thread_idx);
 
-    // Conditional work, spread evenly over the groups. A predicated task the
-    // controllers run whole is decided by the manager of the group the host gave it:
-    // skipped, it goes to that group as an empty piece; to run, it goes on a ring every
-    // manager shares, and the k-th task put there is posted by manager k % groups to
-    // its own controller, in the order put.
-    struct CondRoute {
-        int32_t task;
-        int32_t part;
-    };
-    static constexpr uint32_t kCondRing = 16384;
-    CondRoute cond_ring_[kCondRing];
-    std::atomic<uint64_t> cond_seq_[kCondRing];  // Vyukov slot sequence: t free, t + 1 written
-    std::atomic<uint64_t> cond_tail_{0};
-    bool cond_slots_set_ = false;  // every slot's sequence has been set once
-    void route_conditional(int32_t thread_idx, int32_t task, int32_t part);
-    // Recount a feed's held entries per partition, after its held list changed.
-    void tally_held(PartFeed &pf);
-    // Post the conditional tasks routed to this thread's group that its controller can
-    // take, in ticket order. Returns true if any went.
-    bool feed_routed(int32_t thread_idx);
+    // Shared between the managers, per partition: how many have installed its map --
+    // its items go out once every one has, so no announcement of it can reach a
+    // controller not yet mapping it -- how many of its chains are decided, how many
+    // have been dealt in all, and how many to each group.
+    static constexpr int32_t kMaxPlanPartitions = 1024;
+    std::atomic<int32_t> part_installed_[kMaxPlanPartitions];
+    std::atomic<int32_t> chains_decided_[kMaxPlanPartitions];
+    std::atomic<int32_t> chains_dealt_seq_[kMaxPlanPartitions];
+    std::atomic<int32_t> chains_dealt_[kMaxPlanPartitions][part_plan::kGroups];
+    // Each group's chains, in the order dealt: a multi-producer ring per group, one
+    // slot's sequence reading t when free for ticket t and t + 1 once written.
+    static constexpr uint32_t kRouteRing = 4096;
+    uint32_t route_ring_[part_plan::kGroups][kRouteRing];
+    std::atomic<uint64_t> route_seq_[part_plan::kGroups][kRouteRing];
+    std::atomic<uint64_t> route_tail_[part_plan::kGroups];
+    bool route_slots_set_ = false;  // every slot's sequence has been set once
 
     // Split every shape's ready-queue slot region into one disjoint span per
     // Scheduler thread. Runs once per run, before any push.

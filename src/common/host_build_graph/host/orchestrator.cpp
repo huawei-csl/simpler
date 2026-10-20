@@ -1876,7 +1876,6 @@ static TaskOutputTensors submit_task_common(
     task.group_extent = 0;
     task.predicate_writer = pred_writer;
     task.part = 0;
-    task.part_size = 0;
     task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = aic_kernel_id;
@@ -2160,7 +2159,6 @@ bool graph_submit_outer(
     task.group_extent = 0;
     task.predicate_writer = -1;
     task.part = 0;
-    task.part_size = 0;
     task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
@@ -2959,17 +2957,18 @@ void OrchestratorState::declare_partitions(int32_t target_tasks) {
 
 // Cut the graph into partitions of about `partition_target` tasks. Each boundary
 // moves, within a quarter partition of where it would fall, to the point the fewest
-// dependencies cross: the controllers finish a partition before they start the
-// next, so whatever a boundary splits that could have overlapped it waits.
+// dependencies cross: whatever a boundary splits that could have overlapped it
+// waits for the end of a group's share of the partition before it.
 //
-// Then number each partition for the controllers. Every task a silo runs takes one
-// index per block and active subtask, consecutive, and the tasks are ordered by
-// dependency level within the partition: what finishes early takes the low
-// indices, so the watermark keeps up with the work and a look-ahead of a few hundred
-// covers the rest. A dependency-only task takes no index; its level passes through
-// to its consumers, which name its producers instead.
+// Then order each partition's tasks by dependency level -- what finishes early
+// first, so a group's watermark keeps up with its work and its look-ahead covers the
+// rest -- and build the plan the controllers run the partitions from. A
+// dependency-only task takes no place; its level passes through to its consumers,
+// which name its producers instead.
 void OrchestratorState::finish_partitions() {
     partition_count = 0;
+    plan_first = -1;
+    plan_words = 0;
     const int32_t total = task_allocator.active_count();
     if (partition_target <= 0 || total <= 0) return;
     SharedMemoryTaskHeader &tasks = sm_header->tasks;
@@ -3005,24 +3004,17 @@ void OrchestratorState::finish_partitions() {
         starts.push_back(best);
     }
     starts.push_back(total);
-    const auto indices_of = [&](int32_t id) {
+    const auto runs = [&](int32_t id) {
         const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
-        if (tasks.get_task_by_task_id(id).silo == TASK_SILO_NONE || tasks.is_completed(id) ||
-            slot.logical_block_num <= 0) {
-            return 0;
-        }
-        int32_t subs = 0;
-        for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
-            if (slot.active_mask.subtask_active(static_cast<SubtaskSlot>(sub))) ++subs;
-        }
-        return static_cast<int32_t>(slot.logical_block_num) * subs;
+        return tasks.get_task_by_task_id(id).silo != TASK_SILO_NONE && !tasks.is_completed(id) &&
+               slot.logical_block_num > 0 && slot.active_mask.to_shape() != ResourceShape::DUMMY;
     };
     std::vector<int32_t> level(static_cast<size_t>(total), 0);
     std::vector<int32_t> order;
     for (size_t part = 0; part + 1 < starts.size(); ++part) {
         const int32_t first = starts[part];
         const int32_t end = starts[part + 1];
-        order.clear();
+        const size_t from = order.size();
         for (int32_t id = first; id < end; ++id) {
             const TaskPayload &p = tasks.get_slot_state_by_task_id(id).to_payload();
             const int32_t *fanin = p.fanin_data();
@@ -3030,34 +3022,26 @@ void OrchestratorState::finish_partitions() {
             for (int32_t k = 0; k < p.fanin_count; ++k) {
                 const int32_t prod = fanin[k];
                 if (prod < first || prod >= id) continue;
-                lv = std::max(lv, level[static_cast<size_t>(prod)] + (indices_of(prod) > 0 ? 1 : 0));
+                lv = std::max(lv, level[static_cast<size_t>(prod)] + (runs(prod) ? 1 : 0));
             }
             level[static_cast<size_t>(id)] = lv;
             TaskDescriptor &t = tasks.get_task_by_task_id(id);
             t.part = static_cast<uint16_t>(part);
-            t.part_size = 0;
             t.part_index = TASK_PART_INDEX_NONE;
-            if (indices_of(id) > 0) order.push_back(id);
+            if (runs(id)) order.push_back(id);
         }
-        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+        std::stable_sort(order.begin() + static_cast<ptrdiff_t>(from), order.end(), [&](int32_t a, int32_t b) {
             return level[static_cast<size_t>(a)] < level[static_cast<size_t>(b)];
         });
-        int32_t next = 0;
-        for (const int32_t id : order) {
-            if (next + indices_of(id) > TASK_PART_MAX_INDICES) {
-                LOG_ERROR(
-                    "Partition %zu spans more than %d indices; running the graph without partitions", part,
-                    TASK_PART_MAX_INDICES
-                );
-                for (int32_t t = 0; t < total; ++t) {
-                    tasks.get_task_by_task_id(t).part_index = TASK_PART_INDEX_NONE;
-                }
-                return;
-            }
-            tasks.get_task_by_task_id(id).part_index = static_cast<uint16_t>(next);
-            next += indices_of(id);
+        for (size_t i = from; i < order.size(); ++i) {
+            tasks.get_task_by_task_id(order[i]).part_index = static_cast<uint16_t>(i - from);
         }
-        tasks.get_task_by_task_id(first).part_size = static_cast<uint16_t>(next);
+    }
+    if (!build_partition_plan(starts, level, order)) {
+        for (int32_t t = 0; t < total; ++t) {
+            tasks.get_task_by_task_id(t).part_index = TASK_PART_INDEX_NONE;
+        }
+        return;
     }
     partition_count = static_cast<int32_t>(starts.size()) - 1;
 }
@@ -3319,7 +3303,6 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     task.group_extent = 0;
     task.predicate_writer = -1;
     task.part = 0;
-    task.part_size = 0;
     task.part_index = TASK_PART_INDEX_NONE;
     task.silo = TASK_SILO_NONE;
     task.kernel_id[static_cast<int>(SubtaskSlot::AIC)] = INVALID_KERNEL_ID;

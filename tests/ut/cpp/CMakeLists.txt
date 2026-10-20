@@ -944,6 +944,7 @@ set(HBG_SHARED_RUNTIME_SOURCES
 )
 set(HBG_ORCH_SHARED_SOURCES
     ${HBG_HOST_DIR}/orchestrator.cpp
+    ${HBG_HOST_DIR}/partition_plan.cpp
     ${CMAKE_SOURCE_DIR}/stubs/hbg_orch_stubs.cpp
     ${HBG_SHARED_RUNTIME_SOURCES}
 )

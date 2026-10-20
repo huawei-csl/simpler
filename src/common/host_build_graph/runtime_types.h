@@ -269,12 +269,9 @@ constexpr uint32_t TASK_SILO_HINTS = 240;
 constexpr int32_t TASK_SILO_SPREAD_MIN_BLOCKS = 4;
 // The same, when the graph declares partitions.
 constexpr int32_t TASK_PART_SPREAD_MIN_BLOCKS = 8;
-// A partition-local index is what the controllers' watermark and look-ahead count
-// in: one per block and active subtask of every task the silos run. A task that
-// takes none -- dependency-only, or one the controllers cannot run -- carries this.
+// The part_index of a task the controllers do not run within its partition --
+// dependency-only, or one they cannot run.
 constexpr uint16_t TASK_PART_INDEX_NONE = 0xFFFF;
-// The most indices one partition may span: an index is 11 bits.
-constexpr int32_t TASK_PART_MAX_INDICES = 2048;
 
 /**
  * Task descriptor structure (shared memory)
@@ -318,12 +315,10 @@ struct alignas(64) TaskDescriptor {
     int32_t predicate_writer;
 
     // The partition the task belongs to, when the graph declares partitions: a run
-    // of consecutive tasks the controllers finish before they start the next.
-    // `part_index` is the first partition-local index of the task's own tasks, which
-    // are consecutive, block by block, or TASK_PART_INDEX_NONE when it takes none. On
-    // a partition's first task, `part_size` is how many indices the partition spans.
+    // of consecutive tasks. `part_index` is the task's place in its partition's
+    // dependency-level order, or TASK_PART_INDEX_NONE when the controllers do not run
+    // it; the partition plan holds where each group runs it.
     uint16_t part;
-    uint16_t part_size;
     uint16_t part_index;
 
     // The silo the task is fed to: one of the TASK_SILO_* values.
@@ -331,7 +326,7 @@ struct alignas(64) TaskDescriptor {
 
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[1];
+    uint8_t reserved[3];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();

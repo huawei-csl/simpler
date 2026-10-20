@@ -16,8 +16,8 @@
  *   a hint            anything narrower: its latest stamped producer's, else the
  *                     next one in turn
  *
- * and, with them, the partition-local indices and the writer of the element a
- * dispatch predicate reads.
+ * and, with them, the partitions, the partition plan the controllers run them from,
+ * and the writer of the element a dispatch predicate reads.
  */
 
 #include <gtest/gtest.h>
@@ -28,6 +28,7 @@
 #include "utils/device_arena.h"
 #include "scheduler/scheduler.h"
 #include "host_build_graph/orchestrator.h"
+#include "host_build_graph/partition_plan.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/task_id.h"
 
@@ -78,6 +79,30 @@ protected:
     }
 
     uint8_t silo_of(TaskId id) { return sm_handle->header->tasks.get_task_by_task_id(id.local_id()).silo; }
+
+    // The group a narrow task runs in, under the plan's group count.
+    uint32_t group_of(TaskId id) { return static_cast<uint32_t>(silo_of(id) - TASK_SILO_FIRST) % part_plan::kGroups; }
+
+    const uint32_t *plan() const {
+        return reinterpret_cast<const uint32_t *>(orch.fanin_pool + orch.partition_plan_first());
+    }
+
+    const part_plan::SubPartition &sub(uint32_t part, uint32_t g) const {
+        const auto &h = *part_plan::at<part_plan::Header>(plan(), 0);
+        return *part_plan::at<part_plan::SubPartition>(
+            plan(), h.sub_offset + (part * part_plan::kGroups + g) * part_plan::words_of<part_plan::SubPartition>()
+        );
+    }
+
+    // The item of `id` in a subpartition, or nullptr.
+    const part_plan::Item *item_of(const part_plan::SubPartition &sp, TaskId id) const {
+        for (uint32_t i = 0; i < sp.items; ++i) {
+            const auto *item =
+                part_plan::at<part_plan::Item>(plan(), sp.item_offset + i * part_plan::words_of<part_plan::Item>());
+            if (item->task == id.local_id()) return item;
+        }
+        return nullptr;
+    }
 };
 
 TEST_F(HbgSiloStampTest, UndeclaredGraphStampsNothing) {
@@ -127,8 +152,7 @@ TEST_F(HbgSiloStampTest, ConsumerOfOnlySpreadProducersTakesTheNextHint) {
 
 // Partitions: cut once the graph is complete, each boundary moved within a quarter
 // partition to where the fewest dependencies cross, every task stamped with its
-// partition and each partition's first task with how many indices it spans -- one
-// per block and active subtask of every task the silos run.
+// partition, and a plan built for the controllers.
 TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
     orch.declare_partitions(4);
     // Two chains of four, the second fed by the last task of the first: every cut
@@ -146,8 +170,40 @@ TEST_F(HbgSiloStampTest, PartitionsTieBreakTowardTheTargetSize) {
         EXPECT_EQ(tasks.get_task_by_task_id(id).part, 0);
     for (int32_t id = 4; id < 8; ++id)
         EXPECT_EQ(tasks.get_task_by_task_id(id).part, 1);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 4);
-    EXPECT_EQ(tasks.get_task_by_task_id(4).part_size, 4);
+    ASSERT_GE(orch.partition_plan_first(), 0);
+    const auto &h = *part_plan::at<part_plan::Header>(plan(), 0);
+    EXPECT_EQ(h.words, orch.partition_plan_words());
+    EXPECT_EQ(h.groups, part_plan::kGroups);
+    EXPECT_EQ(h.partitions, 2U);
+}
+
+// A task with a producer in an earlier partition names none of it: its threshold is
+// its group's share of the partition starting, which the group's watermark reaches
+// once every earlier share has finished.
+TEST_F(HbgSiloStampTest, PlanHoldsAnEarlierPartitionsConsumerAtTheBoundary) {
+    orch.declare_partitions(4);
+    std::vector<TaskId> chain{submit(1)};
+    for (int i = 0; i < 7; ++i)
+        chain.push_back(submit(1, &chain.back(), 1));
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 2);
+    const uint32_t g = group_of(chain[0]);
+    const part_plan::SubPartition &first = sub(0, g);
+    const part_plan::SubPartition &second = sub(1, g);
+    EXPECT_EQ(first.base, 0U);
+    EXPECT_EQ(first.span, 4U);
+    EXPECT_EQ(second.base, 4U);
+    const part_plan::Item *head = item_of(second, chain[4]);
+    ASSERT_NE(head, nullptr);
+    EXPECT_EQ(head->named, 0U);
+    EXPECT_EQ(head->threshold, second.base);
+    EXPECT_NE(head->flags & part_plan::kFlagBarrier, 0U);
+    const part_plan::Item *next = item_of(second, chain[5]);
+    ASSERT_NE(next, nullptr);
+    ASSERT_EQ(next->named, 1U);
+    EXPECT_EQ(next->ranges[0].lo, head->local);
+    EXPECT_EQ(next->ranges[0].hi, head->local + 1);
+    EXPECT_EQ(next->flags & part_plan::kFlagBarrier, 0U);
 }
 
 TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
@@ -168,13 +224,10 @@ TEST_F(HbgSiloStampTest, PartitionBoundaryMovesToTheNarrowerCut) {
     EXPECT_EQ(orch.partitions(), 2);
     EXPECT_EQ(tasks.get_task_by_task_id(4).part, 0);
     EXPECT_EQ(tasks.get_task_by_task_id(5).part, 1);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 5);
-    EXPECT_EQ(tasks.get_task_by_task_id(5).part_size, 3);
 }
 
-// Within a partition, indices follow dependency level, not submission order: a
-// root submitted late still precedes a consumer submitted early, and a task's
-// blocks take consecutive indices.
+// Within a partition, tasks are ordered by dependency level, not submission order:
+// a root submitted late still precedes a consumer submitted early.
 TEST_F(HbgSiloStampTest, PartitionIndicesFollowDependencyLevel) {
     orch.declare_partitions(100);
     const TaskId a = submit(1);
@@ -188,10 +241,9 @@ TEST_F(HbgSiloStampTest, PartitionIndicesFollowDependencyLevel) {
     EXPECT_EQ(tasks.get_task_by_task_id(c.local_id()).part_index, 1);
     EXPECT_EQ(tasks.get_task_by_task_id(b.local_id()).part_index, 2);
     EXPECT_EQ(tasks.get_task_by_task_id(d.local_id()).part_index, 3);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 5);
 }
 
-// A dependency-only task takes no index, and its consumer sits one level past the
+// A dependency-only task takes no place, and its consumer sits one level past the
 // dummy's producers rather than two.
 TEST_F(HbgSiloStampTest, DummyTakesNoIndexAndPassesItsLevelThrough) {
     orch.declare_partitions(100);
@@ -210,7 +262,39 @@ TEST_F(HbgSiloStampTest, DummyTakesNoIndexAndPassesItsLevelThrough) {
     EXPECT_EQ(tasks.get_task_by_task_id(root.local_id()).part_index, 1);
     EXPECT_EQ(tasks.get_task_by_task_id(b.local_id()).part_index, 2);
     EXPECT_EQ(tasks.get_task_by_task_id(c.local_id()).part_index, 3);
-    EXPECT_EQ(tasks.get_task_by_task_id(0).part_size, 4);
+}
+
+// A producer split across the groups stands, in the group of a consumer run whole,
+// as one proxy just below the consumer, mapped from the producer's global id and
+// waiting for all four of its pieces; every piece announces that id.
+TEST_F(HbgSiloStampTest, PlanProxiesAProducerRunElsewhere) {
+    orch.declare_partitions(100);
+    const TaskId wide = submit(TASK_PART_SPREAD_MIN_BLOCKS);
+    const TaskId narrow = submit(1, &wide, 1);
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 1);
+    const uint32_t home = group_of(narrow);
+    const part_plan::SubPartition &sp = sub(0, home);
+    ASSERT_EQ(sp.map, 1U);
+    const auto &m = *part_plan::at<part_plan::MapEntry>(plan(), sp.map_offset);
+    EXPECT_EQ(m.expected, part_plan::kGroups);
+    const part_plan::Item *consumer = item_of(sp, narrow);
+    ASSERT_NE(consumer, nullptr);
+    ASSERT_EQ(consumer->named, 1U);
+    EXPECT_EQ(consumer->ranges[0].lo, m.local);
+    EXPECT_EQ(consumer->ranges[0].hi, m.local + 1);
+    EXPECT_EQ(m.local + 1, consumer->local);
+    for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+        const part_plan::SubPartition &share = sub(0, g);
+        const part_plan::Item *piece = item_of(share, wide);
+        ASSERT_NE(piece, nullptr);
+        EXPECT_EQ(
+            piece->block_hi - piece->block_lo, static_cast<uint32_t>(TASK_PART_SPREAD_MIN_BLOCKS) / part_plan::kGroups
+        );
+        EXPECT_EQ(piece->gid, m.gid);
+        EXPECT_NE(piece->flags & part_plan::kFlagAnnounce, 0U);
+        if (g != home) EXPECT_EQ(share.map, 0U);
+    }
 }
 
 // With partitions, a supertask is split across the silos from
@@ -265,4 +349,60 @@ TEST_F(HbgSiloStampTest, PredicateNamesTheLastWriterOfItsElement) {
     SharedMemoryTaskHeader &tasks = sm_handle->header->tasks;
     EXPECT_EQ(tasks.get_task_by_task_id(p.local_id()).predicate_writer, lo_writer.local_id());
     EXPECT_EQ(tasks.get_task_by_task_id(plain.local_id()).predicate_writer, -1);
+}
+
+// Predicated tasks run whole in one group form a chain when they share a predicate
+// and depend on each other: the chain is decided once, at its first task's home
+// slot, and if it runs, it goes whole to one group, its tasks naming each other
+// relative to its start and its producers outside it listed for the manager.
+TEST_F(HbgSiloStampTest, PlanChainsConditionalTasksThatShareAPredicate) {
+    orch.declare_partitions(100);
+    MixedKernels mixed{};
+    mixed.aiv0_kernel_id = 0;
+    uint32_t shape[] = {16};
+    CoreTaskArgs make;
+    create_infos.emplace_back(shape, 1, DataType::INT32);
+    make.add_output(create_infos.back());
+    TaskOutputTensors made = orch.submit_task(mixed, make);
+    const TaskId writer = made.task_id();
+    const simpler::hbg::Tensor &count = made.get_ref(0);
+    CoreTaskPredicate pred;
+    pred.operand.tensor = &count;
+    pred.operand.ndims = 1;
+    pred.operand.indices[0] = 0;
+    pred.op = PredicateOp::GT;
+    pred.target = 0;
+    auto gated = [&](const TaskId *deps, uint32_t n) {
+        CoreTaskArgs args;
+        create_infos.emplace_back(shape, 1, DataType::FLOAT32);
+        args.add_output(create_infos.back());
+        args.set_predicate(pred);
+        if (n > 0) args.set_dependencies(deps, n);
+        return orch.submit_task(mixed, args).task_id();
+    };
+    const TaskId first = gated(&writer, 1);
+    const TaskId second = gated(&first, 1);
+    ASSERT_TRUE(second.is_valid());
+    orch.finish_partitions();
+    ASSERT_EQ(orch.partitions(), 1);
+    const auto &h = *part_plan::at<part_plan::Header>(plan(), 0);
+    ASSERT_EQ(h.chains, 1U);
+    const auto &c = *part_plan::at<part_plan::Chain>(plan(), h.chain_offset);
+    EXPECT_EQ(c.tasks, 2U);
+    EXPECT_EQ(c.ids, 2U);
+    EXPECT_EQ(c.owner, group_of(first));
+    ASSERT_EQ(c.external, 1U);
+    EXPECT_EQ(*reinterpret_cast<const int32_t *>(plan() + c.ext_offset), writer.local_id());
+    const auto &later =
+        *part_plan::at<part_plan::ChainTask>(plan(), c.task_offset + part_plan::words_of<part_plan::ChainTask>());
+    EXPECT_EQ(later.task, second.local_id());
+    ASSERT_EQ(later.named, 1U);
+    EXPECT_EQ(later.ranges[0].lo, 0U);
+    EXPECT_EQ(later.ranges[0].hi, 1U);
+    const part_plan::SubPartition &sp = sub(0, group_of(first));
+    const part_plan::Item *slot = item_of(sp, first);
+    ASSERT_NE(slot, nullptr);
+    EXPECT_EQ(slot->kind, static_cast<uint32_t>(part_plan::kSlot));
+    EXPECT_NE(slot->flags & part_plan::kFlagDecides, 0U);
+    EXPECT_EQ(sp.dyn_count, c.ids);
 }

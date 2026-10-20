@@ -14,7 +14,9 @@
 #include "aicpu/asimgq_core.h"
 #endif
 
+#include <algorithm>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdio>
 
 #include "assert_compat.h"
@@ -215,18 +217,21 @@ void SchedulerContext::log_stall_diagnostics(
 
     if (part_active_) {
         const PartFeed &pf = part_feed_[thread_idx];
+        const int32_t cur = pf.cur;
         LOG_INFO(
-            "[STALL thread=%d] PART queue_part=%d cur=%d posted=%zu/%zu announced=%d next=%d next_first=%d "
-            "held_back=%zu store_room=%u positions_room=%u wait_room=%" PRIu64 " wait_part=%" PRIu64,
-            thread_idx, asimgq::queue_partition(static_cast<uint32_t>(thread_idx)), pf.cur.part, pf.cur.posted,
-            pf.cur.ids.size(), pf.cur.announced ? 1 : 0, pf.next.part, pf.next_first, pf.held_back.size(),
-            asimgq::part_store_room(static_cast<uint32_t>(thread_idx)), gq_index_[thread_idx].room(), pf.wait_room,
-            pf.wait_part
+            "[STALL thread=%d] PART queue_part=%d installed=%d cur=%d item=%u gate=%d held=%zu filled=%d "
+            "route_cursor=%" PRIu64 " store_room=%u positions_room=%u wait_room=%" PRIu64 " wait_part=%" PRIu64
+            " wait_gate=%" PRIu64 " chain_wait_ext=%" PRIu64,
+            thread_idx, asimgq::queue_partition(static_cast<uint32_t>(thread_idx)), pf.installed, cur, pf.cur_item,
+            cur < kMaxPlanPartitions ? part_installed_[cur].load(std::memory_order_relaxed) : -1, pf.held.size(),
+            pf.filled, pf.route_cursor, asimgq::part_store_room(static_cast<uint32_t>(thread_idx)),
+            gq_index_[thread_idx].room(), pf.wait_room, pf.wait_part, pf.wait_gate, pf.chain_wait_ext
         );
-        for (size_t i = 0; i < pf.held_back.size() && i < 8; ++i) {
+        for (size_t i = 0; i < pf.held.size() && i < 8; ++i) {
+            const part_plan::Item &item = *part_plan::at<part_plan::Item>(plan_, pf.held[i].item);
             LOG_INFO(
-                "[STALL thread=%d] PART held_back task=%d wait_on=%d entries=%u", thread_idx, pf.held_back[i].id,
-                pf.held_back[i].wait_on, pf.held_back[i].entries
+                "[STALL thread=%d] PART held part=%d task=%d kind=%u flags=%#x entries=%u", thread_idx, pf.held[i].part,
+                item.task, item.kind, item.flags, pf.held[i].entries
             );
         }
     }
@@ -870,418 +875,487 @@ static int32_t unfinished_producer(SharedMemoryTaskHeader &tasks, int32_t task, 
     return latest;
 }
 
-// Whether a task is conditional work the managers spread over the groups: a
-// predicated task the controllers run whole rather than split.
-static bool routes(const ChipTaskSlotState &slot) {
-    return slot.task_attrs.has_predicate() && slot.to_descriptor().silo != TASK_SILO_SPREAD;
+// Whether every producer of a task that the controllers do not run has finished,
+// seen through dependency-only tasks.
+static bool outside_producers_done(SharedMemoryTaskHeader &tasks, int32_t task, std::vector<int32_t> &walk) {
+    const TaskPayload &payload = tasks.get_slot_state_by_task_id(task).to_payload();
+    walk.assign(payload.fanin_data(), payload.fanin_data() + payload.fanin_count);
+    while (!walk.empty()) {
+        const int32_t prod = walk.back();
+        walk.pop_back();
+        if (tasks.is_completed(prod)) continue;
+        const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(prod);
+        if (part_feeds(ps)) continue;
+        if (ps.task_kind != TaskKind::DUMMY && ps.active_mask.to_shape() != ResourceShape::DUMMY) return false;
+        const TaskPayload &pp = ps.to_payload();
+        walk.insert(walk.end(), pp.fanin_data(), pp.fanin_data() + pp.fanin_count);
+    }
+    return true;
 }
 
-void SchedulerContext::begin_batch(int32_t part, uint32_t size, const std::vector<int32_t> &ids, PartBatch &b) {
+// Whether a task's dispatch predicate has its final value -- once the task writing
+// it has finished, or with none named every producer -- and, if so, whether it runs.
+static bool predicate_decided(SharedMemoryTaskHeader &tasks, int32_t task, std::vector<int32_t> &walk, bool &runs) {
+    const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(task);
+    const int32_t writer = slot.to_descriptor().predicate_writer;
+    const int32_t wait_on =
+        writer >= 0 ? (tasks.is_completed(writer) ? -1 : writer) : unfinished_producer(tasks, task, walk);
+    if (wait_on >= 0) return false;
+    runs = slot.to_payload().predicate.pass();
+    return true;
+}
+
+static_assert(sizeof(asimgq::SimMapEntry) == sizeof(part_plan::MapEntry), "a plan map entry is what the queue reads");
+static_assert(offsetof(asimgq::SimMapEntry, local) == offsetof(part_plan::MapEntry, local));
+static_assert(offsetof(asimgq::SimMapEntry, expected) == offsetof(part_plan::MapEntry, expected));
+
+const part_plan::SubPartition &SchedulerContext::plan_sub(int32_t part, int32_t g) const {
+    const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+    return *part_plan::at<part_plan::SubPartition>(
+        plan_, h.sub_offset + (static_cast<uint32_t>(part) * part_plan::kGroups + static_cast<uint32_t>(g)) *
+                                  part_plan::words_of<part_plan::SubPartition>()
+    );
+}
+
+uint32_t SchedulerContext::part_room(int32_t thread_idx, int32_t part) const {
+    const PartFeed &pf = part_feed_[thread_idx];
+    const uint32_t q = static_cast<uint32_t>(thread_idx);
+    // Room an earlier partition's held items need is not this one's to take; only a
+    // partition the controller has not finished can still be waiting.
+    uint32_t reserved = 0;
+    for (int32_t k = std::max(0, asimgq::queue_partition(q));
+         k < part && static_cast<size_t>(k) < pf.held_entries.size(); ++k) {
+        reserved += pf.held_entries[static_cast<size_t>(k)];
+    }
+    const uint32_t free = std::min(asimgq::part_store_room(q), gq_index_[thread_idx].room());
+    return free > reserved ? free - reserved : 0;
+}
+
+static uint32_t item_entries(const part_plan::Item &item, const ChipTaskSlotState &slot) {
+    if (item.kind == part_plan::kSlot) return 1;
+    return (item.block_hi - item.block_lo) * static_cast<uint32_t>(active_subtask_count(slot));
+}
+
+void SchedulerContext::stage_item(PartFeed &pf, const part_plan::Item &item, bool empty) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
-    b.part = part;
-    b.size = size;
-    b.order.clear();
-    b.built = 0;
-    b.ids.clear();
-    b.blocks.clear();
-    b.first_entry.assign(1, 0);
-    b.entries.clear();
-    b.subslots.clear();
-    b.sets.clear();
-    b.deps.clear();
-    b.held.clear();
-    b.posted = 0;
-    b.announced = false;
-    // Indices are unique within a partition, so placing each supertask at its first
-    // index orders them without a sort.
-    std::vector<int32_t> at(size, -1);
-    for (const int32_t id : ids) {
-        const uint16_t first = tasks.get_task_by_task_id(id).part_index;
-        if (first == TASK_PART_INDEX_NONE || first >= size) {
-            b.order.push_back(id);
-        } else {
-            at[first] = id;
+    const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(item.task);
+    const TaskDescriptor &desc = slot.to_descriptor();
+    const uint32_t set = static_cast<uint32_t>(pf.sets.size());
+    pf.sets.push_back(
+        asimgq::SimLocalSet{
+            static_cast<uint32_t>(pf.ranges.size()), item.named, item.threshold, item.gid, empty,
+            (item.flags & part_plan::kFlagBarrier) != 0, (item.flags & part_plan::kFlagAnnounce) != 0
         }
+    );
+    for (uint32_t k = 0; k < item.named; ++k) {
+        pf.ranges.push_back(asimgq::SimLocalRange{item.ranges[k].lo, item.ranges[k].hi});
     }
-    std::vector<int32_t> unindexed;
-    unindexed.swap(b.order);
-    for (const int32_t id : at) {
-        if (id >= 0) b.order.push_back(id);
-    }
-    b.order.insert(b.order.end(), unindexed.begin(), unindexed.end());
-}
-
-void SchedulerContext::build_batch(int32_t thread_idx, PartBatch &b, size_t limit) {
-    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
-    PartFeed &pf = part_feed_[thread_idx];
-    const int32_t silos = active_sched_threads_;
-    const int32_t part = b.part;
-    const uint64_t from = asimgq::now_ticks();
-    struct Named {
-        int32_t task;
-        uint32_t end;  // one past its last index
+    pf.set_task.push_back(item.task);
+    auto type_of = [](SubtaskSlot s) {
+        return s == SubtaskSlot::AIC ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector;
     };
-    std::vector<Named> named;
-    std::vector<int32_t> walk;
-    const size_t stop = std::min(b.order.size(), b.built + limit);
-    for (; b.built < stop; ++b.built) {
-        const int32_t id = b.order[b.built];
-        ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
-        if (tasks.is_completed(id) || !part_feeds(slot)) continue;
-        const TaskDescriptor &desc = slot.to_descriptor();
-        // A conditional task routed here runs whole in this group, already decided.
-        const bool routed_here = &b == &pf.routed;
-        int32_t lo = 0, hi = slot.logical_block_num;
-        if (!routed_here) silo_piece(desc.silo, slot.logical_block_num, thread_idx, silos, lo, hi);
-        if (lo >= hi) continue;
-        // A predicated piece reaches the controller decided. It is held back until the
-        // value its predicate reads is final -- once the task writing it has finished,
-        // or with none named every producer -- then goes to run, or as an empty piece.
-        // One the controllers run whole goes to the shared ring to run, for the group
-        // whose turn it is.
-        bool empty = false;
-        if (slot.task_attrs.has_predicate() && !routed_here) {
-            const int32_t writer = desc.predicate_writer;
-            const int32_t wait_on =
-                writer >= 0 ? (tasks.is_completed(writer) ? -1 : writer) : unfinished_producer(tasks, id, walk);
-            if (wait_on >= 0) {
-                b.held.push_back(HeldPiece{id, wait_on, static_cast<uint32_t>((hi - lo) * active_subtask_count(slot))});
-                if (&b != &pf.retry) ++pf.pred_held;
-                continue;
-            }
-            empty = !slot.to_payload().predicate.pass();
-            if (!empty && routes(slot)) {
-                route_conditional(thread_idx, id, part);
-                continue;
+    if (item.kind == part_plan::kSlot) {
+        // A home slot stands for the whole task: one entry, which completes every
+        // subtask of it when it retires.
+        SubtaskSlot first = SubtaskSlot::AIC;
+        for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
+            if (slot.active_mask.subtask_active(static_cast<SubtaskSlot>(sub))) {
+                first = static_cast<SubtaskSlot>(sub);
+                break;
             }
         }
-        // Every producer in this partition, named once whichever silos run it: a
-        // supertask's indices are one range. A dependency-only producer is seen
-        // through to its own producers; one the controllers do not run has no
-        // indices to wait on, so the task is held back until it has finished.
-        named.clear();
-        walk.clear();
-        bool hold = false;
-        int32_t blocker = -1;
-        const TaskPayload &payload = slot.to_payload();
-        walk.assign(payload.fanin_data(), payload.fanin_data() + payload.fanin_count);
-        while (!walk.empty() && !hold) {
-            const int32_t prod = walk.back();
-            walk.pop_back();
-            if (tasks.is_completed(prod)) continue;
-            const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(prod);
-            const TaskDescriptor &pd = ps.to_descriptor();
-            if (part_feeds(ps)) {
-                if (pd.part < part) continue;
-                named.push_back(
-                    Named{prod, static_cast<uint32_t>(pd.part_index + ps.logical_block_num * active_subtask_count(ps))}
-                );
-            } else if (ps.task_kind == TaskKind::DUMMY || ps.active_mask.to_shape() == ResourceShape::DUMMY) {
-                const TaskPayload &pp = ps.to_payload();
-                walk.insert(walk.end(), pp.fanin_data(), pp.fanin_data() + pp.fanin_count);
-            } else {
-                hold = true;
-                blocker = prod;
+        pf.entries.push_back(
+            asimgq::SimLocalEntry{
+                0, desc.kernel_id[static_cast<int32_t>(first)], item.task, type_of(first), set, item.local
             }
-        }
-        if (hold) {
-            b.held.push_back(HeldPiece{id, blocker, static_cast<uint32_t>((hi - lo) * active_subtask_count(slot))});
-            continue;
-        }
-        // The four producers ending last are named; the rest end at or below the
-        // fifth one's end, which the partition's watermark then has to reach.
-        std::sort(named.begin(), named.end(), [](const Named &x, const Named &y) {
-            return x.task < y.task;
-        });
-        named.erase(
-            std::unique(
-                named.begin(), named.end(),
-                [](const Named &x, const Named &y) {
-                    return x.task == y.task;
-                }
-            ),
-            named.end()
         );
-        std::sort(named.begin(), named.end(), [](const Named &x, const Named &y) {
-            return x.end > y.end;
-        });
-        const uint32_t dep_first = static_cast<uint32_t>(b.deps.size());
-        const uint32_t dn = static_cast<uint32_t>(std::min<size_t>(named.size(), asimgq::SIM_HELD_MAX_DEPS));
-        for (uint32_t k = 0; k < dn; ++k) {
-            const ChipTaskSlotState &ps = tasks.get_slot_state_by_task_id(named[k].task);
-            uint32_t queues = 0;
-            if (routes(ps)) {
-                queues = asimgq::SIM_PART_ANY_QUEUE;
-            } else {
-                for (int32_t q = 0; q < silos; ++q) {
-                    int32_t plo = 0, phi = 0;
-                    silo_piece(ps.to_descriptor().silo, ps.logical_block_num, q, silos, plo, phi);
-                    if (plo < phi) queues |= 1U << q;
-                }
-            }
-            b.deps.push_back(asimgq::SimPartDep{named[k].task, queues});
-        }
-        const uint32_t threshold = named.size() > asimgq::SIM_HELD_MAX_DEPS ? named[asimgq::SIM_HELD_MAX_DEPS].end : 0;
-        b.sets.push_back(asimgq::SimPartSet{dep_first, dn, threshold, empty});
-        const uint32_t set = static_cast<uint32_t>(b.sets.size() - 1);
-        b.ids.push_back(id);
-        b.blocks.push_back(hi - lo);
-        const int32_t subs = active_subtask_count(slot);
-        for (int32_t blk = lo; blk < hi; ++blk) {
-            int32_t ordinal = 0;
-            for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
-                const SubtaskSlot subslot = static_cast<SubtaskSlot>(sub);
-                if (!slot.active_mask.subtask_active(subslot)) continue;
-                b.entries.push_back(
-                    asimgq::SimPartEntry{
-                        0, desc.kernel_id[sub], id,
-                        subslot == SubtaskSlot::AIC ? asimgq::SimTaskType::Cube : asimgq::SimTaskType::Vector, set,
-                        static_cast<uint32_t>(desc.part_index + blk * subs + ordinal)
-                    }
-                );
-                b.subslots.push_back(subslot);
-                ++ordinal;
-            }
-        }
-        b.first_entry.push_back(static_cast<uint32_t>(b.entries.size()));
+        pf.subslots.push_back(first);
+        pf.set_blocks.push_back(slot.logical_block_num);
+        pf.set_precount.push_back(static_cast<int16_t>(slot.total_required_subtasks - 1));
+        return;
     }
-    pf.build_ticks += asimgq::now_ticks() - from;
+    const int32_t subs = active_subtask_count(slot);
+    for (uint32_t blk = item.block_lo; blk < item.block_hi; ++blk) {
+        int32_t ordinal = 0;
+        for (int32_t sub = 0; sub < SUBTASK_SLOT_COUNT; ++sub) {
+            const SubtaskSlot subslot = static_cast<SubtaskSlot>(sub);
+            if (!slot.active_mask.subtask_active(subslot)) continue;
+            pf.entries.push_back(
+                asimgq::SimLocalEntry{
+                    0, desc.kernel_id[sub], item.task, type_of(subslot), set,
+                    item.local + (blk - item.block_lo) * static_cast<uint32_t>(subs) + static_cast<uint32_t>(ordinal)
+                }
+            );
+            pf.subslots.push_back(subslot);
+            ++ordinal;
+        }
+    }
+    pf.set_blocks.push_back(static_cast<int32_t>(item.block_hi - item.block_lo));
+    pf.set_precount.push_back(0);
 }
 
-bool SchedulerContext::post_pieces(int32_t thread_idx, PartBatch &b) {
+bool SchedulerContext::submit_staged(int32_t thread_idx, int32_t part) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     PartFeed &pf = part_feed_[thread_idx];
     GqIndexSpace &space = gq_index_[thread_idx];
     const uint32_t q = static_cast<uint32_t>(thread_idx);
-    const size_t first = b.posted;
-    // Room an earlier partition's held pieces need is not this batch's to take; only a
-    // partition the controller has not finished can still be waiting. Conditional work
-    // still to be routed here has no room kept: that relies on asimgq::SIM_PART_STORE.
-    uint32_t reserved = 0;
-    if (&b != &pf.retry && &b != &pf.routed) {
-        for (int32_t k = std::max(0, asimgq::queue_partition(q));
-             k < b.part && static_cast<size_t>(k) < pf.held_sum.size(); ++k) {
-            reserved += static_cast<uint32_t>(pf.held_sum[k]);
-        }
-    }
-    const uint32_t free = std::min(asimgq::part_store_room(q), space.room());
-    const uint32_t room = free > reserved ? free - reserved : 0;
-    size_t end = first;
-    while (end < b.ids.size() && b.first_entry[end + 1] - b.first_entry[first] <= room) {
-        ++end;
-    }
-    if (end == first && (first < b.ids.size() || b.announced || !b.complete())) {
-        if (first < b.ids.size()) ++pf.wait_room;
-        return false;
-    }
     const uint64_t from = asimgq::now_ticks();
-    const uint32_t e0 = b.first_entry[first];
-    const uint32_t e1 = b.first_entry[end];
-    const uint32_t d0 = end > first ? b.sets[first].first : 0;
-    const uint32_t d1 = end > first ? b.sets[end - 1].first + b.sets[end - 1].n : 0;
-    // The call's own numbering: its entries name its sets, its sets its deps.
-    std::vector<asimgq::SimPartEntry> entries(b.entries.begin() + e0, b.entries.begin() + e1);
-    std::vector<asimgq::SimPartSet> sets(b.sets.begin() + first, b.sets.begin() + end);
     const int32_t book_core = core_trackers_[thread_idx].get_core_id_by_offset(0);
-    for (uint32_t i = 0; i < entries.size(); ++i) {
-        ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(entries[i].task_id);
-        entries[i].set -= static_cast<uint32_t>(first);
-        entries[i].index = space.assign(
-            GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, b.subslots[e0 + i], book_core, -1, false, false}
+    for (uint32_t i = 0; i < pf.entries.size(); ++i) {
+        ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(pf.entries[i].task_id);
+        pf.entries[i].index = space.assign(
+            GqIndexSpace::Owner{&slot, feed_seq_[thread_idx]++, pf.subslots[i], book_core, -1, false, false}
         );
     }
-    for (asimgq::SimPartSet &st : sets) {
-        st.first -= d0;
-    }
     // Account before the entries reach the queue (see account_published_blocks).
-    for (size_t j = first; j < end; ++j) {
-        sched_->account_published_blocks(tasks.get_slot_state_by_task_id(b.ids[j]), b.blocks[j]);
+    for (size_t j = 0; j < pf.sets.size(); ++j) {
+        sched_->account_published_blocks(tasks.get_slot_state_by_task_id(pf.set_task[j]), pf.set_blocks[j]);
     }
     const uint64_t submit_from = asimgq::now_ticks();
     const uint64_t ledger_from = asimgq::queue_self_overrun_ticks(q);
-    const bool ok = asimgq::submit_partition(
-        q, b.part, b.size, entries.data(), static_cast<uint32_t>(entries.size()), sets.data(),
-        static_cast<uint32_t>(sets.size()), b.deps.data() + d0, d1 - d0
+    const bool ok = asimgq::submit_local(
+        q, part, pf.entries.data(), static_cast<uint32_t>(pf.entries.size()), pf.sets.data(),
+        static_cast<uint32_t>(pf.sets.size()), pf.ranges.data(), static_cast<uint32_t>(pf.ranges.size())
     );
     pf.submit_ticks += asimgq::now_ticks() - submit_from;
     pf.submit_ledger_ticks += asimgq::queue_self_overrun_ticks(q) - ledger_from;
     if (!ok) {
-        for (size_t j = entries.size(); j-- > 0;) {
-            space.unreserve(entries[j].index);
+        for (size_t j = pf.entries.size(); j-- > 0;) {
+            space.unreserve(pf.entries[j].index);
         }
         LOG_ERROR(
-            "Thread %d: partition %d store refused %zu entries (room %u)", thread_idx, b.part, entries.size(), room
+            "Thread %d: partition %d store refused %zu entries (room %u)", thread_idx, part, pf.entries.size(),
+            asimgq::part_store_room(q)
         );
         ++pf.wait_room;
-        return false;
+    } else {
+        // Its one entry retires a home slot's every subtask, and no other entry of the
+        // task exists, so the rest are counted now.
+        for (size_t j = 0; j < pf.sets.size(); ++j) {
+            if (pf.set_precount[j] > 0) {
+                tasks.get_slot_state_by_task_id(pf.set_task[j])
+                    .completed_subtasks.fetch_add(pf.set_precount[j], std::memory_order_relaxed);
+            }
+        }
+        pf.pieces += pf.sets.size();
+        pf.entries_posted += pf.entries.size();
     }
-    for (size_t j = first; j < end; ++j) {
-        const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(b.ids[j]);
-        if (!slot.task_attrs.has_predicate()) continue;
-        ++pf.decided;
-        if (slot.to_descriptor().predicate_writer < 0) ++pf.decided_unnamed;
-        if (b.sets[j].empty) ++pf.skipped;
-    }
-    b.posted = end;
-    b.announced = true;
-    pf.pieces += end - first;
-    pf.entries += entries.size();
+    pf.entries.clear();
+    pf.sets.clear();
+    pf.ranges.clear();
+    pf.subslots.clear();
+    pf.set_task.clear();
+    pf.set_blocks.clear();
+    pf.set_precount.clear();
     pf.post_ticks += asimgq::now_ticks() - from;
-    return true;
+    return ok;
 }
 
-// Feed this thread's controller. Each partition's share is built while the one
-// before it runs, and handed over a piece at a time, in index order, as the store
-// has room -- the next partition's as soon as the controller has reached the one
-// before, so it is resident when the controller moves on. The controller tells the
-// partitions apart and moves from one to the next by itself; all the manager does
-// at a boundary is keep the store full. A predicated piece is held back until the
-// value its predicate reads is final, and then posted decided: to run, or as an
-// empty piece the controller finishes without a core.
-bool SchedulerContext::feed_partitions(int32_t thread_idx) {
-    // Supertasks built per pass of the dispatch loop: a few microseconds of work.
-    constexpr size_t kBuildStep = 16;
-    if (!part_active_ || sched_->task_view.tasks == nullptr) return false;
+void SchedulerContext::decide_chain(int32_t thread_idx, uint32_t chain, bool runs) {
+    PartFeed &pf = part_feed_[thread_idx];
+    if (chain >= pf.chain_seen.size() || pf.chain_seen[chain] != 0) return;
+    pf.chain_seen[chain] = 1;
+    const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+    const part_plan::Chain &c =
+        *part_plan::at<part_plan::Chain>(plan_, h.chain_offset + chain * part_plan::words_of<part_plan::Chain>());
+    if (runs) {
+        // The k-th chain of a partition to run goes to group k, counted from the
+        // partition's own number, so no group takes more than its share of any one.
+        const int32_t k = chains_dealt_seq_[c.part].fetch_add(1, std::memory_order_relaxed);
+        const uint32_t g = (static_cast<uint32_t>(k) + c.part) % static_cast<uint32_t>(active_sched_threads_);
+        chains_dealt_[c.part][g].fetch_add(1, std::memory_order_relaxed);
+        const uint64_t t = route_tail_[g].fetch_add(1, std::memory_order_relaxed);
+        std::atomic<uint64_t> &seq = route_seq_[g][t % kRouteRing];
+        // The slot's ticket of a lap ago is posted before this one is written.
+        while (seq.load(std::memory_order_acquire) != t) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+        route_ring_[g][t % kRouteRing] = chain;
+        seq.store(t + 1, std::memory_order_release);
+        ++pf.chains_dealt;
+    }
+    // Every chain dealt is counted to its group before the partition counts it
+    // decided, so a manager that sees all decided sees every one dealt to it.
+    chains_decided_[c.part].fetch_add(1, std::memory_order_release);
+    ++pf.chains_decided;
+}
+
+// Post the current partition's next items, in order, as far as there is room. A home
+// slot or predicated piece not yet decided, and a piece naming a producer the
+// controllers do not run, is held back and the items behind it go on.
+bool SchedulerContext::post_in_order(int32_t thread_idx) {
     SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
     PartFeed &pf = part_feed_[thread_idx];
-    const uint32_t q = static_cast<uint32_t>(thread_idx);
-    bool progress = feed_routed(thread_idx);
-    if (!pf.held_back.empty()) {
-        const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
-        if (epoch != pf.held_epoch) {
-            pf.held_epoch = epoch;
-            int32_t part = INT32_MAX;
-            for (const HeldPiece &h : pf.held_back) {
-                part = std::min<int32_t>(part, tasks.get_task_by_task_id(h.id).part);
+    const part_plan::SubPartition &sp = plan_sub(pf.cur, thread_idx);
+    const uint32_t room = part_room(thread_idx, pf.cur);
+    const uint32_t first_item = pf.cur_item;
+    const size_t held_before = pf.held.size();
+    uint32_t staged = 0;
+    bool progress = false;
+    while (pf.cur_item < sp.items) {
+        const uint32_t off = sp.item_offset + pf.cur_item * part_plan::words_of<part_plan::Item>();
+        const part_plan::Item &item = *part_plan::at<part_plan::Item>(plan_, off);
+        const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(item.task);
+        const uint32_t need = item_entries(item, slot);
+        bool empty = false;
+        if (item.kind == part_plan::kSlot || (item.flags & part_plan::kFlagPredicated) != 0) {
+            bool runs = false;
+            if (!predicate_decided(tasks, item.task, pf.walk, runs)) {
+                pf.held.push_back(PartHeld{pf.cur, off, need});
+                pf.held_entries[static_cast<size_t>(pf.cur)] += need;
+                ++pf.held_count;
+                ++pf.cur_item;
+                progress = true;
+                continue;
             }
-            // The lowest partition's held pieces are built again once one may go.
-            bool due = false;
-            for (const HeldPiece &h : pf.held_back) {
-                if (tasks.get_task_by_task_id(h.id).part == part && (h.wait_on < 0 || tasks.is_completed(h.wait_on))) {
-                    due = true;
-                    break;
-                }
+            if ((item.flags & part_plan::kFlagDecides) != 0) decide_chain(thread_idx, item.chain, runs);
+            if (item.kind == part_plan::kSlot && runs) {
+                // Its chain runs where it is dealt; the map completes this slot.
+                ++pf.slots_routed;
+                ++pf.cur_item;
+                progress = true;
+                continue;
             }
-            if (due) {
-                pf.ids.clear();
-                std::vector<HeldPiece> later;
-                for (const HeldPiece &h : pf.held_back) {
-                    if (tasks.get_task_by_task_id(h.id).part == part) {
-                        pf.ids.push_back(h.id);
-                    } else {
-                        later.push_back(h);
-                    }
-                }
-                begin_batch(part, pf.sizes[static_cast<size_t>(part)], pf.ids, pf.retry);
-                build_batch(thread_idx, pf.retry, pf.retry.order.size());
-                pf.retry.announced = true;
-                if (!pf.retry.ids.empty() && post_pieces(thread_idx, pf.retry)) {
-                    pf.held_fed += pf.retry.posted;
-                    progress = true;
-                }
-                // What is still held, and what found no room, is tried again.
-                pf.held_back.assign(pf.retry.held.begin(), pf.retry.held.end());
-                for (size_t j = pf.retry.posted; j < pf.retry.ids.size(); ++j) {
-                    pf.held_back.push_back(
-                        HeldPiece{pf.retry.ids[j], -1, pf.retry.first_entry[j + 1] - pf.retry.first_entry[j]}
-                    );
-                }
-                pf.held_back.insert(pf.held_back.end(), later.begin(), later.end());
-                tally_held(pf);
-            }
-        }
-    }
-    // The next share goes to the controller once the current one is all posted.
-    while (pf.next.complete() &&
-           (pf.cur.part < 0 || (pf.cur.complete() && pf.cur.posted == pf.cur.ids.size() && pf.cur.announced))) {
-        std::swap(pf.cur, pf.next);
-        pf.next.part = -1;
-        pf.held_back.insert(pf.held_back.end(), pf.cur.held.begin(), pf.cur.held.end());
-        tally_held(pf);
-        pf.held_ordinary += pf.cur.held.size();
-        ++pf.partitions;
-    }
-    if (pf.cur.part >= 0 && (pf.cur.posted < pf.cur.ids.size() || !pf.cur.announced || !pf.cur.complete())) {
-        if (!pf.cur.complete()) {
-            build_batch(thread_idx, pf.cur, kBuildStep);
+            empty = !runs;
+        } else if ((item.flags & part_plan::kFlagHold) != 0 && !outside_producers_done(tasks, item.task, pf.walk)) {
+            pf.held.push_back(PartHeld{pf.cur, off, need});
+            pf.held_entries[static_cast<size_t>(pf.cur)] += need;
+            ++pf.held_count;
+            ++pf.cur_item;
             progress = true;
+            continue;
         }
-        if (pf.cur.part > asimgq::queue_partition(q) + 1) {
-            ++pf.wait_part;
-        } else if (post_pieces(thread_idx, pf.cur)) {
+        if (staged + need > room) break;
+        if (item.kind == part_plan::kSlot) ++pf.slots_skipped;
+        stage_item(pf, item, empty);
+        staged += need;
+        ++pf.cur_item;
+    }
+    if (!pf.sets.empty()) {
+        if (submit_staged(thread_idx, pf.cur)) {
             progress = true;
+        } else {
+            // Whatever this pass staged or held is taken again from where it started.
+            for (size_t i = held_before; i < pf.held.size(); ++i) {
+                pf.held_entries[static_cast<size_t>(pf.held[i].part)] -= pf.held[i].entries;
+            }
+            pf.held_count -= pf.held.size() - held_before;
+            pf.held.resize(held_before);
+            pf.cur_item = first_item;
+            return false;
+        }
+    } else if (pf.cur_item < sp.items && !progress) {
+        ++pf.wait_room;
+    }
+    return progress;
+}
+
+// Post held items that can go now, the lowest partition's first, once a completion
+// may have decided one.
+bool SchedulerContext::feed_held(int32_t thread_idx) {
+    PartFeed &pf = part_feed_[thread_idx];
+    if (pf.held.empty()) return false;
+    const uint64_t epoch = g_completion_epoch.load(std::memory_order_acquire);
+    if (epoch == pf.held_epoch) return false;
+    pf.held_epoch = epoch;
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    bool progress = false;
+    const int32_t part = pf.held.front().part;
+    uint32_t room = part_room(thread_idx, part);
+    std::vector<PartHeld> keep;
+    std::vector<PartHeld> staged_items;
+    for (const PartHeld &h : pf.held) {
+        const part_plan::Item &item = *part_plan::at<part_plan::Item>(plan_, h.item);
+        bool empty = false;
+        if (h.part != part) {
+            keep.push_back(h);
+            continue;
+        }
+        if (item.kind == part_plan::kSlot || (item.flags & part_plan::kFlagPredicated) != 0) {
+            bool runs = false;
+            if (!predicate_decided(tasks, item.task, pf.walk, runs)) {
+                keep.push_back(h);
+                continue;
+            }
+            if ((item.flags & part_plan::kFlagDecides) != 0) decide_chain(thread_idx, item.chain, runs);
+            if (item.kind == part_plan::kSlot && runs) {
+                ++pf.slots_routed;
+                pf.held_entries[static_cast<size_t>(h.part)] -= h.entries;
+                progress = true;
+                continue;
+            }
+            empty = !runs;
+        } else if (!outside_producers_done(tasks, item.task, pf.walk)) {
+            keep.push_back(h);
+            continue;
+        }
+        if (h.entries > room) {
+            keep.push_back(h);
+            continue;
+        }
+        if (item.kind == part_plan::kSlot) ++pf.slots_skipped;
+        stage_item(pf, item, empty);
+        staged_items.push_back(h);
+        room -= h.entries;
+    }
+    if (!pf.sets.empty()) {
+        if (submit_staged(thread_idx, part)) {
+            for (const PartHeld &h : staged_items) {
+                pf.held_entries[static_cast<size_t>(h.part)] -= h.entries;
+            }
+            pf.held_fed += staged_items.size();
+            progress = true;
+        } else {
+            keep.insert(keep.end(), staged_items.begin(), staged_items.end());
+            std::sort(keep.begin(), keep.end(), [](const PartHeld &x, const PartHeld &y) {
+                return x.part != y.part ? x.part < y.part : x.item < y.item;
+            });
+            pf.held_epoch = ~0ULL;
         }
     }
-    if (pf.next.part < 0 && pf.next_first < total_tasks_) {
-        const int32_t part = tasks.get_task_by_task_id(pf.next_first).part;
-        pf.ids.clear();
-        int32_t end = pf.next_first;
-        while (end < total_tasks_ && tasks.get_task_by_task_id(end).part == part) {
-            pf.ids.push_back(end++);
+    pf.held.swap(keep);
+    return progress;
+}
+
+// Post the chains dealt to this group, in the order dealt, each once every
+// controller maps its partition and its producers outside it are complete.
+bool SchedulerContext::feed_chains(int32_t thread_idx) {
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    PartFeed &pf = part_feed_[thread_idx];
+    const uint32_t g = static_cast<uint32_t>(thread_idx);
+    const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+    bool progress = false;
+    for (;;) {
+        const uint64_t t = pf.route_cursor;
+        std::atomic<uint64_t> &seq = route_seq_[g][t % kRouteRing];
+        if (seq.load(std::memory_order_acquire) != t + 1) break;
+        const uint32_t chain = route_ring_[g][t % kRouteRing];
+        const part_plan::Chain &c =
+            *part_plan::at<part_plan::Chain>(plan_, h.chain_offset + chain * part_plan::words_of<part_plan::Chain>());
+        const int32_t part = static_cast<int32_t>(c.part);
+        if (part >= pf.installed || part_installed_[part].load(std::memory_order_acquire) < active_sched_threads_) {
+            ++pf.wait_gate;
+            break;
         }
-        const uint32_t size = tasks.get_task_by_task_id(pf.next_first).part_size;
-        begin_batch(part, size, pf.ids, pf.next);
-        if (pf.sizes.size() <= static_cast<size_t>(part)) {
-            pf.sizes.resize(static_cast<size_t>(part) + 1, 0);
-            pf.held_sum.resize(static_cast<size_t>(part) + 1, 0);
+        const int32_t *ext = reinterpret_cast<const int32_t *>(plan_ + c.ext_offset);
+        bool ready = true;
+        for (uint32_t i = 0; i < c.external && ready; ++i) {
+            ready = tasks.is_completed(ext[i]);
         }
-        pf.sizes[static_cast<size_t>(part)] = size;
-        pf.next_first = end;
-        progress = true;
-    } else if (pf.next.part >= 0 && !pf.next.complete()) {
-        build_batch(thread_idx, pf.next, kBuildStep);
+        if (!ready) {
+            ++pf.chain_wait_ext;
+            break;
+        }
+        if (c.ids > part_room(thread_idx, part)) {
+            ++pf.wait_room;
+            break;
+        }
+        const uint32_t base = pf.dyn_next[static_cast<size_t>(part)];
+        for (uint32_t k = 0; k < c.tasks; ++k) {
+            const part_plan::ChainTask &ct = *part_plan::at<part_plan::ChainTask>(
+                plan_, c.task_offset + k * part_plan::words_of<part_plan::ChainTask>()
+            );
+            const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(ct.task);
+            part_plan::Item item{};
+            item.task = ct.task;
+            item.local = base + ct.offset;
+            item.block_lo = 0;
+            item.block_hi = static_cast<uint32_t>(slot.logical_block_num);
+            item.kind = part_plan::kPiece;
+            item.flags = part_plan::kFlagAnnounce;
+            item.gid = ct.gid;
+            item.named = ct.named;
+            for (uint32_t r = 0; r < ct.named; ++r) {
+                item.ranges[r] = part_plan::Range{base + ct.ranges[r].lo, base + ct.ranges[r].hi};
+            }
+            stage_item(pf, item, false);
+        }
+        if (!submit_staged(thread_idx, part)) break;
+        pf.dyn_next[static_cast<size_t>(part)] = base + c.ids;
+        ++pf.chains_posted[static_cast<size_t>(part)];
+        seq.store(t + kRouteRing, std::memory_order_release);
+        ++pf.route_cursor;
+        ++pf.chains_in;
         progress = true;
     }
     return progress;
 }
 
-void SchedulerContext::tally_held(PartFeed &pf) {
-    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
-    std::fill(pf.held_sum.begin(), pf.held_sum.end(), 0);
-    for (const HeldPiece &h : pf.held_back) {
-        const size_t k = tasks.get_task_by_task_id(h.id).part;
-        if (k < pf.held_sum.size()) pf.held_sum[k] += h.entries;
-    }
-}
-
-void SchedulerContext::route_conditional(int32_t thread_idx, int32_t task, int32_t part) {
-    const uint64_t t = cond_tail_.fetch_add(1, std::memory_order_relaxed);
-    std::atomic<uint64_t> &seq = cond_seq_[t % kCondRing];
-    // The slot's ticket of a lap ago is posted before this one is written.
-    while (seq.load(std::memory_order_acquire) != t) {
-#if defined(__aarch64__)
-        __asm__ volatile("yield");
-#endif
-    }
-    cond_ring_[t % kCondRing] = CondRoute{task, part};
-    seq.store(t + 1, std::memory_order_release);
-    ++part_feed_[thread_idx].routed_out;
-}
-
-bool SchedulerContext::feed_routed(int32_t thread_idx) {
+// Mark the unused ids of each partition's dynamic region finished, in partition
+// order, once every chain of the partition is decided and every one dealt here is
+// posted.
+bool SchedulerContext::feed_fills(int32_t thread_idx) {
     PartFeed &pf = part_feed_[thread_idx];
-    const uint32_t q = static_cast<uint32_t>(thread_idx);
     bool progress = false;
-    for (;;) {
-        const uint64_t t = pf.cond_cursor;
-        std::atomic<uint64_t> &seq = cond_seq_[t % kCondRing];
-        if (seq.load(std::memory_order_acquire) != t + 1) break;
-        const CondRoute r = cond_ring_[t % kCondRing];
-        // A task of a partition the controller has not come within one of waits, and
-        // so does everything routed here after it.
-        if (r.part > asimgq::queue_partition(q) + 1 || static_cast<size_t>(r.part) >= pf.sizes.size()) break;
-        pf.ids.assign(1, r.task);
-        begin_batch(r.part, pf.sizes[static_cast<size_t>(r.part)], pf.ids, pf.routed);
-        build_batch(thread_idx, pf.routed, 1);
-        pf.routed.announced = true;
-        // One naming a producer the controllers do not run waits for it here.
-        if (!pf.routed.held.empty()) break;
-        if (!pf.routed.ids.empty() && !post_pieces(thread_idx, pf.routed)) break;
-        seq.store(t + kCondRing, std::memory_order_release);
-        pf.cond_cursor = t + static_cast<uint64_t>(active_sched_threads_);
-        ++pf.routed_in;
+    while (pf.filled < pf.installed) {
+        const int32_t p = pf.filled;
+        const part_plan::SubPartition &sp = plan_sub(p, thread_idx);
+        if (sp.chain_count > 0) {
+            if (chains_decided_[p].load(std::memory_order_acquire) < static_cast<int32_t>(sp.chain_count)) break;
+            if (pf.chains_posted[static_cast<size_t>(p)] <
+                chains_dealt_[p][thread_idx].load(std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        const uint32_t end = sp.dyn_lo + sp.dyn_count;
+        if (pf.dyn_next[static_cast<size_t>(p)] < end) {
+            asimgq::fill_local(static_cast<uint32_t>(thread_idx), pf.dyn_next[static_cast<size_t>(p)], end);
+            ++pf.fills;
+        }
+        ++pf.filled;
         progress = true;
     }
+    return progress;
+}
+
+// Feed this thread's controller from the partition plan. A partition's map goes in
+// once the controller is within one partition of it, so a controller maps at most
+// two; its items go out once every controller maps it, and no further ahead than
+// the partition after the one the controller is in.
+bool SchedulerContext::feed_partitions(int32_t thread_idx) {
+    if (!part_active_ || plan_ == nullptr || sched_->task_view.tasks == nullptr) return false;
+    PartFeed &pf = part_feed_[thread_idx];
+    const uint32_t q = static_cast<uint32_t>(thread_idx);
+    const int32_t parts = static_cast<int32_t>(part_plan::at<part_plan::Header>(plan_, 0)->partitions);
+    bool progress = false;
+    const int32_t at = asimgq::queue_partition(q);
+    while (pf.installed < parts && pf.installed <= at + 1) {
+        const part_plan::SubPartition &sp = plan_sub(pf.installed, thread_idx);
+        const auto *map = reinterpret_cast<const asimgq::SimMapEntry *>(plan_ + sp.map_offset);
+        if (!asimgq::install_subpartition(q, pf.installed, sp.base, sp.span, map, sp.map)) {
+            ++pf.wait_install;
+            break;
+        }
+        part_installed_[pf.installed].fetch_add(1, std::memory_order_release);
+        pf.map_entries += sp.map;
+        ++pf.installed;
+        progress = true;
+    }
+    if (feed_chains(thread_idx)) progress = true;
+    if (feed_held(thread_idx)) progress = true;
+    while (pf.cur < parts) {
+        const part_plan::SubPartition &sp = plan_sub(pf.cur, thread_idx);
+        if (pf.cur_item >= sp.items) {
+            ++pf.cur;
+            pf.cur_item = 0;
+            ++pf.partitions;
+            continue;
+        }
+        if (pf.cur >= pf.installed) break;
+        if (part_installed_[pf.cur].load(std::memory_order_acquire) < active_sched_threads_) {
+            ++pf.wait_gate;
+            break;
+        }
+        if (pf.cur > at + 1) {
+            ++pf.wait_part;
+            break;
+        }
+        if (!post_in_order(thread_idx)) break;
+        progress = true;
+    }
+    if (feed_fills(thread_idx)) progress = true;
     return progress;
 }
 
@@ -1293,7 +1367,26 @@ bool SchedulerContext::feed_routed(int32_t thread_idx) {
 void SchedulerContext::gq_prepare_run() {
 #ifdef __SIMULATED_DEVICE__
     silo_active_ = sched_->task_view.tasks != nullptr && sched_->task_view.tasks->silo_tasks > 0;
-    part_active_ = silo_active_ && sched_->task_view.tasks->partitions > 0;
+    part_active_ = silo_active_ && sched_->task_view.tasks->partitions > 0 && sched_->task_view.tasks->plan_words > 0;
+    plan_ = nullptr;
+    if (part_active_) {
+        // The plan is numbered for a fixed set of groups; a run with another number of
+        // managers feeds the silos without it.
+        const SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+        plan_ = reinterpret_cast<const uint32_t *>(reinterpret_cast<const char *>(&tasks) + tasks.plan_offset);
+        const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+        if (h.words != tasks.plan_words || h.groups != part_plan::kGroups ||
+            h.partitions != static_cast<uint32_t>(tasks.partitions) ||
+            active_sched_threads_ != static_cast<int32_t>(part_plan::kGroups) ||
+            tasks.partitions > kMaxPlanPartitions) {
+            LOG_ERROR(
+                "Partition plan for %u groups and %u partitions does not fit %d managers; feeding silos without it",
+                h.groups, h.partitions, active_sched_threads_
+            );
+            part_active_ = false;
+            plan_ = nullptr;
+        }
+    }
     // A silo's share of a partition is resident whole, with the head of the next, so
     // its positions span both: the look-ahead horizon bounds the window rather than
     // the 32 hold slots.
@@ -1312,18 +1405,39 @@ void SchedulerContext::gq_prepare_run() {
     for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
         silo_feed_[i] = SiloFeed{};
         part_feed_[i] = PartFeed{};
-        part_feed_[i].cond_cursor = static_cast<uint64_t>(i);
     }
-    // The shared ring restarts at ticket 0: a slot is free for ticket t when its
-    // sequence reads t. Only the slots the last run used need setting again.
     if (part_active_) {
-        const uint64_t used =
-            cond_slots_set_ ? std::min<uint64_t>(cond_tail_.load(std::memory_order_relaxed), kCondRing) : kCondRing;
-        for (uint64_t i = 0; i < used; ++i) {
-            cond_seq_[i].store(i, std::memory_order_relaxed);
+        const part_plan::Header &h = *part_plan::at<part_plan::Header>(plan_, 0);
+        for (int32_t i = 0; i < active_sched_threads_; i++) {
+            PartFeed &pf = part_feed_[i];
+            pf.held_entries.assign(h.partitions, 0);
+            pf.chains_posted.assign(h.partitions, 0);
+            pf.chain_seen.assign(h.chains, 0);
+            pf.dyn_next.resize(h.partitions);
+            for (uint32_t p = 0; p < h.partitions; ++p) {
+                pf.dyn_next[p] = plan_sub(static_cast<int32_t>(p), i).dyn_lo;
+            }
         }
-        cond_slots_set_ = true;
-        cond_tail_.store(0, std::memory_order_relaxed);
+        for (uint32_t p = 0; p < h.partitions; ++p) {
+            part_installed_[p].store(0, std::memory_order_relaxed);
+            chains_decided_[p].store(0, std::memory_order_relaxed);
+            chains_dealt_seq_[p].store(0, std::memory_order_relaxed);
+            for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+                chains_dealt_[p][g].store(0, std::memory_order_relaxed);
+            }
+        }
+        // Each route ring restarts at ticket 0: a slot is free for ticket t when its
+        // sequence reads t. Only the slots the last run used need setting again.
+        for (uint32_t g = 0; g < part_plan::kGroups; ++g) {
+            const uint64_t used = route_slots_set_ ?
+                                      std::min<uint64_t>(route_tail_[g].load(std::memory_order_relaxed), kRouteRing) :
+                                      kRouteRing;
+            for (uint64_t i = 0; i < used; ++i) {
+                route_seq_[g][i].store(i, std::memory_order_relaxed);
+            }
+            route_tail_[g].store(0, std::memory_order_relaxed);
+        }
+        route_slots_set_ = true;
     }
     cohort_.task_id.store(0, std::memory_order_relaxed);
     cohort_.state.store(SyncStartCohort::kIdle, std::memory_order_relaxed);
@@ -1686,23 +1800,26 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
             asimgq::SimPartStats ps{};
             asimgq::queue_part_stats(q, &ps);
             LOG_INFO(
-                "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64
-                " held_ordinary=%" PRIu64 " held_fed=%" PRIu64 " wait_room=%" PRIu64 " wait_part=%" PRIu64
-                " pred_held=%" PRIu64 " decided=%" PRIu64 " unnamed=%" PRIu64 " skipped=%" PRIu64 " routed_out=%" PRIu64
-                " routed_in=%" PRIu64 " build_us=%.1f post_us=%.1f submit_us=%.1f"
-                " submit_ledger_us=%.1f store_peak=%" PRIu64 " events_in=%" PRIu64 " timed=%" PRIu64 " late=%" PRIu64
-                " late_us=%.1f late_arrive=%" PRIu64 " late_own=%" PRIu64 " late_peer=%" PRIu64
-                " late_threshold=%" PRIu64 " late_switch=%" PRIu64 " wm_waits=%" PRIu64
-                " wm_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f skips=%" PRIu64 " switches=%" PRIu64
-                " behind=%" PRIu64 " behind_us=%.1f",
-                thread_idx, pf.partitions, pf.pieces, pf.entries, pf.held_ordinary, pf.held_fed, pf.wait_room,
-                pf.wait_part, pf.pred_held, pf.decided, pf.decided_unnamed, pf.skipped, pf.routed_out, pf.routed_in,
-                cycles_to_us(pf.build_ticks), cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks),
-                cycles_to_us(pf.submit_ledger_ticks), ps.resident_peak, ps.events_in, ps.timed, ps.late,
-                static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2], ps.late_by[3],
-                ps.late_by[4], ps.wm_waits, static_cast<double>(ps.wm_wait_ns) / 1000.0, ps.la_waits,
-                static_cast<double>(ps.la_wait_ns) / 1000.0, ps.skips, ps.switches, ps.behind,
-                static_cast<double>(ps.behind_ns) / 1000.0
+                "[GQ_PART thread=%d] partitions=%" PRIu64 " pieces=%" PRIu64 " entries=%" PRIu64 " map_entries=%" PRIu64
+                " slots_skipped=%" PRIu64 " slots_routed=%" PRIu64 " held=%" PRIu64 " held_fed=%" PRIu64
+                " wait_room=%" PRIu64 " wait_part=%" PRIu64 " wait_gate=%" PRIu64 " wait_install=%" PRIu64
+                " chains_decided=%" PRIu64 " chains_dealt=%" PRIu64 " chains_in=%" PRIu64 " chain_wait_ext=%" PRIu64
+                " fills=%" PRIu64 " post_us=%.1f submit_us=%.1f submit_ledger_us=%.1f store_peak=%" PRIu64
+                " map_peak=%" PRIu64 " sent=%" PRIu64 " events_in=%" PRIu64 " matched=%" PRIu64 " early=%" PRIu64
+                " bumped=%" PRIu64 " timed=%" PRIu64 " late=%" PRIu64 " late_us=%.1f late_arrive=%" PRIu64
+                " late_own=%" PRIu64 " late_peer=%" PRIu64 " late_threshold=%" PRIu64 " late_map=%" PRIu64
+                " thr_waits=%" PRIu64 " thr_wait_us=%.1f la_waits=%" PRIu64 " la_wait_us=%.1f bar_waits=%" PRIu64
+                " bar_wait_us=%.1f skips=%" PRIu64 " sim_fills=%" PRIu64 " switches=%" PRIu64 " stream=%" PRIu64
+                " range_conflicts=%" PRIu64,
+                thread_idx, pf.partitions, pf.pieces, pf.entries_posted, pf.map_entries, pf.slots_skipped,
+                pf.slots_routed, pf.held_count, pf.held_fed, pf.wait_room, pf.wait_part, pf.wait_gate, pf.wait_install,
+                pf.chains_decided, pf.chains_dealt, pf.chains_in, pf.chain_wait_ext, pf.fills,
+                cycles_to_us(pf.post_ticks), cycles_to_us(pf.submit_ticks), cycles_to_us(pf.submit_ledger_ticks),
+                ps.resident_peak, ps.map_peak, ps.sent, ps.events_in, ps.matched, ps.early, ps.bumped, ps.timed,
+                ps.late, static_cast<double>(ps.late_ns) / 1000.0, ps.late_by[0], ps.late_by[1], ps.late_by[2],
+                ps.late_by[3], ps.late_by[4], ps.waits[0], static_cast<double>(ps.wait_ns[0]) / 1000.0, ps.waits[1],
+                static_cast<double>(ps.wait_ns[1]) / 1000.0, ps.waits[2], static_cast<double>(ps.wait_ns[2]) / 1000.0,
+                ps.skips, ps.fills, ps.switches, ps.stream_len, ps.range_conflicts
             );
         }
         if (silo_active_ && !part_active_) {

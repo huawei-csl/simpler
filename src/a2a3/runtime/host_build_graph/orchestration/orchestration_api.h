@@ -314,10 +314,11 @@ static inline void rt_declare_silos() {
  *
  * Once the graph is complete it is cut into partitions of about `target_tasks`
  * consecutive tasks, each boundary placed where the fewest dependencies cross,
- * and each partition's tasks are numbered by dependency level. Every silo's
- * controller holds its share of a partition, resolves the partition's edges with
- * the others by exchanging their watermarks, and moves to the next partition once
- * the current one has finished whole. Implies rt_declare_silos(); a runtime
+ * and the host builds the partition plan: every silo's share of each partition,
+ * numbered by dependency level in that silo's own ids. Every silo's controller
+ * holds its share of a partition, learns of producers another silo runs from the
+ * global ids the controllers announce to each other, and moves to the next
+ * partition once its own share has finished. Implies rt_declare_silos(); a runtime
  * without silos ignores it.
  */
 static inline void rt_declare_partitions(int32_t target_tasks) {
