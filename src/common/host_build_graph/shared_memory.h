@@ -112,6 +112,12 @@ struct alignas(64) SharedMemoryTaskHeader {
     uint32_t plan_offset;
     uint32_t plan_words;
 
+    // How many groups the graph declared and the host kept, zero when it kept
+    // none. A runtime that resolves by group needs the per-group runs, and every
+    // member carries its own; this count is what says whether any member does, so
+    // a run that declared nothing is answered without a walk over every task.
+    int32_t declared_groups;
+
     // The byte holds a ChipTaskState and only ever advances:
     //   PENDING -> PUBLISHED -> COMPLETED
     // Both transitions are plain stores; monotonicity is by construction, not
@@ -160,6 +166,9 @@ static_assert(offsetof(SharedMemoryTaskHeader, silo_tasks) == 20, "SharedMemoryT
 static_assert(offsetof(SharedMemoryTaskHeader, partitions) == 24, "SharedMemoryTaskHeader partitions layout drift");
 static_assert(offsetof(SharedMemoryTaskHeader, plan_offset) == 28, "SharedMemoryTaskHeader plan_offset layout drift");
 static_assert(offsetof(SharedMemoryTaskHeader, plan_words) == 32, "SharedMemoryTaskHeader plan_words layout drift");
+static_assert(
+    offsetof(SharedMemoryTaskHeader, declared_groups) == 36, "SharedMemoryTaskHeader declared_groups layout drift"
+);
 
 /**
  * Shared memory header structure

@@ -2417,6 +2417,14 @@ void SchedulerContext::deinit() {
     // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
     // the count-gated consumer never reads entries[] past the fresh count.
 
+    // A run that aborted mid-classify leaves a share outstanding, which would hold
+    // the next run's threads in their dispatch loops.
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; i++) {
+        classify_cursor_[i] = 0;
+        classify_end_[i] = 0;
+    }
+    classify_pending_.store(0, std::memory_order_release);
+
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
@@ -2478,10 +2486,10 @@ void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] in
     }
 
     // The polling initial classify (seed the ready queues + wake lists for the
-    // whole graph) runs AFTER this, partitioned across all AICPU threads in
-    // classify_partition() — see AicpuExecutor::run. It is kept out of this
-    // leader-only setup so the O(total_tasks) scan is not serial on one thread
-    // while the others idle-wait for runtime_init_ready_.
+    // whole graph) runs AFTER this: classify_begin() splits the submitted range
+    // across all AICPU threads and each seeds its slice from its dispatch loop, so
+    // the O(total_tasks) scan is neither serial on this thread nor ahead of the
+    // cores.
 
 #if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
@@ -2497,29 +2505,44 @@ void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] in
 #endif
 }
 
-// Polling initial classify (device boot), partitioned across all AICPU threads.
-// Each thread classifies its contiguous slice of the submitted-task range
-// exactly once. Graph tasks additionally enter the bounded preparation queue;
-// their external fanin follows the same ready/wake classification as any other
-// outer task.
-void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
-    if (completed_.load(std::memory_order_acquire) || sched_->task_view.tasks == nullptr) {
-        return;
-    }
-    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+// Disjoint contiguous slices covering [0, submitted): thread t owns
+// [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
+void SchedulerContext::classify_begin(int32_t thread_idx, int32_t nthreads) {
     const int32_t submitted = total_tasks_;
-    // Disjoint contiguous slices covering [0, submitted): thread t owns
-    // [submitted*t/nthreads, submitted*(t+1)/nthreads). int64 math avoids overflow.
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(submitted) * thread_idx) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(submitted) * (thread_idx + 1)) / nthreads);
-    for (int32_t id = lo; id < hi; id++) {
+    classify_cursor_[thread_idx] = lo;
+    classify_end_[thread_idx] = hi;
+    if (hi > lo) classify_pending_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Polling initial classify (device boot), partitioned across all AICPU threads
+// and run a chunk at a time from each thread's dispatch loop. Each thread
+// classifies its contiguous slice of the submitted-task range exactly once.
+// Graph tasks additionally enter the bounded preparation queue; their external
+// fanin follows the same ready/wake classification as any other outer task.
+bool SchedulerContext::classify_chunk(int32_t thread_idx) {
+    int32_t id = classify_cursor_[thread_idx];
+    const int32_t first = id;
+    const int32_t hi = classify_end_[thread_idx];
+    if (id >= hi) return false;
+    if (completed_.load(std::memory_order_acquire) || sched_->task_view.tasks == nullptr) {
+        classify_cursor_[thread_idx] = hi;
+        classify_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
+    const int32_t chunk_end = (hi - id > kClassifyChunk) ? id + kClassifyChunk : hi;
+    for (; id < chunk_end; id++) {
         if (tasks.is_completed(id)) {
             continue;  // completed on the host (hidden alloc); nothing to dispatch
         }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
             if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
+            // A full preparation queue is a wait, not an end: the cursor stays on
+            // this task so the next pass offers it again once the queue drains.
+            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) break;
         }
         // The ready group queue delivers a group's dispatchable tasks, whole group
         // at a time, and only a task some group actually holds may rely on it. A
@@ -2553,4 +2576,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
             }
         }
     }
+    classify_cursor_[thread_idx] = id;
+    if (id >= hi) classify_pending_.fetch_sub(1, std::memory_order_acq_rel);
+    return id > first;
 }

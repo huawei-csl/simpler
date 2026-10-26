@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 #pragma once
 
 #include <stdint.h>
@@ -97,8 +107,17 @@ inline std::atomic<int32_t> g_group_opened[MAX_GROUPS];
 constexpr int32_t MAX_TASKS_TRACKED = 1 << 17;
 inline uint64_t g_delivered[MAX_TASKS_TRACKED / 64];
 
+// Whether the owner / opened / delivered tables above hold anything other than
+// their cleared state. They are cleared only when they do: clearing them is
+// 88 KB of stores, and a run that declares no group reads and writes none of
+// it. It starts true because g_group_owner's cleared value is NO_OWNER rather
+// than zero, so the tables do not begin cleared and the first reset of the
+// process is the one that establishes the invariant.
+inline bool g_owners_dirty = true;
+
 inline void set_delivered(int32_t id, bool yes) {
     if (id < 0 || id >= MAX_TASKS_TRACKED) return;
+    g_owners_dirty = true;
     const uint64_t bit = 1ULL << (id & 63);
     if (yes) {
         g_delivered[id >> 6] |= bit;
@@ -180,6 +199,13 @@ inline int32_t g_group_extent[MAX_GROUPS];
 
 inline int32_t index_declaration() {
     if (!ENABLED || g_tasks == nullptr) return 0;
+    // The walk below advances one task at a time across an undeclared stretch, so
+    // on a graph that declared nothing it reads every descriptor to conclude there
+    // is no group. The host's count answers that without the reads.
+    if (g_tasks->declared_groups <= 0) {
+        g_group_count = 0;
+        return 0;
+    }
     const int32_t total = g_tasks->total_tasks;
     int32_t groups = 0;
     for (int32_t id = 0; id < total;) {
@@ -193,6 +219,7 @@ inline int32_t index_declaration() {
         g_group_first[g] = d->group_first;
         g_group_extent[g] = d->group_extent;
         if (g >= groups) groups = g + 1;
+        g_owners_dirty = true;
         id = d->group_first + d->group_extent;
     }
     g_group_count = groups;
@@ -221,14 +248,20 @@ inline std::atomic<int32_t> g_scan_from;
 constexpr int32_t GROUP_SCAN_WINDOW = 24;
 
 inline void reset_group_owners() {
+    g_group_count = 0;
+    g_scan_from.store(0, std::memory_order_relaxed);
+    // Only a run that indexed a declaration writes an owner, an opened flag or a
+    // delivered bit, so a run that declared none leaves the tables as it found
+    // them and the next one has nothing to clear.
+    if (!g_owners_dirty) return;
     for (int32_t i = 0; i < MAX_GROUPS; ++i) {
         g_group_owner[i].store(NO_OWNER, std::memory_order_relaxed);
         g_group_opened[i].store(0, std::memory_order_relaxed);
         g_group_external[i] = false;
     }
-    for (int32_t i = 0; i < MAX_TASKS_TRACKED / 64; ++i) g_delivered[i] = 0;
-    g_group_count = 0;
-    g_scan_from.store(0, std::memory_order_relaxed);
+    for (int32_t i = 0; i < MAX_TASKS_TRACKED / 64; ++i)
+        g_delivered[i] = 0;
+    g_owners_dirty = false;
 }
 
 // Take `group` for `thread_idx`, once. Several groups may be in flight at a time,
@@ -242,6 +275,7 @@ inline bool try_claim_group(int32_t group, int32_t thread_idx) {
         )) {
         return false;
     }
+    g_owners_dirty = true;
     return true;
 }
 
@@ -264,7 +298,9 @@ inline bool group_is_opened(int32_t group) {
 }
 
 inline void mark_group_opened(int32_t group) {
-    if (group >= 0 && group < MAX_GROUPS) g_group_opened[group].store(1, std::memory_order_release);
+    if (group < 0 || group >= MAX_GROUPS) return;
+    g_group_opened[group].store(1, std::memory_order_release);
+    g_owners_dirty = true;
 }
 
 // The thread that owns `group`, claiming it for `thread_idx` when it is free.
@@ -277,6 +313,7 @@ inline int32_t claim_group(int32_t group, int32_t thread_idx) {
     if (cur != NO_OWNER) return cur;
     int32_t expected = NO_OWNER;
     if (owner.compare_exchange_strong(expected, thread_idx, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        g_owners_dirty = true;
         return thread_idx;
     }
     return expected;

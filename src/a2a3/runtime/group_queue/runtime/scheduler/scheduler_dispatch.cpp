@@ -1355,6 +1355,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (part_active_ && feed_partitions(thread_idx)) {
             made_progress = true;
         }
+        // The remainder of this thread's initial classify, a chunk an iteration.
+        // It runs beside the cores rather than ahead of them: the first chunk puts
+        // the graph's roots in a queue, and a core-bound round absorbs the rest.
+        if (classify_chunk(thread_idx)) {
+            made_progress = true;
+        }
 #if SIMPLER_DFX
         CYCLE_COUNT_START();
         chip_swimlane.sched_loop_count++;
@@ -1375,7 +1381,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // core here, so the core tracker cannot say whether this thread still has
         // work out. Positions handed out but not retired can.
         const bool gq_outstanding = (gq_group::active() || silo_active_) && gq_index_[thread_idx].outstanding() > 0;
-        if (!tracker.has_any_running_cores() && !gq_outstanding) {
+        // A slice still being seeded holds tasks that have reached no queue, so an
+        // empty queue does not mean the run is over.
+        if (!tracker.has_any_running_cores() && !gq_outstanding && !classify_outstanding()) {
             LoopAction action = check_exit_conditions(thread_idx, header, runtime, task_count);
             if (action == LoopAction::BREAK_LOOP) break;
         }

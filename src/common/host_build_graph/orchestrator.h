@@ -219,6 +219,8 @@ struct OrchestratorState {
 
     // Called once orchestration is over, when the whole declaration set is known.
     void finish_groups();
+    // Valid after finish_groups(), which drops a declaration set carrying no edge.
+    int32_t groups() const { return declared_group_count; }
 
     // Build the partition plan for partitions starting at `starts` (the last entry is
     // the task count), with every task's dependency level in its partition and each

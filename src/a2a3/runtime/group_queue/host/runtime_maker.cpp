@@ -828,6 +828,7 @@ int32_t run_host_orchestration(
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.total_tasks = total_tasks;
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.silo_tasks = orchestrator.silo_tasks();
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.partitions = orchestrator.partitions();
+    reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.declared_groups = orchestrator.groups();
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.plan_offset = 0;
     reinterpret_cast<SharedMemoryHeader *>(host_sm)->tasks.plan_words = 0;
 

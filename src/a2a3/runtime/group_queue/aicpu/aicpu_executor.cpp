@@ -80,20 +80,16 @@ struct AicpuExecutor {
     std::atomic<int32_t> hs_arrived_{0};
     std::atomic<int32_t> hs_thread_seq_{0};
 
-    // Parallel-boot-classify coordination (see AicpuExecutor::run). classify_ready_
-    // is published by the boot leader once its leader-only orchestration setup is
-    // visible; classify_arrived_ is the barrier counting threads that finished
-    // their slice of the initial classify. Both are one-shot per run and reset in
-    // deinit().
+    // Published by the boot leader once its leader-only orchestration setup is
+    // visible, which is what lets every thread take its slice of the initial
+    // classify. One-shot per run and reset in deinit().
     std::atomic<bool> classify_ready_{false};
-    std::atomic<int32_t> classify_arrived_{0};
 
     int32_t aicpu_thread_num_{0};
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
     simpler::ThreadCompletionGate completion_gate_;
-    std::atomic<bool> runtime_init_ready_{false};
 
     // Per-Worker arena backing the RuntimeContext + sm_handle + orch/sched/mailbox
     // sub-regions (created in runtime_create_from_sm, released in runtime_destroy).
@@ -325,8 +321,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // never opens, so the host hangs into the op-execute timeout (507018)
         // instead of seeing the failure. On failure: record it in run_rc,
         // leave rt null so the dispatch block below skips, and still publish
-        // runtime_init_ready_ (single point at the block's end) so the peer
-        // threads stop spinning.
+        // classify_ready_ (single point at the block's end) so the peer threads
+        // stop spinning.
         bool boot_ok = (prebuilt_arena != nullptr);
         if (!boot_ok) {
             LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
@@ -335,9 +331,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
 
         if (boot_ok) {
-            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
-            rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
-            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            {
+                AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
+                runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+                rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+                runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            }
+            AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
 
             void *sm_ptr = runtime->get_gm_sm_ptr();
             // The image the host shipped is pitched to the submitted task count,
@@ -368,9 +368,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             } else {
                 // Queue headers are set, so the slot arrays can take their ramp,
                 // and the mailbox ring gets its cursors and publication gates.
-                // All of it precedes runtime_init_ready_, which is what releases
-                // the peer threads into the dispatch loop, so neither a push nor a
-                // completion message sees an uninitialized region.
+                // All of it precedes classify_ready_, which is what releases the
+                // peer threads, so neither a push nor a completion message sees an
+                // uninitialized region.
                 //
                 // Both regions sit in the device-only zone, so their bytes are
                 // whatever the pooled arena last held, and each one's empty state is
@@ -387,11 +387,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.bind_runtime(rt);
 
             // Latch the host-built task count (on_graph_attached sets total_tasks_)
-            // BEFORE the runtime_init_ready_ release below — that store is the barrier
-            // that unblocks the scheduler threads. Otherwise they would acquire
-            // runtime_init_ready_ with total_tasks_=0 and race to an early exit before
-            // the host task count is visible (host-orch has no concurrent orchestrator
-            // to keep them alive).
+            // BEFORE the classify_ready_ release below — that store is what unblocks
+            // the scheduler threads. Otherwise they would acquire classify_ready_
+            // with total_tasks_=0, take an empty slice and race to an early exit
+            // before the host task count is visible (host-orch has no concurrent
+            // orchestrator to keep them alive).
             // NOTE: do NOT call rt_orchestration_done(rt) here. The HOST already
             // called it in run_host_orchestration; the orchestrator's own
             // task-allocator pointers name host memory the device never reads, so
@@ -402,36 +402,36 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // After the task count is latched, because seeding the ready group queue
             // walks the whole graph; before classify_ready_ below, because classify
             // asks which groups that queue owns.
-            sched_ctx_.gq_prepare_run();
+            {
+                AicpuPhaseScope group_seed(AicpuPhase::GroupSeed);
+                sched_ctx_.gq_prepare_run();
+            }
             LOG_INFO("Thread %d: host-orch boot complete (%d tasks)", thread_idx, runtime->host_total_tasks);
         }
 
         // Publish "leader setup done" (SM attached, task count latched, queues
-        // allocated). Every thread then classifies its slice below before any of
-        // them may dispatch — the leader holds runtime_init_ready_ until then.
+        // allocated). Every thread takes its slice of the classify below and then
+        // enters the dispatch loop, which seeds the slice a chunk at a time.
         classify_ready_.store(true, std::memory_order_release);
     }
 
-    // Parallel initial classify. Every AICPU thread waits for the leader's
-    // orchestration setup, seeds its disjoint slice of the whole graph's ready
-    // set + wake lists, then barriers. Only once all slices are done does the
-    // leader publish runtime_init_ready_, so no thread dispatches against a
-    // half-seeded graph.
+    // Every AICPU thread waits for the leader's orchestration setup and takes its
+    // disjoint slice of the whole graph. No barrier follows: the slices are seeded
+    // from the dispatch loops, so the cores start on the roots the first chunk
+    // makes ready instead of waiting for every slice to be walked. A consumer
+    // registered on a producer that has already completed is the ordinary case the
+    // wake list handles, and no thread may conclude the run is over while a slice
+    // is outstanding.
     while (!classify_ready_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
-    if (!sched_ctx_.is_completed() && rt != nullptr) {
-        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
-    }
-    classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
-    if (thread_idx == aicpu_thread_num_ - 1) {
-        while (classify_arrived_.load(std::memory_order_acquire) < aicpu_thread_num_) {
-            SPIN_WAIT_HINT();
-        }
-        runtime_init_ready_.store(true, std::memory_order_release);
-    } else {
-        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
+    {
+        // Opened after the wait above: that wait is the leader's boot seen from a
+        // peer thread, and the cross-thread max(end)-min(start) reduction would
+        // fold the boot it already measures into this phase.
+        AicpuPhaseScope classify(AicpuPhase::Classify);
+        if (!sched_ctx_.is_completed() && rt != nullptr) {
+            sched_ctx_.classify_begin(thread_idx, aicpu_thread_num_);
         }
     }
 
@@ -441,7 +441,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after a failed boot, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
-            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            int32_t completed;
+            {
+                AicpuPhaseScope sched(AicpuPhase::SchedWindow);
+                completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            }
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
@@ -458,7 +462,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // never released would spin until the op-execute timeout.
     // platform_retire_aicore_group claims per core, so a concurrent
     // emergency_shutdown sweep and this call retire each core exactly once.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
+    int32_t shutdown_rc;
+    {
+        AicpuPhaseScope retire(AicpuPhase::Retire);
+        shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
+    }
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }
@@ -494,7 +502,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     sched_ctx_.deinit();
 
     completion_gate_.reset();
-    runtime_init_ready_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
 
@@ -509,7 +516,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     hs_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
     classify_ready_.store(false, std::memory_order_release);
-    classify_arrived_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
@@ -553,12 +559,19 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
     // return is authoritative on all threads and no extra spin is needed.
-    if (g_aicpu_executor.init(runtime) != 0) {
-        LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
-        return -1;
+    {
+        AicpuPhaseScope preamble(AicpuPhase::Preamble);
+        if (g_aicpu_executor.init(runtime) != 0) {
+            LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+            return -1;
+        }
     }
 
-    int32_t rc = g_aicpu_executor.run(runtime);
+    int32_t rc;
+    {
+        AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
+        rc = g_aicpu_executor.run(runtime);
+    }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
@@ -567,6 +580,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
+        AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }

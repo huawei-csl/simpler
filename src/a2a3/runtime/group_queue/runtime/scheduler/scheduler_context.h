@@ -108,12 +108,26 @@ public:
     // there is no orchestrator lifecycle to hook here: the event is the attach.
     void on_graph_attached(RuntimeContext *rt, int32_t thread_idx, int32_t total_tasks);
 
-    // Seed the ready queues + wake lists for the whole graph at boot. Called by
-    // every AICPU thread on a disjoint slice of the submitted-task range, after
-    // on_graph_attached and before runtime_init_ready_ (the caller barriers
-    // all threads between the two). Concurrency-safe: push_ready_routed and
-    // register_wake are the same lock-free primitives used during the run.
-    void classify_partition(int32_t thread_idx, int32_t nthreads);
+    // Take this thread's disjoint slice of the submitted-task range, whose seeding
+    // into the ready queues and wake lists classify_chunk() then performs. Called
+    // on every AICPU thread after on_graph_attached.
+    void classify_begin(int32_t thread_idx, int32_t nthreads);
+
+    // Seed the next run of this thread's slice, at most kClassifyChunk tasks, and
+    // report whether it seeded any. The dispatch loop calls it until the slice is
+    // spent, so the cores start on what the first run makes ready instead of
+    // waiting for every thread to finish its own: a round is core-bound, so the
+    // rest of the walk costs nothing standing beside work already running.
+    //
+    // Seeding beside dispatch is safe because a producer that completes before its
+    // consumer is registered on it is already the ordinary case — register_wake
+    // finds the drained list, re-classifies against every fanin, and either routes
+    // the consumer or re-targets the next unmet producer.
+    bool classify_chunk(int32_t thread_idx);
+
+    // Whether any thread still holds part of its slice. No thread may decide the
+    // run is over while one does: the tasks in it have reached no queue.
+    bool classify_outstanding() const { return classify_pending_.load(std::memory_order_acquire) > 0; }
 
     // Bind the RuntimeContext scheduler pointer.
     void bind_runtime(RuntimeContext *rt);
@@ -195,6 +209,13 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     std::atomic<bool> completed_{false};
+
+    // Each thread's unseeded remainder [cursor, end) of the initial classify, and
+    // how many threads still hold one.
+    static constexpr int32_t kClassifyChunk = 32;
+    int32_t classify_cursor_[MAX_AICPU_THREADS]{};
+    int32_t classify_end_[MAX_AICPU_THREADS]{};
+    std::atomic<int32_t> classify_pending_{0};
     // Per-core retirement claim. The winner owns that core's register window
     // and return gate for the rest of the run; every other path leaves both
     // alone. Indexed by core id, reset in pre_handshake_init.
