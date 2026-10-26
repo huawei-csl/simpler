@@ -29,6 +29,9 @@ run-wall `{start, end}` pair used, generalized to `N` pairs.
 | `PostOrch` | last-thread teardown after the run completes — a2a3 deinit invalidates host-DMA/SDMA-published state before reset; a5 resets scheduler state without cache invalidation. Stamped only on the thread that finishes last, so it is the real teardown tail, strictly after `sched`. |
 | `OrchWindow` | orchestrator thread's submit window (the former device-log `orch_start/end`) |
 | `SchedWindow` | scheduler thread's dispatch window (the former device-log `sched_start/end`) |
+| `Classify` | (inside `GraphBuild`) per-thread seeding of the ready set + wake lists over an attached graph |
+| `GroupSeed` | (inside `GraphBuild`) seeding the ready group queue from an attached graph |
+| `Retire` | (inside `GraphBuild`) core retirement after a thread stops dispatching |
 
 `ConfigValidate` / `ArenaWire` / `SmReset` break out the per-run prep the
 orchestrator thread does **inside `GraphBuild`, before the `OrchWindow` opens**
@@ -37,6 +40,17 @@ region). Before they existed this was an unattributed front-matter gap — on a
 qwen3-14B 3.5k decode step it is ~22 ms, ~31 % of the device wall. They are
 stamped only on the orchestrator thread (sched threads leave the slots unset; the
 host reducer ignores them).
+
+`Classify` / `GroupSeed` / `Retire` are the shape a runtime takes when its graph
+arrives **prebuilt** — `host_build_graph` and `group_queue`, which orchestrate on
+the host. There is no device-side orchestrator, so `SoLoad`, `ConfigValidate` and
+`OrchWindow` stay unset, and `GraphBuild` instead contains: `ArenaWire` (attach
+the prebuilt arena), `SmReset` (attach the SM image and initialize the scheduler's
+queues), `GroupSeed` (group_queue only — seed the ready group queue), `Classify`
+(every thread seeds its slice of the ready set), `SchedWindow` (dispatch) and
+`Retire` (give the cores back). `Classify` opens *after* the wait for the leader's
+boot, so the cross-thread `max(end) − min(start)` reduction does not fold that
+boot into it.
 
 `OrchWindow` / `SchedWindow` replace the device-log `Orch` / `Sched` lines for
 everyday use: the orchestrator and each scheduler thread store their
@@ -121,6 +135,25 @@ device_wall (RunWall)                 ── time flows top → bottom (sequenti
 │              (finishes first)                 (outlasts orch)
 │
 └─ post_orch                             last-thread teardown (deinit), after sched
+```
+
+A host-orchestrated runtime fills the container differently — the windows are
+sequential, because nothing submits while the schedulers run:
+
+```text
+device_wall (RunWall)
+│
+├─ preamble                              executor init: the per-core handshake
+│
+├─ graph_build  (CONTAINER):
+│    ├─ arena_wire                       attach the prebuilt arena
+│    ├─ sm_reset                         attach the SM image, init the queues
+│    ├─ group_seed                       seed the ready group queue (group_queue only)
+│    ├─ classify                         every thread seeds its slice of the ready set
+│    ├─ sched (SchedWindow)              dispatch
+│    └─ retire                           give the cores back
+│
+└─ post_orch                             last-thread teardown (deinit)
 ```
 
 The vertical axis is time: `preamble → graph_build → post_orch` are **sequential**

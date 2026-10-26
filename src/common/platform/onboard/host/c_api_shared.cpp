@@ -619,6 +619,9 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         {AicpuPhase::PostOrch, "chip.run.runner_run.device_wall.post_orch"},
         {AicpuPhase::OrchWindow, "chip.run.runner_run.device_wall.orch"},
         {AicpuPhase::SchedWindow, "chip.run.runner_run.device_wall.sched"},
+        {AicpuPhase::Classify, "chip.run.runner_run.device_wall.classify"},
+        {AicpuPhase::GroupSeed, "chip.run.runner_run.device_wall.group_seed"},
+        {AicpuPhase::Retire, "chip.run.runner_run.device_wall.retire"},
     };
     // RunWall is emitted above as device_wall; every other phase is in the table.
     static_assert(

@@ -336,9 +336,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
 
         if (boot_ok) {
-            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
-            rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
-            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            {
+                AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
+                runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+                rt = reinterpret_cast<RuntimeContext *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+                runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            }
+            AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
 
             void *sm_ptr = runtime->get_gm_sm_ptr();
             // The image the host shipped is pitched to the submitted task count,
@@ -417,18 +421,24 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     while (!classify_ready_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
-    if (!sched_ctx_.is_completed() && rt != nullptr) {
-        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
-    }
-    classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
-    if (thread_idx == aicpu_thread_num_ - 1) {
-        while (classify_arrived_.load(std::memory_order_acquire) < aicpu_thread_num_) {
-            SPIN_WAIT_HINT();
+    {
+        // Opened after the wait above: that wait is the leader's boot seen from a
+        // peer thread, and the cross-thread max(end)-min(start) reduction would
+        // fold the boot it already measures into this phase.
+        AicpuPhaseScope classify(AicpuPhase::Classify);
+        if (!sched_ctx_.is_completed() && rt != nullptr) {
+            sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
         }
-        runtime_init_ready_.store(true, std::memory_order_release);
-    } else {
-        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
+        classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
+        if (thread_idx == aicpu_thread_num_ - 1) {
+            while (classify_arrived_.load(std::memory_order_acquire) < aicpu_thread_num_) {
+                SPIN_WAIT_HINT();
+            }
+            runtime_init_ready_.store(true, std::memory_order_release);
+        } else {
+            while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+                SPIN_WAIT_HINT();
+            }
         }
     }
 
@@ -438,7 +448,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after a failed boot, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
-            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            int32_t completed;
+            {
+                AicpuPhaseScope sched(AicpuPhase::SchedWindow);
+                completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            }
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
@@ -455,7 +469,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // never released would spin until the op-execute timeout.
     // platform_retire_aicore_group claims per core, so a concurrent
     // emergency_shutdown sweep and this call retire each core exactly once.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
+    int32_t shutdown_rc;
+    {
+        AicpuPhaseScope retire(AicpuPhase::Retire);
+        shutdown_rc = sched_ctx_.shutdown(thread_idx, runtime);
+    }
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }
@@ -550,12 +568,19 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
     // return is authoritative on all threads and no extra spin is needed.
-    if (g_aicpu_executor.init(runtime) != 0) {
-        LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
-        return -1;
+    {
+        AicpuPhaseScope preamble(AicpuPhase::Preamble);
+        if (g_aicpu_executor.init(runtime) != 0) {
+            LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+            return -1;
+        }
     }
 
-    int32_t rc = g_aicpu_executor.run(runtime);
+    int32_t rc;
+    {
+        AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
+        rc = g_aicpu_executor.run(runtime);
+    }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
@@ -564,6 +589,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // The finalizer publishes cleanup eligibility only after runtime destruction.
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
+        AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }

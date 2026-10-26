@@ -59,6 +59,12 @@ enum class AicpuPhase : uint32_t {
     ConfigValidate,  // config_func() + arg-count validate
     ArenaWire,       // attach prebuilt runtime arena + wire device pointers
     SmReset,         // SM/ring reset + finalize + bind, up to releasing the schedulers
+    // Host-built-graph prologue sub-phases: a runtime whose graph arrives
+    // prebuilt spends its front matter attaching and walking that graph rather
+    // than submitting one, so the walk is split out from SmReset.
+    Classify,   // per-thread seeding of the ready set + wake lists over the attached graph
+    GroupSeed,  // seeding the ready group queue from the attached graph
+    Retire,     // core retirement after this thread stops dispatching
     Count,
 };
 

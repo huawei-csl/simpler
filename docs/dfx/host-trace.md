@@ -159,15 +159,18 @@ chip.run                                      (= host_wall)
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1
 ├─ chip.run.runner_run          (device enqueue + completion drain)
 │  └─ chip.run.runner_run.device_wall      (whole on-NPU AICPU wall)
-│     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}
-│           TMR device-domain (clk=dev): AICPU subdivision of the on-NPU wall
+│     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,
+│          group_seed,classify,retire,post_orch,orch,sched}
+│           device-domain (clk=dev): AICPU subdivision of the on-NPU wall
 └─ chip.run.validate
 ```
 
-The `device_wall` span exists for both runtimes. Its
-`.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}`
-children are TMR-only; HBG orchestration runs on the host and stamps none of
-those phases. All emitted device spans are tagged `clk=dev`. They are not host
+The `device_wall` span exists for every runtime, and so do its phase children —
+but which ones appear says which runtime ran. TMR orchestrates on the device and
+stamps `so_load` / `config_validate` / `orch`; HBG and group_queue orchestrate on
+the host and instead stamp `group_seed` (group_queue only), `classify` and
+`retire`. `preamble`, `arena_wire`, `sm_reset`, `graph_build`, `sched` and
+`post_orch` are common. All emitted device spans are tagged `clk=dev`. They are not host
 `steady_clock` spans: the AICPU stamps raw sys-counter cycles into a host-allocated buffer
 (whose address rides on `KernelArgs::device_wall_data_base`), the host reads it
 back after stream-sync, converts cycles → ns, and emits the marker. `orch`/
@@ -192,7 +195,7 @@ including time the caller spends polling or doing other host work; blocking
 | 0 | `chip.run` |
 | 1 | `chip.run.bind`, `chip.run.runner_run`, `chip.run.claim_release`, `chip.run.validate` |
 | 2 | `chip.run.bind.args`, `chip.run.bind.prebuilt`, the other HBG `chip.run.bind.*` segments, `chip.run.runner_run.device_wall` |
-| 3 | TMR phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}` and optional `task_slot_*` spans |
+| 3 | phase spans `chip.run.runner_run.device_wall.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,group_seed,classify,retire,post_orch,orch,sched}` and optional `task_slot_*` spans |
 
 ## Host scheduler spans
 
