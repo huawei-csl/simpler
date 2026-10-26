@@ -5,6 +5,16 @@
 alternatives tried on the way, dropped for what
 [docs/asim/partitions.md](../asim/partitions.md) now describes
 
+> **The absolute figures on this page are superseded.** Every arm here was measured
+> with `v3_qwen.calib`, which carries no line for func_id 12 --
+> `paged_attention_rope_cce_aiv`, the AIV half of the 278 us attention kernel -- so the
+> runtime charged it the 1 us default, leaving 11.1 ms an AIV core out of the model. The
+> same design re-measured with a full calibration reads M0 36.18 ms and partitions
+> +6.8 %, not +2.1 %: see
+> [validation/partitions.md](../asim/validation/partitions.md) and
+> [the finer-tile investigation](2026-10-gq-partitions-qwen-finer-tiles.md). The
+> *ordering* of the design changes below, which is what this page is about, is unaffected.
+
 ## Question
 
 Partitions were built and measured on deepseek_v4 and paged_attention, neither of

@@ -197,6 +197,39 @@ Compare compute issued across the arms before trusting any delta. On the two
 cases it matches to 0.08 % and 0.005 % — though for qwen those figures come from
 the in-repo expanded orchestration, since the pypto path emits no counters.
 
+### Splitting `device_wall` into phases
+
+Both host-orchestrated runtimes stamp the AICPU device-phase buffer, so a round
+divides into `preamble` (executor init, including the per-round core handshake),
+the `graph_build` span and its children — `arena_wire`, `sm_reset`, `group_seed`
+(group_queue only), `classify`, `sched`, `retire` — and `post_orch`. The phase
+set is in [device-phases.md](../dfx/device-phases.md).
+
+[analyzers/asim_phases.py](analyzers/asim_phases.py) reads those markers out of
+each arm's `pytest_full.log`, drops the first rounds and prints the per-round
+median of every phase plus the deltas against the first arm:
+
+```bash
+PFX=<run-prefix> ARMS_ORDER="m0 m2 m2t" python docs/asim/analyzers/asim_phases.py
+# OUT_ROOT (default tmp_sac_out) names the directory holding <PFX>_<arm>_<rep>/
+# DROP (default 2) is how many leading rounds to discard
+```
+
+**Read durations, never timestamps.** A span's `dur` has the simulated device's
+own overrun removed while its `ts` is a raw sys-counter offset, so on any arm
+whose model overruns — every group_queue arm — the two are on different clocks
+and every ts-derived interval is wrong by the overrun accrued before it. On one
+partition run the `retire` span starts at 14.3 ms inside an 8.6 ms round. For
+the same reason the analyzer takes `other` as the residual of `graph_build`
+after its children and `total` as the sum of the three top-level phases, rather
+than subtracting timestamps; `other` is a remainder, so it is not comparable
+between arms.
+
+The phases are cross-thread union spans, reduced by the host as
+`max(end) - min(start)` over the scheduler threads. `sched` is therefore not one
+thread's dispatch window and reads ~150 µs above the ledger-corrected window
+metric; use whichever one the comparison needs, but not both at once.
+
 ## Measurement discipline
 
 These are not style preferences; each one was learned from a wrong number.

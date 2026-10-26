@@ -8,53 +8,53 @@ the four.
 
 | case | M0 | partitions | vs M0 |
 | ---- | -- | ---------- | ----- |
-| qwen3-14B decode, 40 layers | 33.25 ms | 33.95 ms | +2.1 % |
+| qwen3-14B decode, 40 layers | 36.18 ms | 38.65 ms | +6.8 % |
 | deepseek_v4, as-is | 32.29 ms | 29.15 ms | -9.8 % |
 | deepseek_v4, half the experts running | 39.21 ms | 35.94 ms | -8.4 % |
 | paged_attention Case1 | 22.24 ms | 12.10 ms | -45.6 % |
 
-## qwen3-14B decode: 2.1 % behind M0, at the design's own floor
+## qwen3-14B decode: 6.8 % behind M0, on a cube-bound case
 
-All 40 layers expanded -- 11,087 tasks, one sync-start cohort a layer -- with
+All 40 layers expanded -- 11,085 tasks, one sync-start cohort a layer -- with
 `rt_declare_partitions(277)` as the entry's first statement: a layer a partition, 41
 partitions. M0, plain M2 and partitions interleaved in every job, eight rounds a rep
 with the first two dropped, three reps (n=18 rounds an arm):
 
-| arm | device_wall | vs M0 | window |
-| --- | ----------- | ----- | ------ |
-| M0 | 33.25 ms | | 32.06 ms |
-| M2 | 33.58 ms | +0.9 % | 31.96 ms |
-| M2, partitions | 33.95 ms | +2.1 % (+2.0 to +2.2) | 32.61 ms |
+| arm | device_wall | vs M0 | window | vs M0 |
+| --- | ----------- | ----- | ------ | ----- |
+| M0 | 36.18 ms | | 35.02 ms | |
+| M2 | 37.21 ms | +2.8 % | 35.64 ms | +1.8 % |
+| M2, partitions | 38.65 ms | +6.8 % (+6.71 to +6.91) | 37.19 ms | +6.2 % |
 
-**The case is cube-bound.** A round carries 30.7 ms of cube work a core and almost
-no vector work, in cube kernels of 18 to 270 us, so the AICPU is off the critical
-path whatever schedules it: M0's window is within 5 % of the cube floor. The oracle
-puts this design at 31.8 ms, 0.8 % under M0's window, so the partition arm can at
-best draw level; it is 1.7 % behind on the window, paired rep by rep.
+**These figures replace an earlier set** -- M0 33.25 ms, partitions 33.95 ms, +2.1 %
+-- measured with a calibration carrying no line for func_id 12,
+`paged_attention_rope_cce_aiv`: the AIV half of the 278 us attention kernel, which
+the runtime then charges the 1 us default. That is 534 ms of vector core time a
+round, 11.1 ms an AIV core, absent from the model, and it flattered every arm
+unequally. The arms above are a regeneration of the same orchestration from pypto
+`6beb9763`, each calibrated from its own silicon chip-swimlane capture with every
+func_id covered: `M2_DONE` reports `default=0`, so no task fell back.
 
-**Where it stands.** Of the 0.70 ms the partition arm trails M0 by, 0.55 ms is inside
-the scheduler window and 0.15 ms outside it: the partition arm spends 1.35 ms of
-`device_wall` outside its window, M0 1.19 ms. Inside it, every cohort drains the
-cores before it runs -- its members hold each cube core from the moment the core
-frees until the last one does -- 1.14 ms a cube core a round here and 1.0 ms in the
-oracle. M0 drains the same way, which is why the design's floor sits at M0's window
-and not below it.
+**The case is cube-bound.** On silicon a round carries 32.5 ms of cube work a core
+and 11.3 ms of vector, in cube kernels of 18 to 278 us, so the AICPU is off the
+critical path whatever schedules it: the hottest cube core is busy 33.74 ms of a
+35.68 ms makespan, and M0's window is within 5 % of that floor. The oracle
+(`PLACE=pick LOOK=512 COHORT=sync PART=277`) puts this design at 36.32 ms, 3.7 %
+above M0's window, so the partition arm cannot draw level here; it measures 6.2 %
+behind on the window, 0.86 ms above its own model.
 
 | per controller and round | partitions |
 | ------------------------ | ---------- |
-| entries | 4,802 |
-| store peak (most of any) | 277 (280) |
-| map peak (most of any) | 187 (206) |
-| global ids announced, received, matched | 2,284, 6,853, 3,704 |
-| releases learned late, in all | 20, 0.03 ms |
-| waits for producers past the fourth | 246, 22.2 ms summed |
-| cohort hold, cube and vector core time | 6.9 ms, 6.3 ms |
+| entries | 4,801 |
+| store peak (of 1,024) | 275 |
+| map peak | 192 |
+| releases learned late | 2.4, 0.01 ms |
+| waits for producers past the fourth | 25.8, 1.64 ms |
+| look-ahead waits | 0 |
 
-The plan deals the narrow tasks, 4,802 entries in every group; it spans up to 289
-local ids a subpartition (mean 194) and maps up to 126 global ids, 8,537 in all. No
-announcement reached a controller before its map. Every arm completes every task,
-and the core time issued agrees to 0.1 %, 186.6 ms a group or a manager's share; the
-cohort's vector kernel has no calibration and takes the 1 us default in every arm.
+Every arm completes every task. The oracle's `la_need` -- the local-id distance a
+group must see ahead to start its next entry -- is 239 to 242 ids against a
+look-ahead of 512, so the window is not binding at this task count.
 
 **What it took.** As first built the partitions ran qwen at ~50 ms: the host's
 placement put 2.6 times as much in two groups as in the other two, a cohort member
@@ -62,6 +62,18 @@ refused by a full ring was dropped, the managers saw each cohort finish ~310 us
 late, and every layer's first tasks waited at the barrier for the whole layer
 before. [investigations](../../investigations/2026-10-gq-partitions-qwen.md) records
 each step and what it measured.
+
+**More tasks a layer helps, and the cheap way is to un-batch.** Lowering
+`GATE_UP_SPMD_N` from 6 to 1 splits the batched gate/up dispatches into one task a
+tile: 327 tasks a layer at byte-identical device work -- the same 19,208 AICore
+tasks -- and the partition arm goes to 4.8 % behind M0 (window 4.3 %, oracle floor
+2.6 % above M0's window) for 0.25 % more silicon time, with its counters flat and
+`la_need` falling to 185. It is independent schedulability that pays, not the count:
+un-batching out_proj as well (350 a layer) measures 5.0 %, no better, because its 24
+blocks all wait on the attention cohort and all feed the residual. Halving the MLP and
+down tiles instead reaches 729 tasks a layer and 4.0 % behind M0, but costs 4.7 % more
+cube work and saturates the 512-id look-ahead:
+[investigations](../../investigations/2026-10-gq-partitions-qwen-finer-tiles.md).
 
 ## deepseek_v4: -9.8 % against M0
 
