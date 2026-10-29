@@ -100,6 +100,21 @@ add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 
+# TraCR. Applies to every variant built from this tree, including the simulated
+# a2a3asim/a2a3asimgq ones -- they compile the same host sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(host_runtime)
+
+# Build the trace post-processor from the host tree, not the AICPU one: it is an
+# offline host tool and the AICPU cross-toolchain has no <filesystem>. Doing it
+# here (rather than only under platform/sim, as upstream does) is what makes the
+# reader exist for an a2a3asim/a2a3asimgq build, which never configures the sim
+# tree. The guard keeps a build that configures several trees from declaring the
+# target twice.
+if(BUILD_TRACR AND NOT TARGET tracr_process)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+endif()
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17
@@ -130,6 +145,17 @@ target_compile_definitions(host_runtime PRIVATE
 # provision simulator-owned register backing) via __SIMULATED_DEVICE__.
 if(ASIM_DEVICE OR ASIMGQ_DEVICE)
     target_compile_definitions(host_runtime PRIVATE __SIMULATED_DEVICE__)
+    # The device stamps markers on the model clock under this knob; the host writes
+    # which clock they are on into metadata.json, so it reads the same setting.
+    if(DEFINED ENV{SIM_TRACR_MODEL_CLOCK})
+        set(SIM_TRACR_MODEL_CLOCK $ENV{SIM_TRACR_MODEL_CLOCK})
+    endif()
+    # BUILD_TRACR is a device-side flag and does not reach this configure, so the
+    # label follows the clock knob alone; with tracing off there is no trace to
+    # label. A wrong label is worse than none, which is why it is not guarded on it.
+    if(SIM_TRACR_MODEL_CLOCK)
+        target_compile_definitions(host_runtime PRIVATE SIM_TRACR_MODEL_CLOCK=1)
+    endif()
 endif()
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)

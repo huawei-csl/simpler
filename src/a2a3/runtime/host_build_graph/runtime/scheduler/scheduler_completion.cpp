@@ -10,6 +10,9 @@
  */
 #include "scheduler_context.h"
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #ifdef __SIMULATED_DEVICE__
 #include "aicpu/asim_core.h"
 #endif
@@ -396,6 +399,12 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+#if !(defined(__SIMULATED_DEVICE__) && ASIM_TRACR_CORE_LANES)
+            // Paired with the MARK_SET in scheduler_dispatch.cpp: when the aSim
+            // model owns these lanes it closes its own spans, and this would add
+            // a second RESET per task on a lane that is already idle.
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
+#endif
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
@@ -410,6 +419,12 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+#if !(defined(__SIMULATED_DEVICE__) && ASIM_TRACR_CORE_LANES)
+            // Paired with the MARK_SET in scheduler_dispatch.cpp: when the aSim
+            // model owns these lanes it closes its own spans, and this would add
+            // a second RESET per task on a lane that is already idle.
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
+#endif
         }
 
         // 2. Update slot data

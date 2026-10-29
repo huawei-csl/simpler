@@ -14,6 +14,9 @@
 #include <cinttypes>
 #include <limits>
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "assert_compat.h"  // debug_assert
 #include "host_build_graph/common.h"
 
@@ -211,11 +214,33 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // write — keeping this cold per-core line off the dispatch path.
     build_payload(payload, slot_state, subslot, block_idx, force_gate);
 
+    // Carry the dispatched kernel's func_id in the marker extraId so TraCR
+    // traces record task identity (which kernel ran). subslot selects this
+    // core's kernel_id (AIC vs AIV for a paired task); post-processing maps
+    // func_id -> kernel name via the run's kernel_config.py.
+    [[maybe_unused]] const uint32_t tracr_func_id =
+        static_cast<uint32_t>(slot_state.to_descriptor().kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
+#if !(defined(__SIMULATED_DEVICE__) && ASIMGQ_TRACR_CORE_LANES)
+        // Suppressed when the GroupQueue model writes these lanes itself: both
+        // would write the same channel, and interleaved spans on one lane cannot
+        // be reconstructed by the per-channel pairing in tracr_process. Grouping
+        // hides this -- the controller places, so this path is dead -- but an
+        // ungrouped workload reaches both emitters and double-records every task.
+        INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Pair, tracr_func_id);
+#endif
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
+#if !(defined(__SIMULATED_DEVICE__) && ASIMGQ_TRACR_CORE_LANES)
+        // Suppressed when the GroupQueue model writes these lanes itself: both
+        // would write the same channel, and interleaved spans on one lane cannot
+        // be reconstructed by the per-channel pairing in tracr_process. Grouping
+        // hides this -- the controller places, so this path is dead -- but an
+        // ungrouped workload reaches both emitters and double-records every task.
+        INSTRUMENTATION_MARK_SET(aicpu_thread_num_ + core_id, Running_Task_Single, tracr_func_id);
+#endif
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -1336,6 +1361,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             static_cast<uint64_t>(scheduler_timeout_ms_override) * PLATFORM_PROF_SYS_CNT_FREQ / 1000;
     }
     while (true) {
+        // Opens the iteration. All three feeds below hand entries to a controller,
+        // so one state covers them whichever is active -- a marker inside the
+        // grouping branch alone would leave a silo or partition run's feed billed
+        // to the previous iteration's last state.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Submit, 0);
         if (completed_.load(std::memory_order_acquire)) {
             break;
         }
@@ -1346,8 +1376,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Refill from the ready group queue before looking for work: a thread works
         // through one group at a time, handing the controller more of it as its
         // position window and the controller's hold room allow.
-        if (gq_group::active() && feed_open_groups(thread_idx)) {
-            made_progress = true;
+        if (gq_group::active()) {
+            if (feed_open_groups(thread_idx)) {
+                made_progress = true;
+            }
         }
         if (silo_active_ && !part_active_ && feed_silos(thread_idx)) {
             made_progress = true;
@@ -1358,6 +1390,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // The remainder of this thread's initial classify, a chunk an iteration.
         // It runs beside the cores rather than ahead of them: the first chunk puts
         // the graph's roots in a queue, and a core-bound round absorbs the rest.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Supply, 0);
         if (classify_chunk(thread_idx)) {
             made_progress = true;
         }
@@ -1377,6 +1410,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         iter_shared_sampled = false;
 #endif
         int32_t task_count = 0;
+        // Stands through the exit check, the core sweep, the async wait list and
+        // the dummy queue, matching host_build_graph's single completion state.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Complete, 0);
         // An entry a group or a silo fed is placed by the controller and holds no
         // core here, so the core tracker cannot say whether this thread still has
         // work out. Positions handed out but not retired can.
@@ -1560,12 +1596,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool try_pushed = false;
 
 #ifdef __SIMULATED_DEVICE__
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Sync, 0);
         service_cohort(thread_idx);
         if (part_active_) service_part_cohort(thread_idx);
 #endif
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Sync, 0);
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1599,6 +1637,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // pass. Limiting the work to one activation and one bounded prepare
         // slice per loop prevents a large definition from monopolizing a
         // scheduler thread.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Supply, 0);
         if (thread_idx < active_sched_threads_) {
             ChipTaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
             if (graph_slot != nullptr) {
@@ -1651,6 +1690,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             }
         }
+
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Submit, 0);
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
@@ -1740,6 +1781,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
             // Polling: no deferred producer-release phase to drain on an idle pass.
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Sched_Idle, 0);
             idle_iterations++;
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {

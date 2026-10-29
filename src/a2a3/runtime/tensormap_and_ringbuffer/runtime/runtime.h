@@ -185,6 +185,12 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
+    // TraCR trace buffers, allocated on the device by the host before launch.
+    // Declared unconditionally so the launch descriptor has one layout whether or
+    // not TraCR is compiled in. Null when TraCR is off.
+    void *tracrData_;
+    void *tracrDataSizes_;
+
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
@@ -256,6 +262,10 @@ public:
     int get_worker_count() const { return dev.worker_count; }
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
+    void *get_tracr_data() const { return dev.tracrData_; }
+    void set_tracr_data(void *p) { dev.tracrData_ = p; }
+    void *get_tracr_data_sizes() const { return dev.tracrDataSizes_; }
+    void set_tracr_data_sizes(void *p) { dev.tracrDataSizes_ = p; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
     AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }

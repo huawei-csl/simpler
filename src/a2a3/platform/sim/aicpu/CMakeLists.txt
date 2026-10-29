@@ -73,6 +73,11 @@ add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
+# TraCR. The sim platform compiles the same instrumented runtime sources as
+# onboard, so it needs the include paths even when BUILD_TRACR is OFF.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
 option(WERROR "Treat compiler warnings as errors" ON)
 if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
     set(WERROR OFF)

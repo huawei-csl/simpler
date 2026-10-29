@@ -76,6 +76,11 @@ add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
+# TraCR. Applies to every variant built from this tree, including the simulated
+# a2a3asim/a2a3asimgq ones -- they compile the same AICPU sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
 # __SIMULATED_DEVICE__ says "no real AICore fabric". It gates the platform-level
 # deltas -- skip the AICore launch, skip set_platform_regs, short-circuit the exit
 # handshake, load the calibration table -- which are identical whichever simulated
@@ -87,7 +92,68 @@ endif()
 if(ASIM_DEVICE)
     target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asim")
 endif()
+if(ASIM_DEVICE)
+    # Per-core TraCR lanes from the aSim model, the same mechanism the GroupQueue
+    # arm uses. With it on, the host_build_graph manager's own Running_Task_* marks
+    # are compiled out here: both would write the same channel. Opt-in for the same
+    # reason as the GroupQueue one -- two stores per task inside the measured window.
+    option(ASIM_TRACR_CORE_LANES "Emit per-core TraCR lanes from the aSim model" OFF)
+    if(DEFINED ENV{ASIM_TRACR_CORE_LANES})
+        set(ASIM_TRACR_CORE_LANES $ENV{ASIM_TRACR_CORE_LANES})
+    endif()
+    if(BUILD_TRACR AND ASIM_TRACR_CORE_LANES)
+        message(STATUS "Enabling aSim per-core TraCR lanes")
+        target_compile_definitions(aicpu_kernel PRIVATE ASIM_TRACR_CORE_LANES=1)
+    endif()
+endif()
+
+# Report the simulated window WITHOUT removing the model's own excess. Applies
+# to every simulated device, so an A/B run of the two builds says how much
+# aicpu_phase_end() subtracts -- which is otherwise unreadable, because the
+# [ASIM_WORK]/[GQ_WORK] counters that carry it are device-side LOG_INFO and
+# never reach any captured log on this path.
+if(ASIM_DEVICE OR ASIMGQ_DEVICE)
+    option(SIM_REPORT_RAW_WINDOW "Leave the model's own excess in the reported window" OFF)
+    if(DEFINED ENV{SIM_REPORT_RAW_WINDOW})
+        set(SIM_REPORT_RAW_WINDOW $ENV{SIM_REPORT_RAW_WINDOW})
+    endif()
+    if(SIM_REPORT_RAW_WINDOW)
+        message(STATUS "Reporting RAW simulated windows (no overrun subtraction)")
+        target_compile_definitions(aicpu_kernel PRIVATE SIM_REPORT_RAW_WINDOW=1)
+    endif()
+endif()
+
+# Stamp TraCR markers on the model clock instead of the real counter, so a trace
+# reads as the simulated timeline rather than the wall-clock one it was recorded
+# in. The model runs on this AICPU inside the window it measures, so its clock is
+# real time LESS the thread's accumulated overrun; without this a round whose
+# simulated window is 29 ms spans ~50 ms of trace. Off by default: the real-time
+# stamp is what a2a3 produces, and keeping it the default means the two platforms'
+# traces are built the same way unless asked otherwise.
+if(ASIM_DEVICE OR ASIMGQ_DEVICE)
+    option(SIM_TRACR_MODEL_CLOCK "Stamp TraCR markers on the simulated clock" OFF)
+    if(DEFINED ENV{SIM_TRACR_MODEL_CLOCK})
+        set(SIM_TRACR_MODEL_CLOCK $ENV{SIM_TRACR_MODEL_CLOCK})
+    endif()
+    if(BUILD_TRACR AND SIM_TRACR_MODEL_CLOCK)
+        message(STATUS "Stamping TraCR markers on the SIMULATED clock")
+        target_compile_definitions(aicpu_kernel PRIVATE SIM_TRACR_MODEL_CLOCK=1)
+    endif()
+endif()
+
 if(ASIMGQ_DEVICE)
+    # Per-core TraCR lanes for the GroupQueue. Only the controller knows which core
+    # ran a grouped task, so the spans are emitted from the device model rather than
+    # the scheduler. Opt-in: it adds two stores per task inside the measured window,
+    # so a build with it on is its own baseline.
+    option(ASIMGQ_TRACR_CORE_LANES "Emit per-core TraCR lanes from the GroupQueue model" OFF)
+    if(DEFINED ENV{ASIMGQ_TRACR_CORE_LANES})
+        set(ASIMGQ_TRACR_CORE_LANES $ENV{ASIMGQ_TRACR_CORE_LANES})
+    endif()
+    if(BUILD_TRACR AND ASIMGQ_TRACR_CORE_LANES)
+        message(STATUS "Enabling GroupQueue per-core TraCR lanes")
+        target_compile_definitions(aicpu_kernel PRIVATE ASIMGQ_TRACR_CORE_LANES=1)
+    endif()
     target_include_directories(aicpu_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../asimgq")
 endif()
 

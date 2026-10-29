@@ -108,6 +108,13 @@ inline void aicpu_phase_end(AicpuPhase phase) {
     // its cores do not move. A device whose cores ran on the real clock would keep
     // computing through the excess, and removing it would delete time they spent
     // -- enough, on a busy-core case, to report less than the work they carried.
+    //
+    // SIM_REPORT_RAW_WINDOW builds the same model but leaves the excess IN, so a
+    // pair of runs gives both the corrected window and the raw one and their
+    // difference is exactly what this removes. Nothing else changes, so the two
+    // are comparable. Off by default: the corrected window is the one that
+    // describes the design rather than the cost of modelling it.
+#if !defined(SIM_REPORT_RAW_WINDOW)
     const int t = platform_aicpu_affinity_thread_idx();
     const uint64_t before =
         (t >= 0 && t < PLATFORM_MAX_AICPU_THREADS) ? g_sim_self_at_phase_start[t][static_cast<int>(phase)] : 0;
@@ -115,6 +122,7 @@ inline void aicpu_phase_end(AicpuPhase phase) {
     const uint64_t self = now > before ? now - before : 0;
     const uint64_t start = records[static_cast<int>(phase)].start_cycle;
     end = (end > start + self) ? end - self : start;
+#endif
 #endif
     records[static_cast<int>(phase)].end_cycle = end;
 }

@@ -9,6 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "aicpu/asimgq_core.h"
+
+#if ASIMGQ_TRACR_CORE_LANES
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+#endif
 #include "aicpu/platform_aicpu_affinity.h"
 
 #include <algorithm>
@@ -120,6 +125,13 @@ struct SimCore {
     // was placed, so a member may sit behind running work and still be co-resident
     // once the cohort's release passes that point.
     uint64_t gated_floor[2] = {0, 0};
+#if ASIMGQ_TRACR_CORE_LANES
+    // The member's kernel and whether it landed behind running work. Both are
+    // facts of its placement, drawn with its duration when it was placed; the
+    // release that starts it reads the entry no more than it redraws the compute.
+    uint32_t gated_func[2] = {0, 0};
+    bool gated_pipelined[2] = {false, false};
+#endif
     // A gated slot holding an early-dispatch pre-stage carries its doorbell key;
     // a cohort member's is SIM_NO_BELL, and only release_cohort() starts those.
     uint32_t bell_core[2] = {SIM_NO_BELL, SIM_NO_BELL};
@@ -219,6 +231,16 @@ struct SimPackage {
     uint32_t aiv1 = UINT32_MAX;
 };
 
+// Queue-local core slot -> the die-wide core id the scheduler knows it by. The
+// controller itself has no use for this (it names cores by their slot), but a
+// per-core TraCR lane does: the trace's channel has to be the same core the
+// host-side metadata names. Only populated when core lanes are compiled in.
+#if ASIMGQ_TRACR_CORE_LANES
+struct SimCoreIdentity {
+    uint32_t global_id = UINT32_MAX;
+};
+#endif
+
 // One GroupQueue: the controller for the packages and cores it serves.
 //
 // It is owned outright by a single AICPU scheduler: no other thread reads or
@@ -298,6 +320,9 @@ struct alignas(64) SimQueue {
     uint32_t package_count = 0;
     SimCore cores[SIM_QUEUE_MAX_PACKAGES * 3];
     uint32_t core_count = 0;
+#if ASIMGQ_TRACR_CORE_LANES
+    SimCoreIdentity core_identity[SIM_QUEUE_MAX_PACKAGES * 3];
+#endif
 
     // Every core's state, as the controller holds it. There is no frontend
     // controller between the queue and the cores: each core signals its own ACK
@@ -1273,6 +1298,61 @@ void refresh_core(SimQueue &q, uint32_t slot) {
 // Commit one entry to a core, starting no earlier than the core is free and no
 // earlier than the entry existed. The end is computed here, once, and never
 // revisited — which is what replaces advancing a state machine on every access.
+#if ASIMGQ_TRACR_CORE_LANES
+// Channel base, set at bring-up. UINT32_MAX means "not configured": emit nothing
+// rather than onto channel 0, which is an AICPU thread's lane.
+uint32_t g_tracr_lane_base = UINT32_MAX;
+
+// Push one core-lane span straight into this thread's TraCR buffer.
+//
+// INSTRUMENTATION_MARK_SET stamps "now", which is wrong here: the span being
+// recorded is a simulated interval that has not happened yet in wall time. The
+// Payload carries its own timestamp, so the pair is stored directly. The buffer
+// is left unsorted by this -- TRACR_FINALIZE sorts it before handing it over,
+// because the post-processor's k-way merge requires each thread's traces to be
+// in timestamp order.
+inline void tracr_core_span(
+    const SimQueue &q, uint32_t core_slot, uint32_t func_id, bool pipelined, uint64_t begin_ticks,
+    uint64_t end_ticks
+) {
+    if (g_tracr_lane_base == UINT32_MAX || !tracrThread) {
+        return;
+    }
+    const uint32_t gid = q.core_identity[core_slot].global_id;
+    if (gid == UINT32_MAX) {
+        return;
+    }
+    const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + gid);
+    // Pair marks a task that landed behind running work, which is what to_pending
+    // means in the hbg and group_queue managers that write these lanes on silicon,
+    // and what the aSim model records. It is NOT the Mix task type: that is a
+    // placement property (one package, halves sharing its local memory) and has
+    // no bearing on whether the core was fed or starved.
+    const uint16_t event = static_cast<uint16_t>(pipelined ? Running_Task_Pair : Running_Task_Single);
+    // Simulated time is cntvct rescaled to PLATFORM_PROF_SYS_CNT_FREQ. The queue's
+    // instants are real time LESS its accumulated overrun, and the gap grows through
+    // the run (it reached ~16 ms on qwen), so which epoch the buffer is on decides
+    // whether the offset is added back. By default the AICPU markers beside these
+    // are stamped on the real counter and it is, or the core lanes drift
+    // progressively earlier. Under SIM_TRACR_MODEL_CLOCK the whole buffer is on the
+    // model clock and these instants already are.
+#if SIM_TRACR_MODEL_CLOCK
+    const uint64_t ofs = 0;
+#else
+    const uint32_t qi = static_cast<uint32_t>(&q - g_queues);
+    const uint64_t ofs = qi < SIM_MAX_QUEUES ? g_ledger[qi].overrun_ticks : 0;
+#endif
+    tracrThread->store_trace(
+        TraCR::Payload{channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)}
+    );
+    tracrThread->store_trace(
+        TraCR::Payload{
+            channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+        }
+    );
+}
+#endif
+
 void commit(
     SimQueue &q, uint32_t core_slot, const SimQueueEntryStore &e, uint32_t part, uint64_t start, uint64_t pushed_at
 ) {
@@ -1310,6 +1390,10 @@ void commit(
         c.finish[c.outstanding] = SIM_GATED;
         c.gated_dur[c.outstanding] = dur;
         c.gated_floor[c.outstanding] = start;
+#if ASIMGQ_TRACR_CORE_LANES
+        c.gated_func[c.outstanding] = static_cast<uint32_t>(e.func_id[part]);
+        c.gated_pipelined[c.outstanding] = pipelined;
+#endif
         c.bell_core[c.outstanding] = e.bell_core;
         c.bell_token[c.outstanding] = e.bell_token;
         c.bell_ready[c.outstanding] = pipelined ? start : start + g_link_ticks + g_core_poll_ticks;
@@ -1345,6 +1429,11 @@ void commit(
         // A mix part cannot move: its halves share one package's local memory.
         c.pipe_stealable = (e.type != SimTaskType::Mix) && e.piece_task < 0;
     }
+#if ASIMGQ_TRACR_CORE_LANES
+    // The kernel body only: fin includes the handshake a non-pipelined task pays
+    // before the kernel starts, which `compute` excludes by construction.
+    tracr_core_span(q, core_slot, e.func_id[part], pipelined, fin - dur, fin);
+#endif
     c.finish[c.outstanding] = fin;
     c.index[c.outstanding] = e.index[part];
     ++c.outstanding;
@@ -1850,6 +1939,10 @@ void retire_core(SimQueue &q, uint32_t core, uint64_t due_at, [[maybe_unused]] u
     c.index[0] = c.index[1];
     c.gated_dur[0] = c.gated_dur[1];
     c.gated_floor[0] = c.gated_floor[1];
+#if ASIMGQ_TRACR_CORE_LANES
+    c.gated_func[0] = c.gated_func[1];
+    c.gated_pipelined[0] = c.gated_pipelined[1];
+#endif
     c.bell_core[0] = c.bell_core[1];
     c.bell_token[0] = c.bell_token[1];
     c.bell_ready[0] = c.bell_ready[1];
@@ -2320,6 +2413,11 @@ void take_bells(SimQueue &q, uint32_t queue_idx) {
             const uint64_t released = lands + g_link_ticks;
             const uint64_t from = c.bell_ready[k] > released ? c.bell_ready[k] : released;
             c.finish[k] = from + g_pickup_ticks + c.gated_dur[k];
+#if ASIMGQ_TRACR_CORE_LANES
+            // The kernel body only, as on the ordinary placement path: the pickup
+            // ahead of it is handshake, which `compute` excludes by construction.
+            tracr_core_span(q, i, c.gated_func[k], c.gated_pipelined[k], c.finish[k] - c.gated_dur[k], c.finish[k]);
+#endif
             publish(q, c.index[k], c.finish[k] + g_fin_ticks + g_link_ticks);
             c.bell_core[k] = SIM_NO_BELL;
             --c.gated_count;
@@ -2431,11 +2529,21 @@ void init() {
     }
 }
 
+void set_tracr_core_lane_base(uint32_t channel_base) {
+#if ASIMGQ_TRACR_CORE_LANES
+    g_tracr_lane_base = channel_base;
+#else
+    (void)channel_base;
+#endif
+}
+
 void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, uint32_t aiv0_core, uint32_t aiv1_core) {
     (void)package_idx;
+#if !ASIMGQ_TRACR_CORE_LANES
     (void)aic_core;
     (void)aiv0_core;
     (void)aiv1_core;
+#endif
     if (queue_idx >= SIM_MAX_QUEUES) {
         return;
     }
@@ -2453,6 +2561,11 @@ void set_package(uint32_t package_idx, uint32_t queue_idx, uint32_t aic_core, ui
     q.aic_m.set(p.aic);
     q.aiv_m.set(p.aiv0);
     q.aiv_m.set(p.aiv1);
+#if ASIMGQ_TRACR_CORE_LANES
+    q.core_identity[p.aic].global_id = aic_core;
+    q.core_identity[p.aiv0].global_id = aiv0_core;
+    q.core_identity[p.aiv1].global_id = aiv1_core;
+#endif
     for (uint32_t core : {p.aic, p.aiv0, p.aiv1}) {
         refresh_core(q, core);
     }
@@ -3200,6 +3313,11 @@ void release_cohort(uint32_t queue_idx, uint64_t at_real) {
             // already there and its startup has overlapped.
             const uint64_t ack = (k > 0) ? 0 : g_link_ticks + g_core_poll_ticks + g_pickup_ticks;
             c.finish[k] = start + ack + c.gated_dur[k];
+#if ASIMGQ_TRACR_CORE_LANES
+            // The kernel body only, as on the ordinary placement path: the ack
+            // ahead of it is handshake, which `compute` excludes by construction.
+            tracr_core_span(q, i, c.gated_func[k], c.gated_pipelined[k], c.finish[k] - c.gated_dur[k], c.finish[k]);
+#endif
             publish(q, c.index[k], c.finish[k] + g_fin_ticks + g_link_ticks);
             if (c.gated_e[k].piece_task >= 0) {
                 part_entry_done(q, c.gated_e[k], c.finish[k] + g_fin_ticks + g_link_ticks);

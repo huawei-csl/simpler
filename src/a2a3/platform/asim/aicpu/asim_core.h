@@ -32,6 +32,18 @@
 // machine is advanced lazily whenever the scheduler reads it. The returned word is bit-identical to
 // the real COND encoding: [bit 31 state | bits 30..0 task_id], ACK=0 / FIN=1.
 
+// Per-core TraCR lanes written by the aSim device model, the same mechanism the
+// GroupQueue arm uses (asimgq_core.cpp). Off by default: the two 16-byte stores
+// per task run on the AICPU inside the window the run measures. A build with it
+// on is its own baseline and must not be compared against one without it.
+//
+// When it is on, the host_build_graph manager's own Running_Task_* marks are
+// compiled out on this platform -- both would otherwise write the same channel,
+// and interleaved spans on one lane cannot be reconstructed.
+#ifndef ASIM_TRACR_CORE_LANES
+#define ASIM_TRACR_CORE_LANES 0
+#endif
+
 namespace asim {
 
 // Configure the aSim device before bring-up. `reg_base` is the base address of
@@ -143,5 +155,8 @@ void asim_residency(uint32_t first_core, uint32_t n_cores, uint64_t *mean_ns, ui
 // charges nothing, because no COND word carries it. A poll that retires both a
 // running and a pipelined task sees only the later of the two ends here.
 uint64_t asim_finish_ts(uint32_t core_idx);
+
+// Channel of core 0; the AICPU thread count. Lanes run base + core_idx.
+void set_tracr_core_lane_base(uint32_t channel_base);
 
 }  // namespace asim

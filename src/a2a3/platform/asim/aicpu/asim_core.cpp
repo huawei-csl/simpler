@@ -19,6 +19,11 @@
 #include "aicpu/platform_aicpu_affinity.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
+#if ASIM_TRACR_CORE_LANES
+#include <tracr/tracr.hpp>
+
+#include <tracr_simpler_markers.hpp>
+#endif
 
 namespace asim {
 
@@ -75,6 +80,13 @@ struct alignas(64) SimCore {
     uint64_t active_released_at = 0;
     uint64_t pushed_released_at = 0;
     uint64_t active_token = 0;
+#if ASIM_TRACR_CORE_LANES
+    // Which kernel each slot holds. The records carry the task id, but a span's
+    // extraId is the func_id its duration was sampled from, and advance()
+    // promotes the pushed task without ever seeing one.
+    uint32_t active_func = 0;
+    uint32_t pushed_func = 0;
+#endif
     uint64_t doorbells = 0;
     uint64_t doorbells_unmatched = 0;
     uint64_t busy = 0;        // compute this core has been given, in ticks
@@ -272,6 +284,49 @@ uint64_t sample_compute_ticks(SimCore &c, int32_t func_id) {
 
 uint32_t core_index_of(const SimCore &c) { return static_cast<uint32_t>(&c - g_cores.data()); }
 
+#if ASIM_TRACR_CORE_LANES
+// Channel base, set at bring-up. UINT32_MAX means "not configured": emit nothing
+// rather than onto channel 0, which is an AICPU thread's lane.
+uint32_t g_tracr_lane_base = UINT32_MAX;
+
+// Push one core-lane span straight into this thread's TraCR buffer -- the same
+// mechanism asimgq_core.cpp uses. INSTRUMENTATION_MARK_SET stamps "now", which is
+// wrong here: the span is a simulated interval that has not happened yet in wall
+// time. The Payload carries its own timestamp, so the pair is stored directly and
+// TRACR_FINALIZE sorts the buffer before handing it over.
+//
+// `begin`/`end` are on this thread's model clock (real time less its ledger). The
+// epoch the buffer is on decides whether that ledger is added back: by default the
+// AICPU markers beside them are stamped on the real counter, so without it the core
+// lanes drift progressively earlier. Under SIM_TRACR_MODEL_CLOCK those markers are
+// on the model clock too, and the spans are already there.
+inline void tracr_core_span(
+    uint32_t core_idx, uint32_t func_id, bool pipelined, uint64_t begin_ticks, uint64_t end_ticks
+) {
+    if (g_tracr_lane_base == UINT32_MAX || !tracrThread) {
+        return;
+    }
+#if SIM_TRACR_MODEL_CLOCK
+    const uint64_t ofs = 0;
+#else
+    const uint64_t *ledger = self_ledger();
+    const uint64_t ofs = ledger != nullptr ? *ledger : 0;
+#endif
+    const uint16_t channel = static_cast<uint16_t>(g_tracr_lane_base + core_idx);
+    // Pair marks a task that landed behind running work, the same thing the
+    // host_build_graph manager's `to_pending` Pair meant before the model took
+    // these lanes over: it pays no handshake, so the split is what says whether
+    // the cores were fed or starved.
+    const uint16_t event = static_cast<uint16_t>(pipelined ? Running_Task_Pair : Running_Task_Single);
+    tracrThread->store_trace(TraCR::Payload{
+        channel, event, func_id, sys_cnt_ticks_to_ns(begin_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+    });
+    tracrThread->store_trace(TraCR::Payload{
+        channel, TraCR::EVENTID_RESET, 0, sys_cnt_ticks_to_ns(end_ticks + ofs, PLATFORM_PROF_SYS_CNT_FREQ)
+    });
+}
+#endif
+
 // Apply every doorbell posted for this core since the owner last looked. A landing
 // time was taken on the real clock; the core runs on the owner's model clock.
 void take_bells(SimCore &c) {
@@ -312,6 +367,11 @@ void start_gated(SimCore &c) {
     emit_record(
         core_index_of(c), c.active_token, static_cast<uint32_t>(c.active_id), from, c.active_ack_at, c.active_fin_at
     );
+#if ASIM_TRACR_CORE_LANES
+    // The kernel body only, as the ungated path records it: the gate wait is
+    // served before ACK, so it is not part of the span.
+    tracr_core_span(core_index_of(c), c.active_func, false, c.active_ack_at, c.active_fin_at);
+#endif
 }
 
 // Advance one core's state machine to `now`, updating its published COND word to
@@ -351,6 +411,13 @@ void advance(SimCore &c, uint64_t now) {
                     core_index_of(c), c.active_token, static_cast<uint32_t>(c.active_id), promoted_ack, promoted_ack,
                     c.active_fin_at
                 );
+#if ASIM_TRACR_CORE_LANES
+                // Promoted at the active task's finish with no latch of its own,
+                // so that instant is both its start and the previous span's end:
+                // the lane abuts. active_fin_at is already the promoted task's.
+                c.active_func = c.pushed_func;
+                tracr_core_span(core_index_of(c), c.active_func, true, promoted_ack, c.active_fin_at);
+#endif
                 continue;
             }
             // The core writes FIN at active_fin_at, but the AICPU cannot
@@ -372,6 +439,9 @@ void advance(SimCore &c, uint64_t now) {
                 c.active_dur = c.pushed_dur;
                 c.active_released_at = c.pushed_released_at;
                 c.active_token = c.pushed_token;
+#if ASIM_TRACR_CORE_LANES
+                c.active_func = c.pushed_func;
+#endif
                 c.pushed_id = AICPU_TASK_INVALID;
                 c.pushed_dur = 0;
                 c.pushed_gated = false;
@@ -478,6 +548,9 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
     if (c.active_id == AICPU_TASK_INVALID) {
         // Fully Free -> Partially Busy: an idle core latches and acks quickly.
         c.active_id = task_id;
+#if ASIM_TRACR_CORE_LANES
+        c.active_func = static_cast<uint32_t>(func_id);
+#endif
         ++c.residency_n;
         if (gated) {
             // On the core once the store lands and its spin reads it; it then fills
@@ -493,6 +566,10 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
             emit_record(
                 core_idx, task_token_raw, static_cast<uint32_t>(task_id), deadline, c.active_ack_at, c.active_fin_at
             );
+#if ASIM_TRACR_CORE_LANES
+            // The kernel body only, as the GroupQueue arm records it: ack -> finish.
+            tracr_core_span(core_idx, c.active_func, false, c.active_ack_at, c.active_fin_at);
+#endif
         }
     } else {
         // Partially Free -> Fully Busy: the pipelined task is taken only when the
@@ -501,6 +578,9 @@ void asim_push(uint32_t core_idx, int32_t task_id, int32_t func_id, uint64_t tas
         // until its doorbell -- so the pushed slot is empty here.)
         c.pushed_id = task_id;
         c.pushed_dur = dur;
+#if ASIM_TRACR_CORE_LANES
+        c.pushed_func = static_cast<uint32_t>(func_id);
+#endif
         c.pushed_token = task_token_raw;
         c.pushed_gated = gated;
         c.pushed_released_at = kNotRung;
@@ -661,6 +741,14 @@ void asim_residency(uint32_t first_core, uint32_t n_cores, uint64_t *mean_ns, ui
     *n = count;
     *mean_ns = count ? total * 1000000000ULL / hz / count : 0;
     *max_ns = worst * 1000000000ULL / hz;
+}
+
+void set_tracr_core_lane_base(uint32_t channel_base) {
+#if ASIM_TRACR_CORE_LANES
+    g_tracr_lane_base = channel_base;
+#else
+    (void)channel_base;
+#endif
 }
 
 uint64_t asim_finish_ts(uint32_t core_idx) {

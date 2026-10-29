@@ -10,6 +10,9 @@
  */
 #include "scheduler_context.h"
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #ifdef __SIMULATED_DEVICE__
 #include "aicpu/asimgq_core.h"
 #include "scheduler/gq_index_space.h"
@@ -310,6 +313,23 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             ++cur_thread_completed;
+            // Close the core lane only for an entry the manager itself placed
+            // (capacity_token >= 0), which is the only kind that opened one in
+            // prepare_subtask_to_core. A grouped entry is placed by the controller:
+            // the manager never learns its core, and Owner::core_id is a booking
+            // placeholder (the thread's first core), so resetting on it would emit
+            // tens of thousands of unmatched events on one arbitrary lane. Per-core
+            // lanes for grouped work would have to come from the controller's own
+            // index_core/finish timestamps, not from here.
+            if (o.capacity_token >= 0) {
+#if !(defined(__SIMULATED_DEVICE__) && ASIMGQ_TRACR_CORE_LANES)
+                // Suppressed when the GroupQueue model writes these lanes itself: a reset
+                // here closes whichever span the model has open on that lane, clipping it
+                // to the instant the manager observed the completion rather than the
+                // modelled end of the kernel body.
+                INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + o.core_id);
+#endif
+            }
             // The controller chose which core ran this entry, so the offset the
             // manager recorded is a capacity token rather than a placement. It is
             // still what bounds intake -- a group holds at most two entries per
@@ -469,6 +489,13 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+#if !(defined(__SIMULATED_DEVICE__) && ASIMGQ_TRACR_CORE_LANES)
+            // Suppressed when the GroupQueue model writes these lanes itself: a reset
+            // here closes whichever span the model has open on that lane, clipping it
+            // to the instant the manager observed the completion rather than the
+            // modelled end of the kernel body.
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
+#endif
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
@@ -483,6 +510,13 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+#if !(defined(__SIMULATED_DEVICE__) && ASIMGQ_TRACR_CORE_LANES)
+            // Suppressed when the GroupQueue model writes these lanes itself: a reset
+            // here closes whichever span the model has open on that lane, clipping it
+            // to the instant the manager observed the completion rather than the
+            // modelled end of the kernel body.
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
+#endif
         }
 
         // 2. Update slot data

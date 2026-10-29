@@ -53,6 +53,11 @@ Runtime::Runtime() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
     }
+
+    // TraCR buffers are allocated per execution by the host; null means "TraCR
+    // off or not yet allocated", which is what the device-side dump checks.
+    tracrData_ = nullptr;
+    tracrDataSizes_ = nullptr;
 #ifdef __SIMULATED_DEVICE__
     // No calibration entry means the simulated device falls back to its default
     // compute, so zero is the "unset" value the loader overwrites.
