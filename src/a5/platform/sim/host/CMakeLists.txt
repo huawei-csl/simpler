@@ -85,6 +85,9 @@ add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 
+include("${SIMPLER_CMAKE_DIR}/tracr.cmake")
+tracr_enable(host_runtime)
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

@@ -10,6 +10,8 @@
  */
 #include "scheduler_context.h"
 
+#include <tracr_simpler_markers.hpp>
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "common/chip_swimlane_profiling.h"
@@ -363,6 +365,7 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
@@ -377,6 +380,7 @@ void SchedulerContext::check_running_cores_for_completion(
 #endif
             );
             cur_thread_completed++;
+            INSTRUMENTATION_MARK_RESET(aicpu_thread_num_ + core_id);
         }
 
         // 2. Update slot data

@@ -32,6 +32,8 @@
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
+#include <tracr_simpler_markers.hpp>
+
 #include "common/run_terminal_accumulator.h"
 #include "common/unified_log.h"
 
@@ -313,6 +315,7 @@ static void publish_aicore_task_timing(Runtime *runtime) {
 // ===== AicpuExecutor Method Implementations =====
 
 int32_t AicpuExecutor::init(Runtime *runtime) {
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Initializing, static_cast<uint32_t>(tracr_getcpu()));
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         return -1;
@@ -627,6 +630,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     int32_t run_rc =
         shutdown_wait_timed_out ? -SIMPLER_ERROR_SCHEDULER_TIMEOUT : run_status_.load(std::memory_order_acquire);
+
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, De_Initializing, 0);
+
     aicore_lifecycle_.signal_shutdown_partition(thread_idx);
     shutdown_signaled_.fetch_add(1, std::memory_order_acq_rel);
     if (!wait_with_scheduler_timeout([this] {
@@ -791,6 +797,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
+    tracr_thread_start();
+    if (INSTRUMENTATION_ACTIVE) LOG_INFO("[TraCR] lane %d on cpu %d", g_tracr_thread_idx, tracr_getcpu());
+
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
     // return is authoritative on all threads and no extra spin is needed.
@@ -812,6 +821,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
         g_aicpu_executor.publish_run_terminal();
+    }
+
+    INSTRUMENTATION_MARK_RESET(g_tracr_thread_idx);
+    if (!tracr_thread_finalize(runtime)) {
+        LOG_ERROR("[TraCR] lane past the %d-lane device buffer; traces dropped", runtime->get_aicpu_thread_num());
     }
 
     if (runtime_rc != 0) {

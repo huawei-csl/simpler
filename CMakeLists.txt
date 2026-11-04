@@ -64,6 +64,14 @@ add_custom_target(build_package_sim
     DEPENDS _task_interface build_runtimes_sim
 )
 
+# TraCR's offline trace post-processor. Built here rather than from a platform
+# CMakeLists because every platform is its own CMake project writing to the
+# same output directory, and one binary serves all of them.
+include("${CMAKE_SOURCE_DIR}/cmake/tracr.cmake")
+if(BUILD_TRACR)
+    include("${CMAKE_SOURCE_DIR}/cmake/tracr_postprocessing.cmake")
+endif()
+
 if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/src/
             DESTINATION simpler_setup/_assets/src
@@ -73,13 +81,19 @@ if(SKBUILD_MODE)
             PATTERN "compile_commands.json" EXCLUDE)
     # The platform CMakeLists include these through SIMPLER_CMAKE_DIR, which
     # runtime_compiler.py resolves to PROJECT_ROOT/cmake — the installed
-    # simpler_setup/_assets/cmake in a wheel. All four are reachable from a
-    # platform configure: host_log_sources.cmake and profiling_config.cmake are
-    # included unconditionally, profiling_config.cmake configures
+    # simpler_setup/_assets/cmake in a wheel. All are reachable from a platform
+    # configure: host_log_sources.cmake, profiling_config.cmake and tracr.cmake
+    # are included unconditionally, profiling_config.cmake configures
     # profiling_build_config.h.in, and sanitizers.cmake is included when a
     # sanitizer build is requested.
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/
             DESTINATION simpler_setup/_assets/cmake)
+    # tracr.cmake resolves these as <cmake dir>/../tools, and the runtime
+    # sources include tracr_simpler_markers.hpp whether or not TraCR is on, so
+    # a wheel-side runtime configure needs them beside the cmake modules.
+    install(FILES ${CMAKE_SOURCE_DIR}/tools/tracr_simpler_api.hpp
+                  ${CMAKE_SOURCE_DIR}/tools/tracr_simpler_markers.hpp
+            DESTINATION simpler_setup/_assets/tools)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL

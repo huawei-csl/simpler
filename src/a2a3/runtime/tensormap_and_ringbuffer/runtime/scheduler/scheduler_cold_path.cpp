@@ -15,6 +15,8 @@
 #include <cinttypes>
 #include <cstdio>
 
+#include <tracr_simpler_markers.hpp>
+
 #include "common/unified_log.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -1447,6 +1449,12 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    // Only the core lanes this run used: metadata.json names worker_count
+    // channels, so a reset above that emits an event on an unnamed channel.
+    for (int32_t i = 0; i < cores_total_num_; i++) {
+        INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + i);
+    }
+
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
         core_exec_states_[i] = {};

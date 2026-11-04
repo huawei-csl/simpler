@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <tracr_simpler_api.hpp>
+
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "call_config.h"
@@ -512,6 +514,12 @@ int DeviceRunner::prepare_execution(
     }
 
     int num_aicore = block_dim * cores_per_blockdim_;
+    rc = tracr_alloc_device_buffers(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_alloc_device_buffers failed rc=%d", rc);
+        return rc;
+    }
+
     // The profiling flag is built by `arm_collectors_for_run` at launch, beside
     // the collector pools it describes.
 
@@ -841,6 +849,12 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             /*device_producers_stopped=*/true
         );
         return DrainOutcome::device_error(runtime_rc);
+    }
+
+    const int tracr_rc = tracr_store_traces(this, *active_run_->runtime);
+    if (tracr_rc != 0) {
+        LOG_ERROR("tracr_store_traces failed rc=%d", tracr_rc);
+        return DrainOutcome::device_error(tracr_rc);
     }
 
     // A retained diagnostics close that could not prove it owns this run's

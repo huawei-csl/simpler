@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #endif
 
+#include <tracr_simpler_markers.hpp>
+
 #include "aicpu/device_time.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -292,6 +294,7 @@ bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
 }  // namespace
 
 int32_t AicpuExecutor::init(Runtime *runtime) {
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Initializing, static_cast<uint32_t>(tracr_getcpu()));
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
@@ -634,6 +637,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             runtime_init_ready_.store(true, std::memory_order_release);
             return -1;
         }
+        INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, DLL_loading, 0);
         // graph_build front-matter phases (orch thread only); the scheduler
         // threads spin-wait on runtime_init_ready_ across this whole region.
         // Each sub-phase gets its own `{}` scope so the boundaries are
@@ -721,6 +725,8 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
                     }
                 }
             }
+
+            INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Allocating, 0);
 
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
@@ -845,6 +851,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
 #if SIMPLER_DFX
         orch_cycle_start = get_sys_cnt_aicpu();
 #endif
+        INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Orchestrating, thread_idx);
         framework_bind_runtime(rt);
         if (*p_bind != nullptr) {
             (*p_bind)(rt);
@@ -1041,6 +1048,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // one that reports the failure.
             normal_path = false;
         } else {
+            INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
             if (serial_orch_sched_) {
                 sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
@@ -1055,6 +1063,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
     }
 
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, De_Initializing, 0);
     // This thread has stopped dispatching, so it can retire the cores it owns
     // without waiting for its peers. Retirement stays ahead of the completion
     // gate below because that gate is a last-one-out latch, not a barrier: it
@@ -1241,6 +1250,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
+    tracr_thread_start();
+    if (INSTRUMENTATION_ACTIVE) LOG_INFO("[TraCR] lane %d on cpu %d", g_tracr_thread_idx, tracr_getcpu());
+
     // Each phase is bracketed by its own scope so the start/end boundaries are
     // visible and an early `return` still records the end via the guard dtor.
     // rc / runtime_rc are declared out here because they outlive their phase.
@@ -1285,6 +1297,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
             g_aicpu_executor.deinit(runtime);
         }
         g_aicpu_executor.publish_run_terminal();
+    }
+
+    INSTRUMENTATION_MARK_RESET(g_tracr_thread_idx);
+    if (!tracr_thread_finalize(runtime)) {
+        LOG_ERROR("[TraCR] lane past the %d-lane device buffer; traces dropped", runtime->get_aicpu_thread_num());
     }
 
     if (runtime_rc != 0) {

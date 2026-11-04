@@ -327,7 +327,14 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t chip_swimlane_level;
     uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
     uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
-    uint32_t graph_section_reserved[9];
+    uint32_t graph_section_reserved[5];
+
+    // Device addresses of this run's TraCR trace buffer and its per-lane fill
+    // counts, reserved by the host and zero when tracing is not armed. Taken
+    // from graph_section_reserved so sm_image_bytes and everything after it
+    // keep the wire offsets all three programs decode by.
+    uint64_t tracr_data_addr_;
+    uint64_t tracr_data_sizes_addr_;
 
     // Size of the shipped shared-memory image, argument pools included. Set by the
     // host before the image is copied; the AICPU cannot recompute it because the pool
@@ -585,6 +592,10 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    uint64_t get_tracr_data() const { return dev.tracr_data_addr_; }
+    void set_tracr_data(uint64_t addr) { dev.tracr_data_addr_ = addr; }
+    uint64_t get_tracr_data_sizes() const { return dev.tracr_data_sizes_addr_; }
+    void set_tracr_data_sizes(uint64_t addr) { dev.tracr_data_sizes_addr_ = addr; }
     Handshake *get_workers() { return dev.workers; }
     const Handshake *get_workers() const { return dev.workers; }
 

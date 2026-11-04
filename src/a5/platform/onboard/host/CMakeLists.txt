@@ -130,6 +130,9 @@ add_custom_command(TARGET host_runtime POST_BUILD
         "$<TARGET_FILE_DIR:host_runtime>/aicpu_cpu_topo_fallback.json"
 )
 
+include("${SIMPLER_CMAKE_DIR}/tracr.cmake")
+tracr_enable(host_runtime)
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

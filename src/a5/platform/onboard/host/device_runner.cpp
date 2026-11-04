@@ -37,6 +37,8 @@
 #include <string>
 #include <vector>
 
+#include <tracr_simpler_api.hpp>
+
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
@@ -443,6 +445,12 @@ int DeviceRunner::prepare_execution(
     // PMU ring tables — is built by `arm_collectors_for_run` at launch and
     // reaches the device through a refreshed KernelArgs copy.
 
+    rc = tracr_alloc_device_buffers(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_alloc_device_buffers failed rc=%d", rc);
+        return rc;
+    }
+
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
     // filter-style gate (see src/common/platform/onboard/aicpu/
     // platform_aicpu_affinity.cpp::platform_aicpu_affinity_gate_filter).
@@ -833,6 +841,12 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             /*device_producers_stopped=*/false
         );
         return DrainOutcome::device_error(discharge_rc);
+    }
+
+    rc = tracr_store_traces(this, *prepared.runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_store_traces failed rc=%d", rc);
+        return DrainOutcome::device_error(rc);
     }
 
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&

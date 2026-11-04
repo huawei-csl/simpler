@@ -36,6 +36,10 @@ function(simpler_ut_common_includes arch tier out_var)
         "${SIMPLER_SRC}/common/log/include"
         # src/common carries the "utils/..." and "platform/..." prefixed headers.
         "${SIMPLER_SRC}/common"
+        # The scheduler sources these targets compile include
+        # tracr_simpler_markers.hpp unconditionally; it resolves to no-op
+        # markers unless the build defines ENABLE_TRACR.
+        "${SIMPLER_REPO_ROOT}/tools"
         # Test-private fixtures are shared across test directories, so they are
         # included by their path from here rather than by bare name. Last among
         # the directories this function contributes, so a fixture never shadows

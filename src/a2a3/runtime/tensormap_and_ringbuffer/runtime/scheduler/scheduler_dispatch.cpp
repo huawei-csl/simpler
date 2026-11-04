@@ -14,6 +14,8 @@
 #include <cinttypes>
 #include <limits>
 
+#include <tracr_simpler_markers.hpp>
+
 #include "common.h"  // debug_assert
 
 #include "common/unified_log.h"
@@ -189,11 +191,17 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // write — keeping this cold per-core line off the dispatch path.
     build_payload(payload, slot_state, subslot, block_idx, force_gate);
 
+    // extraId carries the dispatched kernel's func_id, which post-processing
+    // maps to a kernel name via the run's kernel_config.py. subslot selects
+    // this core's kernel_id: AIC or AIV for a paired task.
+    const uint32_t tracr_func_id = static_cast<uint32_t>(slot_state.task->kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, tracr_func_id);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, tracr_func_id);
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -1035,6 +1043,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
+        INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Complete, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -1158,6 +1167,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Drain_Sync_Start, 0);
 #if SIMPLER_DFX
             // The drain is otherwise a swimlane blind spot: the `continue` below skips
             // every phase record, and handle_drain_mode is uninstrumented. Time it here so
@@ -1194,6 +1204,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             constexpr int DUMMY_DRAIN_BATCH = 8;
             ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+
+            if (dummy_got > 0) {
+                INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Dummy, 0);
+            }
 #if SIMPLER_DFX
             // Dummy outer phase: covers all dependency-only items popped this
             // iter. Per-item identity markers are emitted to a SEPARATE lane
@@ -1203,6 +1217,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint64_t dummy_outer_t0 =
                 (dummy_got > 0 && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
+
             for (int di = 0; di < dummy_got; di++) {
                 ChipTaskSlotState &dummy_slot = *dummy_batch[di];
 
@@ -1295,6 +1310,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
+        INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Dispatch, 0);
+
 #if SIMPLER_DFX
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
@@ -1389,6 +1406,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
             while (deferred_release_count > 0) {
+                INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Release, 0);
+
 #if SIMPLER_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else

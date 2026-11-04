@@ -71,6 +71,9 @@ add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
+include("${SIMPLER_CMAKE_DIR}/tracr.cmake")
+tracr_enable(aicpu_kernel)
+
 option(WERROR "Treat compiler warnings as errors" ON)
 if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
     set(WERROR OFF)

@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <tracr_simpler_markers.hpp>
+
 #include "device/graph_image_source.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_run_result_aicpu.h"
@@ -133,6 +135,7 @@ extern "C" int32_t aicpu_release_callables() {
 // ===== AicpuExecutor Method Implementations =====
 
 int32_t AicpuExecutor::init(Runtime *runtime) {
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Initializing, static_cast<uint32_t>(tracr_getcpu()));
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
@@ -375,10 +378,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         } else {
             sched_ctx_.bind_runtime(rt);
             // 3S+1P: the last thread is the core-less resolution (P) thread; the
-            // rest are core-owning schedulers (S).
-            int32_t completed = (thread_idx == sched_ctx_.p_thread_idx()) ?
-                                    sched_ctx_.run_resolution_thread(runtime, thread_idx) :
-                                    sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            // rest are core-owning schedulers (S). Each gets a distinct TraCR
+            // lane marker so the P thread's drain/reclaim work is separable from
+            // the S threads' dispatch in the trace.
+            int32_t completed;
+            if (thread_idx == sched_ctx_.p_thread_idx()) {
+                INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Resolving, thread_idx);
+                completed = sched_ctx_.run_resolution_thread(runtime, thread_idx);
+            } else {
+                INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, Scheduling, thread_idx);
+                completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            }
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
@@ -387,6 +397,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
         }
     }
+
+    INSTRUMENTATION_MARK_SET(g_tracr_thread_idx, De_Initializing, 0);
 
     // This thread has stopped dispatching, so it can retire the cores it owns
     // without waiting for its peers. Retirement stays ahead of the completion
@@ -526,6 +538,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     LOG_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
+    tracr_thread_start();
+    if (INSTRUMENTATION_ACTIVE) LOG_INFO("[TraCR] lane %d on cpu %d", g_tracr_thread_idx, tracr_getcpu());
+
     // init() barriers every thread internally until init is complete on the
     // leader (or a thread failed), then returns the status — so a non-zero
     // return is authoritative on all threads and no extra spin is needed.
@@ -546,6 +561,11 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
         g_aicpu_executor.publish_run_terminal();
+    }
+
+    INSTRUMENTATION_MARK_RESET(g_tracr_thread_idx);
+    if (!tracr_thread_finalize(runtime)) {
+        LOG_ERROR("[TraCR] lane past the %d-lane device buffer; traces dropped", runtime->get_aicpu_thread_num());
     }
 
     if (runtime_rc != 0) {

@@ -34,6 +34,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <tracr_simpler_api.hpp>
+
 #include "acl/acl.h"
 #include "acl/error_codes/rt_error_codes.h"
 #include "host/acl_error_log.h"
@@ -506,6 +509,15 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
+    // Reserved here because aicpu_thread_num is resolved (it sizes the per-lane
+    // allocation) and the Runtime struct is not yet uploaded, so the addresses
+    // still reach the AICPU.
+    rc = tracr_alloc_device_buffers(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_alloc_device_buffers failed rc=%d", rc);
+        return rc;
+    }
+
     SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
@@ -562,6 +574,13 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // a cross-run wait is proved by the event recorded immediately behind it.
     rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
     if (rc != 0) return DrainOutcome::device_error(rc);
+
+    // reap_run synced the streams, so the AICPU has finished writing traces.
+    rc = tracr_store_traces(this, *prepared.runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_store_traces failed rc=%d", rc);
+        return DrainOutcome::device_error(rc);
+    }
 
     // A proven-complete stream is reusable until a code publication marks it
     // stale. Publish retirement so cleanup does not replace it with an
