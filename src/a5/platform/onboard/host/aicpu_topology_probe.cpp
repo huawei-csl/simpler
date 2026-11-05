@@ -144,9 +144,12 @@ bool query_cpu_topo(uint32_t device_id, DsmiCpuTopo &out) {
 bool derive_topology_from_occupy(const char *soc_name, uint64_t occupy, std::vector<AicpuLogicalCpu> &out_user_cpus) {
     out_user_cpus.clear();
 #if defined(__aarch64__)
+    // DSMI CPU_TOPO is unavailable on this host (rc=65534), and the OCCUPY
+    // mask is the only topology signal left. A flat derivation from it keeps
+    // the affinity gate from dropping every thread; physical, SMT, cluster and
+    // die placement are unknown under this path.
     (void)soc_name;
-    (void)occupy;
-    return false;
+    if (occupy == 0) return false;
 #elif defined(__x86_64__)
     if (soc_name == nullptr || std::strcmp(soc_name, kVerifiedFallbackSoc) != 0 || occupy != kVerifiedFallbackOccupy) {
         return false;
