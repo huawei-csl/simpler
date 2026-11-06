@@ -322,6 +322,47 @@ TEST_P(HbgOrderedFirstReady, ReadyBlockDoesNotSkipDiscoveryOrPublicationOfALater
 
 INSTANTIATE_TEST_SUITE_P(PureCAndV, HbgOrderedFirstReady, ::testing::ValuesIn(kPureCAndV));
 
+class HbgOrderedSharedOrdinaryWork : public ::testing::TestWithParam<LaneMask> {};
+
+TEST_P(HbgOrderedSharedOrdinaryWork, OrdinaryDiscoveryLeavesWorkForAnotherWorker) {
+    OrderedFixture fixture({{1, GetParam()}, {1, GetParam()}});
+    const uint32_t worker = fixture.publisher(0);
+    const uint32_t peer = worker + 3;
+    ASSERT_TRUE(fixture.enqueue(0, worker));
+    ASSERT_TRUE(fixture.enqueue(1, worker));
+    ASSERT_TRUE(fixture.fill(worker));
+    for (uint32_t poll = 0; poll < 8; ++poll)
+        ASSERT_TRUE(fixture.fill(worker));
+    ASSERT_TRUE(fixture.fill(peer));
+    OrderedExecution first{};
+    OrderedExecution second{};
+    ASSERT_TRUE(fixture.begin(worker, &first));
+    ASSERT_TRUE(fixture.begin(peer, &second));
+    EXPECT_NE(first.task, second.task);
+    ASSERT_TRUE(fixture.complete(first));
+    ASSERT_TRUE(fixture.complete(second));
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
+TEST_P(HbgOrderedSharedOrdinaryWork, APreviouslyRetainedCooperativeCandidateStillPublishes) {
+    for (uint32_t ordinary_index = 0; ordinary_index < 2; ++ordinary_index) {
+        OrderedFixture fixture({{1, GetParam()}, {2, GetParam()}}, true);
+        const uint32_t worker = fixture.publisher(0);
+        auto &candidates = fixture.admissions[worker].candidates;
+        ASSERT_TRUE(fixture.pop(0, worker, &candidates[ordinary_index].ready));
+        ASSERT_TRUE(fixture.pop(1, worker, &candidates[1 - ordinary_index].ready));
+        ASSERT_TRUE(fixture.fill(worker));
+        EXPECT_EQ(candidates[ordinary_index].ready.task_ref, 0);
+        OrderedExecution execution{};
+        ASSERT_TRUE(fixture.begin(worker, &execution));
+        EXPECT_EQ(execution.task, 1);
+        EXPECT_EQ(candidates[ordinary_index].ready.task_ref, 0);
+        EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(PureCAndV, HbgOrderedSharedOrdinaryWork, ::testing::ValuesIn(kPureCAndV));
+
 class HbgOrderedExhaustionSafety : public ::testing::TestWithParam<LaneMask> {};
 
 TEST_P(HbgOrderedExhaustionSafety, ZeroWorkMemberClosesWhileRemoteClaimedBlocksRemainLive) {
@@ -826,8 +867,12 @@ TEST(HbgOrderedExecution, SecondPreparedOrdinarySlotRechecksAdmissionAfterTheFir
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
         fixture.base(), fixture.storage.layout.protocol.executions_offset
     );
-    ASSERT_TRUE(fixture.enqueue(0, 0));
-    ASSERT_TRUE(fixture.enqueue(1, 0));
+    // Direct retention can fill both credits even when queue discovery is bounded.
+    for (uint32_t task = 0; task < 2; ++task) {
+        SchedulerReadyClaim claim{};
+        ASSERT_TRUE(fixture.pop(task, 0, &claim));
+        ASSERT_TRUE(scheduler_ordered_retain_candidate(&fixture.admissions[0], claim));
+    }
     ASSERT_TRUE(fixture.fill(0));
     ASSERT_EQ(fixture.locals[0]->local_ready_mask, 3u);
     for (uint32_t poll = 0; poll < 8; ++poll)
@@ -874,7 +919,9 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
             task, reinterpret_cast<uint64_t>(&predicates[task]), sizeof(uint64_t),
             static_cast<uint8_t>(PredicateOp::EQ), 1
         );
-        ASSERT_TRUE(fixture.enqueue(task, 0));
+        SchedulerReadyClaim claim{};
+        ASSERT_TRUE(fixture.pop(task, 0, &claim));
+        ASSERT_TRUE(scheduler_ordered_retain_candidate(&fixture.admissions[0], claim));
     }
     ASSERT_TRUE(fixture.fill(0));
     ASSERT_EQ(fixture.locals[0]->local_ready_mask, 3u);
@@ -882,7 +929,7 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
     std::array<uint32_t, 2> old_generations{};
     for (uint32_t slot = 0; slot < 2; ++slot) {
         EXPECT_FALSE(fixture.locals[0]->slots[slot].cooperative);
-        EXPECT_TRUE(fixture.locals[0]->slots[slot].predicate_cached);
+        EXPECT_NE(fixture.locals[0]->slots[slot].predicate, SchedulerPredicateState::UNEVALUATED);
         old_generations[slot] = fixture.locals[0]->slots[slot].generation;
     }
     ASSERT_TRUE(fixture.admit(2, 3));
@@ -897,8 +944,10 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
     for (uint32_t candidate = 0; candidate < 2; ++candidate) {
         EXPECT_EQ(fixture.admissions[0].candidates[candidate].ready.task_ref, candidate);
         EXPECT_EQ(fixture.admissions[0].candidates[candidate].slot_index, UINT8_MAX);
-        EXPECT_TRUE(fixture.admissions[0].candidates[candidate].predicate_cached);
-        EXPECT_EQ(fixture.admissions[0].candidates[candidate].predicate_pass, candidate == 0);
+        EXPECT_EQ(
+            fixture.admissions[0].candidates[candidate].predicate,
+            candidate == 0 ? SchedulerPredicateState::PASS : SchedulerPredicateState::FAIL
+        );
     }
     uint32_t ready_cooperative = 0;
     for (const auto &slot : fixture.locals[0]->slots) {
@@ -984,7 +1033,7 @@ TEST(HbgOrderedExecution, NonmemberCubeCanExecuteOrdinaryWorkWhileVectorObligati
     ASSERT_TRUE(fixture.complete(cube));
 }
 
-TEST(HbgOrderedExecution, PendingAdmissionPreventsEvenAnOlderCooperativeKernelEntry) {
+TEST(HbgOrderedExecution, PendingLaterAdmissionDoesNotPreemptTheCurrentCooperativeKernel) {
     OrderedFixture fixture({{2, LaneMask::aic()}, {2, LaneMask::aic()}});
     ASSERT_TRUE(fixture.admit(0, 0));
     ASSERT_TRUE(fixture.stage_one(0, 0));
@@ -996,9 +1045,15 @@ TEST(HbgOrderedExecution, PendingAdmissionPreventsEvenAnOlderCooperativeKernelEn
         ),
         SchedulerAdmissionResult::PROGRESS
     );
-    OrderedExecution denied{};
-    EXPECT_FALSE(fixture.begin(0, &denied));
-    EXPECT_EQ(fixture.locals[0]->local_ready_mask, 1u);
+    OrderedExecution first{};
+    ASSERT_TRUE(fixture.begin(0, &first));
+    EXPECT_EQ(first.task, 0);
+    EXPECT_EQ(first.block, 0u);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, 1);
+    EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::CLAIMED));
+    EXPECT_EQ(fixture.control(1)->next_block, 0u);
+    EXPECT_EQ(fixture.locals[0]->local_ready_mask, 0u);
+    ASSERT_TRUE(fixture.complete(first));
     ASSERT_TRUE(scheduler_prepare_admission_record(
         fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0]
     ));
@@ -1008,10 +1063,102 @@ TEST(HbgOrderedExecution, PendingAdmissionPreventsEvenAnOlderCooperativeKernelEn
         ),
         SchedulerAdmissionResult::PROGRESS
     );
-    OrderedExecution permitted{};
-    ASSERT_TRUE(fixture.begin(0, &permitted));
-    EXPECT_EQ(permitted.task, 0);
+    ASSERT_TRUE(fixture.stage_one(0, 0));
+    OrderedExecution second{};
+    ASSERT_TRUE(fixture.begin(0, &second));
+    EXPECT_EQ(second.task, 0);
+    EXPECT_EQ(second.block, 1u);
+    EXPECT_EQ(fixture.control(1)->next_block, 0u);
+    ASSERT_TRUE(fixture.complete(second));
 }
+
+struct OrderedPendingEntryCase {
+    uint32_t worker;
+    uint16_t blocks;
+    bool sync;
+    bool prepared;
+    bool protocol;
+    bool reversed_task_ids{false};
+};
+
+class HbgOrderedPendingEarlierEntry : public ::testing::TestWithParam<OrderedPendingEntryCase> {};
+
+TEST_P(HbgOrderedPendingEarlierEntry, CurrentBlockRetiresWhileLaterPublicationRemainsPending) {
+    const auto scenario = GetParam();
+    const LaneMask mask = scenario.worker % 3 == 0 ? LaneMask::aic() : LaneMask::aiv0();
+    const uint32_t current_task = scenario.reversed_task_ids ? 1 : 0;
+    const uint32_t later_task = current_task ^ 1U;
+    std::vector<OrderedShape> shapes{{2, mask}, {2, mask}, {2, mask}};
+    shapes[current_task] = {scenario.blocks, mask, scenario.sync};
+    OrderedFixture fixture(shapes, scenario.protocol);
+    if (!scenario.protocol)
+        for (auto *local : fixture.locals)
+            local->profiling = nullptr;
+    ASSERT_TRUE(fixture.admit(current_task, scenario.worker));
+    ASSERT_TRUE(fixture.stage_one(scenario.worker, 0));
+    const auto claim = [&](uint32_t task, uint32_t worker) {
+        SchedulerReadyClaim ready{};
+        return fixture.pop(task, worker, &ready) && scheduler_try_claim_admission(
+                                                        fixture.graph.graph(), fixture.base(), fixture.locals[worker],
+                                                        fixture.run(), &fixture.admissions[worker], ready
+                                                    ) == SchedulerAdmissionResult::PROGRESS;
+    };
+    ASSERT_TRUE(claim(later_task, scenario.worker));
+    auto *shared =
+        scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
+    const uint32_t peer = (scenario.worker + 3) % 6;
+    if (scenario.prepared) {
+        ASSERT_TRUE(scheduler_prepare_admission_record(
+            fixture.graph.graph(), fixture.base(), fixture.locals[scenario.worker], fixture.run(),
+            &fixture.admissions[scenario.worker]
+        ));
+        ASSERT_TRUE(claim(2, peer));
+        ASSERT_TRUE(scheduler_prepare_admission_record(
+            fixture.graph.graph(), fixture.base(), fixture.locals[peer], fixture.run(), &fixture.admissions[peer]
+        ));
+        ASSERT_EQ(scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), static_cast<uint64_t>(peer + 1)), 0u);
+        ASSERT_EQ(
+            scheduler_try_commit_admission(
+                fixture.graph.graph(), fixture.base(), fixture.locals[scenario.worker], fixture.run(),
+                &fixture.admissions[scenario.worker]
+            ),
+            SchedulerAdmissionResult::RETRY
+        );
+    }
+    OrderedExecution execution{};
+    ASSERT_TRUE(fixture.begin(scenario.worker, &execution));
+    EXPECT_EQ(execution.task, current_task);
+    EXPECT_EQ(execution.block, 0u);
+    EXPECT_EQ(execution.blocks, scenario.blocks);
+    ASSERT_TRUE(fixture.complete(execution));
+    EXPECT_EQ(fixture.control(current_task)->completed_blocks, 1u);
+    EXPECT_EQ(fixture.control(later_task)->next_block, 0u);
+    EXPECT_EQ(fixture.control(2)->next_block, 0u);
+    EXPECT_EQ(shared->commit_tail, 1u);
+    EXPECT_EQ(shared->commit_lock, scenario.prepared ? peer + 1u : 0u);
+    EXPECT_EQ(fixture.admissions[scenario.worker].pending_task_ref, later_task);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
+std::vector<OrderedPendingEntryCase> ordered_pending_entry_cases() {
+    std::vector<OrderedPendingEntryCase> cases;
+    for (uint32_t worker = 0; worker < 6; ++worker)
+        for (uint16_t blocks : {2, 65})
+            for (bool sync : {false, true}) {
+                if (sync && blocks != 2) continue;
+                for (bool prepared : {false, true})
+                    for (bool protocol : {false, true})
+                        cases.push_back({worker, blocks, sync, prepared, protocol});
+            }
+    for (uint32_t worker = 0; worker < 6; ++worker)
+        for (bool protocol : {false, true})
+            cases.push_back({worker, 2, false, true, protocol, true});
+    return cases;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CooperativeTypesAndPendingPhases, HbgOrderedPendingEarlierEntry, ::testing::ValuesIn(ordered_pending_entry_cases())
+);
 
 TEST(HbgOrderedExecution, PersistentCandidateCreditsRejectDuplicatesAndDoNotOverwriteFullPool) {
     OrderedFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::aic()}, {1, LaneMask::aic()}});
@@ -1680,6 +1827,8 @@ TEST_P(HbgOrderedConcurrentProtocol, ConcurrentWorkersKeepUniqueOwnersAndContigu
     EXPECT_LE(fixture.control(0)->claim_tickets, count + participants.size());
     EXPECT_EQ(fixture.control(0)->next_block, count);
     std::vector<bool> seen(count, false);
+    std::vector<bool> confirmations(count, false);
+    uint32_t seal_publishers = 0;
     const auto *records =
         scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
     const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
@@ -1696,10 +1845,30 @@ TEST_P(HbgOrderedConcurrentProtocol, ConcurrentWorkersKeepUniqueOwnersAndContigu
             EXPECT_EQ(owner.block_idx, block);
             EXPECT_EQ(owner.claim_before.sequence, ++sequence);
             EXPECT_EQ(owner.claim_after.sequence, ++sequence);
+            const auto &certificate = records[block].claim;
+            EXPECT_EQ(certificate.worker_index, owner.worker_index);
+            EXPECT_EQ(certificate.block_idx, block);
+            EXPECT_EQ(certificate.run_epoch, owner.run_epoch);
+            ASSERT_GE(certificate.confirmed_count, 1u);
+            ASSERT_LE(certificate.confirmed_count, count);
+            EXPECT_FALSE(confirmations[certificate.confirmed_count - 1]);
+            confirmations[certificate.confirmed_count - 1] = true;
+            if (certificate.confirmed_count == count) {
+                ++seal_publishers;
+                EXPECT_EQ(certificate.seal_value, count);
+                EXPECT_EQ(certificate.published_before.sequence, ++sequence);
+                EXPECT_EQ(certificate.published_after.sequence, ++sequence);
+            } else {
+                EXPECT_EQ(certificate.seal_value, 0u);
+                EXPECT_EQ(certificate.published_before.sequence, 0u);
+                EXPECT_EQ(certificate.published_after.sequence, 0u);
+            }
         }
         EXPECT_EQ(workers[participants[participant]].next_sequence, sequence);
         EXPECT_EQ(workers[participants[participant]].error_flags, 0u);
     }
+    EXPECT_EQ(seal_publishers, 1u);
+    EXPECT_EQ(fixture.control(0)->claim_seal, count);
     EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
         return value;
     }));

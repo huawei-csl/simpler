@@ -119,7 +119,7 @@ DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `create_thread`, `attach_current_thread`,
 // `configure_aicore_op_timeout`, `ensure_device_initialized`,
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
@@ -379,6 +379,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
@@ -528,9 +529,9 @@ int DeviceRunner::prepare_execution(
         }
     }
 
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
     SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
@@ -765,10 +766,41 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     return rc;
 }
 
+int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned)
+        return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int poll_rc = poll_execution(active);
+    if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
+    prepared.physical_complete = true;
+    const int wait_rc = poll_boundary_waits(prepared);
+    if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    read_device_wall_ns(prepared.pipeline_slot);
+    if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
+        !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+        LOG_WARN("Runtime chip-swimlane extension publication failed");
+    }
+    prepared.retirement_diagnostics_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    cleanup_execution(prepared, true);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
 DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
+    if (!prepared.resources_owned && prepared.physical_complete) {
+        const int rc = wait_run_fence(prepared);
+        if (rc != 0) {
+            log_run_failure(prepared, rc);
+            recover_device_or_mark_unusable(rc);
+        }
+        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, true};
+    }
     if (!prepared.resources_owned || run_progress_.state_of(prepared.identity) == RunProgressState::Idle) {
         LOG_ERROR(
             "drain_execution: slot %u does not describe run epoch %llu (owns=%d)", pipeline_slot,
@@ -808,7 +840,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             prepared.dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/false
         );
-        return DrainOutcome::device_error(rc);
+        return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
     read_device_wall_ns(prepared.pipeline_slot);
@@ -840,7 +872,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             prepared.dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/false
         );
-        return DrainOutcome::device_error(discharge_rc);
+        return DrainOutcome::device_error(discharge_rc, prepared.physical_complete);
     }
 
     rc = tracr_store_traces(this, *prepared.runtime);
@@ -1232,7 +1264,7 @@ int DeviceRunner::force_reset_device() {
     return 0;
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
@@ -1641,7 +1673,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
     auto alloc_cb = [this](size_t size) -> void * {
@@ -1660,7 +1692,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device. No
     // halHostRegister on a5 (matches PMU / chip swimlane / dump collectors).
     auto alloc_cb = [this](size_t size) -> void * {

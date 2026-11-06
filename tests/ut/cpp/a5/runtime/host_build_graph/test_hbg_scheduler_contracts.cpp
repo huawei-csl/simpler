@@ -112,7 +112,7 @@ TEST(AicoreSchedulerState, ResidentSyncStartShapeRequiresMultipleBlocksAndSepara
     }
 }
 
-TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceClusters) {
+TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresInTheDeclaredResourceScope) {
     for (uint64_t workers : {3U, 6U, 9U, 96U, 108U}) {
         for (LaneMask mask :
              {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1(),
@@ -129,9 +129,12 @@ TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceCluste
                 EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
                 if (valid) {
                     const bool mix = mask.is_mix();
-                    const bool aic_only = mask == LaneMask::aic();
-                    EXPECT_EQ(demand.aic, (mix || aic_only) ? blocks : 0u);
-                    EXPECT_EQ(demand.aiv, mix ? blocks * 2 : (aic_only ? 0 : blocks));
+                    EXPECT_EQ(demand.aic, (mix || mask.is_aic()) ? blocks : 0u);
+                    EXPECT_EQ(
+                        demand.aiv, mix ? blocks * (static_cast<uint32_t>(mask.has_aiv0()) +
+                                                    static_cast<uint32_t>(mask.has_aiv1())) :
+                                          (mask.is_aic() ? 0 : blocks)
+                    );
                 }
             }
             SchedulerMinimumWorkerDemand ordinary{};
@@ -540,7 +543,7 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 512u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single
@@ -614,7 +617,7 @@ TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
         std::array<ChipTaskStorage, kTasks> storage{};
     } image;
     auto &storage = image.storage;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, kTasks, kTasks - 1};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), kTasks, kTasks - 1);
 
     for (size_t task = 0; task < kTasks; ++task) {
         SCOPED_TRACE(testing::Message() << "task " << task);
@@ -651,7 +654,7 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
         storage[task].payload.bind_regions(nullptr, nullptr, fanins[task].data());
     }
     storage[1].task.kernel_id[0] = 1;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, 3, 2};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), 3, 2);
 
     // Both records of task 1 resolve from the one base, at that entry's stride.
     EXPECT_EQ(scheduler_graph_descriptor(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].task));

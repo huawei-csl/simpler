@@ -515,9 +515,16 @@ public:
 
     enum class DispatchPhase : uint8_t { IDLE, PENDING };
 
-    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
+    BitStates
+    get_dispatchable_cores(ResourceShape shape, DispatchPhase phase, LaneMask allowed = LaneMask::all()) const {
+        BitStates available =
+            (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) : get_pending_core_offset_states(shape);
+        if (shape == ResourceShape::MIX) return available;
+        BitStates lanes;
+        if (allowed.has_aic()) lanes |= aic_mask_;
+        if (allowed.has_aiv0()) lanes |= aic_mask_ << 1;
+        if (allowed.has_aiv1()) lanes |= aic_mask_ << 2;
+        return available & lanes;
     }
 
     // --- Bit offset <-> worker_id mapping ---
@@ -684,8 +691,9 @@ inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
 // It narrows how far one publisher's work can travel, which is the other half
 // of the same property. A cluster's two AIV lanes take adjacent ranks, so both
 // land in one shard, where their worker ids had straddled a shard boundary and
-// reached two. A single-root fanout is therefore confined to one AIC shard plus
-// one AIV shard; tests/st/a5/host_build_graph/fanout_imbalance measures it.
+// reached two. Ordinary graphs confine a single-root fanout to one AIC shard
+// plus one AIV shard; native Graph workers also search remote shards when their
+// local shard has no claimable work.
 inline __aicore__ constexpr uint32_t scheduler_ready_queue_capacity(uint32_t core_type_index) {
     return core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
                                    SCHEDULER_CLUSTER_CAPACITY;
@@ -785,6 +793,7 @@ enum SchedulerTaskMetadataFlags : uint8_t {
 };
 
 #if !defined(__CCE_AICORE__)
+#include "host_build_graph/submit_types.h"
 // Derive the compact AICore metadata from the established HBG scheduling
 // types. This is a host-only projection: LaneMask and TaskAttrs remain the
 // source of truth, while SchedulerTaskMetadata stays a 16-byte GM read model.
@@ -880,6 +889,11 @@ inline __aicore__ bool scheduler_task_has_fanin(uint8_t flags) { return (flags &
 
 inline __aicore__ bool scheduler_task_is_mix(uint8_t flags) { return (flags & SCHEDULER_TASK_MIX) != 0; }
 
+// The coordinator is a resource participant even for a Vector-only Mix.
+inline __aicore__ LaneMask scheduler_mix_resource_mask(LaneMask active_mask) {
+    return active_mask.merged_with(LaneMask::aic());
+}
+
 inline __aicore__ bool scheduler_task_is_spmd(uint8_t flags) { return (flags & SCHEDULER_TASK_SPMD) != 0; }
 
 inline __aicore__ bool scheduler_task_requires_sync_start(uint8_t flags) {
@@ -949,10 +963,14 @@ struct alignas(128) SchedulerTaskControl {
     uint8_t block_cursor_padding[120];
     alignas(128) volatile uint64_t completed_blocks;
     uint8_t block_completion_padding[120];
-    // Only the claimed owner publishes this phase after the claim lock
-    // serializes UNCLAIMED. This whole region excludes RMW and cached writes.
+    // Only the claimed owner publishes the admission phase. This region
+    // excludes RMW and cached writes, including writes to its padding.
     alignas(128) volatile uint64_t admission_state;
     uint8_t admission_phase_padding[120];
+    // The final valid block confirmer publishes this immutable certificate.
+    // Its atomic-only region excludes cached writes and bypass stores.
+    alignas(128) volatile uint64_t claim_seal;
+    uint8_t claim_seal_padding[120];
 };
 
 // Each record's bitmap follows its header within an independently aligned
@@ -968,6 +986,11 @@ struct alignas(64) SchedulerAdmissionRecord {
     LaneMask active_mask;
     uint8_t flags;
     uint8_t reserved[14];
+};
+
+// Each cluster's retained close seal occupies an independent atomic region.
+struct alignas(128) SchedulerMixCloseSeal {
+    volatile uint64_t value;
 };
 
 struct alignas(128) SchedulerAdmissionControl {
@@ -991,13 +1014,15 @@ struct alignas(128) SchedulerGroupDescriptor {
     LaneMask resource_mask;
     uint8_t lane_subtasks[3];
     uint8_t flags;
-    uint8_t reserved[78];
+    uint64_t previous_lane_seq[3];
+    uint8_t reserved[48];
 };
 
 struct alignas(128) SchedulerGroupLaneAck {
     volatile uint64_t arrived_seq;
     volatile uint64_t released_seq;
-    uint8_t reserved[112];
+    volatile uint64_t assigned_seq;
+    uint8_t reserved[104];
 };
 
 struct alignas(128) SchedulerGroupMailbox {
@@ -1025,9 +1050,10 @@ struct alignas(128) SchedulerReadyInbox {
     uint8_t atomic_line_padding[120];
 };
 
-// Graph-level facts the host measures once while building the graph. Every
-// Scheduler reads this at bootstrap and nothing writes it afterwards, so it
-// occupies its own cache line away from the state Schedulers mutate.
+enum class SchedulerTopologyLayout : uint64_t { GENERAL = 0, COMPACT_LAUNCH = 1 };
+
+// Facts frozen by READY: the host supplies graph facts, and AICPU discovery
+// validates the topology. Workers only read this region during the run.
 struct alignas(128) SchedulerGraphSummary {
     uint64_t mix_task_count;
     uint64_t cooperative_task_count;
@@ -1042,7 +1068,9 @@ struct alignas(128) SchedulerGraphSummary {
     uint64_t mix_close_seals_offset;
     uint64_t run_epoch;
     uint64_t protocol_layout_offset;
-    uint8_t cache_line_padding[24];
+    SchedulerTopologyLayout topology_layout;
+    uint64_t ready_pool_offset;
+    uint8_t cache_line_padding[8];
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -1119,6 +1147,12 @@ enum class SchedulerErrorSite : uint64_t {
     GROUP_CLOSE_INVALID = 124,
     ORDERED_EXIT_IN_FLIGHT = 125,
     ORDERED_EXIT_TIMEOUT = 126,
+    GRAPH_BIND_NODE = 130,
+    GRAPH_BIND_DEFINITION = 131,
+    GRAPH_BIND_INSTANCE = 132,
+    GRAPH_BIND_TENSOR = 133,
+    GRAPH_BIND_SCALAR = 134,
+    GRAPH_BIND_PREDICATE = 135,
 };
 
 enum SchedulerErrorIdentityField : uint32_t {
@@ -1210,70 +1244,76 @@ struct alignas(128) AicpuThreadLifecycleTrace {
 };
 
 struct alignas(128) SchedulerWorkerContext {
-    volatile int32_t core_type;
+    // Routing and address fields are immutable from READY publication to retirement.
+    int32_t core_type;
     int32_t physical_core_id;
-    volatile int32_t type_rank;
+    int32_t type_rank;
     uint32_t worker_reserved;
-    volatile uint64_t run_control_offset;
-    volatile uint64_t task_controls_offset;
+    uint64_t run_control_offset;
+    uint64_t task_controls_offset;
     // Base of this run's ChipTaskStorage array. One address: a task's descriptor
     // and payload are members of one entry, so AICore strides by the storage.
-    volatile uint64_t graph_storage_address;
+    uint64_t graph_storage_address;
     // Held so the wire layout survived the collapse from two addresses to one.
     // Whoever wires this context up must write 0 here and reject a non-zero read,
     // or a later field can be reintroduced over a value someone else is using.
-    volatile uint64_t graph_reserved_address;
-    volatile uint64_t scheduler_state_base_address;
-    volatile uint64_t dispatch_payload_offset;
-    volatile uint64_t trace_cells_offset;
-    volatile uint64_t task_window_last_index;
-    volatile uint64_t graph_task_count;
-    volatile uint64_t worker_index;
-    volatile uint64_t scheduler_ssbuf_reserved0;
-    volatile uint64_t scheduler_ssbuf_reserved1;
-    volatile uint64_t aicpu_lifecycle_traces_offset;
+    uint64_t graph_reserved_address;
+    uint64_t scheduler_state_base_address;
+    uint64_t dispatch_payload_offset;
+    uint64_t trace_cells_offset;
+    uint64_t task_window_last_index;
+    uint64_t graph_task_count;
+    uint64_t worker_index;
+    uint64_t scheduler_ssbuf_reserved0;
+    uint64_t scheduler_ssbuf_reserved1;
+    uint64_t aicpu_lifecycle_traces_offset;
 
-    alignas(128) volatile uint64_t task_metadata_offset;
-    volatile uint64_t ready_inboxes_offset;
-    volatile uint64_t ready_directory_offset;
-    volatile uint64_t activity_buffers_offset;
-    volatile uint64_t worker_contexts_offset;
-    volatile uint64_t scheduler_ssbuf_reserved2;
+    alignas(128) uint64_t task_metadata_offset;
+    uint64_t ready_inboxes_offset;
+    uint64_t ready_directory_offset;
+    uint64_t activity_buffers_offset;
+    uint64_t worker_contexts_offset;
+    uint64_t scheduler_ssbuf_reserved2;
     // The active callable's registration-owned kernel-entry table: an absolute
     // device address, not a scheduler-state offset, because the table lives in
     // that callable's registration block and outlives every run bound to it.
     // `callable_addresses_count` is the table's own length, and the only
     // bound available here: the scheduler state reserves no callable array.
-    volatile uint64_t callable_addresses_address;
-    volatile uint64_t runtime_worker_count;
+    uint64_t callable_addresses_address;
+    uint64_t runtime_worker_count;
     uint64_t bootstrap_scan_end_cycles;
     uint64_t target_bootstrap_start_cycles;
     uint64_t target_bootstrap_end_cycles;
     uint64_t bootstrap_target_aic_cycles;
     uint64_t bootstrap_target_aiv_cycles;
-    volatile uint64_t callable_addresses_count;
+    uint64_t callable_addresses_count;
     // This run's per-subtask PMU staging array, in the same index space as the
     // trace cells. Taken from this group rather than from `topology_reserved`
     // below: that tail is contract-checked zero by `scheduler_initialize_local_config`
     // and consuming one of its words would make a context carrying this offset
     // read as malformed.
-    volatile uint64_t pmu_cells_offset;
+    uint64_t pmu_cells_offset;
 
-    alignas(128) volatile uint64_t graph_summary_offset;
-    volatile uint64_t scheduler_count;
-    volatile uint64_t cluster_count;
-    volatile uint64_t cluster_index;
-    volatile uint64_t scheduler_index;
-    volatile uint64_t is_scheduler;
-    volatile uint64_t cluster_worker_ids[3];
+    alignas(128) uint64_t graph_summary_offset;
+    uint64_t scheduler_count;
+    uint64_t cluster_count;
+    uint64_t cluster_index;
+    uint64_t scheduler_index;
+    uint64_t is_scheduler;
+    uint64_t cluster_worker_ids[3];
     // Mix slots' payloads and executor traces, both addressed by the holding
     // AIV's rank within its type rather than by worker id. They sit in the
     // configuration prefix because that is the span a core observes before
     // reading any of it; a config offset outside it reads as whatever the line
     // last held.
-    volatile uint64_t mix_payloads_offset;
-    volatile uint64_t mix_traces_offset;
+    uint64_t mix_payloads_offset;
+    uint64_t mix_traces_offset;
     uint64_t topology_reserved[1];
+    volatile uint64_t native_header_offset;
+    volatile uint64_t original_task_count;
+    volatile uint32_t graph_view_version;
+    volatile uint32_t graph_view_bytes;
+    volatile uint64_t scheduler_state_bytes;
 
     alignas(128) uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;
@@ -1416,7 +1456,7 @@ static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_sta
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
 static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
-static_assert(sizeof(SchedulerTaskControl) == 512, "task control layout changed");
+static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 24, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor must own its atomic region");
@@ -1427,7 +1467,12 @@ static_assert(
 static_assert(
     offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
 );
+static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic region");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
+static_assert(sizeof(SchedulerMixCloseSeal) == 128, "close seals require independent atomic regions");
+static_assert(alignof(SchedulerMixCloseSeal) == 128, "close seals require isolated alignment");
+static_assert(offsetof(SchedulerMixCloseSeal, value) == 0, "close seal value must lead its region");
+static_assert(std::is_standard_layout_v<SchedulerMixCloseSeal> && std::is_trivially_copyable_v<SchedulerMixCloseSeal>);
 static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
 static_assert(alignof(SchedulerAdmissionControl) == 128, "admission control requires isolated atomic regions");
 static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 128, "tail must not share the lock's atomic region");
@@ -1492,6 +1537,11 @@ static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment 
 static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "runtime offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 256, "topology offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 384, "worker stats offset changed");
+static_assert(offsetof(SchedulerWorkerContext, native_header_offset) == 352);
+static_assert(offsetof(SchedulerWorkerContext, original_task_count) == 360);
+static_assert(offsetof(SchedulerWorkerContext, graph_view_version) == 368);
+static_assert(offsetof(SchedulerWorkerContext, graph_view_bytes) == 372);
+static_assert(offsetof(SchedulerWorkerContext, scheduler_state_bytes) == 376);
 static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wake stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_reserved) == 768, "worker reserved tail offset changed");
@@ -1628,7 +1678,7 @@ inline bool scheduler_plan_spmd_storage(uint64_t *cursor, AicoreSchedulerLayout 
         !scheduler_layout_checked_mul(
             layout->spmd.mix_task_count, layout->spmd.cluster_count, &layout->mix_close_seal_count
         ) ||
-        !scheduler_layout_checked_mul(layout->mix_close_seal_count, sizeof(uint64_t), &bytes) ||
+        !scheduler_layout_checked_mul(layout->mix_close_seal_count, sizeof(SchedulerMixCloseSeal), &bytes) ||
         !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->mix_close_seals_offset))
         return false;
     return true;
@@ -1664,18 +1714,23 @@ inline bool scheduler_plan_protocol_storage(uint64_t *cursor, AicoreSchedulerLay
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
     bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {},
-    bool enable_protocol_profiling = false, bool enable_pmu = false
+    bool enable_protocol_profiling = false, bool enable_pmu = false, uint64_t native_readonly_end_offset = 0
 ) {
     // A ready inbox holds its endpoints as int32 task refs, so a graph whose
     // refs would not fit that encoding cannot be scheduled at all.
     if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count ||
         task_count > static_cast<uint64_t>(INT32_MAX) || !scheduler_spmd_requirements_valid(spmd, task_count))
         return false;
+    if (native_readonly_end_offset != 0 &&
+        (native_readonly_end_offset < sizeof(SchedulerRunControl) ||
+         native_readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 || spmd.worker_count == 0))
+        return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.aic_task_count = aic_task_count;
     next.aiv_task_count = aiv_task_count;
     next.spmd = spmd;
+    next.native_readonly_end_offset = native_readonly_end_offset;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
 #define SCHEDULER_RESERVE_ARRAY(count, type, field)                 \
@@ -1683,8 +1738,13 @@ inline bool scheduler_plan_layout(
      scheduler_layout_reserve(&cursor, bytes, alignof(type), &next.field))
     if (!scheduler_layout_reserve(
             &cursor, sizeof(SchedulerRunControl), alignof(SchedulerRunControl), &next.run_control_offset
-        ) ||
-        !SCHEDULER_RESERVE_ARRAY(
+        ))
+        return false;
+    if (native_readonly_end_offset != 0) {
+        cursor = native_readonly_end_offset;
+        if (!SCHEDULER_RESERVE_ARRAY(spmd.worker_count, SchedulerReadyInbox, control_inboxes_offset)) return false;
+    }
+    if (!SCHEDULER_RESERVE_ARRAY(
             PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
@@ -1750,6 +1810,11 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_READY_INBOX_CAPACITY; ++i)
         ready[i].endpoints = SCHEDULER_READY_ENDPOINTS_EMPTY;
+    if (layout.control_inboxes_offset != 0) {
+        auto *control_ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.control_inboxes_offset);
+        for (uint64_t i = 0; i < layout.spmd.worker_count; ++i)
+            control_ready[i].endpoints = SCHEDULER_READY_ENDPOINTS_EMPTY;
+    }
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         contexts[worker].physical_core_id = -1;
@@ -1794,7 +1859,7 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
             record->order_key = UINT64_MAX;
             record->member_words_offset = offset + sizeof(SchedulerAdmissionRecord);
         }
-        // Log elements use bypass stores; packed close seals use atomics.
+        // Log elements use bypass stores; isolated close seals use atomics.
         // Neither region permits device cached stores or dirty writeback.
         auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
         for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
@@ -1861,7 +1926,7 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
         record->flags = meta.flags;
         if (scheduler_task_is_mix(meta.flags)) {
             record->mix_close_seals_offset =
-                layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(uint64_t);
+                layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
             ++mix_index;
         }
     }

@@ -301,6 +301,10 @@ public:
     bool reissue_launch_permit(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
     void release_native_run(const void *owner);
     bool native_run_active() const;
+    bool native_runs_outstanding() const;
+    void retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    void release_run_result(uint64_t run_epoch);
+    DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
     /** Cleanup-only terminal storage keeps this context alive for close retry. */
     virtual bool terminal_backing_retained() const {
         return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
@@ -336,6 +340,9 @@ public:
      * over a hundred of them share this factory — without a name every one
      * reports as the host process's own `comm` and a crash dump cannot say
      * which tier faulted.
+     *
+     * Returns only after binding succeeds. Failure joins the child without
+     * invoking fn and throws std::system_error; an unattached runner is rejected.
      */
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
@@ -921,8 +928,8 @@ protected:
     // directly from CallableState by launch_device_register — no Runtime
     // round-trip.
     virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
-    int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
+    // Registration owns orchestration code; validation leaves Runtime unchanged.
+    int validate_active_callable(const Runtime &runtime) const;
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
@@ -1161,7 +1168,7 @@ protected:
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
     std::atomic<size_t> scheduler_mode_publish_total_{0};
-    // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
+    // AICPU executor SO: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
     bool aicpu_so_loaded_{false};
@@ -1227,6 +1234,8 @@ protected:
      * fails the epoch comparison rather than being mistaken for this run's.
      */
     RunResourceSlots<DeviceRunResultRegion> device_run_results_;
+    mutable std::mutex retained_result_mu_;
+    std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

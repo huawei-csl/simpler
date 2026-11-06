@@ -285,7 +285,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
@@ -378,6 +378,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
@@ -501,11 +502,9 @@ int DeviceRunner::prepare_execution(
         );
     }
 
-    // Resolve the orchestration SO into a device-resident buffer and refresh
-    // runtime metadata before the Runtime struct is uploaded to device.
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 
@@ -548,11 +547,40 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     });
 }
 
-DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr || !active.prepared->resources_owned) {
-        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
-    }
+int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned)
+        return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int poll_rc = poll_execution(active);
+    if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
+    prepared.physical_complete = true;
+    const int wait_rc = poll_boundary_waits(prepared);
+    if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    const int diagnostics_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    prepared.retirement_diagnostics_rc = diagnostics_rc;
+    read_device_wall_ns(prepared.pipeline_slot);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    prepared.aicore_retirement_attempted = true;
+    const int retire_rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+    if (retire_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    cleanup_execution(prepared, true);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+    PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned) {
+        const int rc = wait_run_fence(prepared);
+        if (rc != 0) {
+            log_run_failure(prepared, rc);
+            recover_device_or_mark_unusable(rc);
+        }
+        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, prepared.physical_complete};
+    }
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
@@ -565,7 +593,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     int rc = reap_run(prepared, &diagnostics_rc);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
-        return DrainOutcome::device_error(rc);
+        return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
     // Both this run's boundaries completed, so every wait queued on one of them
@@ -573,7 +601,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // a fallible call can still report. Nothing waits on a successor's kernels:
     // a cross-run wait is proved by the event recorded immediately behind it.
     rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // reap_run synced the streams, so the AICPU has finished writing traces.
     rc = tracr_store_traces(this, *prepared.runtime);
@@ -587,7 +615,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // unproven state after the device result has already been established.
     prepared.aicore_retirement_attempted = true;
     rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
     // by this run's own core count rather than the runner's, which describes
@@ -764,6 +792,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         return LaunchTransactionResult{};
     }
     prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    prepared.stream_lifetime = run_streams_.retain_aicore();
     if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
     if (prepared.caller_stream != nullptr) {
@@ -980,7 +1009,7 @@ int DeviceRunner::queue_cross_run_wait(
     return record_cross_run_proof(prepared, waiter_stream);
 }
 
-int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {
+int DeviceRunner::reap_run(PreparedExecution &prepared, int *diagnostics_rc) {
     if (!prepared.streams.ready()) {
         LOG_ERROR("reap_run: this run has no stream binding");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1088,7 +1117,7 @@ void DeviceRunner::emit_device_dep_gen_graph(
     }
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
@@ -1373,10 +1402,8 @@ int DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
 }
 
 int DeviceRunner::finalize_impl() {
-    // Fatal path: the ordinary stream completion/error boundary has already
-    // reaped the submitted run. Stop host collector threads locally, drain and
-    // force-reset the card, then forget old handles without per-resource
-    // RTS/HAL calls.
+    // Unknown device readers remain owned until the reset and probes confirm
+    // generation end; host readers stop without draining device queues.
     if (device_unusable_.load(std::memory_order_acquire)) {
         teardown_recorder_.begin(TEARDOWN_PATH_FATAL, device_id_);
         // A Worker that provisioned SDMA holds 48 CP-process streams, which is

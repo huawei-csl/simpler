@@ -13,7 +13,14 @@ from collections import defaultdict
 
 from .execution_identity import FIELDS, _validate_record
 from .native_order import CausalOrder
-from .native_protocol import _error, audit_protocol_sequences
+from .native_protocol import (
+    _error,
+    audit_protocol_sequences,
+    has_claim_seal,
+    has_native_graph,
+    protocol_version,
+    uses_resource_scoped_mix,
+)
 
 MAX = (1 << 64) - 1
 EXECUTABLE, FANIN, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 2, 4, 8, 16, 32, 64)
@@ -34,6 +41,9 @@ def point(record, field):
 class NativeAudit:
     def __init__(self, section, identities):
         self.raw = section
+        self.resource_scoped = uses_resource_scoped_mix(section)
+        self.node_map = {}
+        self.control_nodes = set()
         self.sequence_result = audit_protocol_sequences(section)
         self.causal = CausalOrder(section)
         self.before = self.causal.before
@@ -55,6 +65,8 @@ class NativeAudit:
         self.admission_points = {}
         self.done_points = {}
         self.claim_points = {}
+        self.confirm_points = {}
+        self.claim_seals = {}
         self.close_reads = {}
         self.payload_points = {}
 
@@ -97,12 +109,21 @@ class NativeAudit:
         require({w["cluster_index"] for w in self.workers.values()} == set(range(clusters)), "missing cluster")
 
     def graph(self):
+        if has_native_graph(self.raw):
+            from .native_graph import audit_graph_expansion  # noqa: PLC0415
+
+            self.node_map = audit_graph_expansion(self.raw)
+            self.control_nodes = {ref for ref, node in self.node_map.items() if node["kind"] in (2, 3, 4)}
         prefix = 0
+        trace_indices = set()
         for ref, task in sorted(self.tasks.items()):
             flags, mask, blocks = task["flags"], task["active_mask"], task["block_num"]
             deps = task["dependencies"]
             require(len(set(deps)) == len(deps) and all(0 <= dep < ref for dep in deps), "invalid frozen dependencies")
             require(flags < 128, "unknown task flags")
+            if ref in self.control_nodes:
+                require(mask == 0 and blocks == 1 and flags in (0, FANIN), "invalid native control metadata")
+                continue
             if flags == 0:
                 require(
                     mask == blocks == task["trace_base"] == 0 and task["kernel_ids"] == [0, 0, 0],
@@ -110,6 +131,8 @@ class NativeAudit:
                 )
                 continue
             require(flags & EXECUTABLE and bool(flags & FANIN) == bool(deps), "invalid executable task metadata")
+            if self.node_map:
+                prefix = task["trace_base"]
             require(task["trace_base"] == prefix <= (1 << 32) - 1, "noncontiguous frozen trace prefix")
             if flags & INLINE:
                 require(
@@ -134,13 +157,18 @@ class NativeAudit:
                 if flags & (MIX | SPMD):
                     self.expected_blocks[base] = ref, block
                 for offset, slot in enumerate(slot for slot in range(3) if mask & (1 << slot)):
+                    require(base + offset not in trace_indices, "overlapping execution trace ranges")
+                    trace_indices.add(base + offset)
                     self.expected_executions[base + offset] = ref, block, slot
             prefix += blocks * active
+        if self.node_map:
+            prefix = len(trace_indices)
+            require(trace_indices == set(range(prefix)), "noncontiguous native trace ranges")
         require(
             prefix == self.raw["trace_count"] or (prefix == 0 and self.raw["trace_count"] == len(self.tasks)),
             "trace capacity mismatch",
         )
-        device = {ref for ref, task in self.tasks.items() if task["flags"] & EXECUTABLE}
+        device = {ref for ref, task in self.tasks.items() if task["flags"] & EXECUTABLE} | self.control_nodes
         require(set(self.actors) == device, "missing or extraneous logical completion record")
         for ref in device:
             done = self.actors[ref]["completion"]
@@ -176,7 +204,11 @@ class NativeAudit:
             members = {
                 index
                 for index, worker in self.workers.items()
-                if task["flags"] & MIX or (worker["core_type"] == 0) == bool(task["active_mask"] & 1)
+                if (
+                    bool((task["active_mask"] | 1) & (1 << self.positions[index][1]))
+                    if task["flags"] & MIX and self.resource_scoped
+                    else task["flags"] & MIX or (worker["core_type"] == 0) == bool(task["active_mask"] & 1)
+                )
             }
             words = [0] * ((len(self.workers) + 63) // 64)
             for member in members:
@@ -224,8 +256,9 @@ class NativeAudit:
                 )
         if seals:
             require(seals[0] > 0 and seals[0] % 128 == 0, "invalid close seal base")
+            seal_stride = self.raw["close_seal_stride"] if protocol_version(self.raw) >= 7 else 8
             require(
-                seals == [seals[0] + index * self.raw["cluster_count"] * 8 for index in range(len(seals))],
+                seals == [seals[0] + index * self.raw["cluster_count"] * seal_stride for index in range(len(seals))],
                 "aliased or wrong task close seals",
             )
 
@@ -446,7 +479,9 @@ class NativeAudit:
                 run_epoch=self.raw["run_epoch"],
                 core_id=execution["worker_index"],
                 reg_task_id=index,
-                task_id=execution["task_ref"],
+                task_id=self.node_map[execution["task_ref"]]["public_task_id"]
+                if self.node_map
+                else execution["task_ref"],
                 block_idx=execution["block_idx"],
                 block_num=execution["block_num"],
                 subtask_slot=execution["subtask_slot"],
@@ -518,6 +553,8 @@ class NativeAudit:
                 "duplicate or missing block completion ticket",
             )
             self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
+            if has_claim_seal(self.raw):
+                self.claim_certificates(ref, blocks)
             owned = defaultdict(list)
             for block in blocks:
                 owned[block["owner"]["worker_index"]].append(block["owner"]["block_idx"])
@@ -525,8 +562,78 @@ class NativeAudit:
                 require(all(len(indices) == 1 for indices in owned.values()), "sync_start reused an execution position")
             for worker in self.task_members[ref]:
                 if self.tasks[ref]["flags"] & MIX and self.positions[worker][1]:
+                    if has_claim_seal(self.raw):
+                        member = self.member(ref, worker)
+                        require(
+                            member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                            "vector Mix member fabricated a cursor read",
+                        )
                     continue
                 self.close_cursor(ref, worker, owned[worker])
+
+    def claim_certificates(self, ref, blocks):
+        task = self.tasks[ref]
+        count = task["block_num"]
+        uses_tickets = count > 1 and not task["flags"] & SYNC
+        for block in blocks:
+            certificate, owner = block["claim"], block["owner"]
+            require(certificate is not None, "missing claim certificate")
+            require(
+                certificate["run_epoch"] == self.raw["run_epoch"]
+                and certificate["worker_index"] == owner["worker_index"]
+                and certificate["block_idx"] == owner["block_idx"],
+                "claim certificate identity mismatch",
+            )
+        ordered = sorted(blocks, key=lambda block: block["claim"]["confirmed_count"])
+        require(
+            [block["claim"]["confirmed_count"] for block in ordered] == list(range(1, count + 1)),
+            "duplicate or missing valid claim confirmation",
+        )
+        prior = None
+        for block in ordered:
+            certificate, owner = block["claim"], block["owner"]
+            confirmed = certificate["confirmed_count"]
+            ticket = self.claim_points[(ref, owner["block_idx"])]
+            if uses_tickets:
+                current = self.causal.bounded(
+                    ("claim_confirm", ref, confirmed), point(owner, "claim_before"), point(owner, "claim_after")
+                )
+                self.causal.add(ticket, current)
+            else:
+                require(confirmed == owner["block_idx"] + 1, "CAS confirmation disagrees with its block")
+                current = ticket
+            if prior is not None:
+                self.causal.add(prior, current)
+            self.confirm_points[(ref, confirmed)] = current
+            prior = current
+            if confirmed != count:
+                require(
+                    certificate["seal_value"] == 0
+                    and certificate["published_before"] == [0, 0]
+                    and certificate["published_after"] == [0, 0],
+                    "non-final confirmer published claim seal",
+                )
+                continue
+            require(certificate["seal_value"] == count, "invalid claim seal value")
+            self.before(
+                point(owner, "claim_after"),
+                point(certificate, "published_before"),
+                "claim seal published before final confirmation",
+            )
+            publication = self.causal.bounded(
+                ("claim_seal", ref), point(certificate, "published_before"), point(certificate, "published_after")
+            )
+            self.claim_seals[ref] = publication
+            target = (
+                point(owner, "publish_before")
+                if task["flags"] & MIX
+                else point(self.executions[block["index"]], "permit")
+            )
+            self.before(
+                point(certificate, "published_after"),
+                target,
+                "last block entered before claim seal publication returned",
+            )
 
     def close_cursor(self, ref, worker, owned):
         task, member = self.tasks[ref], self.member(ref, worker)
@@ -542,9 +649,20 @@ class NativeAudit:
         self.close_reads[(ref, worker)] = read
         self.causal.add(("event", worker, closed[2] - 1), read)
         self.causal.add(read, closed)
-        self.causal.add(self.claim_points[(ref, cursor - 1)], read)
-        if cursor < blocks:
-            self.causal.add(read, self.claim_points[(ref, cursor)])
+        if has_claim_seal(self.raw):
+            self.causal.add(self.confirm_points[(ref, cursor)], read)
+            if cursor < blocks:
+                self.causal.add(read, self.confirm_points[(ref, cursor + 1)])
+            seal, observed = member["claim_seal_seen"], member["claim_cursor_seen"]
+            require(
+                (seal == observed == 0) or (seal == observed == cursor == blocks), "invalid claim seal close witness"
+            )
+            if seal:
+                self.causal.add(self.claim_seals[ref], read)
+        else:
+            self.causal.add(self.claim_points[(ref, cursor - 1)], read)
+            if cursor < blocks:
+                self.causal.add(read, self.claim_points[(ref, cursor)])
 
     def completions(self):
         for ref, task in self.tasks.items():
@@ -558,13 +676,17 @@ class NativeAudit:
                 control["next_block"] == control["completed_blocks"] == (task["block_num"] if cooperative else 0),
                 "terminal block counters mismatch",
             )
-            if self.raw["schema"] == "hbg-native-protocol-v5":
+            if protocol_version(self.raw) >= 5:
                 require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
+            if has_claim_seal(self.raw):
+                require(
+                    control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal"
+                )
             if self.raw["schema"] != "hbg-native-protocol-v1":
                 positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
                 minimum_blocks = (
                     2
-                    if self.raw["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5")
+                    if protocol_version(self.raw) >= 4
                     else positions * 2 + (1 if self.raw["schema"] == "hbg-native-protocol-v2" else 0)
                 )
                 uses_tickets = cooperative and not task["flags"] & SYNC and task["block_num"] >= minimum_blocks
@@ -573,7 +695,7 @@ class NativeAudit:
                     task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,
                     "invalid terminal claim ticket counter",
                 )
-            if not task["flags"] & EXECUTABLE:
+            if not task["flags"] & EXECUTABLE and ref not in self.control_nodes:
                 continue
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone")
@@ -593,7 +715,7 @@ class NativeAudit:
                     )
             else:
                 require(self.actors[ref]["admission"] is None, "ordinary/service task has an admission event")
-                if not task["flags"] & INLINE:
+                if not task["flags"] & INLINE and ref not in self.control_nodes:
                     execution = self.executions[task["trace_base"]]
                     require(execution["worker_index"] == done["worker_index"], "ordinary TaskDone wrong worker")
                     self.before(
@@ -619,13 +741,13 @@ class NativeAudit:
         ref = task["task_ref"]
         if ref in self.orders:
             earliest = point(self.actors[ref]["admission"], "before")
-        elif task["flags"] & INLINE:
+        elif task["flags"] & INLINE or ref in self.control_nodes:
             earliest = point(done, "before")
         else:
             execution = self.executions[task["trace_base"]]
             earliest = self.payload_points[execution["index"]][0]
         for dep in task["dependencies"]:
-            if self.tasks[dep]["flags"] & EXECUTABLE:
+            if self.tasks[dep]["flags"] & EXECUTABLE or dep in self.control_nodes:
                 self.causal.add(self.done_points[dep], earliest)
 
     def audit(self):
