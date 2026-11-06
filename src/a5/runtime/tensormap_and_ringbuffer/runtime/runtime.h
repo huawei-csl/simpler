@@ -193,6 +193,14 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // src/common/host_build_graph/runtime.h for rationale.
     int32_t aicpu_launch_count;
 
+    // Device addresses of this run's TraCR trace buffer and its per-lane fill
+    // counts, reserved by the host and zero when tracing is not armed. Carried
+    // here because the a5 onboard platform host is compiled once per runtime
+    // and its DeviceRunner reserves these for whichever Runtime it is built
+    // against; this runtime emits no markers of its own.
+    uint64_t tracr_data_addr_;
+    uint64_t tracr_data_sizes_addr_;
+
     // kernel binary resolution: kernel_id -> GM function_bin_addr mapping
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
@@ -256,6 +264,10 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    uint64_t get_tracr_data() const { return dev.tracr_data_addr_; }
+    void set_tracr_data(uint64_t addr) { dev.tracr_data_addr_ = addr; }
+    uint64_t get_tracr_data_sizes() const { return dev.tracr_data_sizes_addr_; }
+    void set_tracr_data_sizes(uint64_t addr) { dev.tracr_data_sizes_addr_ = addr; }
     Handshake *get_workers() { return dev.workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
