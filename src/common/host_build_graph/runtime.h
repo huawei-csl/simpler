@@ -181,6 +181,14 @@ public:
     // names its argument regions by delta.
     uint64_t sm_image_bytes;
 
+    // Device addresses of this run's TraCR trace buffer and its per-lane fill
+    // counts. The host reserves them before launch and zeroes them again once
+    // the traces are read back; both are zero while tracing is not armed.
+    // Integer-typed because this object is memcpy'd to the device, where a host
+    // pointer would be meaningless.
+    uint64_t tracr_data_addr_;
+    uint64_t tracr_data_sizes_addr_;
+
 private:
     // Kernel binary tracking for cleanup
 
@@ -225,6 +233,10 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    uint64_t get_tracr_data() const { return tracr_data_addr_; }
+    void set_tracr_data(uint64_t addr) { tracr_data_addr_ = addr; }
+    uint64_t get_tracr_data_sizes() const { return tracr_data_sizes_addr_; }
+    void set_tracr_data_sizes(uint64_t addr) { tracr_data_sizes_addr_ = addr; }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }

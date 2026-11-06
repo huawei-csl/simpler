@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+#include <tracr_simpler_api.hpp>
+
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
@@ -397,6 +399,15 @@ int DeviceRunner::prepare_execution(
         }
     }
 
+    // Reserved after the AICPU thread count is final, so the per-lane buffer
+    // and the lane count the device writes with agree. A no-op unless TraCR
+    // is compiled in.
+    rc = tracr_alloc_device_buffers(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_alloc_device_buffers failed rc=%d", rc);
+        return rc;
+    }
+
     // Initialize per-subsystem shared memory.
     if (enable_chip_swimlane_) {
         rc = init_chip_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_, execution->kernel_args);
@@ -642,6 +653,14 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
                 }
             }
         }
+    }
+
+    // Reads device memory and frees the reserved buffers, so it shares the
+    // constraint below: it must precede KernelArgs/runtime cleanup.
+    rc = tracr_store_traces(this, *prepared.runtime);
+    if (rc != 0) {
+        LOG_ERROR("tracr_store_traces failed rc=%d", rc);
+        return rc;
     }
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup.
