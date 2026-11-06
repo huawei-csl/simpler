@@ -46,6 +46,19 @@ _ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.
 
 
 @cache
+def _cmake_bool_env_enabled(name: str, default: bool = False) -> bool:
+    """Interpret a CMake-style boolean env var (ON/OFF/1/0/TRUE/FALSE/YES/NO)."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().upper()
+    if normalized in {"1", "ON", "TRUE", "YES", "Y"}:
+        return True
+    if normalized in {"0", "OFF", "FALSE", "NO", "N"}:
+        return False
+    return default
+
+
 def _artifact_logic_token() -> str:
     """Digest the modules that decide a compiled artifact's bytes.
 
@@ -193,7 +206,11 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
-        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
+        dirs = [runtime_dir, runtime_common_dir, common_dir, src_common_dir]
+        if _cmake_bool_env_enabled("BUILD_TRACR"):
+            tracr_root = self.project_root / "tools"
+            dirs += [str(tracr_root), str(tracr_root / "tracr" / "include"), str(tracr_root / "tracr" / "extern")]
+        return dirs + self.get_platform_include_dirs()
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -656,6 +673,9 @@ class KernelCompiler:
             *self._orchestration_compile_flags(toolchain),
             *self._orchestration_link_flags(toolchain),
         ]
+
+        if _cmake_bool_env_enabled("BUILD_TRACR"):
+            cmd += ["-DENABLE_TRACR", "-DTRACR_DISABLE_FLUSH", "-DUSE_HW_COUNTER"]
 
         if extra_sources:
             for src in extra_sources:
