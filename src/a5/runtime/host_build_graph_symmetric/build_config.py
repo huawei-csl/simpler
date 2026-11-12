@@ -28,29 +28,25 @@
 # taken from one tree or the other, and scheduler.cpp shares a directory with the
 # three scheduler sources that do change.
 #
-# Include order matters: this runtime's "runtime" and "runtime/scheduler" precede
-# host_build_graph's copies so scheduler_context.h resolves here, while
-# scheduler.h, scheduler_types.h, dispatch_payload.h and the rest resolve there.
-# Only the four translation units in this directory include scheduler_context.h,
-# so no borrowed source can see a different SchedulerContext layout.
+# "runtime" and "common" hold this runtime's own scheduler plus a forwarding
+# header per host_build_graph header it does not replace. They are complete
+# on purpose: kernel_compiler.get_orchestration_include_dirs() derives an
+# incore kernel's include path from src/{arch}/runtime/{name}/{runtime,common}
+# by convention rather than from this file, so a runtime whose headers live
+# only behind a source_dirs entry cannot compile a kernel that includes one.
+# Only the four translation units in this directory include
+# scheduler_context.h, so no borrowed source can see a second SchedulerContext
+# layout.
 HBG = "../host_build_graph"
 SHARED = "../../../common/host_build_graph"
 
 BUILD_CONFIG = {
     "aicore": {
-        "include_dirs": [f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
+        "include_dirs": ["runtime", "common", "..", SHARED],
         "source_dirs": [f"{HBG}/aicore", f"{HBG}/orchestration"],
     },
     "aicpu": {
-        "include_dirs": [
-            "runtime",
-            "runtime/scheduler",
-            f"{HBG}/runtime",
-            f"{HBG}/runtime/scheduler",
-            f"{HBG}/common",
-            "..",
-            SHARED,
-        ],
+        "include_dirs": ["runtime", "common", "..", SHARED],
         "source_dirs": [
             "aicpu",
             "runtime",
@@ -60,7 +56,7 @@ BUILD_CONFIG = {
         ],
     },
     "host": {
-        "include_dirs": [f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
+        "include_dirs": ["runtime", "common", "..", SHARED],
         "source_dirs": [
             f"{HBG}/host",
             f"{HBG}/orchestration",
@@ -69,13 +65,7 @@ BUILD_CONFIG = {
         ],
     },
     "orchestration": {
-        "include_dirs": [
-            f"{HBG}/runtime",
-            f"{HBG}/orchestration",
-            f"{HBG}/common",
-            "..",
-            SHARED,
-        ],
+        "include_dirs": ["runtime", f"{HBG}/orchestration", "common", "..", SHARED],
         "source_dirs": [f"{HBG}/orchestration"],
     },
 }
