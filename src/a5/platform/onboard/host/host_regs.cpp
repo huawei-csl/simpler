@@ -44,7 +44,6 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
     const int64_t phys_device_id = pto::acl_to_hal_device_id(device_id);
 
     // Calculate layout parameters from platform config
-    constexpr uint32_t SUB_CORE_PER_DIE = PLATFORM_AICORE_PER_DIE * PLATFORM_CORES_PER_BLOCKDIM;
     constexpr uint32_t AIV_BASE_OFFSET = PLATFORM_AICORE_PER_DIE;
     constexpr size_t MAX_INDEX = DAV_3510::PLATFORM_MAX_PHYSICAL_CORES * PLATFORM_CORES_PER_BLOCKDIM;
 
@@ -74,7 +73,7 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
         // Within each die: [AIC0...AIC17][AIV0_0, AIV0_1, AIV1_0, AIV1_1, ...]
         uint32_t die_idx = core_idx / PLATFORM_AICORE_PER_DIE;
         uint32_t local_idx = core_idx % PLATFORM_AICORE_PER_DIE;
-        uint32_t die_base = die_idx * SUB_CORE_PER_DIE;
+        uint32_t die_base = die_idx * PLATFORM_SUB_CORES_PER_DIE;
 
         uint32_t aicore_index = die_base + local_idx;
         uint32_t aiv_first_index = die_base + AIV_BASE_OFFSET + local_idx * 2;

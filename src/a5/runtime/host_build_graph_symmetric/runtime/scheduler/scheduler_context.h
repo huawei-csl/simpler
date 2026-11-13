@@ -181,6 +181,26 @@ private:
     // each handshake thread for its own [lo,hi) slice during the parallel sweep.
     uint8_t core_type_compact_[RUNTIME_MAX_WORKER]{};
 
+    // Compact per-core die id, filled alongside core_type_compact_ during the
+    // same parallel sweep. The AICore register table is laid out per die as
+    // [PLATFORM_AICORE_PER_DIE AIC][2x that many AIV], so a core's die is its
+    // self-reported physical core id / PLATFORM_SUB_CORES_PER_DIE.
+    uint8_t core_die_compact_[RUNTIME_MAX_WORKER]{};
+
+    // Die each scheduler thread runs on, from the cpu the affinity gate observed
+    // it on: this platform puts 4 AICPU cores on a die, so die = cpu_id / 4.
+    // Each thread writes its own slot in handshake_partition; the leader reads
+    // them all after the arrival barrier. -1 means placement is unknown, which
+    // is the sim case and the dropped-thread case.
+    int8_t thread_die_[MAX_AICPU_THREADS]{};
+
+    // Latched for the whole run when any thread's observed cpu disagrees with
+    // the slot it was given. The affinity gate fills unmatched slots by report
+    // order, so an exec index names a role but does not locate the thread; a
+    // partially-valid die map is worse than none, because it silently assigns a
+    // thread the wrong die's cores.
+    std::atomic<bool> thread_die_invalid_{false};
+
     // Set by any thread whose slice hits an invalid physical_core_id in
     // handshake_partition; checked by the leader in post_handshake_init.
     std::atomic<bool> handshake_failed_{false};
@@ -201,6 +221,10 @@ private:
 
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();
+
+    // Today's die-oblivious cluster round-robin. Also the fallback whenever the
+    // die map does not validate.
+    bool assign_cores_round_robin(int32_t cluster_count);
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.

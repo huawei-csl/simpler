@@ -85,4 +85,8 @@ bool platform_aicpu_affinity_gate_filter(
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_filter_exec_idx; }
 
+// Sim has no physical cpu placement to report; callers must treat -1 as
+// "placement unknown" and fall back to a topology-blind path.
+int32_t platform_aicpu_affinity_thread_cpu() { return -1; }
+
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_filter_exec_idx = idx; }

@@ -29,6 +29,12 @@
 // slot and the sched/orch role id.
 static thread_local int32_t tl_exec_idx = -1;
 
+// Per-thread cpu_id sampled by the filter gate, or -1 when dropped.
+// Read via platform_aicpu_affinity_thread_cpu(); the only source of this
+// thread's physical placement, since allowed_cpus[exec_idx] can name a
+// different cpu under the gate's forward-progress fallback.
+static thread_local int32_t tl_cpu = -1;
+
 // =============================================================================
 // Filter-style gate (onboard).
 // =============================================================================
@@ -56,6 +62,7 @@ static int32_t s_filter_thread_exec_idx[MAX_GATE_THREADS];
 
 bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched) {
     tl_exec_idx = -1;
+    tl_cpu = -1;
 
     // Bound-check both inputs against the static slot buffers
     // (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) before any indexing.
@@ -77,6 +84,8 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 #else
     int32_t cpu = -1;
 #endif
+
+    tl_cpu = cpu;
 
     if (idx < MAX_GATE_THREADS) s_filter_thread_cpu[idx] = cpu;
 
@@ -180,5 +189,7 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 }
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }
+
+int32_t platform_aicpu_affinity_thread_cpu() { return tl_cpu; }
 
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_exec_idx = idx; }

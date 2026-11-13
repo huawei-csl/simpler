@@ -717,6 +717,20 @@ constexpr uint32_t PLATFORM_NUM_DIES = 2;
 constexpr uint32_t PLATFORM_AICORE_PER_DIE = 18;
 
 /**
+ * Sub-cores (AIC + AIV) per die, and the stride of one die in the AICore
+ * register table: that table is laid out per die as [18 AIC][36 AIV], so a
+ * sub-core's die is its physical core id divided by this.
+ */
+constexpr uint32_t PLATFORM_SUB_CORES_PER_DIE = PLATFORM_AICORE_PER_DIE * PLATFORM_CORES_PER_BLOCKDIM;
+
+/**
+ * AICPU cores per die: 2 clusters of 2. A logical cpu's die is its id divided
+ * by this, and its AICPU cluster is its id divided by the cluster size — the
+ * same arithmetic aicpu_topology_probe applies to phy_cpu_id.
+ */
+constexpr int32_t PLATFORM_AICPU_CORES_PER_DIE = 4;
+
+/**
  * Maximum physical AICore count for DAV 3510 chip
  */
 namespace DAV_3510 {

@@ -18,6 +18,7 @@
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -572,6 +573,19 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+    // This thread's own observed cpu, not allowed_cpus[tidx]: the affinity gate
+    // fills unmatched slots by report order, so a slot names a role but does not
+    // locate the thread. PLATFORM_AICPU_CORES_PER_DIE AICPU cores sit on a die.
+    // Sim reports -1, which leaves the map invalid and keeps the round-robin.
+    if (tidx >= 0 && tidx < MAX_AICPU_THREADS) {
+        const int32_t my_cpu = platform_aicpu_affinity_thread_cpu();
+        if (my_cpu < 0) {
+            thread_die_invalid_.store(true, std::memory_order_release);
+        } else {
+            thread_die_[tidx] = static_cast<int8_t>(my_cpu / PLATFORM_AICPU_CORES_PER_DIE);
+        }
+    }
+
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
@@ -680,6 +694,7 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 #endif
         core_exec_states_[i] = st;
         core_type_compact_[i] = static_cast<uint8_t>(ready[r].core_type);
+        core_die_compact_[i] = static_cast<uint8_t>(ready[r].pcid / PLATFORM_SUB_CORES_PER_DIE);
 #if SIMPLER_DFX
         physical_core_ids_[i] = ready[r].pcid;
 #endif
@@ -688,28 +703,151 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 }
 
 // =============================================================================
-// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// Assign discovered cores to scheduler threads.
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
-    // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    //
     // Symmetric threads: every AICPU thread owns clusters, polls their COND
     // registers and resolves the completions it observes. Cores therefore
-    // partition across all of them, and one thread is a valid configuration —
+    // partition across all of them, and one thread is a valid configuration -
     // there is no core-less resolution thread to reserve.
     //
     // Polling a core's COND is a Device-nGnRE load that cannot pipeline against
     // another (~95 ns each, serialised by the nR attribute), so a thread's
     // FIN-detection round costs clusters_owned x lanes x ~95 ns. Spreading the
-    // same clusters over more threads is the only way to shorten that round.
+    // same clusters over more threads shortens that round; keeping a thread's
+    // clusters on its own die shortens each individual load, if a remote-die
+    // register read costs more than a local one.
     if (aicpu_thread_num_ < 1) {
         LOG_ERROR("host_build_graph requires aicpu_thread_num >= 1; got %d", aicpu_thread_num_);
         return false;
     }
     active_sched_threads_ = aicpu_thread_num_;
-    int32_t cluster_count = aic_count_;
+    const int32_t cluster_count = aic_count_;
 
+    // --- Validate the die map before trusting it -----------------------------
+    bool die_ok = !thread_die_invalid_.load(std::memory_order_acquire);
+    for (int32_t t = 0; die_ok && t < active_sched_threads_; t++) {
+        die_ok = (thread_die_[t] >= 0 && thread_die_[t] < static_cast<int8_t>(PLATFORM_NUM_DIES));
+    }
+
+    // A cluster is 1 AIC + 2 AIV on the SAME die by hardware construction. When
+    // that does not hold, physical_core_id is not the register-table index space
+    // this derivation reads it as - which is the sim case - so the map is
+    // unusable rather than merely imperfect.
+    uint8_t cluster_die[RUNTIME_MAX_WORKER];
+    for (int32_t ci = 0; die_ok && ci < cluster_count; ci++) {
+        const uint8_t d = core_die_compact_[aic_worker_ids_[ci]];
+        const uint8_t v0 = core_die_compact_[aiv_worker_ids_[2 * ci]];
+        const uint8_t v1 = core_die_compact_[aiv_worker_ids_[2 * ci + 1]];
+        if (d >= PLATFORM_NUM_DIES || d != v0 || d != v1) {
+            die_ok = false;
+            break;
+        }
+        cluster_die[ci] = d;
+    }
+
+    // Census: a die holding clusters MUST hold a thread, or those clusters land
+    // in no tracker at all - and shutdown() only deinits the cores in its own
+    // thread's tracker, so an unowned core never has its register window closed
+    // and the run dies on the host op timeout instead of finishing.
+    int32_t clusters_on_die[PLATFORM_NUM_DIES] = {};
+    int32_t threads_on_die[PLATFORM_NUM_DIES] = {};
+    int32_t dies_with_clusters = 0;
+    if (die_ok) {
+        for (int32_t ci = 0; ci < cluster_count; ci++) clusters_on_die[cluster_die[ci]]++;
+        for (int32_t t = 0; t < active_sched_threads_; t++) threads_on_die[thread_die_[t]]++;
+        for (uint32_t d = 0; d < PLATFORM_NUM_DIES; d++) {
+            if (clusters_on_die[d] > 0) dies_with_clusters++;
+            if ((threads_on_die[d] > 0) != (clusters_on_die[d] > 0)) die_ok = false;
+        }
+        // One die carrying everything has no locality to gain; it would just be
+        // the round-robin with extra steps.
+        if (dies_with_clusters < 2) die_ok = false;
+    }
+
+    if (!die_ok) {
+        LOG_INFO(
+            "Die-aware assignment unavailable (invalid=%d dies_with_clusters=%d); using cluster round-robin",
+            static_cast<int>(thread_die_invalid_.load(std::memory_order_acquire)), dies_with_clusters
+        );
+        return assign_cores_round_robin(cluster_count);
+    }
+
+    // --- Round-robin within each die over that die's own threads -------------
+    int32_t die_threads[PLATFORM_NUM_DIES][MAX_AICPU_THREADS] = {};
+    int32_t die_thread_n[PLATFORM_NUM_DIES] = {};
+    int32_t die_cursor[PLATFORM_NUM_DIES] = {};
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        const int32_t d = thread_die_[t];
+        die_threads[d][die_thread_n[d]++] = t;
+    }
+
+    int32_t owner[RUNTIME_MAX_WORKER];
+    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
+    for (int32_t ci = 0; ci < cluster_count; ci++) {
+        const int32_t d = cluster_die[ci];
+        const int32_t t = die_threads[d][die_cursor[d]++ % die_thread_n[d]];
+        owner[ci] = t;
+        clusters_per_thread[t]++;
+    }
+
+    // The real per-thread max, not ceil(cluster_count / threads): an uneven
+    // thread-per-die split gives some thread more than the global ceil says.
+    int32_t max_clusters_per_thread = 0;
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        if (clusters_per_thread[t] > max_clusters_per_thread) max_clusters_per_thread = clusters_per_thread[t];
+    }
+    const int32_t thread_cores_num = max_clusters_per_thread * PLATFORM_CORES_PER_BLOCKDIM;
+    if (thread_cores_num > CoreTracker::MAX_CORE_PER_THREAD) {
+        LOG_ERROR(
+            "Die-aware assignment needs %d cores on one thread, over the %d limit", thread_cores_num,
+            CoreTracker::MAX_CORE_PER_THREAD
+        );
+        return false;
+    }
+
+    LOG_INFO(
+        "Assigning cores (die-aware): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
+        active_sched_threads_, aic_count_, aiv_count_
+    );
+
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        core_trackers_[t].init(clusters_per_thread[t]);
+    }
+
+    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
+    int32_t assigned = 0;
+    for (int32_t ci = 0; ci < cluster_count; ci++) {
+        const int32_t t = owner[ci];
+        const int32_t aic_wid = aic_worker_ids_[ci];
+        const int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+        const int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
+        core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
+        assigned++;
+        LOG_DEBUG(
+            "Thread %d (die %d): cluster %d die %d (AIC=%d, AIV0=%d, AIV1=%d)", t, thread_die_[t], ci,
+            cluster_die[ci], aic_wid, aiv0_wid, aiv1_wid
+        );
+    }
+    always_assert(assigned == cluster_count && "every cluster must be owned by exactly one thread");
+
+    // Census at INFO: a run's locality is readable from the device log alone.
+    for (int32_t t = 0; t < active_sched_threads_; t++) {
+        LOG_INFO(
+            "Die-aware: thread %d die %d owns %d clusters (%d cores)", t, thread_die_[t], clusters_per_thread[t],
+            core_trackers_[t].core_num()
+        );
+    }
+    return true;
+}
+
+// =============================================================================
+// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// =============================================================================
+bool SchedulerContext::assign_cores_round_robin(int32_t cluster_count) {
+    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
+    // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
+    //
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
     int32_t max_clusters_per_thread = (cluster_count + active_sched_threads_ - 1) / active_sched_threads_;
     int32_t thread_cores_num = max_clusters_per_thread * 3;
@@ -799,6 +937,12 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // Wire thread configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
     regs_ = regs_base;
+
+    // Clear the die map so a previous launch's placement cannot leak into this
+    // one. This runs on the leader before it publishes hs_setup_done_, so it
+    // happens-before every thread's handshake_partition.
+    memset(thread_die_, -1, sizeof(thread_die_));
+    thread_die_invalid_.store(false, std::memory_order_release);
 
 #if SIMPLER_DFX
     // chip_swimlane_aicpu_init promotes g_chip_swimlane_level from the shared-memory

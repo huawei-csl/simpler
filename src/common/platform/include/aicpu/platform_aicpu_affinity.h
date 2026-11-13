@@ -58,6 +58,16 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 // N-1).
 int32_t platform_aicpu_affinity_thread_idx();
 
+// The cpu_id this thread was observed to be running on when the filter gate
+// sampled sched_getcpu(), or -1 if this thread was dropped or did not go
+// through the filter gate (sim always returns -1).
+//
+// This is the thread's OWN observed cpu, not allowed_cpus[thread_idx]. The two
+// disagree whenever the gate's forward-progress fallback fills a slot by report
+// order, so a caller deriving physical placement (die / cluster) must use this
+// one: a slot index only names a role, it does not locate the thread.
+int32_t platform_aicpu_affinity_thread_cpu();
+
 // Publish this thread's resolved exec index into the affinity TLS.
 //
 // Onboard, the filter gate already assigns the index, so this is a redundant
