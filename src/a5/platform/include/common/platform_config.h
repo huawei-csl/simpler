@@ -731,6 +731,13 @@ constexpr uint32_t PLATFORM_SUB_CORES_PER_DIE = PLATFORM_AICORE_PER_DIE * PLATFO
 constexpr int32_t PLATFORM_AICPU_CORES_PER_DIE = 4;
 
 /**
+ * AICPU cores per AICPU cluster. Two cores in a cluster reach each other about
+ * six times faster than any other pair, so a cluster is the unit a scheduler
+ * placement policy keeps whole or discards whole.
+ */
+constexpr int32_t PLATFORM_AICPU_CORES_PER_CLUSTER = 2;
+
+/**
  * Maximum physical AICore count for DAV 3510 chip
  */
 namespace DAV_3510 {

@@ -545,6 +545,7 @@ def _build_task_args(buffers: dict[str, Buffer], n_layers: int, signature: list)
 def _build_config(
     runtime_env: dict,
     *,
+    aicpu_thread_num: int,
     enable_chip_swimlane: int,
     dump_args: int,
     enable_pmu: int,
@@ -553,6 +554,7 @@ def _build_config(
     output_prefix: str,
 ) -> CallConfig:
     config = CallConfig()
+    config.aicpu_thread_num = aicpu_thread_num
     config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
     config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
     config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
@@ -598,6 +600,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     orchestration_source: str | Path | None = None,
     orchestration_function: str = "aicpu_orchestration_entry",
     runtime_env: dict | None = None,
+    aicpu_thread_num: int = 0,
     rounds: int = 1,
     skip_golden: bool = False,
     seed: int = 1234,
@@ -680,6 +683,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         task_args = _build_task_args(buffers, N_LAYERS, spec["orchestration"]["signature"])
         config = _build_config(
             runtime_env,
+            aicpu_thread_num=aicpu_thread_num,
             enable_chip_swimlane=diagnostics.chip_swimlane,
             dump_args=diagnostics.dump_args,
             enable_pmu=diagnostics.pmu,

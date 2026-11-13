@@ -27,6 +27,12 @@ RUNTIME = "host_build_graph_symmetric"
 ORCHESTRATION_SOURCE = HBG_CASE_DIR / "kernels/orchestration/decode_fwd_layers.cpp"
 CASE_NAME = "GraphExecutionBatch16Seq3500"
 
+# Four scheduler threads, which the a5 cpu selection places two per die. The
+# chip's 36 AICore clusters then divide evenly, so every thread polls 9 clusters
+# on its own die; at five threads the dies hold 3 and 2 threads and the split is
+# 6/6/6/9/9 clusters instead.
+AICPU_THREAD_NUM = 4
+
 
 def _load_tmr_driver():
     module_name = "_qwen3_14b_a5_tmr_driver"
@@ -45,6 +51,7 @@ def _load_tmr_driver():
 def run(device_ids, platform: str, **kwargs) -> int:
     driver = _load_tmr_driver()
     kwargs.setdefault("runtime", RUNTIME)
+    kwargs.setdefault("aicpu_thread_num", AICPU_THREAD_NUM)
     kwargs.setdefault("orchestration_source", ORCHESTRATION_SOURCE)
     kwargs.setdefault("runtime_env", {})
     return driver.run(device_ids, platform, **kwargs)
@@ -58,6 +65,7 @@ def main(argv=None) -> int:
         runtime=RUNTIME,
         orchestration_source=ORCHESTRATION_SOURCE,
         runtime_env={},
+        aicpu_thread_num=AICPU_THREAD_NUM,
     )
 
 

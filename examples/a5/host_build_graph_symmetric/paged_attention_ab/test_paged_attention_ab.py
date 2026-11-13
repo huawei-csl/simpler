@@ -132,5 +132,17 @@ class TestPagedAttentionABSymmetric(_PagedAttentionAB):
     CASES = copy.deepcopy(_CASES)
 
 
+_CASES_4T = copy.deepcopy(_CASES)
+_CASES_4T[0]["config"]["aicpu_thread_num"] = 4
+
+
+@scene_test(level=2, runtime="host_build_graph_symmetric")
+class TestPagedAttentionABSymmetric4(_PagedAttentionAB):
+    """Four threads, two per die: the clusters divide evenly and stay die-local."""
+
+    CALLABLE = copy.deepcopy(_CALLABLE)
+    CASES = copy.deepcopy(_CASES_4T)
+
+
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

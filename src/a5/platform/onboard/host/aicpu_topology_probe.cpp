@@ -11,6 +11,8 @@
 
 #include "aicpu_topology_probe.h"
 
+#include "common/platform_config.h"
+
 #include <dlfcn.h>
 
 #include <algorithm>
@@ -626,6 +628,32 @@ bool compute_unknown_allowed_cpus(
             return a.cpu_id < b.cpu_id;
         });
     }
+    // Prefer cpus whose AICPU cluster is wholly in the pool. A cluster that
+    // also holds a cpu the pool does not offer is shared with the device OS,
+    // and its remaining half measures slower against every partner than a cpu
+    // from a fully free cluster. Applied only when enough cpus survive it, so a
+    // small pool still fills the request.
+    std::vector<AicpuLogicalCpu> whole_cluster;
+    whole_cluster.reserve(ordered.size());
+    for (const auto &cpu : ordered) {
+        const int32_t first = (cpu.cpu_id / PLATFORM_AICPU_CORES_PER_CLUSTER) * PLATFORM_AICPU_CORES_PER_CLUSTER;
+        bool complete = true;
+        for (int32_t sibling = first; sibling < first + PLATFORM_AICPU_CORES_PER_CLUSTER; ++sibling) {
+            bool present = false;
+            for (const auto &other : ordered) {
+                if (other.cpu_id == sibling) {
+                    present = true;
+                    break;
+                }
+            }
+            complete = complete && present;
+        }
+        if (complete) whole_cluster.push_back(cpu);
+    }
+    if (static_cast<int32_t>(whole_cluster.size()) >= active_count) {
+        ordered = std::move(whole_cluster);
+    }
+
     std::vector<int32_t> selected;
     selected.reserve(static_cast<size_t>(active_count));
     for (int32_t i = 0; i < active_count; ++i)
