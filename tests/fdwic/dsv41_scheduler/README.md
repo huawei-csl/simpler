@@ -117,7 +117,7 @@ checks all 40 pairs before refreshing only the selected replay regions. Native M
 
 The selected `pypto_lib_latest/moe` inherits
 [PR3038](https://github.com/hw-native-sys/simpler/pull/3038). It executes the
-original `dev/hbg` `l3_moe`/`l2_moe` orchestration, including the actual
+original generated `dev/hbg` `l2_moe` C++ Host orchestration, including the actual
 `get_tensor_data<int32_t>(num_tokens)` Host read. Counts and routes produced by
 communication remain device-side reads in AICore tasks. Frozen latest-MoE plans
 are rejected. Initial PyPTO-lib and DSL MoE remain fixed-input replay stress cases.
@@ -310,9 +310,11 @@ export DSV41=tests/fdwic/dsv41_scheduler
 bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa"
 ```
 
-This builds the small Host tools and all three sets of model kernels. Python only
-coordinates compilation/packing using `simpler_setup`; neither PyPTO-lib,
-PyPTO JIT, torch, nor Simpler's Python bindings is required for replay cases. Native MoE additionally uses the original model and golden harness.
+This builds the small Host tools, all three sets of model kernels and the
+standalone native MoE callable. Python only coordinates compilation/packing
+using `simpler_setup`; PyPTO-lib, PyPTO JIT, Torch and Simpler Python bindings
+are not needed to build these sources. Initial native MoE input preparation
+uses CPU Torch; all prepared cases execute without it.
 The generated DSL C++ uses CANN headers directly; the DSL Python package is
 not needed to rebuild it.
 
@@ -425,8 +427,7 @@ full forward and the same replay adapter:
 python3 "$DSV41/production/export_cases.py" \
   "$DSV41/build/portable/forward/pypto_lib_latest" \
   "$DSV41/build/prepared/capture/pypto_lib_latest" \
-  "$DSV41/build/new-cases" --flavor pypto_lib_latest \
-  --pypto-lib-root /path/to/pypto-lib-dev-hbg
+  "$DSV41/build/new-cases" --flavor pypto_lib_latest
 ```
 
 Before running an exported local bundle, materialize its inputs and reference:

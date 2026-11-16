@@ -23,7 +23,7 @@
 
 ## 版本与测试方式
 
-- 固定本地测试版本 `6d050abbd10750bc02eeb6641afc800891ac0dab`；两列运行库源码均与该提交一致。复用已核对源码及二进制摘要的 HBG、percounter 构建，以及同一批业务 kernel 和输入。表头保留 `main HBG` / `main percounter`，并不表示两列运行库来自 GitHub 当前 main。
+- 调度源码基于 `5abd1794980eaa493f618067b91aeff117191a63`，不包含 PR #3108。复用已核对的运行库和业务 kernel；本轮改用独立 C++ runner 执行新版 MoE。表头保留 `main HBG` / `main percounter`，并不表示 GitHub 当前 main。
 - 纯 L0：每个运行库1次预热、10次正式测量。AICore wall 为首个实际 AIC/AIV kernel 开始至最后一个实际 kernel 结束，包含中间调度、依赖与通信等待，不包含 AICPU 启动和收尾。Device wall 仅作诊断，不填入表格。
 - 每个用例的两列在同一张卡或同一对卡上顺序测量，用例间交替先测 HBG 或 percounter。双卡每次执行前均完成跨 Device 启动会合；逐轮取两卡各自 AICore 时长的最大值，再取10轮平均，不跨卡相减原始计数器。
 - 全程通过 `task-submit --device auto --device-num N` 自动分配，最多8卡并发。测量日期2026-11-15，A5 Ascend950DT_9581（32 AIC / 64 AIV），CANN 9.3.0。本轮32个运行库/用例组合全部完成，总墙钟时间105.21秒（含提交、排队和回收）。实际设备号与双卡会合证据记录在本地 `artifacts/performance-refresh/summary.json` 及各运行的 `wall.json`。

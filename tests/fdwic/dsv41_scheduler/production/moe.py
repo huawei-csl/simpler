@@ -7,18 +7,14 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Run the original dev/hbg PyPTO-lib MoE with live Host control inputs."""
+"""Prepare and run native MoE without the PyPTO/PyPTO-lib execution environment."""
 
 import argparse
-import ctypes
-import hashlib
-import importlib
 import json
 import math
 import os
 import re
 import runpy
-import shutil
 import statistics
 import subprocess
 import sys
@@ -66,65 +62,6 @@ def control_reads(program):
     return reads
 
 
-def prepare_callable(bundle, compiled):
-    """Store the native orchestration; execution never substitutes a submission replay."""
-    _task_interface = importlib.import_module("_task_interface")
-    _assemble_chip_callables = importlib.import_module("pypto.runtime.distributed_runner")._assemble_chip_callables
-
-    callables, _, _ = _assemble_chip_callables(compiled)
-    if set(callables) != {"l2_moe"}:
-        raise ValueError("Expected the original l2_moe chip program")
-    call = callables["l2_moe"]
-    data = ctypes.string_at(int(call.buffer_ptr()), int(call.buffer_size()))
-    program = bundle / "program"
-    config = runpy.run_path(str(program / "next_levels/l2_moe/kernel_config.py"))
-    source = Path(config["ORCHESTRATION"]["source"])
-    (bundle / "native-callable.bin").write_bytes(data)
-    (bundle / "native-callable.json").write_text(
-        json.dumps(
-            {
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "binding_commit": _task_interface.__build_commit__,
-                "source_commit": json.loads((bundle / "case.json").read_text())["lib_commit"],
-                "host_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-                "runtime_config": config["RUNTIME_CONFIG"],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-
-
-def install_callable(bundle, runtime):
-    """Reuse one native callable on the explicitly selected compatible runtime."""
-    _task_interface = importlib.import_module("_task_interface")
-    distributed_runner = importlib.import_module("pypto.runtime.distributed_runner")
-    ChipCallable = importlib.import_module("simpler.task_interface").ChipCallable
-
-    manifest = json.loads((bundle / "native-callable.json").read_text())
-    case = json.loads((bundle / "case.json").read_text())
-    program = bundle / "program"
-    data = (bundle / "native-callable.bin").read_bytes()
-    source = program / "next_levels/l2_moe/orchestration/l2_moe.cpp"
-    if (
-        manifest["binding_commit"] != _task_interface.__build_commit__
-        or manifest["source_commit"] != case["lib_commit"]
-        or hashlib.sha256(data).hexdigest() != manifest["sha256"]
-        or hashlib.sha256(source.read_bytes()).hexdigest() != manifest["host_source_sha256"]
-    ):
-        raise ValueError("Native MoE callable/source/binding changed; prepare the bundle again")
-    control_reads(program)
-
-    def assemble(compiled):
-        if Path(compiled.output_dir).resolve() != program.resolve():
-            raise ValueError("Native MoE loader received a different compiled program")
-        callables = distributed_runner._ChipCallables()
-        callables.add("l2_moe", ChipCallable.from_bytes(data), manifest["runtime_config"])
-        return callables, runtime, False
-
-    distributed_runner._assemble_chip_callables = assemble
-
-
 def validate_report(report, case, level=None):
     """Require all PR3038 control cases and complete Host/Device measurements."""
     checks = report.get("checks", [])
@@ -148,11 +85,10 @@ def validate_report(report, case, level=None):
     if not isinstance(rounds, int) or rounds < 1 or perf.get("warmup", 0) < 1:
         raise ValueError("Native MoE needs warmup and measured rounds")
     samples = perf.get("device_wall_us", [])
-    host = perf.get("host_wall_us", [])
     ranks = list(perf.get("per_rank_device_us", {}).values())
-    if len(ranks) != 2 or any(len(values) != rounds for values in [samples, host, *ranks]):
-        raise ValueError("Native MoE is missing Host/Device or rank samples")
-    if any(not math.isfinite(x) or x <= 0 for values in [samples, host, *ranks] for x in values):
+    if len(ranks) != 2 or any(len(values) != rounds for values in [samples, *ranks]):
+        raise ValueError("Native MoE is missing Device or rank samples")
+    if any(not math.isfinite(x) or x <= 0 for values in [samples, *ranks] for x in values):
         raise ValueError("Native MoE has invalid timing samples")
     if any(not math.isclose(samples[i], max(rank[i] for rank in ranks), abs_tol=1e-6) for i in range(rounds)):
         raise ValueError("Native MoE Device samples must use the per-round rank maximum")
@@ -170,8 +106,8 @@ def main():
     parser.add_argument("bundle", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--compile-only", action="store_true")
-    parser.add_argument("--lib-root", type=Path, help="Create a new bundle from this dev/hbg checkout")
-    parser.add_argument("--reuse-bundle", type=Path, help="Reuse a prepared native bundle from the same model/binding")
+    parser.add_argument("--build-dir", type=Path, default=ROOT / "build/portable/native-moe")
+    parser.add_argument("--reuse-bundle", type=Path)
     parser.add_argument("--level", type=int, choices=(0, 1, 3), default=0)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--rounds", type=int, default=10)
