@@ -1447,10 +1447,16 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
-    if (legacy_graph_required) {
-        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
-        return true;
-    }
+    // Every graph runs on the AICPU scheduler. A graph with Graph shells
+    // publishes the Graph mode and any other graph the shape mode; the device
+    // handles both modes identically.
+    select_legacy_scheduler(
+        runtime, api,
+        native_graph || legacy_graph_required ? SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH :
+                                                SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
+    );
+    LOG_INFO("A5 HBG: selected AICPU scheduling for %d tasks", total_tasks);
+    return true;
     if (native_graph) {
         std::vector<SchedulerTaskMetadata> expanded(node_count);
         for (uint64_t ref = 0; ref < node_count; ++ref) {
