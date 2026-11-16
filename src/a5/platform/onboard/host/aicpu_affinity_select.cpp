@@ -40,7 +40,8 @@ constexpr char kVerifiedFallbackSoc[] = "Ascend950PR_9579";
 constexpr uint64_t kVerifiedFallbackOccupy = 0x3e;
 
 bool fill_cpu_topo_from_json(
-    const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only
+    const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only,
+    std::vector<int32_t> &out_pinned_allowed_cpus
 );
 
 }  // namespace
@@ -111,7 +112,8 @@ bool detail::build_aicpu_topology(
     bool occupy_only_fallback = false;
     if (!driver_topology_available) {
         if (load_cpu_topo_from_json(
-                soc_name, device_occupancy.occupy, all_cpus, &out_topology.generic_selection_only
+                soc_name, device_occupancy.occupy, all_cpus, &out_topology.generic_selection_only,
+                &out_topology.pinned_allowed_cpus
             )) {
             source = "json_fallback";
             out_topology.source = AicpuTopologySource::kJsonFallback;
@@ -597,6 +599,20 @@ bool compute_scenario_allowed_cpus(
     return true;
 }
 
+namespace {
+// Pinned placements are [scheduler..., orchestrator]. A smaller active count
+// keeps the leading scheduler slots and the orchestrator.
+bool compute_pinned_allowed_cpus(
+    const std::vector<int32_t> &pinned, int32_t active_count, std::vector<int32_t> &out_allowed_cpus
+) {
+    out_allowed_cpus.clear();
+    if (active_count < 2 || pinned.size() < static_cast<size_t>(active_count)) return false;
+    out_allowed_cpus.insert(out_allowed_cpus.end(), pinned.begin(), pinned.begin() + (active_count - 1));
+    out_allowed_cpus.push_back(pinned.back());
+    return true;
+}
+}  // namespace
+
 bool build_aicpu_launch_plan(
     const AicpuTopology &topology, int32_t requested_active_count, AicpuLaunchPlan &out_plan, std::string &out_error
 ) {
@@ -649,7 +665,9 @@ bool build_aicpu_launch_plan(
     out_plan.warn_cpu_topology_unavailable = topology.source != AicpuTopologySource::kDriver;
 
     bool selected = false;
-    if (topology.generic_selection_only) {
+    if (!topology.pinned_allowed_cpus.empty()) {
+        selected = compute_pinned_allowed_cpus(topology.pinned_allowed_cpus, effective, out_plan.allowed_cpus);
+    } else if (topology.generic_selection_only) {
         selected = compute_allowed_cpus(topology.os_schedulable_cpus, effective - 1, 1, out_plan.allowed_cpus);
     } else if (topology.scenario_type == AicpuScenarioType::kUnknown) {
         selected = compute_unknown_allowed_cpus(topology, effective, out_plan.allowed_cpus);
@@ -746,6 +764,8 @@ const char *aicpu_selection_policy_name(AicpuSelectionPolicy policy) {
         return "generic";
     case AicpuSelectionPolicy::kSequentialFallback:
         return "sequential_fallback";
+    case AicpuSelectionPolicy::kPinned:
+        return "pinned";
     }
     return "unknown";
 }
@@ -790,6 +810,34 @@ bool parse_json_string(const char *&p, std::string &out) {
     if (*p != '"') return false;
     ++p;
     return true;
+}
+
+// Parse one JSON array of non-negative integers; a trailing comma is invalid.
+bool parse_json_uint_array(const char *&p, std::vector<int32_t> &out) {
+    skip_json_ws(p);
+    if (*p != '[') return false;
+    ++p;
+    out.clear();
+    while (true) {
+        skip_json_ws(p);
+        if (*p == ']') {
+            ++p;
+            return true;
+        }
+        unsigned int value = 0;
+        if (!parse_json_uint(p, value) || value > 255U) return false;
+        out.push_back(static_cast<int32_t>(value));
+        skip_json_ws(p);
+        if (*p == ',') {
+            ++p;
+            continue;
+        }
+        if (*p == ']') {
+            ++p;
+            return true;
+        }
+        return false;
+    }
 }
 
 bool find_json_object_end(const char *start, const char *&end) {
@@ -923,10 +971,12 @@ bool find_json_key_before(const char *start, const char *end, const char *key, c
 }
 
 bool parse_cpu_topo_json_for_soc(
-    const char *text, const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only
+    const char *text, const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only,
+    std::vector<int32_t> &out_pinned_allowed_cpus
 ) {
     if (text == nullptr || soc_name == nullptr || soc_name[0] == '\0') return false;
     out_generic_selection_only = false;
+    out_pinned_allowed_cpus.clear();
     const char *p = text;
     if (!find_json_key(p, "socs")) return false;
     if (*p != '{') return false;
@@ -969,10 +1019,17 @@ bool parse_cpu_topo_json_for_soc(
             unsigned int required_occupy = 0;
             if (!parse_json_uint(value, required_occupy) || occupy != required_occupy) return false;
         }
+        bool pinned_selection = false;
         if (find_json_key_before(p, obj_end, "selection_policy", value)) {
             std::string selection_policy;
-            if (!parse_json_string(value, selection_policy) || selection_policy != "generic") return false;
-            out_generic_selection_only = true;
+            if (!parse_json_string(value, selection_policy)) return false;
+            if (selection_policy == "generic") {
+                out_generic_selection_only = true;
+            } else if (selection_policy == "pinned") {
+                pinned_selection = true;
+            } else {
+                return false;
+            }
         }
 
         // Parse matching soc object: look for "cpus" array inside.
@@ -986,8 +1043,7 @@ bool parse_cpu_topo_json_for_soc(
             skip_json_ws(obj);
             if (*obj == ']') {
                 ++obj;
-                out.total_nums = n;
-                return n > 0 && n <= kCpuOccupancyBits;
+                break;
             }
             if (n >= kCpuOccupancyBits) return false;
             if (!parse_one_cpu_object(obj, out.cpus[n])) return false;
@@ -999,11 +1055,27 @@ bool parse_cpu_topo_json_for_soc(
             }
             if (*obj == ']') {
                 ++obj;
-                out.total_nums = n;
-                return n > 0;
+                break;
             }
             return false;
         }
+        if (n == 0) return false;
+        out.total_nums = n;
+
+        const char *allowed = p;
+        const bool has_allowed = find_json_key_before(p, obj_end, "allowed_cpus", allowed);
+        if (!pinned_selection) return !has_allowed;
+
+        std::vector<int32_t> pinned;
+        if (!has_allowed || !parse_json_uint_array(allowed, pinned) || pinned.size() < 2) return false;
+        std::set<int32_t> seen;
+        for (int32_t cpu_id : pinned) {
+            if (cpu_id < 0 || cpu_id >= static_cast<int32_t>(kCpuOccupancyBits)) return false;
+            if (((occupy >> cpu_id) & 1ULL) == 0) return false;
+            if (!seen.insert(cpu_id).second) return false;
+        }
+        out_pinned_allowed_cpus = std::move(pinned);
+        return true;
     }
 }
 
@@ -1036,11 +1108,14 @@ bool read_cpu_topo_json_text(std::string &out_text) {
 }
 
 bool fill_cpu_topo_from_json(
-    const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only
+    const char *soc_name, uint64_t occupy, CpuTopologyData &out, bool &out_generic_selection_only,
+    std::vector<int32_t> &out_pinned_allowed_cpus
 ) {
     std::string text;
     if (!read_cpu_topo_json_text(text)) return false;
-    return parse_cpu_topo_json_for_soc(text.c_str(), soc_name, occupy, out, out_generic_selection_only);
+    return parse_cpu_topo_json_for_soc(
+        text.c_str(), soc_name, occupy, out, out_generic_selection_only, out_pinned_allowed_cpus
+    );
 }
 
 void cpu_topo_to_logical(const CpuTopologyData &topo, std::vector<AicpuLogicalCpu> &out) {
@@ -1061,12 +1136,15 @@ void cpu_topo_to_logical(const CpuTopologyData &topo, std::vector<AicpuLogicalCp
 }  // namespace
 
 bool load_cpu_topo_from_json(
-    const char *soc_name, uint64_t occupy, std::vector<AicpuLogicalCpu> &out_all_cpus, bool *out_generic_selection_only
+    const char *soc_name, uint64_t occupy, std::vector<AicpuLogicalCpu> &out_all_cpus, bool *out_generic_selection_only,
+    std::vector<int32_t> *out_pinned_allowed_cpus
 ) {
     out_all_cpus.clear();
+    if (out_pinned_allowed_cpus != nullptr) out_pinned_allowed_cpus->clear();
     CpuTopologyData topo{};
     bool generic_selection_only = false;
-    if (!fill_cpu_topo_from_json(soc_name, occupy, topo, generic_selection_only)) return false;
+    std::vector<int32_t> pinned_allowed_cpus;
+    if (!fill_cpu_topo_from_json(soc_name, occupy, topo, generic_selection_only, pinned_allowed_cpus)) return false;
     if (out_generic_selection_only != nullptr) *out_generic_selection_only = generic_selection_only;
     for (uint32_t i = 0; i < topo.total_nums; ++i) {
         if (topo.cpus[i].cpu_id >= kCpuOccupancyBits) {
@@ -1078,7 +1156,9 @@ bool load_cpu_topo_from_json(
     std::sort(out_all_cpus.begin(), out_all_cpus.end(), [](const AicpuLogicalCpu &a, const AicpuLogicalCpu &b) {
         return a.cpu_id < b.cpu_id;
     });
-    return !out_all_cpus.empty();
+    if (out_all_cpus.empty()) return false;
+    if (out_pinned_allowed_cpus != nullptr) *out_pinned_allowed_cpus = pinned_allowed_cpus;
+    return true;
 }
 
 std::string format_aicpu_topology_json(
