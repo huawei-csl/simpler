@@ -777,12 +777,17 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     const int wait_rc = poll_boundary_waits(prepared);
     if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
     read_device_wall_ns(prepared.pipeline_slot);
+    const int tracr_rc = tracr_store_traces(this, *prepared.runtime);
+    if (tracr_rc != 0) {
+        LOG_ERROR("tracr_store_traces failed rc=%d", tracr_rc);
+    }
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
-    prepared.retirement_diagnostics_rc =
+    const int teardown_rc =
         teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    prepared.retirement_diagnostics_rc = tracr_rc != 0 ? tracr_rc : teardown_rc;
     emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
     print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     cleanup_execution(prepared, true);
