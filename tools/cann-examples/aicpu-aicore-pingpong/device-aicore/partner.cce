@@ -1,0 +1,329 @@
+// Copyright (c) PyPTO Contributors.
+// This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+// CANN Open Software License Agreement Version 2.0 (the "License").
+// Please refer to the License for details. You may not use this file except in compliance with the License.
+// THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+// INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+// See LICENSE in the root of the software repository for the full text of the License.
+// -----------------------------------------------------------------------------------------------------------
+//
+// The AICore half of the AICPU <-> AICore ping-pong.
+//
+// Placement is not controllable: block_dim does not pin a kernel to a chosen
+// core, and the landed core is not stable between runs. What IS guaranteed is
+// coverage. A block holds a whole 1C2V cluster for its lifetime, and on a5
+// PLATFORM_MAX_BLOCKDIM == PLATFORM_MAX_PHYSICAL_CORES == 36, so 36 blocks over
+// 36 clusters is a bijection: every slot is occupied by exactly one block
+// whatever order STARS dispatches them in. The kernel therefore never needs the
+// block_idx -> cluster mapping. It reads its own slot and decides.
+//
+// Both halves of the mix pair run the same body. An AIV slot is just another
+// slot in the 108-entry space, so selecting AIC or AIV is a matter of which
+// slot the host names, not which half returns early.
+//
+// This kernel needs no AscendC header: get_coreid, get_sys_cnt, get_block_idx,
+// get_subblockid, dcci and dsb are all `-x cce` builtins. Including
+// kernel_operator.h would pull in non-weak globals (g_tilingKey among them)
+// that break the combined link of the mix pair.
+
+#include "../shared/pingpong.h"
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+// rtRegisterAllKernel enumerates kernels by the `<name>_0_mix_aic` /
+// `_0_mix_aiv` symbol pair and the registered ELF must carry both halves; a
+// plainly-named entry is rejected with 107000.
+#ifdef __DAV_VEC__
+#define PARTNER_ENTRY aicpu_aicore_pingpong_partner_0_mix_aiv
+#else
+#define PARTNER_ENTRY aicpu_aicore_pingpong_partner_0_mix_aic
+#endif
+
+// ld_dev rejects a volatile-qualified pointer ("the 1st parameter maybe need a
+// type 'half *'"), so strip the qualifier the way scheduler_memory.h does
+// before every bypass load. The volatile is for the AICPU and host compilers;
+// on this side the bypass itself is what guarantees the read reaches GM.
+__aicore__ inline uint32_t PpLoadDevU32(__gm__ volatile uint32_t *p) {
+    __gm__ uint32_t *addr = const_cast<__gm__ uint32_t *>(p);
+    return static_cast<uint32_t>(ld_dev(addr, 0));
+}
+
+// st_dev is the bypass STORE, the counterpart of ld_dev. Same volatile rule.
+__aicore__ inline uint64_t PpLoadDevU64(__gm__ volatile uint64_t *p) {
+    __gm__ uint64_t *addr = const_cast<__gm__ uint64_t *>(p);
+    return static_cast<uint64_t>(ld_dev(addr, 0));
+}
+
+__aicore__ inline void PpStoreDevU64(__gm__ volatile uint64_t *p, uint64_t v) {
+    __gm__ uint64_t *addr = const_cast<__gm__ uint64_t *>(p);
+    st_dev(v, addr, 0);
+}
+
+// Publish one 64-byte line and commit it. CACHELINE_OUT writes the whole line
+// back, which is safe only because every line here has a single writer.
+#define PP_PUBLISH_LINE(p)                              \
+    do {                                                \
+        dcci((p), SINGLE_CACHE_LINE, CACHELINE_OUT);    \
+        dsb(DSB_DDR);                                   \
+    } while (0)
+
+extern "C" __global__ __aicore__ void PARTNER_ENTRY(__gm__ PpArena *arena) {
+    if (arena == (__gm__ PpArena *)0) {
+        return;
+    }
+
+    const uint64_t t_entry = get_sys_cnt();
+
+    // The raw value is not a bare index -- 0x8010 has been observed -- and
+    // indexing the register table with it faults the op as 507018.
+    const uint32_t coreid_raw = (uint32_t)get_coreid();
+    const uint32_t slot = coreid_raw & PP_COREID_MASK;
+    if (slot >= PP_MAX_SLOTS) {
+        return;
+    }
+
+    __gm__ PpAttendance *me = &arena->attendance[slot];
+    me->coreid_raw = coreid_raw;
+    me->block_idx = (uint32_t)get_block_idx();
+    me->block_num = (uint32_t)get_block_num();
+#ifdef __DAV_VEC__
+    me->sub_block_id = (uint32_t)get_subblockid();
+    me->is_aiv = 1u;
+#else
+    me->sub_block_id = 0u;
+    me->is_aiv = 0u;
+#endif
+    me->t_entry = t_entry;
+
+    __gm__ PpCoreProbe *probe = &arena->core_probe[slot];
+    {
+        const uint32_t n = PpLoadDevU32(&arena->ctl.clock_iters);
+        uint64_t acc = t_entry | 1ull;
+        const uint64_t c0 = get_sys_cnt();
+        for (uint32_t i = 0; i < n; ++i) {
+            acc ^= acc << 13;
+            acc ^= acc >> 7;
+            acc ^= acc << 17;
+        }
+        const uint64_t c1 = get_sys_cnt();
+        probe->clock_ticks = c1 - c0;
+        probe->sink = acc;
+        // Published here as well as after the chase, so a block that never
+        // serves a round still reports its clock.
+        probe->attended = PP_ATTEND_MAGIC;
+        PP_PUBLISH_LINE(probe);
+    }
+
+    // ld_dev bypasses the scalar data cache, so a control word written by the
+    // host before launch is read without any invalidate. ctl is host-written
+    // and device-read-only, so nothing this kernel publishes can clobber it.
+    const uint32_t mode = PpLoadDevU32(&arena->ctl.mode);
+
+    // PROBE answers the one question that would force a redesign: does a
+    // bypass store from AICore become visible in GM at all? One block writes
+    // the same magic two ways -- core_ball[0] with dcci+CACHELINE_OUT, which
+    // the existing tools rely on, and core_ball[1] with st_dev+dsb, which this
+    // design wants. The host reads both back. A line that stays zero was never
+    // published.
+    if (mode == PP_MODE_PROBE) {
+        me->attended = PP_ATTEND_MAGIC;
+        me->t_exit = get_sys_cnt();
+        PP_PUBLISH_LINE(me);
+        if (slot == 0u) {
+            arena->core_ball[0].token = PP_PROBE_MAGIC;
+            PP_PUBLISH_LINE(&arena->core_ball[0]);
+            PpStoreDevU64(&arena->core_ball[1].token, PP_PROBE_MAGIC);
+            dsb(DSB_DDR);
+        }
+        return;
+    }
+
+    if (mode == PP_MODE_CENSUS) {
+        // Attendance magic last, after every other field in the line is set:
+        // the host treats the magic as the publish token for this line.
+        me->attended = PP_ATTEND_MAGIC;
+        me->t_exit = get_sys_cnt();
+        PP_PUBLISH_LINE(me);
+        return;
+    }
+
+    me->attended = PP_ATTEND_MAGIC;
+    me->t_exit = get_sys_cnt();
+    PP_PUBLISH_LINE(me);
+
+    // Full-matrix sweep. Every block stays resident for the whole schedule and
+    // participates only on the rounds that name its slot. Round r names its
+    // pair in pair_list[r], which the AICPU driver reads the same way, so the
+    // two sides agree on who is active without exchanging anything but the
+    // round counter.
+    //
+    // Parked blocks poll the round counter on a get_sys_cnt deadline rather
+    // than tightly: with 107 of them parked, a tight poll would put more GM
+    // traffic on the fabric than the measurement itself.
+    const uint64_t run_budget = PpLoadDevU64(&arena->ctl.aicore_run_budget_ticks);
+    const uint64_t throttle = PpLoadDevU64(&arena->ctl.throttle_ticks);
+    const uint32_t n_rounds = PpLoadDevU32(&arena->ctl.n_rounds);
+    const uint64_t t0 = get_sys_cnt();
+    uint64_t trips_total = 0;
+    uint64_t rounds_served = 0;
+    uint32_t rc = PP_RC_RUN_BUDGET;
+
+    // Both endpoints are AICore blocks, and no AICPU is launched. Round r names
+    // its pair as (index of A << 16) | index of B into slot_list. A times the
+    // round and is the sole writer of the round counter while its round is
+    // live; B mirrors. Every spin is bounded by the same run budget, so a
+    // missing partner costs the budget and never the 45 s STARS kill.
+    if (mode == PP_MODE_CORE2CORE) {
+        const uint64_t iters = PpLoadDevU64(&arena->ctl.iters);
+        const uint64_t warmup = PpLoadDevU64(&arena->ctl.warmup);
+
+        while (get_sys_cnt() - t0 < run_budget) {
+            const uint64_t r = PpLoadDevU64(&arena->sched.round);
+            if (r >= (uint64_t)n_rounds) {
+                rc = PP_RC_OK;
+                break;
+            }
+            const uint32_t entry = PpLoadDevU32(&arena->pair_list[r]);
+            const uint32_t slot_a = PpLoadDevU32(&arena->slot_list[(entry >> 16) & 0xFFFFu]);
+            const uint32_t slot_b = PpLoadDevU32(&arena->slot_list[entry & 0xFFFFu]);
+            if (slot != slot_a && slot != slot_b) {
+                const uint64_t wake = get_sys_cnt() + throttle;
+                while (get_sys_cnt() < wake) {
+                }
+                continue;
+            }
+
+            // Unique to this block AND this round, so a token left in a ball
+            // line by an earlier round can never be mistaken for a live one.
+            const uint64_t base = ((uint64_t)(slot + 1u) << 40) | (r << 24);
+
+            if (slot == slot_a) {
+                uint64_t n = 0;
+                for (uint64_t i = 0; i < warmup && get_sys_cnt() - t0 < run_budget; ++i) {
+                    const uint64_t tok = base | (++n);
+                    PpStoreDevU64(&arena->core_ball[0].token, tok);
+                    dsb(DSB_DDR);
+                    while (get_sys_cnt() - t0 < run_budget) {
+                        if (PpLoadDevU64(&arena->core_ball[1].token) == tok) break;
+                    }
+                }
+                const uint64_t m0 = get_sys_cnt();
+                for (uint64_t i = 0; i < iters && get_sys_cnt() - t0 < run_budget; ++i) {
+                    uint64_t tok = base | (++n);
+                    if (i + 1ull == iters) tok |= PP_TOKEN_END_BIT;
+                    PpStoreDevU64(&arena->core_ball[0].token, tok);
+                    dsb(DSB_DDR);
+                    while (get_sys_cnt() - t0 < run_budget) {
+                        if (PpLoadDevU64(&arena->core_ball[1].token) == tok) break;
+                    }
+                    ++trips_total;
+                }
+                const uint64_t m1 = get_sys_cnt();
+                // Bypass store, never dcci: result_ticks[r] shares its line
+                // with seven neighbours that other blocks wrote, and a line
+                // writeback would restore this block's stale copy of those.
+                PpStoreDevU64(&arena->result_ticks[r], m1 - m0);
+                dsb(DSB_DDR);
+                ++rounds_served;
+                PpStoreDevU64(&arena->sched.round, r + 1ull);
+                dsb(DSB_DDR);
+            } else {
+                // The ball lines are never cleared between rounds, so the
+                // value sitting in core_ball[0] on entry is the PREVIOUS
+                // round's last token -- and that one carries the end bit.
+                // Mirroring it would end this round before it began, which is
+                // why a token is accepted only when its round and initiator
+                // fields match the pair this round names.
+                const uint64_t want = (((uint64_t)(slot_a + 1u) << 40) | (r << 24)) >> 24;
+                uint64_t published = 0;
+                while (get_sys_cnt() - t0 < run_budget) {
+                    const uint64_t v = PpLoadDevU64(&arena->core_ball[0].token);
+                    if (v == published || ((v & ~PP_TOKEN_END_BIT) >> 24) != want) {
+                        continue;
+                    }
+                    published = v;
+                    PpStoreDevU64(&arena->core_ball[1].token, v);
+                    dsb(DSB_DDR);
+                    ++trips_total;
+                    if ((v & PP_TOKEN_END_BIT) != 0ull) break;
+                }
+                ++rounds_served;
+                while (get_sys_cnt() - t0 < run_budget) {
+                    if (PpLoadDevU64(&arena->sched.round) != r) break;
+                }
+            }
+        }
+
+        me->rounds_served = rounds_served;
+        me->trips_total = trips_total;
+        me->sweep_rc = (uint64_t)rc;
+        me->t_exit = get_sys_cnt();
+        PP_PUBLISH_LINE(me);
+        return;
+    }
+
+    while (get_sys_cnt() - t0 < run_budget) {
+        const uint64_t r = PpLoadDevU64(&arena->sched.round);
+        if (r >= (uint64_t)n_rounds) {
+            rc = PP_RC_OK;
+            break;
+        }
+        const uint32_t entry = PpLoadDevU32(&arena->pair_list[r]);
+        const uint32_t active_slot = PpLoadDevU32(&arena->slot_list[entry & 0xFFFFu]);
+        if (active_slot != slot) {
+            const uint64_t wake = get_sys_cnt() + throttle;
+            while (get_sys_cnt() < wake) {
+            }
+            continue;
+        }
+
+        if (rounds_served == 0) {
+            const uint32_t steps = PpLoadDevU32(&arena->ctl.chase_steps);
+            uint64_t idx = 0;
+            const uint64_t h0 = get_sys_cnt();
+            for (uint32_t i = 0; i < steps; ++i) {
+                idx = PpLoadDevU64(&arena->chase[idx * 8ull]);
+            }
+            const uint64_t h1 = get_sys_cnt();
+            probe->chase_ticks = h1 - h0;
+            probe->sink = probe->sink ^ idx;
+            probe->attended = PP_ATTEND_MAGIC;
+            PP_PUBLISH_LINE(probe);
+        }
+
+        // This block is the partner for this round. Mirror until the AICPU
+        // sends the end-bit token, then go back to watching the round counter.
+        uint64_t published = 0;
+        while (get_sys_cnt() - t0 < run_budget) {
+            const uint64_t v = PpLoadDevU64(&arena->cpu_ball[0].token);
+            if (v == published) {
+                continue;
+            }
+            published = v;
+            PpStoreDevU64(&arena->core_ball[0].token, v);
+            dsb(DSB_DDR);
+            ++trips_total;
+            if ((v & PP_TOKEN_END_BIT) != 0ull) {
+                break;
+            }
+        }
+        ++rounds_served;
+        // Wait for the AICPU to advance the round before re-reading it, so this
+        // block cannot serve the same round twice.
+        while (get_sys_cnt() - t0 < run_budget) {
+            if (PpLoadDevU64(&arena->sched.round) != r) {
+                break;
+            }
+        }
+    }
+
+    // Own line, own writer: 108 blocks report concurrently without sharing one.
+    me->rounds_served = rounds_served;
+    me->trips_total = trips_total;
+    me->sweep_rc = (uint64_t)rc;
+    me->t_exit = get_sys_cnt();
+    PP_PUBLISH_LINE(me);
+    return;
+}
