@@ -282,6 +282,13 @@ int main(int argc, char **argv) {
     // Full matrix in one launch. Per-launch overhead is ~58 s against ~1.2 ms
     // of measurement, so 756 launches would take 12 h; 756 rounds inside one
     // launch take about a second, and share a clock state into the bargain.
+    //
+    // A schedule longer than PP_MAX_ROUNDS is split into equal chunks that each
+    // fit the arena's pair_list, and one arena runs one chunk. The split is a
+    // host-side loop, so the arena layout the device sees is unchanged and the
+    // numbers stay comparable with a run whose schedule fit in a single piece.
+    std::vector<uint32_t> c2c_all;
+    uint32_t c2c_chunk_rounds = 0;
     {
         const char *cpus_env = std::getenv("PP_CPUS");
         uint32_t n = 0;
@@ -355,43 +362,34 @@ int main(int argc, char **argv) {
         std::printf("[sweep] schedule: %zu rounds, pair order shuffled (seed=%u)\n", sched.size(), seed);
 
         if (mode == PP_MODE_CORE2CORE) {
-            // Replace the sampled schedule: both endpoints are AICore slots
-            // now, and the contrast that matters is cluster / die / chip. A
-            // random sample of the 108-slot space would almost never draw two
-            // slots of the same cluster, which is the one pair with a path
-            // that does not go through GM.
-            static const uint32_t kClusters[] = {0u, 1u, 9u, 17u};
-            uint32_t n_sl = 0;
-            for (uint32_t d = 0; d < 2u; ++d) {
-                for (uint32_t k = 0; k < sizeof(kClusters) / sizeof(kClusters[0]); ++k) {
-                    const uint32_t c = kClusters[k];
-                    const uint32_t base = d * PP_SLOTS_PER_DIE;
-                    host_arena.slot_list[n_sl++] = base + c;
-                    host_arena.slot_list[n_sl++] = base + PP_AIC_PER_DIE + 2u * c;
-                    host_arena.slot_list[n_sl++] = base + PP_AIC_PER_DIE + 2u * c + 1u;
-                }
-            }
+            // Replace the sampled schedule with every AICore slot: both
+            // endpoints are AICore here, and the question is which pairs are
+            // slow, so no pair may be dropped. slot_list is in natural order,
+            // which makes an index into it the slot id itself; the pair order
+            // carries the shuffle instead, so a round's die and cluster
+            // relation is independent of its position in the sweep.
+            const uint32_t n_sl = PP_MAX_SLOTS;
+            for (uint32_t i = 0; i < n_sl; ++i) host_arena.slot_list[i] = i;
             host_arena.ctl.n_cpus = 0;
             host_arena.ctl.n_slots = n_sl;
-            std::vector<uint32_t> c2c;
             for (uint32_t rep = 0; rep < host_arena.ctl.n_reps; ++rep) {
                 for (uint32_t i = 0; i < n_sl; ++i) {
-                    for (uint32_t j = i + 1u; j < n_sl; ++j) c2c.push_back((i << 16) | j);
+                    for (uint32_t j = i + 1u; j < n_sl; ++j) c2c_all.push_back((i << 16) | j);
                 }
             }
-            std::shuffle(c2c.begin(), c2c.end(), rng);
-            if (c2c.size() > PP_MAX_ROUNDS) {
-                std::fprintf(stderr, "core2core schedule %zu rounds exceeds PP_MAX_ROUNDS=%u\n", c2c.size(),
-                             PP_MAX_ROUNDS);
-                return 1;
-            }
-            host_arena.ctl.n_rounds = (uint32_t)c2c.size();
-            for (uint32_t i = 0; i < c2c.size(); ++i) host_arena.pair_list[i] = c2c[i];
-            std::printf("[c2c] %u AICore slots over 8 clusters, %u rounds (unordered pairs x %u reps)\n", n_sl,
-                        host_arena.ctl.n_rounds, host_arena.ctl.n_reps);
-            std::printf("[c2c] slots:");
-            for (uint32_t i = 0; i < n_sl; ++i) std::printf(" %u", (uint32_t)host_arena.slot_list[i]);
-            std::printf("\n");
+            std::shuffle(c2c_all.begin(), c2c_all.end(), rng);
+
+            // Chunks are equal-sized so every arena runs the same number of
+            // rounds for the same wall time, and a chunk is a slice of the
+            // already-shuffled list, so it holds a random subset of pairs
+            // rather than a die or cluster stratum.
+            const uint32_t n_chunks = (uint32_t)((c2c_all.size() + PP_MAX_ROUNDS - 1u) / PP_MAX_ROUNDS);
+            c2c_chunk_rounds = (uint32_t)((c2c_all.size() + n_chunks - 1u) / n_chunks);
+            host_arena.ctl.n_rounds = c2c_chunk_rounds;
+            std::printf("[c2c] %u AICore slots, %zu unordered pairs x %u reps = %zu rounds\n", n_sl,
+                        (size_t)n_sl * (n_sl - 1u) / 2u, host_arena.ctl.n_reps, c2c_all.size());
+            std::printf("[c2c] %u chunk(s) of %u rounds; arena a runs chunk a %% %u\n", n_chunks, c2c_chunk_rounds,
+                        n_chunks);
         }
     }
     {
@@ -529,6 +527,16 @@ int main(int argc, char **argv) {
         // ctl, slot_list and pair_list are device-read-only, so the host copy
         // read back from the previous sweep still holds the schedule.
         host_arena.sched.round = 0;
+        if (mode == PP_MODE_CORE2CORE && !c2c_all.empty()) {
+            const uint32_t n_chunks = (uint32_t)((c2c_all.size() + c2c_chunk_rounds - 1u) / c2c_chunk_rounds);
+            const uint32_t chunk = a % n_chunks;
+            const size_t first = (size_t)chunk * c2c_chunk_rounds;
+            const size_t len = std::min((size_t)c2c_chunk_rounds, c2c_all.size() - first);
+            for (size_t i = 0; i < len; ++i) host_arena.pair_list[i] = c2c_all[first + i];
+            host_arena.ctl.n_rounds = (uint32_t)len;
+            std::printf("[c2c] arena %u runs chunk %u of %u: pairs %zu..%zu\n", a, chunk, n_chunks, first,
+                        first + len - 1u);
+        }
         ACL_CHECK(aclrtMemset(arena, sizeof(PpArena), 0, sizeof(PpArena)), "memset arena");
         ACL_CHECK(
             aclrtMemcpy(arena, offsetof(PpArena, attendance), &host_arena, offsetof(PpArena, attendance),
