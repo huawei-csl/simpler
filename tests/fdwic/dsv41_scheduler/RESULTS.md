@@ -23,7 +23,8 @@
 
 ## 版本与测试方式
 
-- 调度源码基于 `5abd1794980eaa493f618067b91aeff117191a63`，不包含 PR #3108。复用已核对的运行库和业务 kernel；本轮改用独立 C++ runner 执行新版 MoE。表头保留 `main HBG` / `main percounter`，并不表示 GitHub 当前 main。
+- 测试源码 `f1d91abdb80a1ea455e3239b4d060003170d693d`：当前本地 HBG `3730c4be060a5abc442250d37a1aa89f66afcc7d`，合入 [PR #3114](https://github.com/hw-native-sys/simpler/pull/3114) 的 `a0b90c0be790ddf445e11f50f118f8e37a28f5a5`，并保留独立 MoE 测试入口。两套运行库从这一固定源码构建；业务 kernel 和输入复用原包。表头保留 `main HBG` / `main percounter`，不表示 GitHub 当前 main。
+- TMR 列来自带首尾采集的测试运行库：AICPU 回放固定任务流，补充 L0 AICore 首尾采集。采集现已移到 `tmr_runtime.py` 创建的独立源码副本和输出目录；普通 TMR 源码及默认构建不包含这些改动。本次保留原11组数据，隔离构建另做验证。按 TMR Tensor ABI 重编实际使用的 kernel，数值计算源和输入不变。11组全部通过原有回放数值校验。TMR 另批次自动分配设备，三列不是同卡三方配对；不能把差值全部归因于调度算法。
 - 纯 L0：每个运行库1次预热、10次正式测量。AICore wall 为首个实际 AIC/AIV kernel 开始至最后一个实际 kernel 结束，包含中间调度、依赖与通信等待，不包含 AICPU 启动和收尾。Device wall 仅作诊断，不填入表格。
 - 每个用例的两列在同一张卡或同一对卡上顺序测量，用例间交替先测 HBG 或 percounter。双卡每次执行前均完成跨 Device 启动会合；逐轮取两卡各自 AICore 时长的最大值，再取10轮平均，不跨卡相减原始计数器。
 - 全程通过 `task-submit --device auto --device-num N` 自动分配，最多8卡并发。测量日期2026-11-15，A5 Ascend950DT_9581（32 AIC / 64 AIV），CANN 9.3.0。本轮32个运行库/用例组合全部完成，总墙钟时间105.21秒（含提交、排队和回收）。实际设备号与双卡会合证据记录在本地 `artifacts/performance-refresh/summary.json` 及各运行的 `wall.json`。
@@ -36,6 +37,6 @@
 - 8个非通信配置沿用各自已计算的下界，本轮不重采 L1、不重求解。新版下界来自历史 HBG 534c L1，初版/DSL 来自各自历史21d2 L1；半同步和全同步使用独立模型与耗时。用例、kernel、依赖和同步策略保持不变。
 - 模型保留任务完成依赖、32 AIC / 64 AIV 容量、不可抢占 block、MIX 同 block 共同启动、sync_start 全 block 共同启动；调度成本为零，放宽 cluster 放置。时长向下量化为100ns，取10轮已证明下界的平均值。
 - 下界依赖历史 L1 kernel 时长，是同步约束下的参考模型，不是硬件绝对极限，也不保证是本轮 L0 的严格下界。通信场景不计算。
-- 最优实测距下界 = `(min(main HBG, main percounter) / 同步约束下界 - 1) × 100%`，按未舍入值计算，不截断负值。
+- 最优实测距下界 = `(min(main HBG, main percounter, 可用的 AICPU TMR) / 同步约束下界 - 1) × 100%`，按未舍入值计算，不截断负值。
 - **†**：新版 Engram 的10轮未证明最优；平均已证明下界0.732110ms、可行排程0.735090ms，表中采用前者。其他7个配置均已证明全部轮次最优。
 - 用例和复现方式见 [README](README.md)，模型见 [BOUND.md](BOUND.md)。

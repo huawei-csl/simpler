@@ -44,10 +44,14 @@ def test_manifests_and_tables_contain_only_selected_cases():
 
 def test_performance_table_matches_selected_variants():
     actual = []
+    tmr = []
     for line in (SUITE / "RESULTS.md").read_text().splitlines():
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
-        if len(cells) == 6 and re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[2]):
+        if len(cells) == 7 and re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[2]):
             actual.append((cells[0], cells[1]))
+            if cells[4] != "—":
+                assert re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[4])
+                tmr.append((cells[0], cells[1]))
     labels = [label for case, label in actual if case == "c2a_full"]
     assert len(set(labels)) == 4
     sources = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_dsl", "pypto_lib_latest")
