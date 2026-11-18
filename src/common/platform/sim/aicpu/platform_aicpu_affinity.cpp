@@ -211,6 +211,12 @@ static bool filter_gate_impl(
 
 int32_t platform_aicpu_affinity_thread_idx() { return affinity_tls_key().value(); }
 
+int32_t platform_aicpu_affinity_thread_cpu() { return -1; }
+
+int32_t platform_aicpu_affinity_thread_die() { return -1; }
+
+bool platform_aicpu_affinity_set_thread_die(int32_t) { return affinity_tls_key().publish_physical_die(-1); }
+
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) {
     if (!affinity_tls_key().publish(idx)) {
         // Fatal diagnostics bypass the asynchronous logger so abort cannot lose them.

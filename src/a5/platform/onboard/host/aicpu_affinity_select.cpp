@@ -26,6 +26,7 @@
 #include <unordered_map>
 
 #include "common/platform_config.h"
+#include "common/aicpu_die_map.h"
 #include "common/unified_log.h"
 
 namespace simpler::a5 {
@@ -33,6 +34,26 @@ namespace simpler::a5 {
 using detail::CpuTopologyData;
 using detail::CpuTopologyEntry;
 using detail::kCpuOccupancyBits;
+
+uint32_t pack_aicpu_cpu_die_map(const AicpuTopology &topology) {
+    // Partially-good layouts do not establish correspondence with the AICore
+    // physical-die numbering. Occupancy-only data has no physical CPU identity.
+    if (topology.scenario_type != AicpuScenarioType::kFg || topology.generic_selection_only ||
+        topology.source == AicpuTopologySource::kOccupyFallback) {
+        return kUnknownAicpuDieMap;
+    }
+    uint32_t packed = kUnknownAicpuDieMap;
+    uint32_t seen = 0;
+    for (const AicpuLogicalCpu &cpu : topology.os_schedulable_cpus) {
+        if (cpu.cpu_id < 0 || cpu.cpu_id >= kAicpuDieMapCpuCount || cpu.phy_cpu_id < 0 || cpu.phy_cpu_id >= 8 ||
+            cpu.die_id != cpu.phy_cpu_id / 4 || (seen & (1u << cpu.cpu_id)) != 0) {
+            return kUnknownAicpuDieMap;
+        }
+        seen |= 1u << cpu.cpu_id;
+        packed = aicpu_die_map_set(packed, cpu.cpu_id, cpu.die_id);
+    }
+    return packed;
+}
 
 namespace {
 
@@ -764,6 +785,8 @@ const char *aicpu_selection_policy_name(AicpuSelectionPolicy policy) {
         return "generic";
     case AicpuSelectionPolicy::kSequentialFallback:
         return "sequential_fallback";
+    case AicpuSelectionPolicy::kPinned:
+        return "pinned";
     }
     return "unknown";
 }

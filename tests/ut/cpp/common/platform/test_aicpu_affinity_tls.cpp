@@ -65,6 +65,90 @@ TEST(AicpuAffinityTls, BoundCellKeepsThreadsIndependent) {
     EXPECT_EQ(index, 3);
     EXPECT_EQ(platform_aicpu_affinity_bind_thread(nullptr), 0);
 }
+
+TEST(AicpuAffinityTls, PhysicalPlacementBelongsToTheCurrentBinding) {
+    simpler::AffinityTlsKey key;
+    int32_t identity = 2;
+    EXPECT_FALSE(key.publish_observed_cpu(5));
+    EXPECT_FALSE(key.publish_physical_die(1));
+    ASSERT_EQ(key.bind(&identity), 0);
+    EXPECT_EQ(key.observed_cpu(), -1);
+    EXPECT_EQ(key.physical_die(), -1);
+    ASSERT_TRUE(key.publish_observed_cpu(5));
+    ASSERT_TRUE(key.publish_physical_die(1));
+    EXPECT_EQ(key.observed_cpu(), 5);
+    EXPECT_EQ(key.physical_die(), 1);
+
+    std::thread other([&] {
+        EXPECT_EQ(key.observed_cpu(), -1);
+        EXPECT_EQ(key.physical_die(), -1);
+        int32_t other_identity = 3;
+        ASSERT_EQ(key.bind(&other_identity), 0);
+        ASSERT_TRUE(key.publish_observed_cpu(2));
+        ASSERT_TRUE(key.publish_physical_die(0));
+        EXPECT_EQ(key.observed_cpu(), 2);
+        EXPECT_EQ(key.physical_die(), 0);
+        ASSERT_EQ(key.bind(nullptr), 0);
+    });
+    other.join();
+    EXPECT_EQ(key.observed_cpu(), 5);
+    EXPECT_EQ(key.physical_die(), 1);
+
+    // Invalidating stale ownership cannot write a cell reused by a later cohort.
+    identity = 4;
+    key.invalidate();
+    EXPECT_EQ(identity, 4);
+    EXPECT_EQ(key.observed_cpu(), -1);
+    EXPECT_EQ(key.physical_die(), -1);
+    ASSERT_EQ(key.bind(&identity), 0);
+    EXPECT_EQ(key.observed_cpu(), -1);
+    EXPECT_EQ(key.physical_die(), -1);
+    ASSERT_TRUE(key.publish_observed_cpu(3));
+    ASSERT_TRUE(key.publish_physical_die(0));
+    ASSERT_EQ(key.bind(&identity), 0);
+    EXPECT_EQ(key.observed_cpu(), -1);
+    EXPECT_EQ(key.physical_die(), -1);
+    ASSERT_EQ(key.bind(nullptr), 0);
+    EXPECT_EQ(key.observed_cpu(), -1);
+    EXPECT_EQ(key.physical_die(), -1);
+}
+
+TEST(AicpuAffinityTls, DirectPlatformBindingDoesNotInventPhysicalPlacement) {
+    int32_t identity = 1;
+    ASSERT_EQ(platform_aicpu_affinity_bind_thread(&identity), 0);
+    EXPECT_EQ(platform_aicpu_affinity_thread_cpu(), -1);
+    EXPECT_EQ(platform_aicpu_affinity_thread_die(), -1);
+    ASSERT_EQ(platform_aicpu_affinity_bind_thread(nullptr), 0);
+    EXPECT_EQ(platform_aicpu_affinity_thread_cpu(), -1);
+    EXPECT_EQ(platform_aicpu_affinity_thread_die(), -1);
+}
+
+TEST(AicpuAffinityTls, BorrowedSlotKeepsObservedCpuUntilBindingRetires) {
+    cpu_set_t original;
+    ASSERT_EQ(sched_getaffinity(0, sizeof(original), &original), 0);
+    const int32_t observed_cpu = sched_getcpu();
+    ASSERT_GE(observed_cpu, 0);
+    cpu_set_t pinned;
+    CPU_ZERO(&pinned);
+    CPU_SET(observed_cpu, &pinned);
+    ASSERT_EQ(sched_setaffinity(0, sizeof(pinned), &pinned), 0);
+
+    // One unique observed CPU can borrow an unreachable requested slot.
+    const int32_t allowed[1] = {observed_cpu + 1};
+    EXPECT_TRUE(platform_aicpu_affinity_gate_filter(allowed, 1, 1));
+    EXPECT_EQ(platform_aicpu_affinity_thread_idx(), 0);
+#if defined(AFFINITY_TEST_SIM)
+    EXPECT_EQ(platform_aicpu_affinity_thread_cpu(), -1);
+#else
+    EXPECT_EQ(platform_aicpu_affinity_thread_cpu(), observed_cpu);
+#endif
+    EXPECT_EQ(platform_aicpu_affinity_thread_die(), -1);
+    EXPECT_EQ(platform_aicpu_affinity_bind_thread(nullptr), 0);
+    EXPECT_EQ(platform_aicpu_affinity_thread_cpu(), -1);
+    EXPECT_EQ(platform_aicpu_affinity_thread_die(), -1);
+    EXPECT_EQ(sched_setaffinity(0, sizeof(original), &original), 0);
+}
+
 TEST(AicpuAffinityTlsDeathTest, BindingFailureRejectsWholeCohortWithoutHanging) {
     ASSERT_EXIT(
         {

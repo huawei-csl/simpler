@@ -50,6 +50,7 @@ enum class AicpuSelectionPolicy {
     kScenario,
     kGeneric,
     kSequentialFallback,
+    kPinned,
 };
 
 struct AicpuDeviceOccupancy {
@@ -183,6 +184,9 @@ bool build_aicpu_launch_plan(
 
 const char *aicpu_scenario_name(AicpuScenarioType scenario);
 const char *aicpu_topology_source_name(AicpuTopologySource source);
+
+// Unknown/partially-good topologies carry no inferred physical-die map.
+uint32_t pack_aicpu_cpu_die_map(const AicpuTopology &topology);
 
 // Serialize the complete topology and launch decision for diagnostic tooling.
 // The result is a standalone JSON object terminated by a newline.

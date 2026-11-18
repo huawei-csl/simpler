@@ -39,6 +39,7 @@
 #include <type_traits>
 
 #include "common/dma_workspace.h"
+#include "common/aicpu_die_map.h"
 #include "common/launch_entry_args.h"
 
 inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = false;
@@ -161,6 +162,9 @@ struct KernelArgs {
 
     uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
 
+    // Physical die indexed by logical CPU, supplied by the host topology probe.
+    uint32_t aicpu_cpu_die_map{simpler::a5::kUnknownAicpuDieMap};
+
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
@@ -180,8 +184,8 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
 // seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// ten uint32_t rather than nine. This fills 176 bytes exactly; a2a3 rounds
-// its 180 bytes of members to 184 bytes for 8-byte alignment.
+// eleven uint32_t rather than nine. The 180 bytes of members round to 184
+// bytes for 8-byte alignment.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -197,8 +201,9 @@ static_assert(
 // independently lock the Graph triple, cache policy and trailing SIMT anchor.
 static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
-static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, aicpu_cpu_die_map) == 172, "AICPU die map offset drift");
+static_assert(offsetof(KernelArgs, force_simt_anchor) == 176, "SIMT anchor offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

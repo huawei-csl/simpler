@@ -115,6 +115,13 @@ static int execute_platform_task(void *arg) {
         return -1;
     }
 
+    const int32_t physical_die =
+        simpler::a5::aicpu_die_from_map(k_args->aicpu_cpu_die_map, platform_aicpu_affinity_thread_cpu());
+    if (!platform_aicpu_affinity_set_thread_die(physical_die)) {
+        LOG_ERROR("%s", "AICPU die assignment requires a bound execution identity");
+        return -1;
+    }
+
     // Publish the phase-buffer base so the finer preamble/so_load/graph_build/
     // post_orch + orch/sched phases stamped inside aicpu_execute / the scheduler
     // resolve their per-thread slot via platform_aicpu_affinity_thread_idx()

@@ -524,7 +524,9 @@ int main(int argc, char **argv) {
         }
 
         simpler::a5::AicpuSelectionPolicy policy = simpler::a5::AicpuSelectionPolicy::kScenario;
-        if (topology.generic_selection_only) {
+        if (!topology.pinned_allowed_cpus.empty()) {
+            policy = simpler::a5::AicpuSelectionPolicy::kPinned;
+        } else if (topology.generic_selection_only) {
             policy = simpler::a5::AicpuSelectionPolicy::kGeneric;
         } else if (topology.scenario_type == simpler::a5::AicpuScenarioType::kUnknown) {
             policy = simpler::a5::AicpuSelectionPolicy::kSequentialFallback;

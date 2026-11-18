@@ -10,6 +10,7 @@
  */
 #include "graph_image_view.h"
 #include "scheduler_context.h"
+#include "scheduler_cluster_assignment.h"
 
 #include <cinttypes>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/platform_regs.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "common/memory_barrier.h"
@@ -642,6 +644,8 @@ int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
+    thread_cpu_[tidx] = platform_aicpu_affinity_thread_cpu();
+    thread_die_[tidx] = static_cast<int8_t>(platform_aicpu_affinity_thread_die());
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
@@ -759,6 +763,8 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 #endif
         core_exec_states_[i] = st;
         core_type_compact_[i] = static_cast<uint8_t>(ready[r].core_type);
+        core_die_compact_[i] =
+            static_cast<uint8_t>(ready[r].pcid / (PLATFORM_AICORE_PER_DIE * PLATFORM_CORES_PER_BLOCKDIM));
 #if SIMPLER_DFX
         physical_core_ids_[i] = ready[r].pcid;
 #endif
@@ -776,75 +782,63 @@ static constexpr int8_t kA5DieLptThread[36] = {
 };
 
 // =============================================================================
-// Assign discovered cores to scheduler threads (die-partitioned).
+// Assign intact clusters to every scheduler, using verified physical locality.
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Die-partitioned assignment: each scheduler thread serves only clusters on
-    // its own die. With PLATFORM_NUM_DIES dies and an even split of scheduler
-    // threads, thread t serves die t / threads_per_die, and that die's clusters
-    // are striped across its threads. Falls back to cluster-aligned round-robin
-    // when the thread count or cluster count does not divide evenly.
-    // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    //
-    // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
-    // partition across the remaining (aicpu_thread_num_ - 1) scheduler threads
-    // only, so P never owns a cluster and never polls a COND register. P is
-    // mandatory — like tmr's scheduler + orchestrator split, host_build_graph
-    // needs at least two AICPU threads (one S + one P); one thread cannot own
-    // cores and resolve on a dedicated thread at once.
-    if (aicpu_thread_num_ < 2) {
-        LOG_ERROR(
-            "host_build_graph requires aicpu_thread_num >= 2 (1 scheduler + 1 resolution); got %d", aicpu_thread_num_
-        );
+    if (aicpu_thread_num_ < 2 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid host_build_graph scheduler count %d", aicpu_thread_num_);
         return false;
     }
-    p_thread_idx_ = aicpu_thread_num_ - 1;
-    active_sched_threads_ = aicpu_thread_num_ - 1;
-    int32_t cluster_count = aic_count_;
-
-    const int32_t threads_per_die = active_sched_threads_ / PLATFORM_NUM_DIES;
-    const bool die_partitioned =
-        threads_per_die > 0 && active_sched_threads_ % PLATFORM_NUM_DIES == 0 &&
-        cluster_count == static_cast<int32_t>(PLATFORM_NUM_DIES * PLATFORM_AICORE_PER_DIE);
-    auto thread_for_cluster = [&](int32_t ci) -> int32_t {
-        if (!die_partitioned) return ci % active_sched_threads_;
-        if (cluster_count == 36 && active_sched_threads_ == 4) return kA5DieLptThread[ci];
-        const int32_t die = ci / PLATFORM_AICORE_PER_DIE;
-        const int32_t local = ci % PLATFORM_AICORE_PER_DIE;
-        return die * threads_per_die + (local % threads_per_die);
-    };
-
-    // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
-    int32_t max_clusters_per_thread = (cluster_count + active_sched_threads_ - 1) / active_sched_threads_;
-    int32_t thread_cores_num = max_clusters_per_thread * 3;
-
-    if (thread_cores_num > CoreTracker::MAX_CORE_PER_THREAD) {
-        LOG_ERROR("Can't assign more then 64 cores in per scheduler");
+    active_sched_threads_ = aicpu_thread_num_;
+    const int32_t cluster_count = aic_count_;
+    if (cluster_count <= 0 || cluster_count > PLATFORM_MAX_BLOCKDIM || aiv_count_ != 2 * cluster_count) {
+        LOG_ERROR("Invalid cluster census: %d AIC and %d AIV", aic_count_, aiv_count_);
         return false;
     }
 
+    simpler::hbg::ClusterDies clusters[PLATFORM_MAX_BLOCKDIM]{};
+    for (int32_t ci = 0; ci < cluster_count; ++ci) {
+        clusters[ci] = {
+            core_die_compact_[aic_worker_ids_[ci]], core_die_compact_[aiv_worker_ids_[2 * ci]],
+            core_die_compact_[aiv_worker_ids_[2 * ci + 1]]
+        };
+    }
+    int32_t owners[PLATFORM_MAX_BLOCKDIM]{};
+    int32_t clusters_per_thread[MAX_AICPU_THREADS]{};
+    const auto placement = simpler::hbg::plan_cluster_assignment(
+        clusters, cluster_count, thread_cpu_, thread_die_, active_sched_threads_, owners, clusters_per_thread
+    );
+    if (placement == simpler::hbg::ClusterPlacement::Invalid) return false;
+
+    int32_t max_clusters_per_thread = 0;
+    for (int32_t t = 0; t < active_sched_threads_; ++t) {
+        if (clusters_per_thread[t] * PLATFORM_CORES_PER_BLOCKDIM > CoreTracker::MAX_CORE_PER_THREAD) {
+            LOG_ERROR("Thread %d exceeds core tracker capacity with %d clusters", t, clusters_per_thread[t]);
+            return false;
+        }
+        if (clusters_per_thread[t] > max_clusters_per_thread) max_clusters_per_thread = clusters_per_thread[t];
+    }
     LOG_INFO(
-        "Assigning cores (%s): %d clusters across %d sched threads (%d AIC, %d AIV), %d threads/die",
-        die_partitioned ? "die-partitioned" : "round-robin", cluster_count, active_sched_threads_, aic_count_,
-        aiv_count_, die_partitioned ? threads_per_die : 0
+        "Assigning cores (%s): %d clusters across %d sched threads (%d AIC, %d AIV)",
+        placement == simpler::hbg::ClusterPlacement::DieLocal ? "die-local" : "round-robin", cluster_count,
+        active_sched_threads_, aic_count_, aiv_count_
     );
 
     // running_reg_task_id / pending_reg_task_id for every serviced core are reset
     // in handshake_partition's sweep.
 
-    // Count clusters per thread first (the split may distribute unevenly)
-    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[thread_for_cluster(ci)]++;
-    }
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
+        LOG_INFO(
+            "Scheduler %d: observed_cpu=%d physical_die=%d clusters=%d", i, thread_cpu_[i], thread_die_[i],
+            clusters_per_thread[i]
+        );
     }
 
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = thread_for_cluster(ci);
+        int32_t t = owners[ci];
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
@@ -863,7 +857,8 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
 
     LOG_INFO(
-        "Config: threads=%d, cores=%d, cores_per_thread=%d", aicpu_thread_num_, cores_total_num_, thread_cores_num
+        "Config: threads=%d, cores=%d, max_cores_per_thread=%d", aicpu_thread_num_, cores_total_num_,
+        max_clusters_per_thread * PLATFORM_CORES_PER_BLOCKDIM
     );
     return true;
 }
@@ -888,6 +883,11 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
+    memset(core_die_compact_, 0xff, sizeof(core_die_compact_));
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; ++t) {
+        thread_cpu_[t] = -1;
+        thread_die_[t] = -1;
+    }
 
     // Wire thread configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1122,30 +1122,13 @@ void SchedulerContext::bind_runtime(RuntimeContext *rt) {
 
 // =============================================================================
 // Post-attach bookkeeping. Runs once on the boot leader after the host-built
-// image is attached; latches total_tasks_, sizes the per-S queues to it, and
-// folds inline-completed tasks. classify_ready_ is released after this call and
+// image is attached; latches total_tasks_ and folds inline-completed tasks.
+// classify_ready_ is released after this call and
 // is what publishes total_tasks_ to the peer threads, which acquire it before
 // classify_partition reads the count.
 // =============================================================================
 void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks) {
     total_tasks_ = total_tasks;
-
-    // Allocate the per-S CompletedTaskQueues here on the boot leader, before it
-    // releases runtime_init_ready_ — no scheduler thread can push until then.
-    // Completed-but-unresolved tasks in flight are bounded by the run's task count
-    // (a task must have been submitted to run and complete), so size to that,
-    // rounded up to a power of two and floored at 256. That bound is exact, so
-    // there is no artificial ceiling and a producer never has to spin on a full
-    // queue.
-    uint64_t sp_bound = static_cast<uint64_t>(total_tasks);
-    uint64_t sp_cap = 256;
-    while (sp_cap < sp_bound) {
-        sp_cap <<= 1;
-    }
-    for (int32_t t = 0; t < active_sched_threads_; t++) {
-        sp_queues_[t].destroy();  // free a prior run's buffer before re-alloc
-        sp_queues_[t].init(sp_cap);
-    }
 
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->inline_completed_tasks);

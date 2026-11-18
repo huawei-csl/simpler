@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "aicpu_topology_probe.h"
+#include "common/aicpu_die_map.h"
+#include "common/kernel_args.h"
 #include "common/platform_config.h"
 
 extern "C" {
@@ -216,6 +218,72 @@ TEST(A5AicpuTopologyJsonFallback, Loads9599LayoutFromPackagedJson) {
     EXPECT_EQ(other_phys.size(), 7U);
 }
 
+TEST(A5AicpuTopologyJsonFallback, Builds9592PinnedFallbackFromPackagedJson) {
+    simpler::a5::detail::CpuTopologyData raw{};
+    simpler::a5::AicpuDeviceOccupancy occupancy{};
+    occupancy.occupy_valid = true;
+    occupancy.occupy = 0xfeU;
+    AicpuTopology topology;
+    ASSERT_TRUE(simpler::a5::detail::build_aicpu_topology(
+        occupancy, "Ascend950DT_9592", /*driver_topology_available=*/false, raw, topology
+    ));
+    EXPECT_EQ(topology.source, AicpuTopologySource::kJsonFallback);
+    EXPECT_EQ(topology.logical_cpu_count, 7U);
+    EXPECT_EQ(topology.scenario_type, AicpuScenarioType::kFg);
+    EXPECT_FALSE(topology.generic_selection_only);
+    EXPECT_EQ(topology.pinned_allowed_cpus, (std::vector<int32_t>{2, 3, 4, 5, 6}));
+    ASSERT_EQ(topology.os_schedulable_cpus.size(), 7U);
+    for (int32_t i = 0; i < 7; ++i) {
+        EXPECT_EQ(topology.os_schedulable_cpus[i].cpu_id, i + 1);
+        EXPECT_EQ(topology.os_schedulable_cpus[i].cluster_id, (i + 1) / 2);
+        EXPECT_EQ(topology.os_schedulable_cpus[i].die_id, (i + 1) / 4);
+    }
+    const uint32_t packed = simpler::a5::pack_aicpu_cpu_die_map(topology);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 0), -1);
+    for (int32_t cpu = 1; cpu <= 7; ++cpu)
+        EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, cpu), cpu / 4);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 8), -1);
+}
+
+TEST(A5AicpuPhysicalDieMap, UsesPhysicalMetadataInsteadOfLogicalCpuNumber) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.scenario_type = AicpuScenarioType::kFg;
+    topology.os_schedulable_cpus = {{2, 5, 0, 2, 1}, {9, 2, 1, 1, 0}};
+    const uint32_t packed = simpler::a5::pack_aicpu_cpu_die_map(topology);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 2), 1);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 9), 0);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 3), -1);
+}
+
+TEST(A5AicpuPhysicalDieMap, UnverifiedAndAmbiguousMetadataRemainUnknown) {
+    AicpuTopology valid;
+    valid.source = AicpuTopologySource::kDriver;
+    valid.scenario_type = AicpuScenarioType::kFg;
+    valid.os_schedulable_cpus = {{2, 2, 0, 1, 0}, {5, 5, 0, 2, 1}};
+    for (int32_t config = 0; config < 7; ++config) {
+        auto topology = valid;
+        if (config == 0) topology.scenario_type = AicpuScenarioType::kUnknown;
+        if (config == 1) topology.scenario_type = AicpuScenarioType::kPg1;
+        if (config == 2) topology.source = AicpuTopologySource::kOccupyFallback;
+        if (config == 3) topology.generic_selection_only = true;
+        if (config == 4) topology.os_schedulable_cpus.push_back(topology.os_schedulable_cpus[0]);
+        if (config == 5) topology.os_schedulable_cpus[1].die_id = 0;
+        if (config == 6) topology.os_schedulable_cpus[1].cpu_id = 16;
+        EXPECT_EQ(simpler::a5::pack_aicpu_cpu_die_map(topology), simpler::a5::kUnknownAicpuDieMap);
+    }
+}
+
+TEST(A5AicpuPhysicalDieMap, CurrentLaunchLayoutDefaultsToUnknown) {
+    KernelArgs args{};
+    EXPECT_EQ(args.aicpu_cpu_die_map, simpler::a5::kUnknownAicpuDieMap);
+    EXPECT_EQ(sizeof(args), 184u);
+    EXPECT_EQ(offsetof(KernelArgs, aicpu_cpu_die_map), 172u);
+    EXPECT_EQ(offsetof(KernelArgs, force_simt_anchor), 176u);
+    for (int32_t cpu = -1; cpu <= 16; ++cpu)
+        EXPECT_EQ(simpler::a5::aicpu_die_from_map(args.aicpu_cpu_die_map, cpu), -1);
+}
+
 #if defined(__x86_64__)
 TEST(A5AicpuTopologyJsonFallback, PreservesVerifiedFallbackSignatureAndSelection) {
     std::vector<AicpuLogicalCpu> cpus;
@@ -255,6 +323,7 @@ TEST(A5AicpuTopologyJsonFallback, RejectsUnverifiedSignatures) {
 
     expect_rejected("Ascend950PR_9599", 0x1f0);
     expect_rejected("Ascend950PR_9579", 0x1f8);
+    expect_rejected("Ascend950DT_9592", 0xff);
     expect_rejected("Ascend950PR_unknown", 0);
     expect_rejected("Ascend950PR_missing", 0);
     expect_rejected(nullptr, 0);
@@ -491,6 +560,38 @@ TEST(A5AicpuLaunchPlan, WarnsWhenCpuTopologyFallsBackToPackagedJson) {
     EXPECT_FALSE(plan.warn_stable_reachable_below_default);
     EXPECT_EQ(plan.effective_active_count, 5);
     EXPECT_EQ(plan.launch_count, 6);
+}
+
+TEST(A5AicpuLaunchPlan, UsesPinnedJsonPlacementForDt9592) {
+    std::vector<AicpuLogicalCpu> all_cpus;
+    std::vector<int32_t> pinned;
+    bool generic_selection_only = true;
+    ASSERT_TRUE(load_cpu_topo_from_json("Ascend950DT_9592", 0xfeU, all_cpus, &generic_selection_only, &pinned));
+    EXPECT_FALSE(generic_selection_only);
+    ASSERT_EQ(all_cpus.size(), 7U);
+    EXPECT_EQ(pinned, (std::vector<int32_t>{2, 3, 4, 5, 6}));
+
+    AicpuTopology topology;
+    topology.soc_name = "Ascend950DT_9592";
+    topology.source = AicpuTopologySource::kJsonFallback;
+    topology.scenario_type = AicpuScenarioType::kFg;
+    topology.os_schedulable_cpus = all_cpus;
+    topology.pinned_allowed_cpus = pinned;
+    set_device_occupy(topology, 0xfeU);
+
+    AicpuLaunchPlan plan;
+    std::string error;
+    ASSERT_TRUE(build_aicpu_launch_plan(topology, 0, plan, error)) << error;
+    EXPECT_EQ(plan.stable_reachable_count, 7);
+    EXPECT_EQ(plan.effective_active_count, 5);
+    EXPECT_EQ(plan.launch_count, 7);
+    EXPECT_EQ(plan.allowed_cpus, (std::vector<int32_t>{2, 3, 4, 5, 6}));
+
+    ASSERT_TRUE(build_aicpu_launch_plan(topology, 3, plan, error)) << error;
+    EXPECT_EQ(plan.allowed_cpus, (std::vector<int32_t>{2, 3, 6}));
+
+    const std::string json = format_aicpu_topology_json(topology, AicpuSelectionPolicy::kPinned, plan);
+    EXPECT_NE(json.find("\"selection_policy\": \"pinned\""), std::string::npos);
 }
 
 TEST(A5AicpuLaunchPlan, EnforcesManualAndLaunchCapacityWithoutClamping) {

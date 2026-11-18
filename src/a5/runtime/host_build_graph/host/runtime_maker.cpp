@@ -1534,9 +1534,6 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
-    // Offered before this runtime's own fallbacks and before its native Graph
-    // expansion: an extension that takes the graph owns the rest of the bind,
-    // and a declining one leaves them to decide.
     // Every graph runs on the AICPU scheduler. A graph with Graph shells
     // publishes the Graph mode and any other graph the shape mode; the device
     // handles both modes identically.
@@ -1547,14 +1544,6 @@ bool create_scheduler_state(
     );
     LOG_INFO("A5 HBG: selected AICPU scheduling for %d tasks", total_tasks);
     return true;
-    const auto extension = scheduler_extension_select(
-        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments
-    );
-    if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
-    if (legacy_graph_required) {
-        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
-        return true;
-    }
     if (native_graph) {
         std::vector<SchedulerTaskMetadata> expanded(node_count);
         for (uint64_t ref = 0; ref < node_count; ++ref) {

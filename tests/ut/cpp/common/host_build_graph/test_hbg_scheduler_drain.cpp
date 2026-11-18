@@ -33,6 +33,12 @@ int SchedulerContext::prepare_block_for_dispatch(
     return 0;
 }
 
+// This drain-only target does not link the cold path. An error would be an
+// unexpected outcome here; error/retirement behavior has its own tests.
+void SchedulerContext::fail_scheduler(Runtime *, int32_t thread_idx, int32_t error_code) {
+    ADD_FAILURE() << "unexpected scheduler error " << error_code << " on thread " << thread_idx;
+}
+
 class SchedulerContextTestPeer {
 public:
     // The state a thread finds when it enters handle_drain_mode after the drain it
