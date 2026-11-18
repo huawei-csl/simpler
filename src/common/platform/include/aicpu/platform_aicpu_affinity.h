@@ -78,6 +78,17 @@ bool platform_aicpu_affinity_gate_filter(
 // N-1).
 int32_t platform_aicpu_affinity_thread_idx();
 
+// CPU sampled for this participant by the onboard filter gate. A borrowed
+// execution slot can name another CPU after report-order recovery, so the
+// requested CPU table is not a substitute for this observation. Returns -1
+// for unbound/rejected participants, direct bindings, and simulation.
+int32_t platform_aicpu_affinity_thread_cpu();
+
+// Physical die of the observed CPU, or -1 when topology is unavailable.
+// The producer resolves this from the current launch's host topology map.
+int32_t platform_aicpu_affinity_thread_die();
+bool platform_aicpu_affinity_set_thread_die(int32_t die);
+
 // Publish this thread's resolved exec index into the affinity TLS.
 //
 // Onboard, the filter gate already assigns the index, so this is a redundant

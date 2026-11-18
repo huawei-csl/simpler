@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "aicpu_topology_probe.h"
+#include "common/aicpu_die_map.h"
+#include "common/kernel_args.h"
 #include "common/platform_config.h"
 
 extern "C" {
@@ -236,6 +238,50 @@ TEST(A5AicpuTopologyJsonFallback, Builds9592PinnedFallbackFromPackagedJson) {
         EXPECT_EQ(topology.os_schedulable_cpus[i].cluster_id, (i + 1) / 2);
         EXPECT_EQ(topology.os_schedulable_cpus[i].die_id, (i + 1) / 4);
     }
+    const uint32_t packed = simpler::a5::pack_aicpu_cpu_die_map(topology);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 0), -1);
+    for (int32_t cpu = 1; cpu <= 7; ++cpu)
+        EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, cpu), cpu / 4);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 8), -1);
+}
+
+TEST(A5AicpuPhysicalDieMap, UsesPhysicalMetadataInsteadOfLogicalCpuNumber) {
+    AicpuTopology topology;
+    topology.source = AicpuTopologySource::kDriver;
+    topology.scenario_type = AicpuScenarioType::kFg;
+    topology.os_schedulable_cpus = {{2, 5, 0, 2, 1}, {9, 2, 1, 1, 0}};
+    const uint32_t packed = simpler::a5::pack_aicpu_cpu_die_map(topology);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 2), 1);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 9), 0);
+    EXPECT_EQ(simpler::a5::aicpu_die_from_map(packed, 3), -1);
+}
+
+TEST(A5AicpuPhysicalDieMap, UnverifiedAndAmbiguousMetadataRemainUnknown) {
+    AicpuTopology valid;
+    valid.source = AicpuTopologySource::kDriver;
+    valid.scenario_type = AicpuScenarioType::kFg;
+    valid.os_schedulable_cpus = {{2, 2, 0, 1, 0}, {5, 5, 0, 2, 1}};
+    for (int32_t config = 0; config < 7; ++config) {
+        auto topology = valid;
+        if (config == 0) topology.scenario_type = AicpuScenarioType::kUnknown;
+        if (config == 1) topology.scenario_type = AicpuScenarioType::kPg1;
+        if (config == 2) topology.source = AicpuTopologySource::kOccupyFallback;
+        if (config == 3) topology.generic_selection_only = true;
+        if (config == 4) topology.os_schedulable_cpus.push_back(topology.os_schedulable_cpus[0]);
+        if (config == 5) topology.os_schedulable_cpus[1].die_id = 0;
+        if (config == 6) topology.os_schedulable_cpus[1].cpu_id = 16;
+        EXPECT_EQ(simpler::a5::pack_aicpu_cpu_die_map(topology), simpler::a5::kUnknownAicpuDieMap);
+    }
+}
+
+TEST(A5AicpuPhysicalDieMap, CurrentLaunchLayoutDefaultsToUnknown) {
+    KernelArgs args{};
+    EXPECT_EQ(args.aicpu_cpu_die_map, simpler::a5::kUnknownAicpuDieMap);
+    EXPECT_EQ(sizeof(args), 184u);
+    EXPECT_EQ(offsetof(KernelArgs, aicpu_cpu_die_map), 172u);
+    EXPECT_EQ(offsetof(KernelArgs, force_simt_anchor), 176u);
+    for (int32_t cpu = -1; cpu <= 16; ++cpu)
+        EXPECT_EQ(simpler::a5::aicpu_die_from_map(args.aicpu_cpu_die_map, cpu), -1);
 }
 
 #if defined(__x86_64__)

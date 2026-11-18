@@ -198,6 +198,7 @@ static bool filter_gate_impl(
     while (s_filter_classify_ready.load(std::memory_order_acquire) == 0) {}
 
     binding_cohort.record(platform_aicpu_affinity_bind_thread(&s_filter_thread_exec_idx[idx]));
+    affinity_tls_key().publish_observed_cpu(cpu);
     bool survive = affinity_tls_key().value() >= 0 && (native == nullptr || s_filter_entry_status == 0);
 
     // Every participant copies the error before the last participant resets it.
@@ -231,6 +232,12 @@ static bool filter_gate_impl(
 }
 
 int32_t platform_aicpu_affinity_thread_idx() { return affinity_tls_key().value(); }
+
+int32_t platform_aicpu_affinity_thread_cpu() { return affinity_tls_key().observed_cpu(); }
+
+int32_t platform_aicpu_affinity_thread_die() { return affinity_tls_key().physical_die(); }
+
+bool platform_aicpu_affinity_set_thread_die(int32_t die) { return affinity_tls_key().publish_physical_die(die); }
 
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) {
     if (!affinity_tls_key().publish(idx)) {

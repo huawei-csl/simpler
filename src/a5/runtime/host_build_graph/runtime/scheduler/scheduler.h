@@ -1783,15 +1783,15 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
     int32_t drain_err = SIMPLER_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
+    result.completed += sink.inline_completed;
+    result.resolved += sink.inline_resolved;
     if (drain_err != SIMPLER_ERROR_NONE) {
         result.error_code = drain_err;
         unlock();
         return result;
     }
-    result.completed += sink.inline_completed;
-    result.resolved += sink.inline_resolved;
 
-    for (int32_t i = count - 1; i >= 0; --i) {
+    for (int32_t i = count.load(std::memory_order_relaxed) - 1; i >= 0; --i) {
         AsyncWaitEntry &entry = entries[i];
         for (int32_t c = 0; c < entry.condition_count; c++) {
             CompletionCondition &cond = entry.conditions[c];
@@ -1828,9 +1828,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             result.completed += outcome.stream_tasks_completed;
             result.resolved++;
 
-            int32_t last = count - 1;
+            int32_t last = count.load(std::memory_order_relaxed) - 1;
             if (i != last) entries[i] = entries[last];
-            count = last;
+            count.store(last, std::memory_order_relaxed);
         }
     }
 

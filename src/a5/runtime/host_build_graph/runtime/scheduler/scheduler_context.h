@@ -35,58 +35,6 @@ class Runtime;
 struct Handshake;
 struct RuntimeContext;
 
-// SPSC ring carrying completed-but-unresolved task slots from one scheduler (S)
-// thread to the dedicated resolution (P) thread. Whole-graph-resident hbg never
-// reclaims a slot, so the queued ChipTaskSlotState* stays valid until P reads it.
-// Single producer (the owning S thread) / single consumer (P): plain
-// acquire/release on head/tail, no CAS. Capacity is a power of two sized to the
-// run's task count, which bounds the completed-but-unresolved tasks in flight
-// exactly, so a producer does not spin on a full queue in practice; the spin is a
-// correctness backstop only
-// (P drains independently, so it always makes progress). The std::atomic cursors
-// make this type non-copyable / non-movable, so `buf` cannot be double-freed
-// through an accidental copy.
-struct CompletedTaskQueue {
-    ChipTaskSlotState **buf{nullptr};
-    uint64_t cap{0};
-    uint64_t mask{0};
-    alignas(64) std::atomic<uint64_t> head{0};  // consumer (P) cursor
-    alignas(64) std::atomic<uint64_t> tail{0};  // producer (S) cursor
-
-    void init(uint64_t capacity_pow2) {
-        debug_assert(capacity_pow2 != 0 && (capacity_pow2 & (capacity_pow2 - 1)) == 0);
-        cap = capacity_pow2;
-        mask = capacity_pow2 - 1;
-        buf = new ChipTaskSlotState *[capacity_pow2];
-        head.store(0, std::memory_order_relaxed);
-        tail.store(0, std::memory_order_relaxed);
-    }
-    void destroy() {
-        delete[] buf;
-        buf = nullptr;
-    }
-    // Producer (S). Spins only if the ring is full — sized so this never fires.
-    void push(ChipTaskSlotState *s) {
-        uint64_t t = tail.load(std::memory_order_relaxed);
-        while (t - head.load(std::memory_order_acquire) >= cap) {
-            SPIN_WAIT_HINT();
-        }
-        buf[t & mask] = s;
-        tail.store(t + 1, std::memory_order_release);
-    }
-    // Consumer (P). Returns nullptr when empty.
-    ChipTaskSlotState *pop() {
-        uint64_t h = head.load(std::memory_order_relaxed);
-        if (h == tail.load(std::memory_order_acquire)) {
-            return nullptr;
-        }
-        ChipTaskSlotState *s = buf[h & mask];
-        head.store(h + 1, std::memory_order_release);
-        return s;
-    }
-    uint64_t size() const { return tail.load(std::memory_order_acquire) - head.load(std::memory_order_acquire); }
-};
-
 class SchedulerContextTestPeer;
 
 /**
@@ -137,25 +85,14 @@ public:
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
-    // Dedicated resolution (P) thread entry (3S+1P). Owns no cores: drains the
-    // per-S CompletedTaskQueues and runs on_task_complete for each finished task
-    // (task_states publish + wake-list drain), making P
-    // the sole producer of the ready queues. Owns completed_tasks_ / termination.
-    int32_t run_resolution_thread(Runtime *runtime, int32_t thread_idx);
-
-    // Index of the dedicated resolution (P) thread — the last AICPU thread.
-    // host_build_graph always reserves it (aicpu_thread_num >= 2 is required).
-    int32_t p_thread_idx() const { return p_thread_idx_; }
-
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
-    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
+    // Threads assigned no cores are a no-op.
     int32_t shutdown(Runtime *runtime, int32_t thread_idx);
 
     // Run all post-attach scheduler bookkeeping, once, on the boot leader:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
     //  - latches the host-built task count
-    //  - sizes the per-S completed-task queues to it
     //  - folds inline_completed_tasks into completed_tasks_
     // The orchestration this graph came from ran to completion on the host, so
     // there is no orchestrator lifecycle to hook here: the event is the attach.
@@ -251,15 +188,6 @@ private:
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
-    // --- 3S+1P dedicated resolution thread ---
-    // The AICPU threads split into (aicpu_thread_num_ - 1) core-owning schedulers
-    // (S) plus one core-less resolution thread (P) at index p_thread_idx_ =
-    // aicpu_thread_num_ - 1. host_build_graph requires aicpu_thread_num_ >= 2 (one
-    // S + one P). Each S thread hands its finished tasks to P through
-    // sp_queues_[its_thread_idx].
-    int32_t p_thread_idx_{-1};
-    CompletedTaskQueue sp_queues_[MAX_AICPU_THREADS];
-
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};
@@ -271,6 +199,9 @@ private:
     // per-core volatile GM load from the 64B-aligned Handshake struct. Filled by
     // each handshake thread for its own [lo,hi) slice during the parallel sweep.
     uint8_t core_type_compact_[RUNTIME_MAX_WORKER]{};
+    int32_t thread_cpu_[MAX_AICPU_THREADS]{};
+    int8_t thread_die_[MAX_AICPU_THREADS]{};
+    uint8_t core_die_compact_[RUNTIME_MAX_WORKER]{};
 
     // Set by any thread whose slice hits an invalid physical_core_id in
     // handshake_partition; checked by the leader in post_handshake_init.
@@ -290,7 +221,7 @@ private:
     // Core management (scheduler_cold_path.cpp)
     // =========================================================================
 
-    // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
+    // Assign every discovered cluster (1 AIC + 2 AIV) to one scheduling thread.
     bool assign_cores_to_threads();
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
@@ -476,8 +407,8 @@ private:
     );
 
     void complete_slot_task(
-        ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot, int32_t thread_idx,
-        int32_t core_id, Handshake *hank, int32_t &completed_this_turn
+        Runtime *runtime, ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot,
+        int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
@@ -488,8 +419,8 @@ private:
     static void clear_running_slot(CoreExecState &core);
 
     void check_running_cores_for_completion(
-        int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-        bool &made_progress
+        Runtime *runtime, int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn,
+        int32_t &cur_thread_completed, bool &made_progress
     );
 
     bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num);

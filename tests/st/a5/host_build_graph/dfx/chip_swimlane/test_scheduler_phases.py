@@ -62,6 +62,59 @@ FANOUT_WIDTH = 32
 EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1  # root + children + final
 
 
+def _verify_symmetric_aicpu_phases(raw):
+    """The AICPU variant schedules and completes on threads that also own cores."""
+    metadata = raw["metadata"]
+    assigned_threads = None
+    # The current exporter omits this metadata when its ownership snapshot is
+    # empty. Phase records alone do not establish each core's owner.
+    if "core_to_thread" in metadata:
+        owners = [int(owner) for owner in metadata["core_to_thread"]]
+        assert len(owners) == metadata["num_cores"]
+        assert all(owner >= 0 for owner in owners), "every discovered core needs a scheduler"
+        assigned_threads = set(owners)
+        assert assigned_threads == set(range(max(assigned_threads) + 1))
+        for owner in assigned_threads:
+            core_types = Counter(
+                core_type for core_type, thread in zip(metadata["core_types"], owners) if thread == owner
+            )
+            assert core_types["aic"] > 0
+            assert core_types["aiv"] == 2 * core_types["aic"], "a scheduler must own whole 1C2V clusters"
+
+    streams = raw["scheduler_records"]["streams"]
+    assert streams, "A5 HBG AICPU scheduler records are missing"
+    assert all(stream["producer"] == "aicpu" for stream in streams)
+    assert len({stream["scheduler_id"] for stream in streams}) == len(streams)
+    for stream in streams:
+        thread = int(stream["scheduler_id"])
+        assert thread >= 0
+        if assigned_threads is not None:
+            assert thread in assigned_threads, "symmetric HBG must not have a core-less resolver"
+        assert stream["worker_id"] == thread
+        assert stream["core_type"] == "aicpu"
+        assert "runtime" not in stream
+        assert stream["capture"]["dropped"] == 0
+        assert stream["capture"]["truncated"] is False
+        assert stream["capture"]["committed"] == len(stream["records"])
+        records = stream["records"]
+        assert all(record["loop_iter"] > 0 for record in records)
+        assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)
+        ordered = sorted(records, key=lambda record: (record["start_cycles"], record["end_cycles"]))
+        assert all(left["end_cycles"] <= right["start_cycles"] for left, right in zip(ordered, ordered[1:]))
+
+    records = [record for stream in streams for record in stream["records"]]
+    assert {int(record["run_epoch"]) for record in records} == {int(row[6]) for row in raw["aicore_tasks"]}
+    counts = Counter()
+    for record in records:
+        counts[record["kind"]] += int(record["tasks_processed"])
+    # This DAG has one block per kernel and one terminal dependency-only task.
+    # Inline dependency resolution is included in Complete; no P-thread phase is emitted.
+    assert counts["dispatch"] == EXPECTED_PROFILED_TASKS
+    assert counts["complete"] == EXPECTED_PROFILED_TASKS
+    assert counts["dummy"] == 1
+    assert "resolve_standalone" not in counts
+
+
 @scene_test(level=2, runtime="host_build_graph")
 class TestSchedulerPhases(SceneTestCase):
     CALLABLE = {
@@ -132,109 +185,113 @@ class TestSchedulerPhases(SceneTestCase):
 
             if level >= 2:
                 scheduler_tasks = raw["scheduler_tasks"]
-                assert scheduler_tasks["producer"] == "aicore"
+                scheduler_producer = scheduler_tasks["producer"]
+                assert scheduler_producer in {"aicpu", "aicore"}
                 scheduler_rows = scheduler_tasks["records"]
                 assert len(scheduler_rows) == len(aicore_rows)
-                # HBG builds these rows itself from host-side traces, so the
-                # epoch it stamps has to agree with the AICore stream's.
+                # Both scheduler producers must identify the same device invocation.
                 assert {int(row[6]) for row in aicore_rows} == {int(row[4]) for row in scheduler_rows}
                 aicore_by_key = {(int(row[0]), int(row[2])): row for row in aicore_rows}
                 assert {(int(row[0]), int(row[1])) for row in scheduler_rows} == set(aicore_by_key)
                 for core_id, reg_task_id, dispatch_cycles, finish_cycles, _run_epoch in scheduler_rows:
                     aicore_row = aicore_by_key[(int(core_id), int(reg_task_id))]
                     assert 0 < dispatch_cycles <= aicore_row[3] <= aicore_row[4] <= finish_cycles
-                lifecycle_records = raw["aicpu_lifecycle_records"]
-                assert lifecycle_records, "AICPU lifecycle records are missing"
-                thread_ids = [int(record["aicpu_thread_id"]) for record in lifecycle_records]
-                assert thread_ids == list(range(len(thread_ids)))
-                assert all("worker_id" not in record for record in lifecycle_records)
-                for record in lifecycle_records:
-                    assert 0 < record["handshake_start_cycles"] <= record["handshake_complete_cycles"]
-                    assert 0 < record["context_publish_start_cycles"] <= record["context_publish_complete_cycles"]
-                    assert 0 < record["bootstrap_wait_start_cycles"] <= record["bootstrap_complete_cycles"]
-                    assert 0 < record["register_release_start_cycles"] <= record["register_release_end_cycles"]
-                    assert 0 < record["exit_signal_start_cycles"] <= record["exit_signal_end_cycles"]
-                    assert 0 < record["exit_wait_start_cycles"] <= record["exit_wait_end_cycles"]
-                leader = lifecycle_records[0]
-                assert 0 < leader["config_start_cycles"] <= leader["topology_complete_cycles"]
-                assert all(
-                    record["config_start_cycles"] == record["topology_complete_cycles"] == 0
-                    for record in lifecycle_records[1:]
-                )
+                if scheduler_producer == "aicore":
+                    lifecycle_records = raw["aicpu_lifecycle_records"]
+                    assert lifecycle_records, "AICPU lifecycle records are missing"
+                    thread_ids = [int(record["aicpu_thread_id"]) for record in lifecycle_records]
+                    assert thread_ids == list(range(len(thread_ids)))
+                    assert all("worker_id" not in record for record in lifecycle_records)
+                    for record in lifecycle_records:
+                        assert 0 < record["handshake_start_cycles"] <= record["handshake_complete_cycles"]
+                        assert 0 < record["context_publish_start_cycles"] <= record["context_publish_complete_cycles"]
+                        assert 0 < record["bootstrap_wait_start_cycles"] <= record["bootstrap_complete_cycles"]
+                        assert 0 < record["register_release_start_cycles"] <= record["register_release_end_cycles"]
+                        assert 0 < record["exit_signal_start_cycles"] <= record["exit_signal_end_cycles"]
+                        assert 0 < record["exit_wait_start_cycles"] <= record["exit_wait_end_cycles"]
+                    leader = lifecycle_records[0]
+                    assert 0 < leader["config_start_cycles"] <= leader["topology_complete_cycles"]
+                    assert all(
+                        record["config_start_cycles"] == record["topology_complete_cycles"] == 0
+                        for record in lifecycle_records[1:]
+                    )
             else:
                 assert "scheduler_tasks" not in raw
                 assert "aicpu_lifecycle_records" not in raw
 
             if level >= 3:
-                streams = raw["scheduler_records"]["streams"]
-                assert streams, "A5 HBG AICore Scheduler records are missing"
-                assert all(stream["producer"] == "aicore" for stream in streams)
-                assert all("runtime" not in stream for stream in streams)
-                assert all(stream["capture"]["dropped"] == 0 for stream in streams)
-                emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                # Ready Inbox tasks can all be launched through worksteal.
-                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
-                assert required_kinds <= emitted_kinds, (
-                    f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
-                )
-                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
-                records = [record for stream in streams for record in stream["records"]]
-                launch_kinds = {"dispatch", "worksteal", "refill"}
-                launches_by_task = Counter(
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
-                )
-                assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
-                assert set(launches_by_task.values()) == {1}
-                profiled_task_ids = set(launches_by_task)
-                state_probe_task_ids = {
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] == "state_probe" and record["task_id"] is not None
-                }
-                assert state_probe_task_ids <= profiled_task_ids
-                inbox_launch_task_ids = {
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
-                }
-                assert inbox_launch_task_ids <= state_probe_task_ids, (
-                    "Ready Inbox launches are missing state_probe records: "
-                    f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
-                )
-                refill_task_ids = {
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] == "refill" and record["task_id"] is not None
-                }
-                assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
-                    "tasks without state_probe were not launched by refill: "
-                    f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
-                )
-                for stream in streams:
-                    ordered = sorted(
-                        stream["records"],
-                        key=lambda record: (record["start_cycles"], record["end_cycles"]),
+                if scheduler_producer == "aicpu":
+                    _verify_symmetric_aicpu_phases(raw)
+                else:
+                    streams = raw["scheduler_records"]["streams"]
+                    assert streams, "A5 HBG AICore Scheduler records are missing"
+                    assert all(stream["producer"] == "aicore" for stream in streams)
+                    assert all("runtime" not in stream for stream in streams)
+                    assert all(stream["capture"]["dropped"] == 0 for stream in streams)
+                    emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
+                    # Ready Inbox tasks can all be launched through worksteal.
+                    required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
+                    assert required_kinds <= emitted_kinds, (
+                        f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                     )
+                    assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
+                    records = [record for stream in streams for record in stream["records"]]
+                    launch_kinds = {"dispatch", "worksteal", "refill"}
+                    launches_by_task = Counter(
+                        int(record["task_id"])
+                        for record in records
+                        if record["kind"] in launch_kinds and record["task_id"] is not None
+                    )
+                    assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
+                    assert set(launches_by_task.values()) == {1}
+                    profiled_task_ids = set(launches_by_task)
+                    state_probe_task_ids = {
+                        int(record["task_id"])
+                        for record in records
+                        if record["kind"] == "state_probe" and record["task_id"] is not None
+                    }
+                    assert state_probe_task_ids <= profiled_task_ids
+                    inbox_launch_task_ids = {
+                        int(record["task_id"])
+                        for record in records
+                        if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
+                    }
+                    assert inbox_launch_task_ids <= state_probe_task_ids, (
+                        "Ready Inbox launches are missing state_probe records: "
+                        f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+                    )
+                    refill_task_ids = {
+                        int(record["task_id"])
+                        for record in records
+                        if record["kind"] == "refill" and record["task_id"] is not None
+                    }
+                    assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
+                        "tasks without state_probe were not launched by refill: "
+                        f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
+                    )
+                    for stream in streams:
+                        ordered = sorted(
+                            stream["records"],
+                            key=lambda record: (record["start_cycles"], record["end_cycles"]),
+                        )
+                        assert all(
+                            previous["end_cycles"] <= current["start_cycles"]
+                            for previous, current in zip(ordered, ordered[1:])
+                        )
+                    probe_by_task = {
+                        int(record["task_id"]): record
+                        for record in records
+                        if record["kind"] == "state_probe" and record["task_id"] is not None
+                    }
+                    launch_by_task = {
+                        int(record["task_id"]): record
+                        for record in records
+                        if record["kind"] in launch_kinds and record["task_id"] is not None
+                    }
                     assert all(
-                        previous["end_cycles"] <= current["start_cycles"]
-                        for previous, current in zip(ordered, ordered[1:])
+                        probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
+                        for task_id, probe in probe_by_task.items()
                     )
-                probe_by_task = {
-                    int(record["task_id"]): record
-                    for record in records
-                    if record["kind"] == "state_probe" and record["task_id"] is not None
-                }
-                launch_by_task = {
-                    int(record["task_id"]): record
-                    for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
-                }
-                assert all(
-                    probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
-                    for task_id, probe in probe_by_task.items()
-                )
             else:
                 assert "scheduler_records" not in raw
 

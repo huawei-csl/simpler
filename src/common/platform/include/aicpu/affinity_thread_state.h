@@ -28,6 +28,8 @@ namespace simpler {
 struct AffinityTlsRecord {
     int32_t *cell{nullptr};  // cell updated by publish(); nullptr while unbound
     int32_t value{-1};       // identity returned while cell is bound
+    int32_t observed_cpu{-1};
+    int32_t physical_die{-1};
 };
 
 // Two records per gate participant. MAX_GATE_THREADS covers the launch budget;
@@ -67,6 +69,8 @@ public:
         }
         record->cell = cell;
         record->value = *cell;
+        record->observed_cpu = -1;
+        record->physical_die = -1;
         return 0;
     }
 
@@ -76,11 +80,37 @@ public:
         if (record == nullptr) return;
         record->cell = nullptr;
         record->value = -1;
+        record->observed_cpu = -1;
+        record->physical_die = -1;
     }
 
     int32_t value() const {
         const AffinityTlsRecord *record = record_ptr();
         return record != nullptr && record->cell != nullptr ? record->value : -1;
+    }
+
+    int32_t observed_cpu() const {
+        const AffinityTlsRecord *record = record_ptr();
+        return record != nullptr && record->cell != nullptr && record->value >= 0 ? record->observed_cpu : -1;
+    }
+
+    bool publish_observed_cpu(int32_t cpu) {
+        AffinityTlsRecord *record = record_ptr();
+        if (record == nullptr || record->cell == nullptr || record->value < 0) return false;
+        record->observed_cpu = cpu;
+        return true;
+    }
+
+    int32_t physical_die() const {
+        const AffinityTlsRecord *record = record_ptr();
+        return record != nullptr && record->cell != nullptr && record->value >= 0 ? record->physical_die : -1;
+    }
+
+    bool publish_physical_die(int32_t die) {
+        AffinityTlsRecord *record = record_ptr();
+        if (record == nullptr || record->cell == nullptr || record->value < 0) return false;
+        record->physical_die = die;
+        return true;
     }
 
     // Writes the resolved identity to the record and its bound cell.
@@ -102,6 +132,8 @@ private:
         if (record != nullptr) {
             record->cell = nullptr;
             record->value = -1;
+            record->observed_cpu = -1;
+            record->physical_die = -1;
         }
         const int error = pthread_setspecific(key_, nullptr);
         if (error == 0 && record != nullptr) return_record(record);

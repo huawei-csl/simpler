@@ -994,283 +994,6 @@ int32_t SchedulerContext::try_early_dispatch(
 }
 
 // =============================================================================
-// Dedicated resolution (P) thread — 3S+1P
-// =============================================================================
-
-// P owns no AICore cores. It drains the per-S CompletedTaskQueues and runs
-// on_task_complete for every finished task: publish task_states, drain the
-// wake list (route/re-register waiters into the ready queues). As the sole
-// producer of the ready queues its enqueues never contend. P owns
-// completed_tasks_ and the terminal completed_ flip, so the S threads keep
-// dispatching until P has resolved the whole graph.
-int32_t SchedulerContext::run_resolution_thread(Runtime *runtime, int32_t thread_idx) {
-    always_assert(sched_ != nullptr);
-    SharedMemoryHeader *header = sched_->sm_header;
-    if (!header) {
-        LOG_ERROR("resolution: header is null");
-        return -1;
-    }
-    LOG_INFO("Thread %d: resolution (P) thread starting, serving %d schedulers", thread_idx, active_sched_threads_);
-
-#if SIMPLER_DFX
-    auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
-    chip_swimlane.reset();
-    chip_swimlane.chip_swimlane_enabled = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-
-    const bool record_sched_phases = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES;
-    auto record_p_phase = [&](SchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t tasks_processed,
-                              const int16_t shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
-        int16_t shared_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
-        capture_shared_ready_depth(sched_, shared_at_end);
-        chip_swimlane_aicpu_record_sched_phase(
-            thread_idx, kind, start_time, end_time, chip_swimlane.sched_loop_count, tasks_processed,
-            /*pop_hit=*/0, /*pop_miss=*/0, shared_at_start, shared_at_end
-        );
-    };
-    simpler::hbg::AsyncPollPhaseAccumulator async_poll_phase;
-    int16_t async_poll_shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
-    auto flush_async_poll = [&](uint64_t end_time) {
-        if (!async_poll_phase.active()) return;
-        // Consecutive empty polls are compacted into one bar whose duration is
-        // their exact summed CPU time. Anchoring the compact bar at the flush
-        // point preserves phase accounting without exporting one record per
-        // spin iteration.
-        const simpler::hbg::AsyncPollPhaseSummary summary = async_poll_phase.flush(end_time);
-        record_p_phase(
-            SchedPhaseKind::AsyncPoll, summary.start_time, summary.end_time, summary.resolved,
-            async_poll_shared_at_start
-        );
-    };
-#endif
-
-    uint64_t last_progress_ts = get_sys_cnt_aicpu();
-    uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
-    const int32_t scheduler_timeout_ms_override = get_scheduler_timeout_ms();
-    if (scheduler_timeout_ms_override > 0) {
-        scheduler_timeout_cycles =
-            static_cast<uint64_t>(scheduler_timeout_ms_override) * PLATFORM_PROF_SYS_CNT_FREQ / 1000;
-    }
-
-    while (true) {
-        if (completed_.load(std::memory_order_acquire)) break;
-
-#if SIMPLER_DFX
-        chip_swimlane.sched_loop_count++;
-#endif
-
-        int32_t published_task_count = 0;
-        if (check_exit_conditions(thread_idx, header, runtime, published_task_count) == LoopAction::BREAK_LOOP) break;
-
-        int32_t resolved_this_pass = 0;
-        bool resolved_any = false;
-#if SIMPLER_DFX
-        uint64_t resolve_t0 = 0;
-        int16_t resolve_shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
-        uint32_t resolve_count = 0;
-#endif
-        for (int32_t s = 0; s < active_sched_threads_ && !completed_.load(std::memory_order_acquire); s++) {
-            ChipTaskSlotState *slot;
-            while ((slot = sp_queues_[s].pop()) != nullptr) {
-#if SIMPLER_DFX
-                if (record_sched_phases && resolve_t0 == 0) {
-                    resolve_t0 = get_sys_cnt_aicpu();
-                    flush_async_poll(resolve_t0);
-                    capture_shared_ready_depth(sched_, resolve_shared_at_start);
-                }
-#endif
-#if SIMPLER_SCHED_PROFILING
-                SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot, thread_idx);
-#else
-                SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*slot);
-#endif
-                if (outcome.error_code != SIMPLER_ERROR_NONE) {
-                    fail_scheduler(runtime, thread_idx, outcome.error_code);
-                    break;
-                }
-                resolved_this_pass += outcome.stream_tasks_completed;
-                resolved_any = true;
-#if SIMPLER_DFX
-                resolve_count++;
-#endif
-            }
-        }
-#if SIMPLER_DFX
-        if (resolve_t0 != 0) {
-            record_p_phase(
-                SchedPhaseKind::ResolveStandalone, resolve_t0, get_sys_cnt_aicpu(), resolve_count,
-                resolve_shared_at_start
-            );
-        }
-#endif
-        if (completed_.load(std::memory_order_acquire)) break;
-
-        // Async deferred completions, moved off the scheduler threads. Every
-        // condition that fires resolves via on_task_complete inside
-        // poll_and_complete, so async ready tasks also enter the ready queues
-        // through P alone.
-        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
-            (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
-#if SIMPLER_DFX
-            uint64_t async_poll_t0 = 0;
-            if (record_sched_phases) {
-                if (!async_poll_phase.active()) {
-                    capture_shared_ready_depth(sched_, async_poll_shared_at_start);
-                    async_poll_phase.begin();
-                }
-                async_poll_t0 = get_sys_cnt_aicpu();
-            }
-#endif
-            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_
-#if SIMPLER_SCHED_PROFILING
-                ,
-                thread_idx
-#endif
-            );
-#if SIMPLER_DFX
-            if (async_poll_t0 != 0) {
-                const uint64_t async_poll_t1 = get_sys_cnt_aicpu();
-                const bool flush_poll_phase = async_poll_phase.add_poll(
-                    async_poll_t0, async_poll_t1, static_cast<uint32_t>(poll_result.resolved),
-                    poll_result.error_code != SIMPLER_ERROR_NONE
-                );
-                if (flush_poll_phase) {
-                    flush_async_poll(async_poll_t1);
-                }
-            }
-#endif
-            if (poll_result.error_code != SIMPLER_ERROR_NONE) {
-                fail_scheduler(runtime, thread_idx, poll_result.error_code);
-                break;
-            }
-            resolved_this_pass += poll_result.completed;
-            resolved_any = resolved_any || poll_result.resolved > 0;
-        }
-
-        // Dependency-only tasks (empty active_mask, or a predicate that failed)
-        // route to dummy_ready_queue during resolution; P produces and drains it,
-        // so the queue is single-threaded end to end. Loop until empty — a dummy's
-        // resolution can make further dummies ready in the same pass.
-        {
-            constexpr int DUMMY_DRAIN_BATCH = 8;
-            ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
-            int dummy_got;
-#if SIMPLER_DFX
-            uint64_t dummy_t0 = 0;
-            int16_t dummy_shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
-            uint32_t dummy_count = 0;
-#endif
-            while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
-#if SIMPLER_DFX
-                if (record_sched_phases && dummy_t0 == 0) {
-                    dummy_t0 = get_sys_cnt_aicpu();
-                    flush_async_poll(dummy_t0);
-                    capture_shared_ready_depth(sched_, dummy_shared_at_start);
-                }
-#endif
-                for (int di = 0; di < dummy_got; di++) {
-#if SIMPLER_SCHED_PROFILING
-                    SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di], thread_idx);
-#else
-                    SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
-#endif
-                    if (outcome.error_code != SIMPLER_ERROR_NONE) {
-                        fail_scheduler(runtime, thread_idx, outcome.error_code);
-                        break;
-                    }
-                    resolved_this_pass += outcome.stream_tasks_completed;
-                    resolved_any = true;
-#if SIMPLER_DFX
-                    dummy_count++;
-#endif
-                }
-                if (completed_.load(std::memory_order_acquire)) break;
-            }
-#if SIMPLER_DFX
-            if (dummy_t0 != 0) {
-                record_p_phase(
-                    SchedPhaseKind::Dummy, dummy_t0, get_sys_cnt_aicpu(), dummy_count, dummy_shared_at_start
-                );
-            }
-#endif
-        }
-        if (completed_.load(std::memory_order_acquire)) break;
-
-        if (resolved_any) {
-            if (resolved_this_pass > 0) {
-                completed_tasks_.fetch_add(resolved_this_pass, std::memory_order_relaxed);
-#if SIMPLER_SCHED_PROFILING
-                // P owns the completion accounting, so it owns the profiling mirror too
-                // (the S threads' completed_this_turn no longer feeds it in P mode).
-                sched_->tasks_completed.fetch_add(resolved_this_pass, std::memory_order_relaxed);
-#endif
-            }
-            last_progress_ts = get_sys_cnt_aicpu();
-            continue;  // fast re-drain while work keeps arriving
-        }
-
-        // Idle: nothing to resolve this pass. A task legitimately in flight — some
-        // thread still owns a RUNNING core — means P is merely waiting for that
-        // task to finish, not stalled: refresh the budget and keep spinning
-        // (mirrors resolve_and_dispatch's sibling-owns-running guard, so a task
-        // that runs longer than the timeout does not false-latch here). Only latch
-        // a hang when work is outstanding AND no thread anywhere owns a running
-        // task — a genuine forward-progress stall / pre-dispatch deadlock.
-        uint64_t now = get_sys_cnt_aicpu();
-        if (now - last_progress_ts > scheduler_timeout_cycles) {
-            const int32_t total = total_tasks_;
-            bool outstanding = total > 0 && completed_tasks_.load(std::memory_order_relaxed) < total;
-            if (outstanding && no_thread_owns_running_task()) {
-                LOG_ERROR(
-                    "Thread %d: P resolution stall (%d/%d resolved)", thread_idx,
-                    completed_tasks_.load(std::memory_order_relaxed), total
-                );
-                int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
-                    expected, SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_acq_rel, std::memory_order_acquire
-                );
-                if (!completed_.exchange(true, std::memory_order_acq_rel)) {
-                    emergency_shutdown(runtime);
-                }
-                break;
-            }
-            last_progress_ts = now;  // a task is still running (or none outstanding): not a stall
-        }
-        SPIN_WAIT_HINT();
-    }
-
-#if SIMPLER_DFX
-    flush_async_poll(get_sys_cnt_aicpu());
-    // P owns no cores, so the AICore-keyed flushes below iterate an empty core
-    // list; the sched-phase-buffer flush is the one that matters — it drains any
-    // per-thread records P wrote (e.g. under SCHED_PROFILING) so they are not lost.
-    if (chip_swimlane.chip_swimlane_enabled) {
-        chip_swimlane_aicpu_flush(
-            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
-        );
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
-            chip_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
-        }
-    }
-    if (is_dump_args_enabled()) {
-        dump_args_flush(thread_idx);
-        // After this lane's last flush, so the settled counts include every
-        // record it will ever publish. One producer per dump thread, and this
-        // is the thread that owns this one; a thread reaches exactly one of
-        // these exits, so no lane is settled twice.
-        dump_args_close_run(thread_idx);
-    }
-    if (is_pmu_enabled()) {
-        pmu_aicpu_flush_buffers(
-            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
-        );
-    }
-#endif
-
-    return completed_tasks_.load(std::memory_order_relaxed);
-}
-
-// =============================================================================
 // Main scheduler dispatch loop
 // =============================================================================
 
@@ -1298,6 +1021,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
     chip_swimlane.reset();
     chip_swimlane.chip_swimlane_enabled = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
+    // Consecutive empty async polls compact into one bar: every thread polls the
+    // wait list, so one record per spin would swamp the lane. Flush at the start
+    // of every other emitted phase so the backdated poll span cannot overlap it.
+    simpler::hbg::AsyncPollPhaseAccumulator async_poll_phase;
+    int16_t async_poll_shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+
 #endif
 
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
@@ -1360,6 +1089,27 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         iter_shared_sampled = false;
         capture_phase_end(shared_out);
     };
+    auto record_resolution_phase = [&](SchedPhaseKind kind, uint64_t start_time, uint64_t end_time,
+                                       uint32_t tasks_processed,
+                                       const int16_t shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES]) {
+        int16_t shared_at_end[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
+        capture_phase_end_fresh(shared_at_end);
+        chip_swimlane_aicpu_record_sched_phase(
+            thread_idx, kind, start_time, end_time, chip_swimlane.sched_loop_count, tasks_processed,
+            /*pop_hit=*/0, /*pop_miss=*/0, shared_at_start, shared_at_end
+        );
+        for (int shape = 0; shape < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; shape++) {
+            phase_start_shared[shape] = shared_at_end[shape];
+        }
+    };
+    auto flush_async_poll = [&](uint64_t end_time) {
+        if (!async_poll_phase.active()) return;
+        const simpler::hbg::AsyncPollPhaseSummary summary = async_poll_phase.flush(end_time);
+        record_resolution_phase(
+            SchedPhaseKind::AsyncPoll, summary.start_time, summary.end_time, summary.resolved,
+            async_poll_shared_at_start
+        );
+    };
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         capture_phase_end(phase_start_shared);
     }
@@ -1416,7 +1166,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool try_completed = tracker.has_any_running_cores();
         if (try_completed) {
             check_running_cores_for_completion(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress
+                runtime, thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress
             );
         }
         if (completed_this_turn > 0) {
@@ -1437,12 +1187,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-        // Async deferred-completion polling and dependency-only (dummy /
-        // predicate-failed) retirement both run on P, which owns every
-        // completion→ready transition — the scheduler threads' loop stays purely
-        // core-local (poll own COND, dispatch own cores) and never touches the
-        // shared mailbox or dummy queue.
-
 #if SIMPLER_DFX
         if (!try_completed) {
             CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
@@ -1456,6 +1200,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 (chip_swimlane.phase_complete_count > 0 || chip_swimlane.phase_subretire_count > 0)) {
                 // Complete's release_fanin pushes newly-ready consumers into the
                 // shared ready_queues[], so the end depth differs from the start.
+                flush_async_poll(_t0_phase);
                 int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 capture_phase_end_fresh(phase_end_shared);
                 chip_swimlane_aicpu_record_sched_phase(
@@ -1470,6 +1215,126 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 chip_swimlane.phase_subretire_count = 0;
             }
         }
+#endif
+
+        if (completed_.load(std::memory_order_acquire)) break;
+
+        // Occupancy is only a hint. Entry inspection and completion are serialized
+        // by the wait-list lock, regardless of which scheduler observes work.
+        if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
+            (sched_->async_wait_list.count.load(std::memory_order_relaxed) > 0 || rt_->aicore_mailbox->has_pending())) {
+#if SIMPLER_DFX
+            uint64_t async_poll_t0 = 0;
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+                if (!async_poll_phase.active()) {
+                    capture_shared_ready_depth(sched_, async_poll_shared_at_start);
+                    async_poll_phase.begin();
+                }
+                async_poll_t0 = get_sys_cnt_aicpu();
+            }
+#endif
+            AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
+                rt_->aicore_mailbox, sched_
+#if SIMPLER_SCHED_PROFILING
+                ,
+                thread_idx
+#endif
+            );
+#if SIMPLER_DFX
+            if (async_poll_t0 != 0) {
+                const uint64_t async_poll_t1 = get_sys_cnt_aicpu();
+                _t0_phase = async_poll_t1;
+                if (async_poll_phase.add_poll(
+                        async_poll_t0, async_poll_t1, static_cast<uint32_t>(poll_result.resolved),
+                        poll_result.error_code != SIMPLER_ERROR_NONE
+                    )) {
+                    flush_async_poll(async_poll_t1);
+                }
+            }
+#endif
+            if (poll_result.completed > 0) {
+                completed_tasks_.fetch_add(poll_result.completed, std::memory_order_relaxed);
+#if SIMPLER_SCHED_PROFILING
+                sched_->tasks_completed.fetch_add(poll_result.completed, std::memory_order_relaxed);
+#endif
+                cur_thread_completed += poll_result.completed;
+            }
+            if (poll_result.error_code != SIMPLER_ERROR_NONE) {
+                fail_scheduler(runtime, thread_idx, poll_result.error_code);
+                break;
+            }
+            if (poll_result.resolved > 0 || poll_result.completed > 0) made_progress = true;
+        }
+
+        // Dependency-only tasks (empty active_mask, or a predicate that failed)
+        // occupy no core, so no FIN will ever retire them: they are routed to
+        // dummy_ready_queue during resolution and retired here. The queue is
+        // MPMC, so every thread draining its own batch is correct — a dummy
+        // chain simply spreads across threads instead of unwinding on one.
+        {
+            constexpr int DUMMY_DRAIN_BATCH = 8;
+            ChipTaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
+            int dummy_got;
+            int32_t dummy_completed = 0;
+#if SIMPLER_DFX
+            uint64_t dummy_t0 = 0;
+            int16_t dummy_shared_at_start[CHIP_SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+            uint32_t dummy_retired = 0;
+#endif
+            while ((dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH)) > 0) {
+#if SIMPLER_DFX
+                if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && dummy_t0 == 0) {
+                    dummy_t0 = get_sys_cnt_aicpu();
+                    flush_async_poll(dummy_t0);
+                    capture_shared_ready_depth(sched_, dummy_shared_at_start);
+                }
+#endif
+                for (int di = 0; di < dummy_got; di++) {
+#if SIMPLER_SCHED_PROFILING
+                    SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di], thread_idx);
+#else
+                    SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(*dummy_batch[di]);
+#endif
+                    if (outcome.error_code != SIMPLER_ERROR_NONE) {
+                        fail_scheduler(runtime, thread_idx, outcome.error_code);
+                        dummy_got = -1;
+                        break;
+                    }
+                    dummy_completed += outcome.stream_tasks_completed;
+                    made_progress = true;
+#if SIMPLER_DFX
+                    dummy_retired++;
+#endif
+                }
+                if (dummy_got < 0) break;
+                if (completed_.load(std::memory_order_acquire)) break;
+            }
+#if SIMPLER_DFX
+            if (dummy_t0 != 0) {
+                const uint64_t dummy_t1 = get_sys_cnt_aicpu();
+                record_resolution_phase(
+                    SchedPhaseKind::Dummy, dummy_t0, dummy_t1, dummy_retired, dummy_shared_at_start
+                );
+                _t0_phase = dummy_t1;
+            }
+#endif
+            if (dummy_completed > 0) {
+                completed_tasks_.fetch_add(dummy_completed, std::memory_order_relaxed);
+#if SIMPLER_SCHED_PROFILING
+                sched_->tasks_completed.fetch_add(dummy_completed, std::memory_order_relaxed);
+#endif
+                cur_thread_completed += dummy_completed;
+                made_progress = true;
+            }
+        }
+        // A dummy completion that failed has already retired every initialized
+        // AICore through fail_scheduler, so the dispatch work further down this
+        // iteration must not run: it would write register windows on cores that
+        // are gone. Also catches a peer thread latching the error concurrently.
+        if (completed_.load(std::memory_order_acquire)) break;
+
+#if SIMPLER_DFX
+        CYCLE_COUNT_LAP(chip_swimlane.sched_complete_cycle);
 #endif
 
         bool try_pushed = false;
@@ -1489,8 +1354,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // reset or follower bail before stage_go — never stage, so they
             // would otherwise clutter the lane with zero-work drain(0) bars.
             if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
+                const uint64_t drain_t1 = get_sys_cnt_aicpu();
+                flush_async_poll(drain_t0);
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, SchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(), chip_swimlane.sched_loop_count,
+                    thread_idx, SchedPhaseKind::Drain, drain_t0, drain_t1, chip_swimlane.sched_loop_count,
                     static_cast<uint32_t>(drain_stage_wall)
                 );
             }
@@ -1508,7 +1375,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // what lets it sit behind the Phase 2 drain check — a drain holding it
         // back costs a delay, never forward progress.
         //
-        // Keep it ahead of dummy/regular dispatch so a Graph body can expose its
+        // Keep it ahead of regular dispatch so a Graph body can expose its
         // tasks without waiting for an otherwise unrelated dispatch pass. One
         // bounded prepare slice per loop prevents a large definition from
         // monopolizing a scheduler thread.
@@ -1546,6 +1413,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
                 if (graph_prepare_t0 != 0) {
                     uint64_t graph_prepare_t1 = get_sys_cnt_aicpu();
+                    flush_async_poll(graph_prepare_t0);
                     chip_swimlane_aicpu_record_task_phase(
                         thread_idx, SchedPhaseKind::GraphPrepare, graph_prepare_t0, graph_prepare_t1,
                         chip_swimlane.sched_loop_count, prepare_task_id, static_cast<uint32_t>(tasks_materialized)
@@ -1555,9 +1423,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             }
         }
-
-        // Phase 3 (dependency-only dummy / predicate-failed retirement) runs on
-        // the resolution thread P, not here — see run_resolution_thread.
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
@@ -1574,6 +1439,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // a Complete bar of their own — confusing for trace consumers.)
         if (dispatch_t0 != 0 && chip_swimlane.phase_dispatch_count > 0) {
             uint64_t dispatch_t1 = get_sys_cnt_aicpu();
+            flush_async_poll(_t0_phase);
             uint64_t pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
             uint64_t pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
             debug_assert(pop_hit_delta < (1ULL << 32));
@@ -1611,6 +1477,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // to early-dispatch rather than disappearing into a blank gap.
         if (early_dispatch_record && staged_count > 0) {
             uint64_t early_dispatch_t1 = get_sys_cnt_aicpu();
+            flush_async_poll(early_dispatch_t0);
             chip_swimlane_aicpu_record_sched_phase(
                 thread_idx, SchedPhaseKind::EarlyDispatch, early_dispatch_t0, early_dispatch_t1,
                 sched_chip_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(staged_count)
@@ -1714,6 +1581,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // Polling: no deferred producer-release batch to drain at loop exit.
 
 #if SIMPLER_DFX
+    flush_async_poll(get_sys_cnt_aicpu());
+
     // Final-drain: emit any pop_hit / pop_miss accrued since the last
     // dispatch emit (typically the trailing idle loops while waiting for the
     // last in-flight tasks to complete) as a zero-duration synthetic dispatch record so
