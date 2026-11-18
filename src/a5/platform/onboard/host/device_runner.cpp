@@ -439,6 +439,7 @@ int DeviceRunner::prepare_execution(
             LOG_ERROR("AICPU topology probe failed; affinity gate will not launch");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        execution->kernel_args.args.aicpu_cpu_die_map = simpler::a5::pack_aicpu_cpu_die_map(topology);
         simpler::a5::AicpuLaunchPlan launch_plan;
         std::string plan_error;
         if (!simpler::a5::build_aicpu_launch_plan(topology, requested_aicpu_num, launch_plan, plan_error)) {

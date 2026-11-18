@@ -1169,6 +1169,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         -Wl,--wrap=pthread_setspecific -Wl,--wrap=pthread_key_create)
     set_tests_properties(test_aicpu_affinity_tls PROPERTIES TIMEOUT 20)
     simpler_ut_add_target(NAME test_aicpu_affinity_tls_sim
+        DEFINES AFFINITY_TEST_SIM=1
         SOURCES test_aicpu_affinity_tls.cpp
             ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
             ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp

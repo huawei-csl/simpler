@@ -84,6 +84,8 @@ that ...".
 
 Newest first.
 
+- [2026-11 — Porting symmetric AICPU scheduling onto hbg-aicpu-perf](2026-11-a5-hbg-symmetric-port.md) — implemented PR #2179-style symmetry with cooperative async progress, current Graph/error accounting and corrected profiling boundaries. The requested five-thread round-robin versus four-thread die-local comparison adds explicit CPU/die metadata and a 184-byte A5 launch payload. Ten focused C++ targets, nineteen Python tests and six syntax checks pass; simulation and A/B/C hardware matrix completed. All nine NPU1 runs passed. The C die-local owner pattern matched; its physical core-to-die map was not exported, so that map is not independently proven by the capture.
+
 - [2026-11 — A5 HBG admission shortcuts](../zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md) — withdrawn: batched publication showed no established benefit; replacing claim-seal atomics with bypass stores lacks the required A5 hardware evidence despite passing selected functional tests.
 
 - [2026-11 — A5 HBG independent block scheduling](../zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md) — implementation restored to the task-level T/H8 ordinary-credit candidate; retained as a future candidate. Qwen reaches 37.855 ms versus historical 38.454 ms, but the AICore cold build grows from 744.257 s to 2295.011 s (3.08x). Full work-protocol acceptance remains incomplete.

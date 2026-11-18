@@ -139,10 +139,15 @@ inline const char *async_engine_name(AsyncEngine engine) {
     }
 }
 
+static_assert(sizeof(std::atomic<int32_t>) == sizeof(int32_t));
+static_assert(alignof(std::atomic<int32_t>) == alignof(int32_t));
+static_assert(std::atomic<int32_t>::is_always_lock_free);
+
 struct AsyncWaitList {
     std::atomic<int32_t> busy{0};
     AsyncWaitEntry entries[MAX_ASYNC_WAITS];
-    int32_t count{0};
+    // Occupancy is a lock-free polling hint; entries remain protected by busy.
+    std::atomic<int32_t> count{0};
     // Diagnostic: counts every FIN-side try_push that hit a full mailbox.
     // Expected to stay zero on real workloads (ring is 4096 entries); a
     // non-zero value means consumers are too slow or the ring is undersized.
@@ -156,7 +161,7 @@ struct AsyncWaitList {
     // the 190 KB entries[] region needs no per-bind sweep.
     void reset_for_reuse() {
         busy.store(0, std::memory_order_relaxed);
-        count = 0;
+        count.store(0, std::memory_order_relaxed);
         mpsc_skipped_count.store(0, std::memory_order_relaxed);
     }
 
@@ -168,7 +173,8 @@ struct AsyncWaitList {
     void unlock() { busy.store(0, std::memory_order_release); }
 
     AsyncWaitEntry *find_entry_by_token(TaskId token) {
-        for (int32_t i = 0; i < count; i++) {
+        const int32_t entry_count = count.load(std::memory_order_relaxed);
+        for (int32_t i = 0; i < entry_count; i++) {
             if (entries[i].task_token == token) return &entries[i];
         }
         return nullptr;
@@ -215,16 +221,18 @@ struct AsyncWaitList {
                     // First message for this task — materialize the entry here.
                     // slot_state stays null until the matching TASK_NORMAL_DONE
                     // sentinel arrives.
-                    if (count >= MAX_ASYNC_WAITS) {
+                    const int32_t entry_count = count.load(std::memory_order_relaxed);
+                    if (entry_count >= MAX_ASYNC_WAITS) {
                         error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
-                    entry = &entries[count++];
+                    entry = &entries[entry_count];
                     entry->task_token = msg.task_token;
                     entry->slot_state = nullptr;
                     entry->condition_count = 0;
                     entry->waiting_completion_count = 0;
                     entry->normal_done = false;
+                    count.store(entry_count + 1, std::memory_order_relaxed);
                 }
                 if (!append_condition_locked(
                         *entry, msg.addr, msg.backend_cookie, msg.expected_value, static_cast<AsyncEngine>(msg.engine),
@@ -250,16 +258,18 @@ struct AsyncWaitList {
                         }
                         continue;
                     }
-                    if (count >= MAX_ASYNC_WAITS) {
+                    const int32_t entry_count = count.load(std::memory_order_relaxed);
+                    if (entry_count >= MAX_ASYNC_WAITS) {
                         error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
-                    entry = &entries[count++];
+                    entry = &entries[entry_count];
                     entry->task_token = msg.task_token;
                     entry->slot_state = slot_state_ptr;
                     entry->condition_count = 0;
                     entry->waiting_completion_count = 0;
                     entry->normal_done = true;
+                    count.store(entry_count + 1, std::memory_order_relaxed);
                 } else {
                     if (entry->slot_state == nullptr) {
                         entry->slot_state = slot_state_ptr;

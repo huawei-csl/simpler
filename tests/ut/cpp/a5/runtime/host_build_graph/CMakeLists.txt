@@ -105,6 +105,11 @@ a5_hbg_case(test_hbg_submit_poison.cpp ORCH)
 a5_hbg_case(test_graph_activation.cpp
     SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
 
+a5_hbg_case(test_hbg_async_progress.cpp TIMEOUT 20
+    SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
+
+a5_hbg_case(test_hbg_cluster_assignment.cpp NO_OBJS TIMEOUT 20)
+
 # The epoch the scheduler reports under, and the terminal record the legacy
 # path still writes. Both read state this arch's hbg AICPU headers declare and
 # call the shared runtime's out-of-line members.
