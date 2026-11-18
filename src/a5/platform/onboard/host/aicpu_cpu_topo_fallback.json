@@ -27,6 +27,21 @@
         {"cpu_id": 4, "phy_cpu_id": 4, "hyperthread_id": 0, "role": "compute", "available": true},
         {"cpu_id": 5, "phy_cpu_id": 5, "hyperthread_id": 0, "role": "compute", "available": true}
       ]
+    },
+    "Ascend950DT_9592": {
+      "_comment": "Layout inferred from the 950 die map: cpu_id = phy_cpu_id, two cores per AI CPU cluster, cluster_id = phy_cpu_id / 2, die_id = phy_cpu_id / 4. cpu0 is the CCPU/OS core and is outside OCCUPY, so cpu1 shares its cluster. allowed_cpus pins [S0, S1, S2, S3, O] for this OCCUPY signature.",
+      "occupy_mask": 254,
+      "selection_policy": "pinned",
+      "allowed_cpus": [2, 3, 4, 5, 6],
+      "cpus": [
+        {"cpu_id": 1, "phy_cpu_id": 1, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 2, "phy_cpu_id": 2, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 3, "phy_cpu_id": 3, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 4, "phy_cpu_id": 4, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 5, "phy_cpu_id": 5, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 6, "phy_cpu_id": 6, "hyperthread_id": 0, "role": "compute", "available": true},
+        {"cpu_id": 7, "phy_cpu_id": 7, "hyperthread_id": 0, "role": "compute", "available": true}
+      ]
     }
   }
 }

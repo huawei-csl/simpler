@@ -71,6 +71,9 @@ struct AicpuTopology {
     std::vector<AicpuLogicalCpu> os_schedulable_cpus;
     AicpuDeviceOccupancy device_occupancy;
     bool generic_selection_only{false};
+    // Non-empty when a fallback entry pins the placement for this SoC/OCCUPY
+    // signature. Order is [scheduler..., orchestrator], so back() is O.
+    std::vector<int32_t> pinned_allowed_cpus;
 };
 
 // Complete host decision for one AICPU launch. The affinity convention is
@@ -104,10 +107,12 @@ bool enumerate_cpus_from_occupy(uint64_t occupy, std::vector<AicpuLogicalCpu> &o
 // constraint declared by that entry (host architecture and/or OCCUPY) match.
 // Output is not OCCUPY-filtered. `out_generic_selection_only` reports entries
 // that must keep using compute_allowed_cpus() instead of scenario selection.
+// `out_pinned_allowed_cpus` receives the entry's pinned [scheduler...,
+// orchestrator] placement; entries without `allowed_cpus` leave it empty.
 // Returns false when the signature is absent, mismatched, or unusable.
 bool load_cpu_topo_from_json(
     const char *soc_name, uint64_t occupy, std::vector<AicpuLogicalCpu> &out_all_cpus,
-    bool *out_generic_selection_only = nullptr
+    bool *out_generic_selection_only = nullptr, std::vector<int32_t> *out_pinned_allowed_cpus = nullptr
 );
 
 // Compute the `ALLOWED_CPUS` selection for the surviving threads.

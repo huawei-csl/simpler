@@ -766,11 +766,24 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
+// Phase 1b calibration: cluster -> scheduler thread, balanced by the per-cluster
+// work measured on the CSA l4 capture (2026-11-10). Threads 0,1 serve die 0 and
+// 2,3 serve die 1. This is a workload calibration, not a topology invariant; the
+// even/odd striping below is the fallback when the shape does not match.
+static constexpr int8_t kA5DieLptThread[36] = {
+    1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+    3, 3, 2, 3, 2, 3, 2, 2, 3, 2, 2, 3, 2, 3, 3, 2, 3, 2
+};
+
 // =============================================================================
-// Assign discovered cores to scheduler threads (cluster-aligned round-robin).
+// Assign discovered cores to scheduler threads (die-partitioned).
 // =============================================================================
 bool SchedulerContext::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
+    // Die-partitioned assignment: each scheduler thread serves only clusters on
+    // its own die. With PLATFORM_NUM_DIES dies and an even split of scheduler
+    // threads, thread t serves die t / threads_per_die, and that die's clusters
+    // are striped across its threads. Falls back to cluster-aligned round-robin
+    // when the thread count or cluster count does not divide evenly.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
     //
     // 3S+1P: the last AICPU thread is the core-less resolution thread (P); cores
@@ -789,6 +802,18 @@ bool SchedulerContext::assign_cores_to_threads() {
     active_sched_threads_ = aicpu_thread_num_ - 1;
     int32_t cluster_count = aic_count_;
 
+    const int32_t threads_per_die = active_sched_threads_ / PLATFORM_NUM_DIES;
+    const bool die_partitioned =
+        threads_per_die > 0 && active_sched_threads_ % PLATFORM_NUM_DIES == 0 &&
+        cluster_count == static_cast<int32_t>(PLATFORM_NUM_DIES * PLATFORM_AICORE_PER_DIE);
+    auto thread_for_cluster = [&](int32_t ci) -> int32_t {
+        if (!die_partitioned) return ci % active_sched_threads_;
+        if (cluster_count == 36 && active_sched_threads_ == 4) return kA5DieLptThread[ci];
+        const int32_t die = ci / PLATFORM_AICORE_PER_DIE;
+        const int32_t local = ci % PLATFORM_AICORE_PER_DIE;
+        return die * threads_per_die + (local % threads_per_die);
+    };
+
     // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
     int32_t max_clusters_per_thread = (cluster_count + active_sched_threads_ - 1) / active_sched_threads_;
     int32_t thread_cores_num = max_clusters_per_thread * 3;
@@ -799,17 +824,18 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
 
     LOG_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
-        active_sched_threads_, aic_count_, aiv_count_
+        "Assigning cores (%s): %d clusters across %d sched threads (%d AIC, %d AIV), %d threads/die",
+        die_partitioned ? "die-partitioned" : "round-robin", cluster_count, active_sched_threads_, aic_count_,
+        aiv_count_, die_partitioned ? threads_per_die : 0
     );
 
     // running_reg_task_id / pending_reg_task_id for every serviced core are reset
     // in handshake_partition's sweep.
 
-    // Count clusters per thread first (round-robin may distribute unevenly)
+    // Count clusters per thread first (the split may distribute unevenly)
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % active_sched_threads_]++;
+        clusters_per_thread[thread_for_cluster(ci)]++;
     }
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
@@ -818,7 +844,7 @@ bool SchedulerContext::assign_cores_to_threads() {
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % active_sched_threads_;
+        int32_t t = thread_for_cluster(ci);
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
