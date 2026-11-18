@@ -126,6 +126,8 @@ target_include_directories(host_runtime
         # its #include "platform_comm/comm.h" / "platform_comm/comm_context.h".
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/sim_context
+        # a5 kernel_args.h now includes common/aicpu_die_map.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../a5/platform/include
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
 

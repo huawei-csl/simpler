@@ -805,10 +805,21 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
     int32_t owners[PLATFORM_MAX_BLOCKDIM]{};
     int32_t clusters_per_thread[MAX_AICPU_THREADS]{};
-    const auto placement = simpler::hbg::plan_cluster_assignment(
+    auto placement = simpler::hbg::plan_cluster_assignment(
         clusters, cluster_count, thread_cpu_, thread_die_, active_sched_threads_, owners, clusters_per_thread
     );
     if (placement == simpler::hbg::ClusterPlacement::Invalid) return false;
+    // Phase 1b CSA calibration: this host reports no physical CPU-to-die map, so
+    // the topology-aware planner falls back to round-robin. For the full 36-cluster
+    // census with four schedulers, use the per-cluster work split measured on the
+    // CSA l4 capture instead. This is a workload calibration, not a topology claim.
+    if (placement == simpler::hbg::ClusterPlacement::RoundRobin && cluster_count == 36 &&
+        active_sched_threads_ == 4) {
+        for (int32_t ci = 0; ci < cluster_count; ++ci) owners[ci] = kA5DieLptThread[ci];
+        for (int32_t t = 0; t < active_sched_threads_; ++t) clusters_per_thread[t] = 0;
+        for (int32_t ci = 0; ci < cluster_count; ++ci) ++clusters_per_thread[owners[ci]];
+        placement = simpler::hbg::ClusterPlacement::DieLocal;
+    }
 
     int32_t max_clusters_per_thread = 0;
     for (int32_t t = 0; t < active_sched_threads_; ++t) {

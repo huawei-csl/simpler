@@ -31,7 +31,7 @@ else:
 @scene_test(level=2, runtime="host_build_graph")
 class TestDeepSeekV4ProCSAHBG(SceneTestCase):
     CALLABLE = workload.CALLABLE
-    CASES = [{"name": "B4S2Seed0", "platforms": ["a5"], "manual": True, "params": {}}]
+    CASES = [{"name": "B4S2Seed0", "platforms": ["a5"], "manual": True, "params": {}, "config": {"aicpu_thread_num": 4}}]
 
     @classmethod
     def compile_chip_callable(cls, platform):
