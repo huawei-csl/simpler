@@ -1589,7 +1589,8 @@ bool create_scheduler_state(
         runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments
     );
     if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
-    if (legacy_graph_required) {
+    // Local-only: force every graph onto the legacy AICPU scheduler.
+    if (true) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
         return true;
     }

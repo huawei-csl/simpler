@@ -20,6 +20,10 @@
 namespace simpler::ccu {
 namespace {
 
+// CANN 9.2.0 headers stop at HCOMM_CCU_RES_TYPE_INSTRUCTION; slot 7 is the
+// cascading counter added by the newer SDK. The capacity loop skips it anyway.
+constexpr auto kCascadingCounterResource = static_cast<HcommCcuResType>(7);
+
 struct ReadyDefinition {
     SimplerCcuNativeKernelEntry entry;
     const SimplerCcuRegistrationBinding *binding;
@@ -91,7 +95,7 @@ int HcommDomainRegistrationSdk::validate_capacity() {
         // HCOMM allocates them while registering a kernel, so their instance count is zero before registration. Check
         // the device's remaining consecutive instruction space instead. Cascading counters are also absent from the
         // instance descriptor in the current SDK; registration remains the authoritative capacity check for them.
-        if (type == HCOMM_CCU_RES_TYPE_CASC_CNT) continue;
+        if (type == kCascadingCounterResource) continue;
         const auto descriptor = type == HCOMM_CCU_RES_TYPE_INSTRUCTION ? remaining_descriptor : instance_descriptor;
         uint32_t available{};
         rc = HcommCcuInsResDescQueryNum(descriptor, type, &available);
