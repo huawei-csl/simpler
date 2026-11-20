@@ -17,13 +17,19 @@
 #include <mutex>
 #include <utility>
 
+// The device-wide CntNotify pool holds 2,048 objects and is shared with the
+// ACL runtime's own stream notify record/wait tasks. A scheduler that claims
+// every id starves those tasks, which then fail with 507001 (TS error) at
+// stream sync. Keep a reserve for the runtime.
+inline constexpr size_t kSchedulerCntNotifyBudget = 1792;
+
 class SchedulerNotificationStorage {
 public:
     explicit SchedulerNotificationStorage(void *context) :
         context(context) {}
     virtual ~SchedulerNotificationStorage() = default;
     virtual size_t capacity() const = 0;
-    virtual SchedulerDoneNotifications prepare(size_t count) = 0;
+    virtual SchedulerDoneNotifications prepare(size_t count, size_t budget) = 0;
     virtual int release() = 0;
     virtual void abandon() noexcept = 0;
     void *const context;
@@ -67,8 +73,12 @@ public:
             if (!selected || selected->context != context) return -1;
             bank.push_back(selected);
         }
+        size_t used = 0;
+        for (const auto &entry : pools_)
+            for (const auto &pool : entry.second) used += pool->capacity();
+        const size_t budget = used < kSchedulerCntNotifyBudget ? kSchedulerCntNotifyBudget - used : 0;
         try {
-            auto result = selected->prepare(count);
+            auto result = selected->prepare(count, budget);
             result.owner = selected;
             *out = std::move(result);
             return 0;

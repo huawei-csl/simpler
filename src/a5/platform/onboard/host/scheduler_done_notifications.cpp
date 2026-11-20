@@ -14,6 +14,7 @@
 
 #include <acl/acl.h>
 #include <rt_external_device.h>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -37,11 +38,13 @@ public:
         counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {}
     size_t capacity() const override { return notifications_.size(); }
 
-    SchedulerDoneNotifications prepare(size_t count) override {
+    SchedulerDoneNotifications prepare(size_t count, size_t budget) override {
         if (retiring) throw std::invalid_argument("invalid CntNotify pool acquire");
         SchedulerDoneNotifications result{std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
-        notifications_.reserve(count);
-        while (notifications_.size() < count) {
+        const size_t existing = notifications_.size();
+        const size_t target = existing + std::min(budget, count > existing ? count - existing : 0);
+        notifications_.reserve(target);
+        while (notifications_.size() < target) {
             notifications_.emplace_back();
             auto &notification = notifications_.back();
             const auto rc = aclrtCntNotifyCreate(&notification.handle, 0);
@@ -49,7 +52,7 @@ public:
                 notifications_.pop_back();
                 LOG_WARN(
                     "A5 HBG: CntNotify capacity exhausted at %zu/%zu; remaining nodes use GM", notifications_.size(),
-                    count
+                    target
                 );
                 break;
             }

@@ -30,9 +30,10 @@ public:
         ++counts_.created;
     }
     size_t capacity() const override { return capacity_; }
-    SchedulerDoneNotifications prepare(size_t count) override {
+    SchedulerDoneNotifications prepare(size_t count, size_t budget) override {
         ++counts_.prepared;
-        capacity_ = std::min(std::max(capacity_, count), counts_.capacity_limit);
+        const size_t target = std::min(count, capacity_ + budget);
+        capacity_ = std::max(capacity_, std::min(target, counts_.capacity_limit));
         SchedulerDoneNotifications result{std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
         std::fill_n(result.addresses.begin(), std::min(capacity_, count), 32);
         if (counter_) std::fill_n(result.add_addresses.begin(), std::min(capacity_, count), 40);
