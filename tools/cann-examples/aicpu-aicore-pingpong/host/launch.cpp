@@ -221,7 +221,11 @@ int main(int argc, char **argv) {
     }
     const int device_id = std::atoi(argv[1]);
     const uint32_t mode = (argc > 2) ? (uint32_t)std::atoi(argv[2]) : PP_MODE_CENSUS;
-    const uint32_t block_dim = (argc > 3) ? (uint32_t)std::atoi(argv[3]) : PP_MAX_BLOCKDIM;
+    // 0, or no argument at all, means "ask the device". PP_MAX_BLOCKDIM is the
+    // 950DT cluster count, and over-dispatching it on a part with fewer clusters
+    // stalls the stream until the op-execute timeout with nothing in any log, so
+    // the count is queried below rather than assumed.
+    const uint32_t block_dim_arg = (argc > 3) ? (uint32_t)std::atoi(argv[3]) : 0u;
     const uint32_t slot_a = (argc > 4) ? (uint32_t)std::atoi(argv[4]) : 0u;    // AIC die 0
     const uint32_t slot_b = (argc > 5) ? (uint32_t)std::atoi(argv[5]) : 54u;   // AIC die 1
     const int32_t cpu_a = (argc > 6) ? std::atoi(argv[6]) : 2;                 // AICPU die 0 (never cpu1)
@@ -252,6 +256,25 @@ int main(int argc, char **argv) {
 
     ACL_CHECK(aclInit(nullptr), "aclInit");
     ACL_CHECK(aclrtSetDevice(device_id), "aclrtSetDevice");
+
+    // One block holds one 1AIC+2AIV cluster, so blockDim is a bijection onto the
+    // clusters only when it equals the cube-core count. That count is a property
+    // of the part, not of the architecture: 950DT reports 36, 950PR parts report
+    // 36 or 28.
+    int64_t cube_cores = 0, vector_cores = 0;
+    ACL_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_AI_CORE_NUM, &cube_cores), "AI_CORE_NUM");
+    ACL_CHECK(
+        aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &vector_cores), "VECTOR_CORE_NUM"
+    );
+    const uint32_t block_dim = (block_dim_arg != 0u) ? block_dim_arg : (uint32_t)cube_cores;
+    std::printf("[chip] %lld cube + %lld vector cores -> %lld slots; blockDim=%u (%s)\n",
+                (long long)cube_cores, (long long)vector_cores, (long long)(cube_cores + vector_cores),
+                block_dim, block_dim_arg != 0u ? "argv" : "queried");
+    if ((int64_t)block_dim > cube_cores) {
+        std::fprintf(stderr, "blockDim %u exceeds the %lld cube cores on this part; the launch would stall\n",
+                     block_dim, (long long)cube_cores);
+        return 1;
+    }
     aclrtStream stream_aicore = nullptr, stream_aicpu = nullptr;
     ACL_CHECK(aclrtCreateStream(&stream_aicore), "aclrtCreateStream(aicore)");
     if (need_aicpu) ACL_CHECK(aclrtCreateStream(&stream_aicpu), "aclrtCreateStream(aicpu)");
@@ -272,6 +295,66 @@ int main(int argc, char **argv) {
     // 8 MB stack cannot hold it.
     static PpArena host_arena;
     std::memset(&host_arena, 0, sizeof(host_arena));
+
+    // ---- Register the AICore half ----
+    rtDevBinary_t bin{};
+    bin.magic = RT_DEV_BINARY_MAGIC_ELF;
+    bin.version = 0;
+    bin.data = partner_bytes.data();
+    bin.length = partner_bytes.size();
+    void *aicore_handle = nullptr;
+    RT_CHECK(rtRegisterAllKernel(&bin, &aicore_handle), "rtRegisterAllKernel(partner)");
+
+    // ---- Which slots this part actually has ----
+    // The slot space is 108 wide on every a5 part, but a part with fewer
+    // clusters occupies it sparsely, and a disabled cluster leaves a hole that
+    // no arithmetic on the core count predicts. A census launch reports the set
+    // and cannot block: every block writes one line and returns. Scheduling a
+    // slot that no block owns would spin that round to its budget instead.
+    std::vector<uint32_t> occupied;
+    {
+        host_arena.ctl.go = 1;
+        host_arena.ctl.mode = PP_MODE_CENSUS;
+        host_arena.ctl.clock_iters = 1;
+        ACL_CHECK(
+            aclrtMemcpy(arena_ptrs[0], sizeof(PpArena), &host_arena, sizeof(PpArena), ACL_MEMCPY_HOST_TO_DEVICE),
+            "H2D census arena"
+        );
+        struct CensusArgs {
+            uint64_t arena_ptr;
+        } ca;
+        ca.arena_ptr = reinterpret_cast<uint64_t>(arena_ptrs[0]);
+        rtArgsEx_t census_args = {};
+        census_args.args = &ca;
+        census_args.argsSize = sizeof(ca);
+        rtTaskCfgInfo_t census_cfg = {};
+        census_cfg.schemMode = RT_SCHEM_MODE_BATCH;
+        RT_CHECK(
+            rtKernelLaunchWithHandleV2(aicore_handle, 0, block_dim, &census_args, nullptr, stream_aicore,
+                                       &census_cfg),
+            "rtKernelLaunchWithHandleV2(census)"
+        );
+        ACL_CHECK(aclrtSynchronizeStream(stream_aicore), "sync census");
+        ACL_CHECK(
+            aclrtMemcpy(&host_arena, sizeof(PpArena), arena_ptrs[0], sizeof(PpArena), ACL_MEMCPY_DEVICE_TO_HOST),
+            "D2H census arena"
+        );
+        uint32_t occ_aic = 0, occ_die[2] = {0, 0};
+        for (uint32_t s = 0; s < PP_MAX_SLOTS; ++s) {
+            if (host_arena.attendance[s].attended != PP_ATTEND_MAGIC) continue;
+            occupied.push_back(s);
+            if (PP_SLOT_IS_AIC(s)) ++occ_aic;
+            ++occ_die[PP_SLOT_DIE(s)];
+        }
+        std::memset(&host_arena, 0, sizeof(host_arena));
+        if (occupied.empty()) {
+            std::fprintf(stderr, "census found no AICore blocks; nothing can be scheduled\n");
+            return 1;
+        }
+        std::printf("[census] %zu occupied slots: %u AIC, %zu AIV; die0 %u / die1 %u\n", occupied.size(), occ_aic,
+                    occupied.size() - occ_aic, occ_die[0], occ_die[1]);
+    }
+
     host_arena.ctl.go = 1;
     host_arena.ctl.mode = mode;
     host_arena.ctl.n_blocks_expected = block_dim;
@@ -317,12 +400,11 @@ int main(int argc, char **argv) {
         const char *slots_env = std::getenv("PP_NSLOTS");
         const char *seed_env = std::getenv("PP_SEED");
         const char *reps_env = std::getenv("PP_REPS");
-        uint32_t want = slots_env ? (uint32_t)std::atoi(slots_env) : PP_MAX_SLOTS;
+        uint32_t want = slots_env ? (uint32_t)std::atoi(slots_env) : (uint32_t)occupied.size();
         if (want > PP_MAX_SLOTLIST) want = PP_MAX_SLOTLIST;
-        if (want > PP_MAX_SLOTS) want = PP_MAX_SLOTS;
+        if (want > occupied.size()) want = (uint32_t)occupied.size();
         const unsigned seed = seed_env ? (unsigned)std::atoi(seed_env) : 20261111u;
-        std::vector<uint32_t> pool(PP_MAX_SLOTS);
-        for (uint32_t i = 0; i < PP_MAX_SLOTS; ++i) pool[i] = i;
+        std::vector<uint32_t> pool(occupied);
         std::mt19937 rng(seed);
         std::shuffle(pool.begin(), pool.end(), rng);
         pool.resize(want);
@@ -331,8 +413,8 @@ int main(int argc, char **argv) {
             host_arena.slot_list[i] = pool[i];
             if (PP_SLOT_IS_AIC(pool[i])) ++n_aic;
         }
-        std::printf("[sweep] sampled %u of %u AICore slots (seed=%u): %u AIC, %u AIV\n", want, PP_MAX_SLOTS, seed,
-                    n_aic, want - n_aic);
+        std::printf("[sweep] sampled %u of %zu AICore slots (seed=%u): %u AIC, %u AIV\n", want, occupied.size(),
+                    seed, n_aic, want - n_aic);
         std::printf("[sweep] slots:");
         for (uint32_t i = 0; i < want; ++i) std::printf(" %u", pool[i]);
         std::printf("\n");
@@ -362,14 +444,14 @@ int main(int argc, char **argv) {
         std::printf("[sweep] schedule: %zu rounds, pair order shuffled (seed=%u)\n", sched.size(), seed);
 
         if (mode == PP_MODE_CORE2CORE) {
-            // Replace the sampled schedule with every AICore slot: both
-            // endpoints are AICore here, and the question is which pairs are
-            // slow, so no pair may be dropped. slot_list is in natural order,
-            // which makes an index into it the slot id itself; the pair order
-            // carries the shuffle instead, so a round's die and cluster
-            // relation is independent of its position in the sweep.
-            const uint32_t n_sl = PP_MAX_SLOTS;
-            for (uint32_t i = 0; i < n_sl; ++i) host_arena.slot_list[i] = i;
+            // Replace the sampled schedule with every slot the census found:
+            // both endpoints are AICore here, and the question is which pairs
+            // are slow, so no pair may be dropped. slot_list is in ascending
+            // slot order and the pair order carries the shuffle instead, so a
+            // round's die and cluster relation is independent of its position
+            // in the sweep.
+            const uint32_t n_sl = (uint32_t)occupied.size();
+            for (uint32_t i = 0; i < n_sl; ++i) host_arena.slot_list[i] = occupied[i];
             host_arena.ctl.n_cpus = 0;
             host_arena.ctl.n_slots = n_sl;
             for (uint32_t rep = 0; rep < host_arena.ctl.n_reps; ++rep) {
@@ -510,14 +592,6 @@ int main(int argc, char **argv) {
         RT_CHECK(rtsFuncGetByName(binary_handle, run_op, &run_handle), "rtsFuncGetByName run");
     }
 
-    // ---- Register and launch the AICore half ----
-    rtDevBinary_t bin{};
-    bin.magic = RT_DEV_BINARY_MAGIC_ELF;
-    bin.version = 0;
-    bin.data = partner_bytes.data();
-    bin.length = partner_bytes.size();
-    void *aicore_handle = nullptr;
-    RT_CHECK(rtRegisterAllKernel(&bin, &aicore_handle), "rtRegisterAllKernel(partner)");
     std::printf("[launch] mode=%u blockDim=%u slots=(%u,%u) cpus=(%d,%d) iters=%llu warmup=%llu\n", mode, block_dim,
                 slot_a, slot_b, cpu_a, cpu_b, (unsigned long long)iters, (unsigned long long)warmup);
 
@@ -597,9 +671,11 @@ int main(int argc, char **argv) {
         // ---- Report ----
         uint32_t attended = 0, aic_seen = 0, aiv_seen = 0, per_die[2] = {0, 0};
         uint64_t first_entry = UINT64_MAX, last_exit = 0;
+        std::vector<uint32_t> present;
         for (uint32_t s = 0; s < PP_MAX_SLOTS; ++s) {
             const PpAttendance &e = host_arena.attendance[s];
             if (e.attended != PP_ATTEND_MAGIC) continue;
+            present.push_back(s);
             ++attended;
             PP_SLOT_IS_AIC(s) ? ++aic_seen : ++aiv_seen;
             ++per_die[PP_SLOT_DIE(s)];
@@ -612,6 +688,15 @@ int main(int argc, char **argv) {
         const uint32_t expected = block_dim * 3u;
         if (attended != expected) {
             std::printf("  WARNING: expected %u attending slots (blockDim*3), saw %u\n", expected, attended);
+        }
+        // The occupied slot ids are the part's real topology, and they are what
+        // PP_SLOT_DIE / PP_SLOT_IS_AIC / PP_SLOT_CLUSTER have to agree with. On a
+        // part with fewer clusters the space stays 108 wide and thins out, so the
+        // list is printed rather than summarised.
+        if (mode == PP_MODE_CENSUS) {
+            std::printf("  occupied slots (%zu):", present.size());
+            for (size_t i = 0; i < present.size(); ++i) std::printf(" %u", present[i]);
+            std::printf("\n");
         }
         if (attended > 0) {
             std::printf("  dispatch span: %llu ticks\n", (unsigned long long)(last_exit - first_entry));

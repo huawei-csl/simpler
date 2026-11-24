@@ -28,9 +28,20 @@ target_include_directories(aicpu_pingpong PRIVATE
     ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/profiling
 )
 
+# libascend_dump.so, pulled in by libascendcl, resolves drvHdc*/drvDevice*
+# against libascend_hal.so, which ships with the driver rather than the
+# toolkit and is not on the default search path on every host. Override with
+# -DASCEND_DRIVER_LIB_DIR=... where the driver lives elsewhere.
+set(ASCEND_DRIVER_LIB_DIR "/usr/local/Ascend/driver/lib64/driver" CACHE PATH
+    "Directory holding libascend_hal.so")
+
 target_link_directories(aicpu_pingpong PRIVATE
     ${ASCEND_HOME_PATH}/lib64
     ${ASCEND_HOME_PATH}/runtime/lib64
+    ${ASCEND_DRIVER_LIB_DIR}
+)
+set_target_properties(aicpu_pingpong PROPERTIES
+    BUILD_RPATH "${ASCEND_HOME_PATH}/lib64;${ASCEND_DRIVER_LIB_DIR}"
 )
 
 target_link_libraries(aicpu_pingpong PRIVATE ascendcl runtime)
