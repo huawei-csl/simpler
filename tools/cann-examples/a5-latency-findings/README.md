@@ -45,6 +45,15 @@ evidence.
 `cpu0` is owned by the AICPU OS, so 7 cores are user-schedulable — 3 on die 0 and
 4 on die 1. `cluster_id = phy_cpu_id / 2`, `die_id = phy_cpu_id / 4`.
 
+**None of that structure is visible to software.** The AICPU OS publishes one
+package (`physical_package_id = 0` for every core), no `cluster_id`, no
+`die_id`, no SMT (each core is its own thread sibling), a last-level cache
+shared by *all* cores (`L2u@0-7` on `_9592`, `L2u@0-3` on `_957b`), and **one
+CPU NUMA node holding every core** — `node0` with ~1.5 GiB beside 8-10
+**cpu-less** memory nodes that add up to the chip's HBM. So the 2-core grouping
+below is a timing result, not a topology query, and no scheduler can read it
+from the OS.
+
 ## AICPU ↔ AICPU: 192 ns inside a cluster, a lottery between them
 
 ![AICPU ping-pong matrix: 7x7 heatmap of round-trip latency floors, ~191 ns
@@ -119,7 +128,10 @@ boundary that matters to an AICPU hand-off is the cluster, not the die.
 
 ### `Ascend950PR_957b`: same law, fewer cores
 
-3 user-schedulable AICPUs (`present` = 0-3, cpu0 OS-owned), so one cluster pair:
+3 user-schedulable AICPUs (`present` = 0-3, cpu0 OS-owned), so one cluster pair.
+**Which die(s) those two clusters sit on is not established** — the AICPU side
+of every measurement here resolves clusters, not dies (above), so `die =
+phy_cpu_id / 4` is an untested extrapolation on a part with half the cores:
 
 | | min | median | max | range |
 | --- | ---: | ---: | ---: | ---: |
@@ -184,6 +196,28 @@ Note, though, that the home die here was identified by *which configuration ran
 faster*, and the AICore↔AICore matrix finds no home effect at all. See
 [Two dies, one GM](#two-dies-one-gm) — the effect is real, its cause is not
 established.
+
+**`cpu_term` is keyed to the AICPU's cluster, not its die.** Re-reading the
+per-arena sweep with the cpus kept separate, the four AICPU clusters take four
+distinct values, and the split is not the die line — ns against the cpu-mean of
+each arena:
+
+```text
+  cpu           1       2       3       4       5       6       7
+  cluster      c0      c1      c1      c2      c2      c3      c3
+  die          d0      d0      d0      d1      d1      d1      d1
+  arena 0   +118.6   -10.1   -10.1   +15.6   +16.9   -64.6   -66.3
+  arena 2    +98.2    -8.6   -17.2   +57.8   +65.1   -97.7   -97.6
+  arena 7    +44.3   -18.6   -18.5   +55.4   +58.7   -59.9   -61.4
+```
+
+Cluster-mates always agree to a few ns. `cpu1` does **not** track `cpu2,3`
+despite sharing die 0 with them, and in arena 0 it is further from them than
+`cpu4,5` are from across the die boundary. So the +170 ns figure is the span of
+a four-level per-cluster term collapsed onto two, and the "off the home die"
+reading of it does not survive. The table above should be read as a floor plus
+two crossings whose AICPU half has finer structure than stated; re-deriving the
+term per cluster has not been done.
 
 ## The boundary costs writes, not reads
 

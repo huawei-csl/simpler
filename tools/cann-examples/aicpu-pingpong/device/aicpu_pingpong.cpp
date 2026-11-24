@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -100,6 +101,12 @@ struct PingPongOutput {
     char cpu_present[64];
     char cpu_online[64];
     char cpu_possible[64];
+    // What the OS believes about its own cores, as opposed to what latency
+    // implies: the sibling lists give the package and SMT grouping, the cache
+    // lines give which cores share which level, and the node lists say whether
+    // the OS models any of it as NUMA at all.
+    char node_info[512];
+    char slot_topo[kMaxSlots][112];
     // Measurement mode. A dependent-ALU chain each role times against the fixed
     // 1 GHz counter inside the measured launch: a hand-off cost that moves while
     // this stays put did not move because the core clock moved. 0 means the
@@ -208,6 +215,69 @@ inline uint64_t ReadPfn(const void *va, uint64_t page_bytes) {
     if (n != (ssize_t)sizeof(ent)) return 0;
     if ((ent & (1ULL << 63)) == 0) return 0;
     return ent & ((1ULL << 55) - 1);
+}
+
+// "online=<list> n<id>[<cpus>]=<MiB> ..." for every node the OS publishes. A
+// node with no cpus is memory the OS reaches but schedules nothing on.
+inline void DescribeNodes(char *out, size_t cap) {
+    out[0] = '\0';
+    size_t n = 0;
+    char buf[64];
+    char path[160];
+    if (ReadSysfsText("/sys/devices/system/node/online", buf, sizeof(buf)))
+        n += (size_t)std::snprintf(out + n, cap - n, "online=%s", buf);
+    for (int id = 0; id < 64 && n + 1 < cap; ++id) {
+        std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", id);
+        char cpus[32];
+        if (!ReadSysfsText(path, cpus, sizeof(cpus))) continue;
+        unsigned long long mib = 0;
+        std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", id);
+        char mem[256];
+        if (ReadSysfsText(path, mem, sizeof(mem))) {
+            const char *p = std::strstr(mem, "MemTotal:");
+            if (p != nullptr) mib = strtoull(p + 9, nullptr, 10) / 1024ULL;
+        }
+        const int w = std::snprintf(out + n, cap - n, " n%d[%s]=%lluM", id, cpus[0] ? cpus : "-", mib);
+        if (w > 0) n += (size_t)w;
+        if (n >= cap) n = cap - 1;
+    }
+}
+
+// "sib=<package> thr=<smt> L<n><d|i|u>:<size>@<sharers> ..." for one cpu. A
+// level whose files are absent is left out, so an empty string means the OS
+// publishes no cache or sibling topology for this core.
+inline void DescribeCpu(int32_t cpu, char *out, size_t cap) {
+    out[0] = '\0';
+    size_t n = 0;
+    char buf[48];
+    char path[160];
+    auto append = [&](const char *fmt, const char *a, const char *b) {
+        if (n + 1 >= cap) return;
+        const int w = std::snprintf(out + n, cap - n, fmt, a, b);
+        if (w > 0) n += (size_t)w;
+        if (n >= cap) n = cap - 1;
+    };
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_siblings_list", cpu);
+    if (ReadSysfsText(path, buf, sizeof(buf))) append("sib=%s%s", buf, "");
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+    if (ReadSysfsText(path, buf, sizeof(buf))) append(" thr=%s%s", buf, "");
+    for (int idx = 0; idx < 4; ++idx) {
+        char lvl[8];
+        char type[24];
+        char size[16];
+        char shared[32];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/level", cpu, idx);
+        if (!ReadSysfsText(path, lvl, sizeof(lvl))) continue;
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/type", cpu, idx);
+        if (!ReadSysfsText(path, type, sizeof(type))) type[0] = '\0';
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/size", cpu, idx);
+        if (!ReadSysfsText(path, size, sizeof(size))) size[0] = '\0';
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/shared_cpu_list", cpu, idx);
+        if (!ReadSysfsText(path, shared, sizeof(shared))) shared[0] = '\0';
+        char tag[40];
+        std::snprintf(tag, sizeof(tag), " L%s%c:%s", lvl, type[0] ? (char)(type[0] | 0x20) : 'u', size[0] ? size : "?");
+        append("%s@%s", tag, shared[0] ? shared : "?");
+    }
 }
 
 // A latency-bound chain: every EOR consumes the previous one's result, so the
@@ -343,7 +413,9 @@ __attribute__((visibility("default"))) int simpler_aicpu_pingpong(void *args) {
                 ReadSysfsText("/sys/devices/system/cpu/present", out->cpu_present, sizeof(out->cpu_present));
                 ReadSysfsText("/sys/devices/system/cpu/online", out->cpu_online, sizeof(out->cpu_online));
                 ReadSysfsText("/sys/devices/system/cpu/possible", out->cpu_possible, sizeof(out->cpu_possible));
+                DescribeNodes(out->node_info, sizeof(out->node_info));
             }
+            DescribeCpu(cpu, out->slot_topo[idx], sizeof(out->slot_topo[idx]));
             out->claim_counter = idx + 1;
         }
         return 0;

@@ -185,6 +185,8 @@ struct PingPongOutput {
     char cpu_present[64];
     char cpu_online[64];
     char cpu_possible[64];
+    char node_info[512];
+    char slot_topo[kMaxSlots][112];
     uint64_t probe_ops;
     uint64_t probe_ticks_a;
     uint64_t probe_ticks_b;
@@ -467,6 +469,20 @@ int main(int argc, char **argv) {
     std::printf("  /sys/devices/system/cpu/present  : %s\n", show(host_out.cpu_present));
     std::printf("  /sys/devices/system/cpu/online   : %s\n", show(host_out.cpu_online));
     std::printf("  /sys/devices/system/cpu/possible : %s\n", show(host_out.cpu_possible));
+    std::printf("  /sys/devices/system/node         : %s\n", show(host_out.node_info));
+
+    // Cache sharing is the direct answer to "cluster or NUMA domain": the
+    // sharers of the outermost level are the group, whatever it is called.
+    std::printf("\n=== AICPU OS cache and sibling topology ===\n");
+    {
+        std::vector<int> seen;
+        for (uint32_t i = 0; i < host_out.claim_counter && i < kMaxSlots; ++i) {
+            const int c = host_out.thread_cpu[i];
+            if (std::find(seen.begin(), seen.end(), c) != seen.end()) continue;
+            seen.push_back(c);
+            std::printf("  cpu%-3d %s\n", c, show(host_out.slot_topo[i]));
+        }
+    }
 
     // cpu_id -> cluster/die is unresolvable from the driver on this part
     // (CPU_TOPO returns DRV_ERROR_NOT_SUPPORT), so report the AICPU OS's own

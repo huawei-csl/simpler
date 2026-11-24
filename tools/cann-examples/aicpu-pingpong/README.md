@@ -72,6 +72,14 @@ silently mislabelled.
 A `reps`-long run inside one launch amortizes launch overhead; the host reports
 both the minimum and the median across reps.
 
+**Discovery also prints what the OS believes about its own cores** — the node
+list with each node's cpus and memory, the package and SMT sibling lists, and
+which cores share each cache level. On both measured a5 parts that view is
+flat: one package, no SMT, one CPU NUMA node holding every core, and a
+last-level cache shared by all of them, beside 8-10 cpu-less memory nodes that
+sum to the chip's HBM. The 2-core grouping the latency finds appears nowhere in
+it, so the matrix is the only way to see it.
+
 **The discovered set is a lower bound on the pool.** It is where CANN chose to
 put threads, so a part could have cores it never dispatches to. The inventory
 from step 1 is the AICPU OS's own count and is the upper bound; when the two
