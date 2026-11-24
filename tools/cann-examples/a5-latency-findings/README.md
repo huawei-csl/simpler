@@ -1,9 +1,10 @@
 # a5 hand-off latency, measured
 
-Everything here was measured on one chip, **`Ascend950DT_9592`**, on both of its
-device ids. Nothing was measured on `Ascend950PR` — the layout is probably the
-same, but treat every number below as unverified there until someone runs the
-tools on one.
+Everything here was measured on **`Ascend950DT_9592`**, on both of its device
+ids, unless a section says otherwise. The AICore matrix and the AICPU↔AICPU
+section have since been re-run on an **`Ascend950PR_957b`** (28 AICore clusters,
+3 user AICPUs) and say so where the two parts differ; everything else is still
+unverified on a PR part.
 
 All four figures are **corroboration, not the source**: every number in them is
 also written out below, so this file can be read as plain text.
@@ -44,14 +45,14 @@ evidence.
 `cpu0` is owned by the AICPU OS, so 7 cores are user-schedulable — 3 on die 0 and
 4 on die 1. `cluster_id = phy_cpu_id / 2`, `die_id = phy_cpu_id / 4`.
 
-## AICPU ↔ AICPU: two tiers, and the die boundary is free
+## AICPU ↔ AICPU: 192 ns inside a cluster, a lottery between them
 
-![AICPU ping-pong matrix: 7x7 heatmap of round-trip latency, showing ~191 ns
-inside a cluster and ~1113 ns for every other pair regardless of
-die](figures/aicpu-pingpong-matrix.png)
+![AICPU ping-pong matrix: 7x7 heatmap of round-trip latency floors, ~191 ns
+inside a cluster and 1113 ns or more for every other
+pair](figures/aicpu-pingpong-matrix.png)
 
 ```text
-Round-trip floor over 6 sweeps, ns, device 0.  Upper triangle only: a round trip
+Round-trip FLOOR over 6 sweeps, ns, device 0.  Upper triangle only: a round trip
 contains both directions, so just a < b was measured.  cpu0 is OS-owned and not
 measured.  cluster = cpu / 2,  die = cpu / 4.
 
@@ -65,21 +66,89 @@ measured.  cluster = cpu / 2,  die = cpu / 4.
    6 |                                     -     190.3
 ```
 
-| Pair | Round trip |
-| ---- | ---------- |
-| Inside a cluster | **~191 ns**, stable to 1% over 6 sweeps |
-| Anything else | **~1113 ns**, about 6× |
+Read that as a floor and nothing more. Every off-diagonal cell is the best of 6
+draws of a quantity that spans 500 ns, and the diagonal blocks are the only
+numbers in it a single run can be expected to reproduce.
 
-There is no third tier for the die boundary. `cpu2,3 ↔ cpu6,7` crosses it and
-costs 1114 ns; `cpu4,5 ↔ cpu6,7` stays inside die 1 and costs the same 1114 ns.
+**Inside a cluster the hand-off is 192 ns and nothing moves it.** Over 204
+counter addresses in 12 processes, `cpu2↔cpu3`, `cpu4↔cpu5` and `cpu6↔cpu7` each
+span under 5 ns. Not the address, not the process, not the launch.
 
-Two things in that matrix are *not* explained:
+**Across clusters the cost is drawn per allocation.** One pair, measured on 64
+counters 128 B apart within a single launch, costs anything from 1101 to
+1627 ns:
 
-- **`cpu1` reads high everywhere.** It is the cluster-mate of the OS core.
-- **Every cell above the 1113 floor involves cluster 2 (`cpu4,5`) paired with a
-  die-0 cluster** — 1170 against cluster 1, 1328 against `cpu1`. We first put
-  this down to DVFS, but the clock has since been measured directly and does not
-  move (below), so the explanation is open.
+| cluster pair | min | median | max | range |
+| --- | ---: | ---: | ---: | ---: |
+| c0–c1  `cpu1 ↔ cpu2,3` | 1101 | 1116 | 1627 | **526** |
+| c0–c2  `cpu1 ↔ cpu4,5` | 1317 | 1366 | 1420 | 104 |
+| c0–c3  `cpu1 ↔ cpu6,7` | 1115 | 1301 | 1562 | 447 |
+| c1–c2  `cpu2,3 ↔ cpu4,5` | 1116 | 1301 | 1562 | 446 |
+| c1–c3  `cpu2,3 ↔ cpu6,7` | 1110 | 1225 | 1327 | 217 |
+| c2–c3  `cpu4,5 ↔ cpu6,7` | 1066 | 1322 | 1607 | 542 |
+| any same-cluster pair | 192 | 193 | 197 | 5 |
+
+ns, device 1, 204 samples per row = 12 processes × 16 aligned 512-byte blocks.
+
+**The selector is the line's address, at 512-byte granularity.** Counters inside
+one aligned 512 B block agree to 1.7 ns (median over every block measured); the
+next block along differs by up to 334. The *virtual* address is not the
+selector: the AICPU OS loads the SO at the same base in every process
+(`0x3fff0032100` on the DT, `0x3fff80f2300` for the bank), yet the cost is
+redrawn each process. What changes is the physical page the BSS lands on.
+
+**One hidden variable reorders the whole matrix.** Over those 204 samples
+`corr(c0–c1, c2–c3) = −0.92`. With c0–c1 at its floor, c2–c3 reads 1493 ns
+median; with c0–c1 above 1400, c2–c3 reads 1116. A line that is cheap for one
+cluster pair is expensive for the opposite one, which is what a coherence home
+does: it sits near one pair of clusters and far from the other.
+
+**It is not DVFS, and this is now measured on the AICPU too.** Each role times a
+dependent-ALU chain against the 1 GHz counter inside the measured launch:
+**800.1 µs ± 0.3 over every launch on both parts**, while the hand-off moves by a
+third. The cores run at a fixed clock.
+
+**c0–c2 is the one pair with a floor of its own.** `cpu1 ↔ cpu4,5` never drops
+below 1317 ns at any address, and spans only 104 ns. Every other cross-cluster
+pair reaches ~1115 on a good draw. So there is one genuine placement term in
+this matrix, and it is the cluster-0-to-cluster-2 one.
+
+**There is still no die tier.** `cpu2,3 ↔ cpu6,7` crosses the die boundary and
+`cpu4,5 ↔ cpu6,7` does not; both floor at ~1115 and both span ~450 ns. The
+boundary that matters to an AICPU hand-off is the cluster, not the die.
+
+### `Ascend950PR_957b`: same law, fewer cores
+
+3 user-schedulable AICPUs (`present` = 0-3, cpu0 OS-owned), so one cluster pair:
+
+| | min | median | max | range |
+| --- | ---: | ---: | ---: | ---: |
+| `cpu2 ↔ cpu3` same cluster | 189.9 | 191.0 | 193.4 | 3.6 |
+| `cpu1 ↔ cpu2,3` across | 1161 | 1315 | 1564 | 403 |
+
+Same 512-byte granularity, same ~10 discrete levels, same fixed ALU probe. The
+part has fewer cores and the same hand-off behaviour.
+
+### What this corrects
+
+An earlier revision read the floor matrix above as the cost — "**~1113 ns** for
+anything not inside a cluster" — and listed two cells it could not explain:
+`cpu1` reading high everywhere, and cluster 2 against a die-0 cluster reading
+1170 instead of 1113. Both resolve:
+
+- 1113 ns is the best draw, not the cost. The same pair pays 1101–1627 ns
+  depending on where its counter landed.
+- `cpu1` reading high against `cpu4,5` is the c0–c2 floor, which is real.
+- The 1170 cells were one home draw, not a property of cluster 2. Over 204
+  draws that pair's median is 1301.
+
+The DVFS explanation that revision left open is closed: the clock does not move.
+
+**What to do with it.** A cross-cluster AICPU handshake — a ticket lock, a shared
+ready-queue index, a scheduler notification — pays a cost set by where its line
+landed, with a 1.5× spread and no API that reports or chooses it. Allocate the
+structure once and keep it; reallocating re-rolls the draw. Putting both ends in
+one cluster removes the question altogether, at 192 ns.
 
 ## AICPU ↔ AICore: one floor plus two independent crossings
 
@@ -265,6 +334,30 @@ crosses the boundary twice should cost.
 
 **So: two dies of cores over one GM.** Draw the boundary between the cores.
 
+### `Ascend950PR_957b`: the bipartition reproduces, the allocation row does not
+
+84 sub-cores (28 AIC + 56 AIV, 14 clusters per die, die 1 cluster 4 absent), all
+3486 pairs × 16 repeats, same parameters as the DT run:
+
+| | 950DT_9592 | 950PR_957b |
+| --- | ---: | ---: |
+| same cluster | 366.9 | 390.6 |
+| same die, other cluster | 384.0 | 389.7 |
+| across dies | 722.9 | 791.3 |
+| empty band at the split | 241.1 | 328.1 |
+| blind bipartition | 54/54 exact | 42/42 exact |
+| GM read, cross-die delta | +0.16 | −0.57 |
+| **per-arena \|die0 − die1\|** | **1.0** | **20.9** |
+
+ns. The bipartition is as clean on the PR as on the DT — 42/42, matching
+`slot / 54` on all 84 cores, with nothing in the band. Reads stay uniform. But
+the first row of the evidence table above does **not** carry over: on the PR an
+allocation's cost differs by ~21 ns between the two dies, and the polarity flips
+between launches at the same device virtual address. So *"an allocation has no
+die affinity a core can feel"* is a statement about `_9592`, not about a5. The
+conclusion it supports still holds — 21 ns sits an order of magnitude under the
+~400 ns a core placement costs, and no API exposes it — but quote it per part.
+
 One thing this does **not** settle. The AICPU↔AICore law above has two terms
 keyed to the arena's home die, worth +170 and +225 ns, and that home was
 identified by which configuration ran faster. The AICore-pair data finds no home
@@ -278,12 +371,14 @@ AICPU-path home terms as describing a real effect whose cause is not established
   larger arena, moved the AICPU↔AICore floor from 975 to 1114 ns and the terms to
   +80 / +176. The *contrasts* held across both builds; the absolute floor did
   not. Quote the structure, not the constant.
-- **`Ascend950PR` is unmeasured**, as is any a5 SKU other than `_9592`. CANN's a5
-  ini files span `ai_core_cnt` from 8 to ~28 per die, so even the 18 is per-SKU.
-- The AICPU↔AICPU matrix is a floor over 6 sweeps on device 0; the AICPU↔AICore
-  numbers are medians over 16 arena sweeps across two launches; the
-  AICore↔AICore matrix is the median of 12 repeats per pair over 24 arena-runs
-  on device 1.
+- **Only two SKUs are measured**, `_9592` and `_957b`. CANN's a5 ini files span
+  `ai_core_cnt` from 4 to 36 and `ai_cpu_cnt` from 5 to 7, so no count here is an
+  a5 constant. The AICPU↔AICore section and the GM-read table are DT-only.
+- The AICPU↔AICPU floor matrix is the best of 6 sweeps on device 0 and is
+  superseded by the per-address tables beside it (12 processes × 16 blocks,
+  device 1); the AICPU↔AICore numbers are medians over 16 arena sweeps across
+  two launches; the AICore↔AICore matrix is the median of 12 repeats per pair
+  over 24 arena-runs on device 1.
 - **A subset can invent structure that full sampling removes.** Two claims in
   earlier drafts came from an 8-cluster subset and did not survive measuring all
   108 sub-cores: a ~31 ns arena-home effect for AICore pairs (actually 1.0 ns),

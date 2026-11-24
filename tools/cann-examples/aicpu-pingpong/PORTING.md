@@ -56,7 +56,15 @@ Two things make a hardcoded list wrong:
 - **CANN over-subscribes rather than widening the pool.** Launching more threads
   than the pool holds does not reach more cpus; the surplus piles onto one sink
   cpu. On the box this was written on, 16 launched threads produced the spread
-  `1 1 1 1 2 2 3 3 4 4 5 5 6 6 7 7` — seven distinct cpus, cpu1 four times.
+  `1 1 1 1 2 2 3 3 4 4 5 5 6 6 7 7` — seven distinct cpus, cpu1 four times. On
+  `Ascend950PR_957b`, 32 launched threads produced only `1 2 3`, ten or eleven
+  threads deep on each.
+
+The discovery block also prints the AICPU OS's own `/sys/devices/system/cpu/
+{present,online,possible}`. That is the upper bound where the dispatched set is
+the lower one, and it is what distinguishes "this part has fewer AICPU cores"
+from "CANN dispatches to fewer of them". So far the two always agree: `0-7` with
+7 user-schedulable on `_9592`, `0-3` with 3 on `_957b`.
 
 Report the raw spread line, not just the unique set. The duplicate pattern tells
 the next reader how the dispatcher behaved.
@@ -77,10 +85,10 @@ Arguments: `<device_id> [launch_count] [iters] [reps] [warmup]`.
 If your box arbitrates devices with a queue (`task-submit` or equivalent), wrap
 it — this holds an AICPU core pair for the whole sweep.
 
-## 3. Repeat whole sweeps, not just reps
+## 3. The cross-cluster number is a property of the counter, not of the pair
 
 **Within** one launch the measurement is extremely stable: min and median across
-reps agreed to 0.01 ns on every pair. **Between** launches it is not. Two sweeps
+reps agree to 0.01 ns on every pair. **Between** launches it is not. Two sweeps
 on the same box, same binary, minutes apart:
 
 | pair | sweep A | sweep B |
@@ -88,27 +96,43 @@ on the same box, same binary, minutes apart:
 | (1,2) | 1114 ns | 1560 ns |
 | (4,6) | 1418 ns | 1114 ns |
 
-So raising `reps` buys you nothing you do not already have. Run the **whole
-sweep** 5–6 times and report the spread across sweeps. A single sweep's matrix
-looks far more precise than it is.
+**The variable is the contended line's address.** The line sweep (mode 2) walks
+64 counters 128 B apart inside one launch and finds the same 1101–1627 ns range
+there, quantised at **aligned 512-byte** granularity: counters in one block
+agree to 1.7 ns, the next block differs by up to 334. The SO's load address is
+identical in every process, so what is redrawn per process is the physical page.
+Both measured a5 parts behave this way.
 
-The intra-cluster (fast-tier) numbers were stable across everything; it is the
-cross-cluster band that wanders.
+So raising `reps` buys nothing, and raising the sweep count only samples the
+draw. For a number worth quoting, take the **line sweep** and report min /
+median / max; for a comparison against an older matrix, take the floor over 5–6
+whole sweeps and say that it is a floor.
+
+The intra-cluster tier is immune: under 5 ns of spread over every address and
+every launch on both parts.
 
 ## 4. Reading the bands
 
-Expect tiers, fastest first: SMT siblings → same cluster → same die → cross die.
-Where the steps fall tells you the topology. a5's runtime derives
+Only the intra-cluster tier is readable off a single sweep. The cross-cluster
+cells of one matrix are one draw each (§3), so a "same die vs cross die" step
+seen in one sweep is as likely to be the counter's home as the topology — on
+`_9592` the cross-die and same-die cross-cluster bands overlap completely once
+every address is sampled. Use the floor over many sweeps, or the line sweep.
+
+With that in hand, expect tiers, fastest first: SMT siblings → same cluster →
+same die → cross die. Where the steps fall tells you the topology. a5's runtime derives
 `cluster_id = phy_cpu_id / 2` and `die_id = phy_cpu_id / 4`
 (`src/a5/platform/onboard/host/aicpu_topology_probe.h`); your part may differ.
 
 Two cautions learned the hard way:
 
-- **A cpu that shares a cluster with the AICPU OS core reads slow in every
-  pairing.** On the reference box cpu0 is the OS and cpu1 is its cluster-mate;
-  every cpu1 pair is inflated, and cpu1↔cluster-mate-of-another-cluster came out
-  *slower than crossing the die boundary*. Do not fit a topology model before
-  identifying which cpu_id the OS owns (`AICPU + OS_SCHED`, device-side).
+- **One cluster pair really is expensive, and it is not the one a single sweep
+  points at.** Over 204 addresses on `_9592`, `cpu1 ↔ cpu4,5` never drops below
+  1317 ns while every other cross-cluster pair reaches ~1115 on a good draw. The
+  rest of the "cpu1 reads slow everywhere" pattern in a single sweep is the
+  address draw. Identify which cpu_id the OS owns (`AICPU + OS_SCHED`,
+  device-side) before fitting any topology model, and sample addresses before
+  attributing a band to a core.
 - **Fast tier ≈ 96 ns one-way is a cluster/L3 number, not an L1/SMT number.** If
   your part exposes real SMT siblings, expect a tier well below that. If your
   fastest tier is ~96 ns and you assumed SMT, you have probably found
@@ -149,14 +173,17 @@ So the two sets are comparable:
 2. `OCCUPY` (host-side **and** device-side if you can get both — on a5 they
    differ) and `OS_SCHED`.
 3. The discovery spread line, verbatim.
-4. The `CSV,a,b,min,median` block from each sweep — all of them, not a merged
-   matrix.
+4. The `CSV,a,b,min,median,...` block from each sweep — all of them, not a
+   merged matrix — and the `LINE,a,b,line,ns` block from at least one run, which
+   is the only part of the output that separates address from topology.
+   The `probe_a` / `probe_b` column with them: it is the evidence that the clock
+   held still while those numbers were taken.
 5. The timer frequency line.
 6. Compiler version and `-march` used for the inner SO.
 7. `CPU_TOPO` if your driver still serves it. That makes your run the ground
    truth that calibrates everyone else's timing-only inference.
 
-## 7. Reference result to compare against
+## 7. Reference results to compare against
 
 `Ascend950DT_9592`, device 0, `OCCUPY = 0xfe`, 7 user cpus at cpu_id 1..7,
 `iters=1000 reps=5 warmup=200`, median ns per **round trip** (halve for one-way):
@@ -172,9 +199,27 @@ So the two sets are comparable:
      7  1379.8  1300.1   1300.0  1114.3   1114.3   192.3        -
 ```
 
-Read as: 8 physical AICPU cores in 4 clusters of 2 across 2 dies, cpu0 owned by
-the AICPU OS. ~192 ns intra-cluster, ~1114 ns same-die cross-cluster, ~1300 ns
-cross-die, and the cpu1 row inflated by sharing its cluster's L3 with the OS
-core. This matches the published a5 spec — 4 AI CPU clusters × 2 dual-threaded
-Linx816 with 4 MB L3 each, and a 128 MB chip-wide unified L2 — which the matrix
-reproduced without any topology API.
+**That is one draw.** The 192.3 / 193.0 diagonal blocks reproduce anywhere; the
+off-diagonal cells are that run's counter address and will not. Compare against
+the per-address table instead — `_9592`, device 1, 12 processes × 16 aligned
+512-byte blocks, ns:
+
+| cluster pair | min | median | max |
+| --- | ---: | ---: | ---: |
+| c0–c1  `cpu1 ↔ cpu2,3` | 1101 | 1116 | 1627 |
+| c0–c2  `cpu1 ↔ cpu4,5` | 1317 | 1366 | 1420 |
+| c0–c3  `cpu1 ↔ cpu6,7` | 1115 | 1301 | 1562 |
+| c1–c2  `cpu2,3 ↔ cpu4,5` | 1116 | 1301 | 1562 |
+| c1–c3  `cpu2,3 ↔ cpu6,7` | 1110 | 1225 | 1327 |
+| c2–c3  `cpu4,5 ↔ cpu6,7` | 1066 | 1322 | 1607 |
+| same cluster | 192 | 193 | 197 |
+
+`Ascend950PR_957b`, 3 user cpus, same method: `cpu2↔cpu3` 189.9 / 191.0 / 193.4,
+`cpu1↔cpu2,3` 1161 / 1315 / 1564.
+
+Read as: 4 AICPU clusters of 2 across 2 dies on `_9592` (cpu0 OS-owned), 2
+clusters on `_957b`. ~192 ns intra-cluster on both, and a cross-cluster cost
+that is a draw over the counter's home with one genuine placement term
+(`c0–c2`). The 192 ns tier matches the published a5 spec — 4 AI CPU clusters ×
+2 dual-threaded Linx816 with 4 MB L3 each — which the matrix reproduced without
+any topology API.

@@ -114,6 +114,7 @@ namespace {
 constexpr size_t kDeviceArgsBytes = 160;
 constexpr uint32_t kMaxSlots = 32;
 constexpr uint32_t kMaxReps = 16;
+constexpr uint32_t kBankLines = 64;
 
 #define ACL_CHECK(call, msg)                                                    \
     do {                                                                        \
@@ -180,6 +181,23 @@ struct PingPongOutput {
     int32_t thread_core_id[kMaxSlots];
     int32_t thread_package_id[kMaxSlots];
     int32_t thread_cluster_id[kMaxSlots];
+    int32_t thread_die_id[kMaxSlots];
+    char cpu_present[64];
+    char cpu_online[64];
+    char cpu_possible[64];
+    uint64_t probe_ops;
+    uint64_t probe_ticks_a;
+    uint64_t probe_ticks_b;
+    uint64_t shared_va;
+    uint64_t shared_pfn;
+    uint64_t page_bytes;
+    int32_t khz_a_start;
+    int32_t khz_a_end;
+    int32_t khz_b_start;
+    int32_t khz_b_end;
+    uint64_t bank_va;
+    uint32_t lines_done;
+    uint64_t line_ticks[kBankLines];
 };
 #pragma pack(pop)
 
@@ -426,25 +444,39 @@ int main(int argc, char **argv) {
     if (run_round(0, -1, -1, discover_threads) != 0) return 1;
 
     std::vector<int> cpus;
-    for (uint32_t i = 0; i < host_out.claim_counter && i < kMaxSlots; ++i) cpus.push_back(host_out.thread_cpu[i]);
+    for (uint32_t i = 0; i < host_out.claim_counter && i < kMaxSlots; ++i)
+        cpus.push_back(host_out.thread_cpu[i]);
     std::sort(cpus.begin(), cpus.end());
     std::printf("\n=== discovery: launched %d threads, %u reported ===\n", discover_threads, host_out.claim_counter);
     std::printf("  cpu_id spread (sorted, duplicates = CANN over-subscription):\n    ");
-    for (size_t i = 0; i < cpus.size(); ++i) std::printf("%s%d", (i ? " " : ""), cpus[i]);
+    for (size_t i = 0; i < cpus.size(); ++i)
+        std::printf("%s%d", (i ? " " : ""), cpus[i]);
     std::printf("\n");
     cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
     const int n = (int)cpus.size();
     std::printf("  unique user-schedulable cpu_ids: %d  ->  %d unordered pairs\n", n, n * (n - 1) / 2);
 
+    // The set above is where CANN put threads, which is a lower bound on the
+    // pool. The AICPU OS's own inventory is the upper bound, and the gap between
+    // them is the difference between a part with fewer AICPU cores and a CANN
+    // that dispatches to fewer of them.
+    auto show = [](const char *s) {
+        return (s[0] != '\0') ? s : "(unreadable)";
+    };
+    std::printf("\n=== AICPU OS cpu inventory ===\n");
+    std::printf("  /sys/devices/system/cpu/present  : %s\n", show(host_out.cpu_present));
+    std::printf("  /sys/devices/system/cpu/online   : %s\n", show(host_out.cpu_online));
+    std::printf("  /sys/devices/system/cpu/possible : %s\n", show(host_out.cpu_possible));
+
     // cpu_id -> cluster/die is unresolvable from the driver on this part
     // (CPU_TOPO returns DRV_ERROR_NOT_SUPPORT), so report the AICPU OS's own
     // sysfs view. -1 means the file is absent, which is itself the answer.
     std::printf("\n=== AICPU OS sysfs topology (-1 = file absent) ===\n");
-    std::printf("  %-8s %-10s %-20s %-12s\n", "cpu_id", "core_id", "physical_package_id", "cluster_id");
+    std::printf("  %-8s %-10s %-20s %-12s %-8s\n", "cpu_id", "core_id", "physical_package_id", "cluster_id", "die_id");
     for (uint32_t i = 0; i < host_out.claim_counter && i < kMaxSlots; ++i) {
         std::printf(
-            "  %-8d %-10d %-20d %-12d\n", host_out.thread_cpu[i], host_out.thread_core_id[i],
-            host_out.thread_package_id[i], host_out.thread_cluster_id[i]
+            "  %-8d %-10d %-20d %-12d %-8d\n", host_out.thread_cpu[i], host_out.thread_core_id[i],
+            host_out.thread_package_id[i], host_out.thread_cluster_id[i], host_out.thread_die_id[i]
         );
     }
     if (n < 2) {
@@ -456,13 +488,14 @@ int main(int argc, char **argv) {
     // --- pair sweep ---------------------------------------------------------
     std::vector<double> med(n * n, -1.0), best(n * n, -1.0);
     std::vector<double> rmed(n * n, -1.0), rbest(n * n, -1.0), ratio(n * n, -1.0);
+    std::vector<double> probe_us(n * n, -1.0);
     std::printf(
         "\n=== sweep: iters=%llu reps=%u warmup=%llu launch_count=%d ===\n", (unsigned long long)iters, reps,
         (unsigned long long)warmup, launch_count
     );
     std::printf(
-        "  %-6s %-6s %9s %9s %9s %9s %7s  %s\n", "cpu_a", "cpu_b", "bare_min", "bare_med", "isb_min", "isb_med",
-        "isb/bare", "status"
+        "  %-6s %-6s %9s %9s %9s %9s %7s %9s %9s  %s\n", "cpu_a", "cpu_b", "bare_min", "bare_med", "isb_min", "isb_med",
+        "isb/bare", "probe_a", "probe_b", "status"
     );
     for (int i = 0; i < n; ++i) {
         for (int j = i + 1; j < n; ++j) {
@@ -471,9 +504,17 @@ int main(int argc, char **argv) {
             std::string st = StatusText(host_out.status_a) + "/" + StatusText(host_out.status_b);
             if (host_out.role_a_seen == 0 || host_out.role_b_seen == 0) st += " [role-missing]";
             const uint32_t rdone = host_out.reps_done_relax > kMaxReps ? kMaxReps : host_out.reps_done_relax;
+            // Both roles time the same dependent-ALU chain inside this launch,
+            // so a round trip that moves while the probe does not is not the
+            // core clock moving.
+            const double tick_hz = host_out.freq_hz ? (double)host_out.freq_hz : 1e9;
+            const double probe_a_us = (double)host_out.probe_ticks_a * 1e6 / tick_hz;
+            const double probe_b_us = (double)host_out.probe_ticks_b * 1e6 / tick_hz;
+            probe_us[i * n + j] = probe_us[j * n + i] = probe_a_us;
             if (done == 0 || host_out.freq_hz == 0) {
                 std::printf(
-                    "  %-6d %-6d %9s %9s %9s %9s %7s  %s\n", cpus[i], cpus[j], "-", "-", "-", "-", "-", st.c_str()
+                    "  %-6d %-6d %9s %9s %9s %9s %7s %9.1f %9.1f  %s\n", cpus[i], cpus[j], "-", "-", "-", "-", "-",
+                    probe_a_us, probe_b_us, st.c_str()
                 );
                 continue;
             }
@@ -500,12 +541,23 @@ int main(int argc, char **argv) {
                 rat = rmd / md;
                 ratio[i * n + j] = ratio[j * n + i] = rat;
                 std::printf(
-                    "  %-6d %-6d %9.1f %9.1f %9.1f %9.1f %7.3f  %s\n", cpus[i], cpus[j], mn, md, rmn, rmd, rat,
-                    st.c_str()
+                    "  %-6d %-6d %9.1f %9.1f %9.1f %9.1f %7.3f %9.1f %9.1f  %s\n", cpus[i], cpus[j], mn, md, rmn, rmd,
+                    rat, probe_a_us, probe_b_us, st.c_str()
                 );
             } else {
                 std::printf(
-                    "  %-6d %-6d %9.1f %9.1f %9s %9s %7s  %s\n", cpus[i], cpus[j], mn, md, "-", "-", "-", st.c_str()
+                    "  %-6d %-6d %9.1f %9.1f %9s %9s %7s %9.1f %9.1f  %s\n", cpus[i], cpus[j], mn, md, "-", "-", "-",
+                    probe_a_us, probe_b_us, st.c_str()
+                );
+            }
+            std::printf(
+                "         counter line: va=0x%llx pfn=0x%llx page=%llu\n", (unsigned long long)host_out.shared_va,
+                (unsigned long long)host_out.shared_pfn, (unsigned long long)host_out.page_bytes
+            );
+            if (host_out.khz_a_start >= 0 || host_out.khz_b_start >= 0) {
+                std::printf(
+                    "         cpufreq kHz: cpu%d %d->%d  cpu%d %d->%d\n", cpus[i], host_out.khz_a_start,
+                    host_out.khz_a_end, cpus[j], host_out.khz_b_start, host_out.khz_b_end
                 );
             }
             std::fflush(stdout);
@@ -515,7 +567,8 @@ int main(int argc, char **argv) {
     auto print_matrix = [&](const char *title, const std::vector<double> &m) {
         std::printf("\n=== %s ===\n", title);
         std::printf("%8s", "cpu");
-        for (int j = 0; j < n; ++j) std::printf("%9d", cpus[j]);
+        for (int j = 0; j < n; ++j)
+            std::printf("%9d", cpus[j]);
         std::printf("\n");
         for (int i = 0; i < n; ++i) {
             std::printf("%8d", cpus[i]);
@@ -536,12 +589,51 @@ int main(int argc, char **argv) {
     print_matrix("isb spin: round-trip latency, ns (median of reps)", rmed);
     print_matrix("isb / bare ratio (same launch, so clock-independent)", ratio);
 
-    std::printf("\n=== CSV (cpu_a,cpu_b,min_ns,median_ns,relax_min_ns,relax_median_ns,ratio) ===\n");
+    // The pair matrix measures one counter, so a per-launch cost cannot be told
+    // apart from a per-address one. This walks 64 counters 128 B apart in a
+    // single launch, with the pair and the clock held fixed.
+    std::printf("\n=== line sweep: round-trip latency per counter line, ns ===\n");
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            if (run_round(2, cpus[i], cpus[j], launch_count) != 0) return 1;
+            if (host_out.freq_hz == 0) {
+                std::printf("  cpu%d<->cpu%d: no timer\n", cpus[i], cpus[j]);
+                continue;
+            }
+            const uint32_t nl = host_out.lines_done > kBankLines ? kBankLines : host_out.lines_done;
+            std::vector<double> ns;
+            for (uint32_t l = 0; l < nl; ++l)
+                ns.push_back((double)host_out.line_ticks[l] * 1e9 / (double)host_out.freq_hz / (double)iters);
+            std::printf(
+                "  cpu%d<->cpu%d  bank_va=0x%llx  lines %u/%u  status %s/%s\n", cpus[i], cpus[j],
+                (unsigned long long)host_out.bank_va, nl, kBankLines, StatusText(host_out.status_a).c_str(),
+                StatusText(host_out.status_b).c_str()
+            );
+            if (nl == 0) continue;
+            for (uint32_t l = 0; l < nl; ++l) {
+                if (l % 8 == 0) std::printf("    line %2u:", l);
+                std::printf(" %8.1f", ns[l]);
+                if (l % 8 == 7) std::printf("\n");
+            }
+            if (nl % 8 != 0) std::printf("\n");
+            std::vector<double> sorted(ns);
+            std::sort(sorted.begin(), sorted.end());
+            std::printf(
+                "    min %.1f  median %.1f  max %.1f  spread %.1f ns\n", sorted.front(), sorted[sorted.size() / 2],
+                sorted.back(), sorted.back() - sorted.front()
+            );
+            for (uint32_t l = 0; l < nl; ++l)
+                std::printf("LINE,%d,%d,%u,%.2f\n", cpus[i], cpus[j], l, ns[l]);
+            std::fflush(stdout);
+        }
+    }
+
+    std::printf("\n=== CSV (cpu_a,cpu_b,min_ns,median_ns,relax_min_ns,relax_median_ns,ratio,probe_us) ===\n");
     for (int i = 0; i < n; ++i)
         for (int j = i + 1; j < n; ++j)
             std::printf(
-                "CSV,%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f\n", cpus[i], cpus[j], best[i * n + j], med[i * n + j],
-                rbest[i * n + j], rmed[i * n + j], ratio[i * n + j]
+                "CSV,%d,%d,%.2f,%.2f,%.2f,%.2f,%.4f,%.1f\n", cpus[i], cpus[j], best[i * n + j], med[i * n + j],
+                rbest[i * n + j], rmed[i * n + j], ratio[i * n + j], probe_us[i * n + j]
             );
     std::printf(
         "\nOne round trip = both threads increment once (2 fetch_adds).\n"

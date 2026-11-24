@@ -59,15 +59,43 @@ silently mislabelled.
 ## Protocol
 
 ```text
-1. discovery launch (mode=0)   every thread records sched_getcpu() -> unique cpu_id set
+1. discovery launch (mode=0)   every thread records sched_getcpu() -> unique cpu_id set,
+                               plus the AICPU OS's own /sys cpu inventory
 2. for each unordered pair:
      launch simpler_aicpu_init with 1 thread   (resets the BSS counters)
      launch simpler_aicpu_pingpong with N      (only the pair participates)
      read back reps x round-trip tick counts
+3. for each unordered pair (mode=2):
+     one timed interval on each of 64 counters 128 B apart, in a single launch
 ```
 
 A `reps`-long run inside one launch amortizes launch overhead; the host reports
 both the minimum and the median across reps.
+
+**The discovered set is a lower bound on the pool.** It is where CANN chose to
+put threads, so a part could have cores it never dispatches to. The inventory
+from step 1 is the AICPU OS's own count and is the upper bound; when the two
+agree, as they do on `_9592` (`present` = 0-7, 7 user-schedulable) and on
+`_957b` (`present` = 0-3, 3 user-schedulable), the pool is the hardware. Raising
+`launch_count` past the pool makes CANN over-subscribe, and the duplicates in
+the printed spread are the direct evidence that it is exhausted.
+
+**Step 3 is what separates a per-pair cost from a per-address one.** Step 2
+measures one counter, so a cost that depends on where that counter sits is
+indistinguishable from a cost that depends on the two cores. Walking 64 lines
+inside one launch holds the pair, the clock and the process fixed and varies
+only the address. On both measured a5 parts the cross-cluster round trip varies
+by 400-540 ns across those lines while the same-cluster one varies by under
+5 ns, so step 2 alone is not a pair measurement — see
+[`../a5-latency-findings/`](../a5-latency-findings/README.md).
+
+**Each role also times a dependent-ALU chain inside the measured launch**
+(`probe_a` / `probe_b`, microseconds). It reads 800.1 µs ± 0.3 on both parts
+across every launch taken so far, which is what rules out DVFS as the source of
+a hand-off number that moves. A probe that moves with the hand-off would mean
+the opposite, so read the two columns together. `cpufreq` is absent on the AICPU
+OS, so the probe is the only clock witness; the per-cpu `scaling_cur_freq` read
+prints only when the file exists.
 
 ## Build
 
@@ -106,14 +134,21 @@ Arguments are `<device_id> [launch_count] [iters] [reps] [warmup]`;
 The matrix is symmetric (a round trip has no direction) with an empty diagonal —
 one thread per cpu_id means a core has no partner on itself.
 
-Latency should cluster by topology. a5 derives `cluster_id = phy_cpu_id / 2` and
-`die_id = phy_cpu_id / 4` (see
+Latency clusters by topology, but only the diagonal blocks are reproducible: a
+single sweep's off-diagonal cells are one draw of a quantity that spans hundreds
+of ns, so compare matrices only as floors over many sweeps, or use the line
+sweep. a5 derives `cluster_id = phy_cpu_id / 2` and `die_id = phy_cpu_id / 4` (see
 [`src/a5/docs/hardware.md`](../../../src/a5/docs/hardware.md)), so expect bands:
 SMT siblings fastest, then same-cluster, then same-die, then cross-die. Reading
 the bands off the matrix is a way to **recover the AICPU topology from timing**
 on a SKU whose `CPU_TOPO` the driver refuses to report — which is the case on
 newer a5 drivers, where `halGetDeviceInfoByBuff(SYSTEM, CPU_TOPO)` returns
 `DRV_ERROR_NOT_SUPPORT`.
+
+The line sweep prints its 64 samples per pair plus `min / median / max /
+spread`, and `LINE,<cpu_a>,<cpu_b>,<line>,<ns>` rows for analysis. `lines N/64`
+says how many completed: a pair whose partner stalls past the spin budget stops
+the walk there rather than reporting zeros.
 
 Per-pair status is printed next to each sample:
 
@@ -136,3 +171,7 @@ Per-pair status is printed next to each sample:
   signalling are different paths with different costs.
 - One thread per cpu_id, so there is no same-core (SMT-sibling-free) diagonal
   sample.
+- The counter's physical page is not observable: `/proc/self/pagemap` returns
+  the present bit and a zero frame to this process, and the SO's load address is
+  the same in every process, so the line sweep shows *that* the address decides
+  the cost without naming which address bits do it.
